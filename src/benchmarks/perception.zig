@@ -490,6 +490,7 @@ fn runOnce(
         .items_per_range = case.stageItemsPerRange(perception_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .scope_dense_indices = think_set,
     });
 }
@@ -660,6 +661,7 @@ fn runCrowdOnce(
         .items_per_range = case.stageItemsPerRange(perception_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .scope_dense_indices = think_set,
     });
 }

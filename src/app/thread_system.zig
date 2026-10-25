@@ -64,6 +64,7 @@ pub const ThreadSystemConfig = struct {
 
 pub const ParallelForOptions = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     range_alignment_items: usize = 1,
     adaptive: bool = true,
@@ -84,6 +85,10 @@ pub const BatchWorkRequest = struct {
     item_count: usize,
     /// Explicit range size opts out of the adaptive tuner (fixed shape).
     items_per_range: ?usize = null,
+    /// A fixed batch count per participant opts out of the adaptive tuner too: the batch
+    /// is shaped from its item count as the tuner shapes its pool batches
+    /// (`poolItemsPerRange`). An explicit `items_per_range` wins.
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     range_alignment_items: usize = 1,
     adaptive: bool = true,
@@ -156,7 +161,8 @@ const min_batch_multiplier: f64 = 0.25;
 // and a loss flips the nudge up past the start (measured: light stages ran 9-16 workers
 // on the old climb and held at the full pool when the nudge stepped up first).
 const initial_nudge_direction: i8 = -1;
-const max_batch_multiplier: f64 = 4.0;
+/// The batch-count clamp's top: the most batches per participant a tuner selects.
+pub const max_batch_multiplier: f64 = 4.0;
 
 const NudgeState = enum {
     // Before the first step: the EMA settles, then the first reference is taken.
@@ -740,28 +746,18 @@ pub const AdaptiveWorkTuner = struct {
         return predicted_threaded_ns < estimated_work_ns;
     }
 
-    // The whole pool's participants x `batches_per_participant`, rounded, as batches,
-    // shaped by `profileForRangeCount` (workers follow the batches); inline when no two
-    // batches fit or no worker may run.
+    // The whole pool's batches at `batches_per_participant` (`poolItemsPerRange`), normalized,
+    // with a worker per batch beyond main's up to the pool; inline when no two batches fit or
+    // no worker may run.
     fn poolProfile(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest, batches_per_participant: f64) AdaptiveWorkProfile {
-        const participants: f64 = @floatFromInt(request.max_worker_threads + 1);
-        return self.profileForRangeCount(request, roundedUsize(participants * batches_per_participant)) orelse
-            self.normalizedProfile(inlineProfile(request), request);
-    }
-
-    // The threaded profile with `ranges` batches clamped to [2, maxRangeCount], each at
-    // least one alignment unit, and a worker per batch beyond main's, up to the pool. Null
-    // when no two aligned batches fit or no worker may run.
-    fn profileForRangeCount(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest, ranges: usize) ?AdaptiveWorkProfile {
-        if (request.max_worker_threads == 0) return null;
-        const max_ranges = maxRangeCount(request.item_count, request.range_alignment_items);
-        if (max_ranges < 2) return null;
-        const profile = self.normalizedProfile(.{
-            .worker_threads = request.max_worker_threads,
-            .items_per_range = targetRangeSizeForRangeCount(request.item_count, std.math.clamp(ranges, 2, max_ranges)),
-        }, request);
-        if (profile.worker_threads == 0) return null;
-        return profile;
+        if (poolItemsPerRange(request.item_count, request.max_worker_threads, request.range_alignment_items, batches_per_participant)) |items_per_range| {
+            const profile = self.normalizedProfile(.{
+                .worker_threads = request.max_worker_threads,
+                .items_per_range = items_per_range,
+            }, request);
+            if (profile.worker_threads != 0) return profile;
+        }
+        return self.normalizedProfile(inlineProfile(request), request);
     }
 
     // Inline batches teach per-item work. Threaded batches add the participant overhead
@@ -952,7 +948,7 @@ pub const ThreadSystem = struct {
     owner_in_batch: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ThreadSystemConfig) !ThreadSystem {
-        const worker_thread_count = try resolveWorkerThreadCount(config.max_worker_threads);
+        const worker_thread_count = config.max_worker_threads orelse defaultWorkerThreadCount();
         const shared = try allocator.create(Shared);
         errdefer allocator.destroy(shared);
         shared.* = .{ .descriptor = .{ .io = io } };
@@ -1072,6 +1068,23 @@ pub const ThreadSystem = struct {
         return selection;
     }
 
+    // The workers a request may use: its cap, at most this system's workers.
+    fn workerCap(self: *const ThreadSystem, max_worker_threads: ?usize) usize {
+        return @min(max_worker_threads orelse self.workers.len, self.workers.len);
+    }
+
+    /// The aligned range size the fixed `batches_per_participant` option resolves
+    /// `item_count` items to on this system: the pool shape (`poolItemsPerRange`) over the
+    /// workers the request's `max_worker_threads` cap allows, aligned forward to
+    /// `range_alignment_items`, or one range when no two aligned batches fit or no worker may
+    /// run. `resolveSelection` shapes the option from it, and benches read it to check that shape.
+    pub fn fixedBatchesItemsPerRange(self: *const ThreadSystem, item_count: usize, max_worker_threads: ?usize, range_alignment_items: usize, batches_per_participant: f64) usize {
+        std.debug.assert(batches_per_participant >= min_batch_multiplier and batches_per_participant <= max_batch_multiplier);
+        const alignment = @max(range_alignment_items, @as(usize, 1));
+        const range = poolItemsPerRange(item_count, self.workerCap(max_worker_threads), alignment, batches_per_participant) orelse @max(item_count, 1);
+        return std.mem.alignForwardAnyAlign(usize, range, alignment);
+    }
+
     // The shape under `adaptive_tuner` when it is active (consulting and updating it), else
     // the fixed shape: the owner's `selectBatchProfile`.
     fn resolveSelection(
@@ -1080,9 +1093,13 @@ pub const ThreadSystem = struct {
         request: BatchWorkRequest,
     ) BatchSelection {
         const range_alignment_items = @max(request.range_alignment_items, @as(usize, 1));
-        const max_worker_threads = @min(request.max_worker_threads orelse self.workers.len, self.workers.len);
-        const requested_items_per_range = @max(request.items_per_range orelse self.config.items_per_range, @as(usize, 1));
-        const active_tuner = if (request.adaptive and request.items_per_range == null and max_worker_threads > 0)
+        const max_worker_threads = self.workerCap(request.max_worker_threads);
+        const fixed_items_per_range = request.items_per_range orelse if (request.batches_per_participant) |batches|
+            self.fixedBatchesItemsPerRange(request.item_count, request.max_worker_threads, range_alignment_items, batches)
+        else
+            null;
+        const requested_items_per_range = @max(fixed_items_per_range orelse self.config.items_per_range, @as(usize, 1));
+        const active_tuner = if (request.adaptive and fixed_items_per_range == null and max_worker_threads > 0)
             adaptive_tuner
         else
             null;
@@ -1143,6 +1160,7 @@ pub const ThreadSystem = struct {
             self.resolveSelection(options.adaptive_tuner, .{
                 .item_count = item_count,
                 .items_per_range = options.items_per_range,
+                .batches_per_participant = options.batches_per_participant,
                 .max_worker_threads = options.max_worker_threads,
                 .range_alignment_items = range_alignment_items,
                 .adaptive = options.adaptive,
@@ -1255,7 +1273,7 @@ pub const ThreadSystem = struct {
         range_alignment_items: usize,
         active_tuner: ?*AdaptiveWorkTuner,
     ) BatchSelection {
-        const max_worker_threads = @min(max_worker_threads_cap orelse self.workers.len, self.workers.len);
+        const max_worker_threads = self.workerCap(max_worker_threads_cap);
         const shape = shapeBatch(item_count, selected, max_worker_threads, range_alignment_items, active_tuner != null);
         return .{
             .profile = .{ .worker_threads = shape.worker_threads, .items_per_range = shape.items_per_range },
@@ -1286,6 +1304,7 @@ pub const ThreadSystem = struct {
             self.untunedSelection(.{
                 .item_count = item_count,
                 .items_per_range = options.items_per_range,
+                .batches_per_participant = options.batches_per_participant,
                 .max_worker_threads = options.max_worker_threads,
                 .range_alignment_items = range_alignment_items,
                 .adaptive = options.adaptive,
@@ -1485,8 +1504,9 @@ fn normalizeConfig(config: ThreadSystemConfig) ThreadSystemConfig {
     return normalized;
 }
 
-fn resolveWorkerThreadCount(override_count: ?usize) !usize {
-    if (override_count) |count| return count;
+/// The worker count a `ThreadSystem` with no `max_worker_threads` spawns: one per CPU beyond
+/// the main/render thread's, and none on one CPU or when the count is unavailable.
+pub fn defaultWorkerThreadCount() usize {
     const cpu_count = std.Thread.getCpuCount() catch |err| {
         log.warn("failed to query CPU count for ThreadSystem; using serial execution fallback: {}", .{err});
         return 0;
@@ -1795,9 +1815,12 @@ pub fn accumulateBatch(total: *BatchStats, batch: BatchStats) void {
 }
 
 /// A stage's range controls. A fixed `items_per_range` opts the stage out of its tuner;
-/// `max_worker_threads` caps participation; `adaptive = false` pins the fixed shape.
+/// `batches_per_participant` opts the stage out at a batch count per participant shaped from
+/// each dispatch's items; `max_worker_threads` caps participation; `adaptive = false` pins
+/// the fixed shape.
 pub const StageControls = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -1809,6 +1832,7 @@ pub const Dispatch = struct {
     thread_system: *ThreadSystem,
     tuner: *AdaptiveWorkTuner,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 
@@ -1817,18 +1841,20 @@ pub const Dispatch = struct {
             .thread_system = thread_system,
             .tuner = tuner,
             .items_per_range = controls.items_per_range,
+            .batches_per_participant = controls.batches_per_participant,
             .max_worker_threads = controls.max_worker_threads,
             .adaptive = controls.adaptive,
         };
     }
 
     /// The batch shape of `item_count` items; the tuner drives an adaptive dispatch with
-    /// no fixed range size.
+    /// no fixed range size or batch count.
     pub fn select(self: Dispatch, item_count: usize, range_alignment_items: usize) BatchSelection {
-        const tuner: ?*AdaptiveWorkTuner = if (self.adaptive and self.items_per_range == null) self.tuner else null;
+        const tuner: ?*AdaptiveWorkTuner = if (self.adaptive and self.items_per_range == null and self.batches_per_participant == null) self.tuner else null;
         return self.thread_system.selectBatchProfile(tuner, .{
             .item_count = item_count,
             .items_per_range = self.items_per_range,
+            .batches_per_participant = self.batches_per_participant,
             .max_worker_threads = self.max_worker_threads,
             .range_alignment_items = range_alignment_items,
             .adaptive = self.adaptive,
@@ -1839,6 +1865,7 @@ pub const Dispatch = struct {
     pub fn run(self: Dispatch, selection: BatchSelection, item_count: usize, range_alignment_items: usize, context: *anyopaque, job: JobFn) BatchStats {
         return self.thread_system.parallelForWithOptions(item_count, context, job, .{
             .items_per_range = self.items_per_range,
+            .batches_per_participant = self.batches_per_participant,
             .max_worker_threads = self.max_worker_threads,
             .range_alignment_items = range_alignment_items,
             .adaptive = self.adaptive,
@@ -1849,7 +1876,8 @@ pub const Dispatch = struct {
 };
 
 /// Threading for one update's stages: the thread system and the caller's control config,
-/// whose `items_per_range`, `max_worker_threads`, and `adaptive` every stage shares.
+/// whose `items_per_range`, `batches_per_participant`, `max_worker_threads`, and `adaptive`
+/// every stage shares.
 pub fn StageThreads(comptime Config: type) type {
     return struct {
         const Self = @This();
@@ -1861,6 +1889,7 @@ pub fn StageThreads(comptime Config: type) type {
         pub fn stage(self: Self, tuner: *AdaptiveWorkTuner) Dispatch {
             return Dispatch.init(self.thread_system, tuner, .{
                 .items_per_range = self.config.items_per_range,
+                .batches_per_participant = self.config.batches_per_participant,
                 .max_worker_threads = self.config.max_worker_threads,
                 .adaptive = self.config.adaptive,
             });
@@ -1962,6 +1991,7 @@ pub const RoundDispatch = struct {
                 .adaptive = stage.adaptive,
                 .adaptive_tuner = null,
                 .items_per_range = stage.items_per_range,
+                .batches_per_participant = stage.batches_per_participant,
                 .max_worker_threads = stage.max_worker_threads,
                 .range_alignment_items = 1,
                 .selected_profile = selection.profile,
@@ -2033,15 +2063,25 @@ fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_thread
     };
 }
 
+/// The range size, before alignment, of `item_count` items split into the participants'
+/// (`max_worker_threads` + main) x `batches_per_participant` batches, rounded and clamped to
+/// [2, `maxRangeCount`]. Null when no two aligned batches fit or no worker may run. The
+/// tuner's pool shapes and the fixed `batches_per_participant` option
+/// (`ThreadSystem.fixedBatchesItemsPerRange`) both size from it.
+fn poolItemsPerRange(item_count: usize, max_worker_threads: usize, range_alignment_items: usize, batches_per_participant: f64) ?usize {
+    if (max_worker_threads == 0) return null;
+    const max_ranges = maxRangeCount(item_count, range_alignment_items);
+    if (max_ranges < 2) return null;
+    const participants: f64 = @floatFromInt(max_worker_threads + 1);
+    return targetRangeSizeForRangeCount(item_count, std.math.clamp(roundedUsize(participants * batches_per_participant), 2, max_ranges));
+}
+
 fn targetRangeSizeForRangeCount(item_count: usize, target_ranges: usize) usize {
     return @max(@as(usize, 1), @divCeil(item_count, @max(target_ranges, @as(usize, 1))));
 }
 
 fn roundedUsize(value: f64) usize {
-    if (value <= 1) return 1;
-    const max_f: f64 = @floatFromInt(std.math.maxInt(usize));
-    if (value >= max_f) return std.math.maxInt(usize);
-    return @intFromFloat(@floor(value + 0.5));
+    return @max(1, std.math.lossyCast(usize, @round(value)));
 }
 
 fn ewma(current: f64, observed: f64, alpha: f64) f64 {
@@ -2758,7 +2798,7 @@ test "round dispatch records one tuner sample per step, and folds inline rounds 
 }
 
 test "stage threads with workers is null with no worker or a zero worker cap" {
-    const Config = struct { items_per_range: ?usize = null, max_worker_threads: ?usize = null, adaptive: bool = true };
+    const Config = struct { items_per_range: ?usize = null, batches_per_participant: ?f64 = null, max_worker_threads: ?usize = null, adaptive: bool = true };
     const Threads = StageThreads(Config);
     var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial.deinit();
@@ -2767,12 +2807,193 @@ test "stage threads with workers is null with no worker or a zero worker cap" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
     try std.testing.expect(Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .max_worker_threads = 0 } }) == null);
-    const held = Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .items_per_range = 8, .max_worker_threads = 1, .adaptive = false } }).?;
+    const held = Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .items_per_range = 8, .batches_per_participant = 2.0, .max_worker_threads = 1, .adaptive = false } }).?;
     var tuner = AdaptiveWorkTuner.init(.{});
     const stage = held.stage(&tuner);
     try std.testing.expectEqual(@as(?usize, 8), stage.items_per_range);
+    try std.testing.expectEqual(@as(?f64, 2.0), stage.batches_per_participant);
     try std.testing.expectEqual(@as(?usize, 1), stage.max_worker_threads);
     try std.testing.expect(!stage.adaptive and stage.tuner == &tuner);
+}
+
+test "a batches-per-participant option shapes a fixed batch from its item count as the tuner shapes its pool batches" {
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const reference = AdaptiveWorkTuner.init(.{});
+    const Case = struct { items: usize, batches: f64, cap: ?usize = null, ranges: usize, workers: usize };
+    const alignment: usize = 16;
+    const cases = [_]Case{
+        // Three workers and main: 4 x 4 = 16 batches.
+        .{ .items = 1_000, .batches = 4.0, .ranges = 16, .workers = 3 },
+        // A worker cap of one: 2 participants x 4 = 8 batches.
+        .{ .items = 1_000, .batches = 4.0, .cap = 1, .ranges = 8, .workers = 1 },
+        // A quarter batch per participant rounds to one batch and clamps to two.
+        .{ .items = 1_000, .batches = 0.25, .ranges = 2, .workers = 1 },
+        // 100 items hold 7 aligned units, which bound the 16 batches.
+        .{ .items = 100, .batches = 4.0, .ranges = 7, .workers = 3 },
+        // One aligned unit runs one inline range.
+        .{ .items = 16, .batches = 4.0, .ranges = 1, .workers = 0 },
+    };
+    for (cases) |case| {
+        const selection = threads.selectBatchProfile(&tuner, .{
+            .item_count = case.items,
+            .batches_per_participant = case.batches,
+            .max_worker_threads = case.cap,
+            .range_alignment_items = alignment,
+            .adaptive = true,
+        });
+        try std.testing.expectEqual(case.ranges, selection.range_count);
+        try std.testing.expectEqual(case.workers, selection.worker_threads);
+        try std.testing.expectEqual(case.ranges, rangeCount(case.items, selection.items_per_range));
+        try std.testing.expectEqual(@as(usize, 0), selection.items_per_range % alignment);
+        try std.testing.expect(selection.active_tuner == null);
+        // A threaded batch sits at the tuner's pool shape for the same request.
+        if (case.workers != 0) {
+            const pool = reference.poolProfile(.{
+                .item_count = case.items,
+                .available_worker_threads = threads.workerThreadCount(),
+                .max_worker_threads = case.cap orelse threads.workerThreadCount(),
+                .fallback_items_per_range = threads.config.items_per_range,
+                .range_alignment_items = alignment,
+            }, case.batches);
+            try std.testing.expectEqual(pool.items_per_range, selection.items_per_range);
+            try std.testing.expectEqual(pool.worker_threads, selection.worker_threads);
+        }
+    }
+    // The option never reached the tuner.
+    try std.testing.expectEqual(@as(usize, 0), tuner.sample_count);
+    try std.testing.expect(tuner.last_request == null);
+}
+
+test "a batches-per-participant option with no worker runs one inline range" {
+    const item_count: usize = 1_000;
+    const request = BatchWorkRequest{ .item_count = item_count, .batches_per_participant = max_batch_multiplier, .range_alignment_items = 16 };
+    var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial.deinit();
+    const serial_selection = serial.selectBatchProfile(null, request);
+    try std.testing.expectEqual(@as(usize, 1), serial_selection.range_count);
+    try std.testing.expectEqual(@as(usize, 0), serial_selection.worker_threads);
+    try std.testing.expectEqual(item_count, serial_selection.items_per_range);
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var capped = request;
+    capped.max_worker_threads = 0;
+    const capped_selection = threads.selectBatchProfile(null, capped);
+    try std.testing.expectEqual(@as(usize, 1), capped_selection.range_count);
+    try std.testing.expectEqual(@as(usize, 0), capped_selection.worker_threads);
+    try std.testing.expectEqual(item_count, capped_selection.items_per_range);
+}
+
+test "an explicit range size wins over a batches-per-participant option" {
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const item_count: usize = 1_000;
+    const selection = threads.selectBatchProfile(&tuner, .{
+        .item_count = item_count,
+        .items_per_range = 8,
+        .batches_per_participant = max_batch_multiplier,
+        .adaptive = true,
+    });
+    try std.testing.expectEqual(@as(usize, 8), selection.items_per_range);
+    try std.testing.expectEqual(rangeCount(item_count, 8), selection.range_count);
+    try std.testing.expect(selection.active_tuner == null);
+    try std.testing.expectEqual(@as(usize, 0), tuner.sample_count);
+}
+
+test "stage threads forward a batches-per-participant option and its dispatch covers every item once at that shape" {
+    if (@import("builtin").single_threaded) return;
+    const Config = struct { items_per_range: ?usize = null, batches_per_participant: ?f64 = null, max_worker_threads: ?usize = null, adaptive: bool = true };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const stage = (StageThreads(Config){ .thread_system = &threads, .config = .{ .batches_per_participant = max_batch_multiplier } }).stage(&tuner);
+    try std.testing.expectEqual(@as(?f64, max_batch_multiplier), stage.batches_per_participant);
+
+    var hits: [1_000]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
+    var context = CoverageContext{ .hits = hits[0..] };
+    const alignment: usize = 16;
+    const selection = stage.select(hits.len, alignment);
+    // Two workers and main: 3 x 4 = 12 batches of 84 items, aligned to 96, hold 11 ranges.
+    const range = std.mem.alignForwardAnyAlign(usize, poolItemsPerRange(hits.len, 2, alignment, max_batch_multiplier).?, alignment);
+    try std.testing.expectEqual(@as(usize, 96), range);
+    try std.testing.expectEqual(range, selection.items_per_range);
+    try std.testing.expectEqual(rangeCount(hits.len, range), selection.range_count);
+    try std.testing.expect(selection.active_tuner == null);
+    const batch = stage.run(selection, hits.len, alignment, &context, markCoverage);
+    try std.testing.expect(!batch.ran_inline);
+    try std.testing.expectEqual(selection.range_count, batch.range_count);
+    try std.testing.expectEqual(selection.range_count, batch.main_thread_ranges + batch.worker_thread_ranges);
+    for (&hits) |*hit| try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+
+    // Rounds select the same shape at alignment 1: 12 batches of 84 items.
+    var rounds = RoundDispatch.begin(stage, hits.len);
+    try std.testing.expectEqual(poolItemsPerRange(hits.len, 2, 1, max_batch_multiplier).?, rounds.selection.?.items_per_range);
+    try std.testing.expectEqual(@as(usize, 12), rounds.selection.?.range_count);
+    var round_context = StageTestContext{};
+    rounds.run(hits.len, &round_context, &round_context.range_count, stageTestJob);
+    const total = rounds.finish(hits.len);
+    try std.testing.expectEqual(@as(usize, 12), total.range_count);
+    try std.testing.expectEqual(hits.len, round_context.items.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), tuner.sample_count);
+}
+
+test "a direct dispatch with a batches-per-participant option and no selected profile runs at that shape" {
+    if (@import("builtin").single_threaded) return;
+    // A configured range of 8 would split 1,000 items into 125 ranges.
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
+    defer threads.deinit();
+    var hits: [1_000]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
+    var context = CoverageContext{ .hits = hits[0..] };
+    const batch = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{
+        .batches_per_participant = max_batch_multiplier,
+        .range_alignment_items = 16,
+        .adaptive = false,
+    });
+    // Three workers and main: 4 x 4 = 16 batches of 63 items, aligned to 64.
+    try std.testing.expectEqual(@as(usize, 64), batch.items_per_range);
+    try std.testing.expectEqual(@as(usize, 16), batch.range_count);
+    try std.testing.expectEqual(threads.fixedBatchesItemsPerRange(hits.len, null, 16, max_batch_multiplier), batch.items_per_range);
+    try std.testing.expect(!batch.ran_inline and !batch.forced_inline);
+    try std.testing.expectEqual(batch.range_count, batch.main_thread_ranges + batch.worker_thread_ranges);
+    for (&hits) |*hit| try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+}
+
+// Outer job for an inline owner batch whose one range dispatches a nested batch with a
+// batches-per-participant option.
+const BatchesNestingOuter = struct {
+    threads: *ThreadSystem,
+    record: *NestedRecord,
+    range_count: usize,
+};
+
+fn batchesNestingOuterJob(context: *anyopaque, _: ParallelRange, id: WorkerId) void {
+    const outer: *BatchesNestingOuter = @ptrCast(@alignCast(context));
+    outer.record.run(outer.threads, id, outer.range_count, nested_inner_items, .{
+        .adaptive = false,
+        .batches_per_participant = max_batch_multiplier,
+    });
+}
+
+test "a nested batch with a batches-per-participant option runs that shape forced inline" {
+    if (@import("builtin").single_threaded) return;
+    // A configured range of 8 would split the nested 32 items into 4 ranges.
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
+    defer threads.deinit();
+    var record = NestedRecord{};
+    // Two workers and main: 3 x 4 = 12 batches of 3 items hold 11 ranges.
+    var outer = BatchesNestingOuter{ .threads = &threads, .record = &record, .range_count = 11 };
+    try std.testing.expectEqual(outer.range_count, rangeCount(nested_inner_items, threads.fixedBatchesItemsPerRange(nested_inner_items, null, 1, max_batch_multiplier)));
+    // One item: the owner runs it inline, inside its batch.
+    const stats = threads.parallelForWithOptions(1, &outer, batchesNestingOuterJob, .{ .adaptive = false });
+    try std.testing.expect(stats.ran_inline and !stats.forced_inline);
+    try std.testing.expectEqual(@as(usize, 3), record.batch.items_per_range);
+    try record.expectRanInlineOnCaller(nested_inner_items, outer.range_count);
+    try std.testing.expectEqual(WorkerId.main.index, record.caller.index);
 }
 
 // A data-dependent range output: item i writes `copies[i]` copies of i, counting the ones

@@ -24,6 +24,7 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const RangeSlots = @import("../../app/thread_system.zig").RangeSlots;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
+const StageControls = @import("../../app/thread_system.zig").StageControls;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -377,6 +378,7 @@ const SpillSource = struct {
 
 pub const CollisionConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
     strips: CollisionStrips = .default,
@@ -856,6 +858,10 @@ pub const CollisionSystem = struct {
     static_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     trigger_query_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     trigger_query_rebuild_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(rebuild_tuner_config),
+    // Range controls of the commit seam's trigger sync (`syncCommittedTriggers`: its query
+    // and the store's patch or rebuild stages). Production runs adaptive with no cap (the
+    // tuners decide range sizing); benches and tests pin a fixed partition or a worker cap.
+    trigger_controls: StageControls = .{},
     emit_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     /// The last `update`'s strips, or the ones the owner set before a step ran (the world's,
     /// for the pipeline's init build); the engine tile until either.
@@ -1068,7 +1074,14 @@ pub const CollisionSystem = struct {
         if (view.geometry == null) return;
         try self.syncTriggers(data, view, .{
             .thread_system = thread_system,
-            .config = .{ .strips = self.strips, .static_colliders = view },
+            .config = .{
+                .strips = self.strips,
+                .static_colliders = view,
+                .items_per_range = self.trigger_controls.items_per_range,
+                .batches_per_participant = self.trigger_controls.batches_per_participant,
+                .max_worker_threads = self.trigger_controls.max_worker_threads,
+                .adaptive = self.trigger_controls.adaptive,
+            },
         });
     }
 
@@ -1832,6 +1845,7 @@ pub const CollisionSystem = struct {
 fn storeThreads(threads: Threads) StoreThreads {
     return .{ .thread_system = threads.thread_system, .config = .{
         .items_per_range = threads.config.items_per_range,
+        .batches_per_participant = threads.config.batches_per_participant,
         .max_worker_threads = threads.config.max_worker_threads,
         .adaptive = threads.config.adaptive,
     } };
@@ -6139,9 +6153,9 @@ test "incremental trigger patches match a full trigger rebuild" {
     try expectTriggerPatchesMatchRebuild(2);
 }
 
-// A patched system's cold store over `data`'s statics, stepped at fixed 16-item ranges on
-// `workers` workers; `commit` checks each seam patch against a rebuild. Initialized in place:
-// the thread system stays where it started.
+// A patched system's cold store over `data`'s statics, stepped and seam-synced at fixed
+// 16-item ranges on `workers` workers; `commit` checks each seam patch against a rebuild.
+// Initialized in place: the thread system stays where it started.
 const TriggerPatchFixture = struct {
     colliders: StaticColliderSystem,
     threads: ThreadSystem,
@@ -6158,6 +6172,7 @@ const TriggerPatchFixture = struct {
         errdefer self.threads.deinit();
         self.patched = CollisionSystem.init(std.testing.allocator);
         errdefer self.patched.deinit();
+        self.patched.trigger_controls = .{ .max_worker_threads = workers, .items_per_range = collision_range_alignment_items, .adaptive = false };
         self.contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
         errdefer self.contacts.deinit();
         try updateOn(&self.patched, data, &self.contacts, self.colliders.view(), &self.threads, workers);

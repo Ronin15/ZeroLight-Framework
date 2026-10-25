@@ -144,6 +144,7 @@ pub const SpatialIndexConfig = struct {
     /// whole fraction of a chunk's width. A query's scan radius in cells derives from it.
     cell_size: f32 = 32.0,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };

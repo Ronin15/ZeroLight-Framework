@@ -306,6 +306,7 @@ const default_wander_resample_period_steps: u32 = 300;
 
 pub const AiConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     separation_items_per_range: ?usize = null,
     intent_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
@@ -449,6 +450,7 @@ pub const AiSystem = struct {
         const gathered = self.rows.slice();
         const separation = Dispatch.init(thread_system, &self.separation_tuner, .{
             .items_per_range = config.separation_items_per_range orelse config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });
@@ -460,6 +462,7 @@ pub const AiSystem = struct {
 
         const intent = Dispatch.init(thread_system, &self.intent_tuner, .{
             .items_per_range = config.intent_items_per_range orelse config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });
@@ -504,6 +507,7 @@ pub const AiSystem = struct {
         if (n == 0) return .{};
         const gather = Dispatch.init(thread_system, &self.gather_tuner, .{
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });

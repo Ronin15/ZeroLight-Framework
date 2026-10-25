@@ -15,7 +15,6 @@
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const FlushTuners = @import("../../game/systems/pathfinding/publish.zig").FlushTuners;
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
@@ -673,13 +672,12 @@ fn checkShrinkFlush(case: suite.BenchmarkCase, thread_system: *const ThreadSyste
     const passes = [2]BatchStats{ step.perf.registry_flush_count_batch, step.perf.registry_flush_batch };
     if (passes[1].item_count == 0) return error.ShrinkFlushSkipped;
     if (thread_system.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
-    if (case.stageItemsPerRange(pathfinding_range_alignment_items)) |range| {
+    if (!case.adaptive) {
         for (passes) |pass| {
-            if (pass.range_count != rangeCount(pass.item_count, range)) return error.ShrinkFlushShape;
+            suite.checkFixedRangeCount(case, thread_system, case.stageItemsPerRange(pathfinding_range_alignment_items), pass) catch return error.ShrinkFlushShape;
         }
         return;
     }
-    if (!case.adaptive) return;
     const one_off = ShrinkFlushStart.recordsOf(&system.tuners.one_off_flush);
     for (one_off, start.one_off) |now, before| {
         if (now != before + 1) return error.ShrinkFlushOffOneOffSet;

@@ -142,6 +142,7 @@ pub const PipelineSeam = struct {
             .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
             .max_worker_threads = case.maxWorkerThreads(),
             .adaptive = case.adaptive,
+            .batches_per_participant = case.stageBatchesPerParticipant(),
             .strips = CollisionStrips.ofWorld(world),
             .static_colliders = self.pipeline.static_colliders.view(),
         });
@@ -203,7 +204,7 @@ pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCa
     for (std.enums.values(RebuildStage)) |stage| {
         colliders.rebuild_tuners.set(stage, AdaptiveWorkTuner.init(rebuild_tuner_config));
     }
-    colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
+    colliders.splice_controls = .{ .adaptive = case.adaptive, .batches_per_participant = case.stageBatchesPerParticipant(), .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }
 
 /// The world tileset's metadata; the caller deinits it.
@@ -309,6 +310,7 @@ pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void 
     system.tuners.one_off_flush = fresh.one_off_flush;
     system.nav_controls = .{
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .max_worker_threads = case.maxWorkerThreads(),
         .items_per_range = case.stageItemsPerRangeForPartition(partition_items, 1),
     };

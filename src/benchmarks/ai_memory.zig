@@ -237,6 +237,7 @@ fn runOnce(system: *AiMemorySystem, fixture: *Fixture, run: Run, thread_system: 
         .items_per_range = case.stageItemsPerRange(ai_memory_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .scope_dense_indices = run.think_set,
     });
 }

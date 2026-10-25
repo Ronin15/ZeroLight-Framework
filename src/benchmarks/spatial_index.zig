@@ -73,11 +73,11 @@ pub const shape_group = suite.BenchmarkGroup{
     .item_counts = &shape_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeShapeWorkload,
-    // The fixed control proves the shapes dispatch; the tuned case is the production tuner.
+    // The fixed controls prove the shapes dispatch; the tuned case is the production tuner.
     .cases = &shape_cases,
 };
 
-const shape_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-auto", "thread-adaptive-tuned-range" });
+const shape_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-auto", "thread-clamp-range", "thread-adaptive-tuned-range" });
 
 pub const query_group = suite.BenchmarkGroup{
     .name = "spatial_index-query",
@@ -222,6 +222,7 @@ fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: Index
         .items_per_range = case.stageItemsPerRange(spatial_index_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
 }
 

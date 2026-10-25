@@ -1588,6 +1588,7 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         stats.perf.off_main_stage_ns += dispatch.off_main_ns;
         stats.perf.inline_stage_ns += dispatch.inline_ns;
         stats.perf.closure_rows_round_items_max = @max(stats.perf.closure_rows_round_items_max, dispatch.round_items_max);
+        stats.perf.closure_rows_step_items_max = @max(stats.perf.closure_rows_step_items_max, round_total);
         counters.perf.rounds = rounds;
         for (closure.plan_items.items) |piece| counters.perf.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
     }

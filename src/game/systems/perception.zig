@@ -154,6 +154,7 @@ pub const PerceptionConfig = struct {
     /// `SimulationEvents`'s own capacity check throw.
     max_events_per_step: usize = default_max_events_per_step,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -291,6 +292,7 @@ pub const PerceptionSystem = struct {
 
         const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });
@@ -364,6 +366,7 @@ pub const PerceptionSystem = struct {
         if (n == 0) return .{};
         const gather = Dispatch.init(thread_system, &self.gather_tuner, .{
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });

@@ -61,24 +61,31 @@ reviewer diligence:
     `?usize` `[<stage>_]items_per_range` field (`StageControls`,
     `ParallelForOptions`, `BatchWorkRequest`, `Dispatch`, each system's
     `*Config`) or the `T` of a `StageThreads(T)`; its seam fields are its
-    `?usize` `[<stage>_]items_per_range` / `[<stage>_]max_worker_threads` and
-    `bool` `[<stage>_]adaptive` fields. The contexts, resolved across files:
+    `?usize` `[<stage>_]items_per_range` / `[<stage>_]max_worker_threads`,
+    `?f64` `[<stage>_]batches_per_participant`, and `bool`
+    `[<stage>_]adaptive` fields. The contexts, resolved across files:
     a stage-config literal (`T{`, `: T = .{`, `return .{` in a function
     returning `T`), a `.{` literal assigned to a name declared with a
     stage-config type (`self.nav_controls = .{`, `.config = .{`), a `.{`
     argument in a stage-config parameter's position (by name, arity, and a
     type receiver's container, as `Dispatch.init(`), and a statement setting
     a seam field, `adaptive_tuner`, or `selected_profile`.
-    13.1: a `items_per_range` / `max_worker_threads` seam field set to
-    anything but a forward: the same control's declared seam field read from
-    `config` / `<x>_config` declared with a stage-config type (`orelse`
-    chains of them), or the selection's own (`selection.items_per_range`,
-    `selection.worker_threads`, `shape.items_per_range`).
+    13.1: a `items_per_range` / `max_worker_threads` /
+    `batches_per_participant` seam field set to anything but a forward: the
+    same control's declared seam field read from `config` / `<x>_config` /
+    `controls` / `<x>_controls` declared with a stage-config type (`orelse`
+    chains of them), or the
+    selection's own (`selection.items_per_range`, `selection.worker_threads`,
+    `shape.items_per_range`; a selection carries no batch count).
     13.2: an `adaptive` seam field set to anything but a forward.
     13.3: a shape no tuner records: `adaptive_tuner` other than a selection's
     `active_tuner`, `selected_profile` other than a selection's `profile`,
     `selectBatchProfile(null, ...)`, or a `parallelForWithOptions` whose
     options literal has no `adaptive_tuner`.
+    13.4: a forward of a config's `items_per_range` without its
+    `batches_per_participant` forward from the same owner (in the same
+    literal, or for a statement, a statement on the same receiver in the
+    same block) drops the batch-count control.
     Job-context literals are not contexts. Scope: production files (rule
     9's) minus `src/app/thread_system.zig` (the seam's owner, still read for
     declarations), their `test` blocks, and helpers only tests reach. A
@@ -897,15 +904,18 @@ def lint_layer_imports(files: list[Path]) -> list[tuple[str, int, str, str]]:
 # Rule 13. A stage-config type is a struct declaring a `?usize` `[<stage>_]items_per_range`
 # field (`StageControls`, `ParallelForOptions`, `BatchWorkRequest`, `Dispatch`, each system's
 # `*Config`) or the `T` of a `StageThreads(T)`. Its seam fields are its `?usize`
-# `[<stage>_]items_per_range` / `[<stage>_]max_worker_threads` and `bool` `[<stage>_]adaptive`
-# fields; `adaptive_tuner` and `selected_profile` are the tuner fields.
+# `[<stage>_]items_per_range` / `[<stage>_]max_worker_threads`, `?f64`
+# `[<stage>_]batches_per_participant`, and `bool` `[<stage>_]adaptive` fields;
+# `adaptive_tuner` and `selected_profile` are the tuner fields.
 THREAD_SYSTEM_FILE = "src/app/thread_system.zig"
-CONTROLS = ("items_per_range", "max_worker_threads", "adaptive")
+CONTROLS = ("items_per_range", "max_worker_threads", "batches_per_participant", "adaptive")
+# Each control's declared seam-field type.
+CONTROL_KINDS = {"adaptive": "bool", "batches_per_participant": "?f64"}
 TUNER_FIELDS = ("adaptive_tuner", "selected_profile")
 IDENT = r"[A-Za-z_]\w*"
 STRUCT_DECL = re.compile(rf"\bconst\s+({IDENT})\s*=\s*(?:extern\s+|packed\s+)?struct\s*\{{")
 STAGE_THREADS_TYPE = re.compile(rf"\bStageThreads\(\s*({IDENT})\s*\)")
-BODY_FIELD = re.compile(rf"(?:^|[,{{\n])\s*(?:pub\s+)?({IDENT})\s*:\s*(\?usize|bool)\b")
+BODY_FIELD = re.compile(rf"(?:^|[,{{\n])\s*(?:pub\s+)?({IDENT})\s*:\s*(\?usize|\?f64|bool)\b")
 FN_DECL = re.compile(rf"\bfn\s+({IDENT})\s*\(")
 CALL = re.compile(rf"(?<![\w@])(?:({IDENT})\s*\.\s*)?({IDENT})\s*\(")
 PARAM = re.compile(rf"^\s*(?:comptime\s+|noalias\s+)?({IDENT})\s*:\s*(.+)$", re.DOTALL)
@@ -921,7 +931,7 @@ SELECTION_FORWARD = {
     "adaptive_tuner": re.compile(rf"^{SELECTION}\.active_tuner$"),
     "selected_profile": re.compile(rf"^{SELECTION}\.profile$"),
 }
-CONFIG_NAME = re.compile(r"^(?:\w+_)?config$")
+CONFIG_NAME = re.compile(r"^(?:\w+_)?(?:config|controls)$")
 
 
 class ControlModel:
@@ -947,7 +957,7 @@ class ControlModel:
                 self.config_types.add(decl.group(1))
                 for name, kind in fields:
                     for control in CONTROLS:
-                        if re.fullmatch(rf"(?:\w+_)?{control}", name) and kind == ("bool" if control == "adaptive" else "?usize"):
+                        if re.fullmatch(rf"(?:\w+_)?{control}", name) and kind == CONTROL_KINDS.get(control, "?usize"):
                             self.seam_fields[name] = control
             structs.append(spans)
             self.config_types.update(STAGE_THREADS_TYPE.findall(text))
@@ -1024,8 +1034,9 @@ def top_level_parts(text: str, start: int, end: int) -> list[tuple[int, str]]:
 
 
 def is_config_forward(model: ControlModel, control: str, value: str) -> bool:
-    """`value` is a seam field of `control` read from a stage-config value (`config` or
-    `<x>_config`, declared with a stage-config type), alone or in an `orelse` chain."""
+    """`value` is a seam field of `control` read from a stage-config value (`config`,
+    `<x>_config`, `controls`, or `<x>_controls`, declared with a stage-config type), alone or
+    in an `orelse` chain."""
     for term in value.split(" orelse "):
         forward = FORWARD_TERM.match(term.strip())
         if not forward:
@@ -1049,27 +1060,99 @@ def control_violation(model: ControlModel, field: str, value: str) -> str | None
         return None
     if is_config_forward(model, control, value):
         return None
-    if control != "adaptive" and SELECTION_FORWARD[control].match(value):
+    selection = SELECTION_FORWARD.get(control) if control != "adaptive" else None
+    if selection is not None and selection.match(value):
         return None
     if control == "adaptive":
         return f"13.2: `{field} = {value}` is not a forward of a config `adaptive`; production stages stay tuned unless their config says otherwise"
     return (
         f"13.1: `{field} = {value}` is not a forward; production forwards its stage config "
-        f"(`config.[<stage>_]{control}`) or its selection, and a fixed shape is set only by tests and benches"
+        f"(`[<x>_]config.[<stage>_]{control}` or `[<x>_]controls.[<stage>_]{control}`) or its selection, "
+        f"and a fixed shape is set only by tests and benches"
     )
+
+
+BATCH_COUNT_MESSAGE = (
+    "13.4: a forward of a config's `items_per_range` without its `batches_per_participant` "
+    "forwarded from the same owner drops the batch-count control"
+)
+
+
+def forward_owners(value: str) -> set[str]:
+    """The owners (everything before the field, `stage.config`) a forward's terms read from."""
+    return {term.strip().rsplit(".", 1)[0] for term in value.split(" orelse ")}
+
+
+def batch_count_dropped(range_owners: set[str], batch_values: list[str]) -> bool:
+    """13.4: a range forwarded from `range_owners` with no batch count forwarded from one of
+    them. A batch count set to anything but a forward is 13.1's."""
+    return not any(forward_owners(value) <= range_owners for value in batch_values)
 
 
 def literal_control_hits(model: ControlModel, text: str, open_brace: int) -> list[tuple[int, str]]:
     """Rule 13 hits among the fields of the stage-config literal opening at `open_brace`."""
     hits: list[tuple[int, str]] = []
     close = matching_close(text, open_brace)
+    first: int | None = None
+    range_owners: set[str] = set()
+    batch_values: list[str] = []
+    sets_batches = False
     for offset, part in top_level_parts(text, open_brace + 1, close):
         field = LITERAL_FIELD.match(part.strip())
         if not field:
             continue
-        message = control_violation(model, field.group(1), field.group(2))
+        start = offset + len(part) - len(part.lstrip())
+        first = start if first is None else first
+        name, value = field.group(1), " ".join(field.group(2).split())
+        control = model.seam_fields.get(name)
+        if control == "items_per_range" and is_config_forward(model, control, value):
+            range_owners |= forward_owners(value)
+        if control == "batches_per_participant":
+            sets_batches = True
+            if is_config_forward(model, control, value):
+                batch_values.append(value)
+        message = control_violation(model, name, value)
         if message:
-            hits.append((offset + len(part) - len(part.lstrip()), message))
+            hits.append((start, message))
+    # 13.4: forwarding a config's range size but not its batch count drops that control; a
+    # batch count that is not a forward is 13.1's alone.
+    if range_owners and first is not None and (not sets_batches or (batch_values and batch_count_dropped(range_owners, batch_values))):
+        hits.append((first, BATCH_COUNT_MESSAGE))
+    return hits
+
+
+def enclosing_block(text: str, position: int) -> tuple[int, int]:
+    """The span of the innermost `{...}` block holding `position`, or the whole text."""
+    depth = 0
+    for index in range(position - 1, -1, -1):
+        char = text[index]
+        if char == "}":
+            depth += 1
+        elif char == "{":
+            if depth == 0:
+                return index, matching_close(text, index)
+            depth -= 1
+    return 0, len(text)
+
+
+def statement_batch_count_hits(model: ControlModel, text: str) -> list[tuple[int, str]]:
+    """13.4 on statements: a receiver's seam range set to a config forward
+    (`options.items_per_range = config.items_per_range;`) with no statement in the same block
+    setting the same receiver's batch count to a forward from the same owner."""
+    range_fields = "|".join(sorted(name for name, control in model.seam_fields.items() if control == "items_per_range")) or "(?!)"
+    batch_fields = "|".join(sorted(name for name, control in model.seam_fields.items() if control == "batches_per_participant")) or "(?!)"
+    receiver = rf"(?<![\w.])({IDENT}(?:\.{IDENT}|\.\*|\[[^\]\n]*\])*)"
+    hits: list[tuple[int, str]] = []
+    for assign in re.finditer(rf"{receiver}\.({range_fields})\s*=(?!=)\s*([^;]*);", text):
+        value = " ".join(assign.group(3).split())
+        if not is_config_forward(model, "items_per_range", value):
+            continue
+        start, end = enclosing_block(text, assign.start())
+        sibling = re.compile(rf"(?<![\w.]){re.escape(assign.group(1))}\.(?:{batch_fields})\s*=(?!=)\s*([^;]*);")
+        values = (" ".join(match.group(1).split()) for match in sibling.finditer(text, start, end))
+        batch_values = [batch for batch in values if is_config_forward(model, "batches_per_participant", batch)]
+        if batch_count_dropped(forward_owners(value), batch_values):
+            hits.append((assign.start(), BATCH_COUNT_MESSAGE))
     return hits
 
 
@@ -1138,6 +1221,7 @@ def dispatch_control_hits(model: ControlModel, text: str) -> list[tuple[int, str
         message = control_violation(model, assign.group(1), assign.group(2))
         if message:
             hits.append((assign.start(), message))
+    hits.extend(statement_batch_count_hits(model, text))
     return sorted(set(hits))
 
 
@@ -1146,11 +1230,13 @@ def dispatch_control_hits(model: ControlModel, text: str) -> list[tuple[int, str
 DISPATCH_CONTROL_DECLS = """
 pub const StageControls = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
 pub const ParallelForOptions = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     range_alignment_items: usize = 1,
     adaptive: bool = true,
@@ -1160,6 +1246,7 @@ pub const ParallelForOptions = struct {
 pub const BatchWorkRequest = struct {
     item_count: usize,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -1175,6 +1262,7 @@ pub const ThreadSystem = struct {
 pub const Dispatch = struct {
     thread_system: *ThreadSystem,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
     pub fn init(thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner, controls: StageControls) Dispatch {}
@@ -1182,17 +1270,20 @@ pub const Dispatch = struct {
 pub const SteeringConfig = struct {
     items_per_range: ?usize = null,
     band_items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
 pub const AiConfig = struct {
     items_per_range: ?usize = null,
     separation_items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
 const ParticleUpdateConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
 };
 const MovementThreads = StageThreads(MovementConfig);
 const SteeringSystem = struct {
@@ -1202,6 +1293,9 @@ const SteeringSystem = struct {
 };
 const EditThreads = struct {
     controls: StageControls = .{},
+};
+const CollisionSystem = struct {
+    trigger_controls: StageControls = .{},
 };
 """
 # Each snippet and the sub-rules it hits. The hits are the production lines L2 and L3 removed
@@ -1222,6 +1316,7 @@ DISPATCH_CONTROL_CASES = (
     (
         "const count_batch = threads.thread_system.parallelForWithOptions(items, &job, emitCountJob, .{\n"
         "    .items_per_range = threads.config.items_per_range,\n"
+        "    .batches_per_participant = threads.config.batches_per_participant,\n"
         "    .max_worker_threads = threads.config.max_worker_threads,\n"
         "    .range_alignment_items = collision_range_alignment_items,\n"
         "    .adaptive = threads.config.adaptive,\n    .adaptive_tuner = null,\n"
@@ -1255,19 +1350,71 @@ DISPATCH_CONTROL_CASES = (
     ("_ = Dispatch.init(ts, &t, .{ .items_per_range = config.max_items_per_range });", ("13.1",)),
     ("_ = Dispatch.init(ts, &t, .{ .adaptive = config.non_adaptive });", ("13.2",)),
     ("_ = Dispatch.init(ts, &t, .{ .max_worker_threads = config.items_per_range });", ("13.1",)),
+    ("const c = SteeringConfig{ .batches_per_participant = 4.0 };", ("13.1",)),
+    ("options.batches_per_participant = 2.0;", ("13.1",)),
+    (
+        "_ = Dispatch.init(ts, &t, .{ .items_per_range = config.items_per_range, "
+        ".batches_per_participant = config.max_worker_threads });",
+        ("13.1",),
+    ),
+    (
+        "_ = Dispatch.init(ts, &t, .{ .items_per_range = config.items_per_range, "
+        ".max_worker_threads = config.max_worker_threads, .adaptive = config.adaptive });",
+        ("13.4",),
+    ),
+    ("self.nav_controls = .{ .batches_per_participant = 4.0 };", ("13.1",)),
+    (
+        "_ = Dispatch.init(ts, &t, .{ .items_per_range = config.items_per_range, "
+        ".batches_per_participant = update_config.batches_per_participant });",
+        ("13.4",),
+    ),
+    ("options.items_per_range = config.items_per_range;", ("13.4",)),
+    (
+        "{\n    options.items_per_range = config.items_per_range;\n"
+        "    options.batches_per_participant = update_config.batches_per_participant;\n}",
+        ("13.4",),
+    ),
+    (
+        "{\n    options.items_per_range = config.items_per_range;\n}\n"
+        "options.batches_per_participant = config.batches_per_participant;",
+        ("13.4",),
+    ),
+    (
+        "{\n    options.items_per_range = config.items_per_range;\n"
+        "    options.batches_per_participant = config.batches_per_participant;\n}",
+        (),
+    ),
+    (
+        "try self.syncTriggers(data, view, .{ .thread_system = ts, .config = .{ .strips = self.strips, "
+        ".items_per_range = self.trigger_threads_controls.items_per_range, "
+        ".batches_per_participant = self.trigger_threads_controls.batches_per_participant } });",
+        ("13.1", "13.1"),
+    ),
+    (
+        "_ = Dispatch.init(ts, &t, .{ .items_per_range = config.items_per_range, "
+        ".max_worker_threads = config.max_worker_threads, .adaptive = config.adaptive, "
+        ".batches_per_participant = config.batches_per_participant });",
+        (),
+    ),
     (
         "const separation = Dispatch.init(thread_system, &self.separation_tuner, .{\n"
         "    .items_per_range = config.separation_items_per_range orelse config.items_per_range,\n"
+        "    .batches_per_participant = config.batches_per_participant,\n"
         "    .max_worker_threads = config.max_worker_threads,\n    .adaptive = config.adaptive,\n});",
         (),
     ),
     (
         "const sort_stage = Dispatch.init(stage.thread_system, &self.grid_sort_tuner, .{\n"
         "    .items_per_range = stage.config.band_items_per_range,\n"
+        "    .batches_per_participant = stage.config.batches_per_participant,\n"
         "    .max_worker_threads = stage.config.max_worker_threads,\n    .adaptive = stage.config.adaptive,\n});",
         (),
     ),
-    ("const dispatch = Dispatch.init(thread_system, &self.adaptive_tuner, .{ .items_per_range = update_config.items_per_range });", ()),
+    (
+        "const dispatch = Dispatch.init(thread_system, &self.adaptive_tuner, .{ .items_per_range = update_config.items_per_range, "
+        ".batches_per_participant = update_config.batches_per_participant });",
+        (),
+    ),
     (
         "const batch = thread_system.parallelForWithOptions(n, &context, collisionGatherJob, .{\n"
         "    .max_worker_threads = selection.worker_threads,\n    .adaptive_tuner = selection.active_tuner,\n"
@@ -1276,6 +1423,14 @@ DISPATCH_CONTROL_CASES = (
     ),
     ("const s = threads.selectBatchProfile(&tuner, .{ .item_count = n, .adaptive = config.adaptive });", ()),
     ("var job = PlaneJob{ .items_per_range = selection.items_per_range, .run_count = 1 };", ()),
+    (
+        "try self.syncTriggers(data, view, .{ .thread_system = ts, .config = .{ .strips = self.strips, "
+        ".items_per_range = self.trigger_controls.items_per_range, "
+        ".max_worker_threads = self.trigger_controls.max_worker_threads, "
+        ".adaptive = self.trigger_controls.adaptive, "
+        ".batches_per_participant = self.trigger_controls.batches_per_participant } });",
+        (),
+    ),
     ("var job = AgentsJob{ .items_per_range = agent_count };", ()),
     ("job.items_per_range = selection.items_per_range;", ()),
     ("job.items_per_range = shape.items_per_range;", ()),

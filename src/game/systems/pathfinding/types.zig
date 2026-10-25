@@ -356,9 +356,11 @@ pub const NavUpdateStats = struct {
         conn_seed_batch: BatchStats = .{},
         conn_gather_batch: BatchStats = .{},
         // The fewest and most searches any flood round dispatched (both zero with no round),
-        // and the flood rounds' dispatch time on workers.
+        // the most active sets a flood step with a round sized its rounds from
+        // (`RoundDispatch.begin`), and the flood rounds' dispatch time on workers.
         conn_round_items_min: usize = 0,
         conn_round_items_max: usize = 0,
+        conn_flood_step_items_max: usize = 0,
         conn_flood_off_main_ns: u64 = 0,
         // Active sets the flood rounds' builds walked on the main thread.
         conn_build_visits: usize = 0,
@@ -398,8 +400,10 @@ pub const NavUpdateStats = struct {
         closure_land_deferrals: usize = 0,
         closure_live_words: usize = 0,
         closure_tail_capacity: usize = 0,
-        // The most round items one closure rows round dispatched.
+        // The most round items one closure rows round dispatched, and the most round items a
+        // closure batch's rows step sized its rounds from (`RoundDispatch.begin`).
         closure_rows_round_items_max: usize = 0,
+        closure_rows_step_items_max: usize = 0,
         // Each the most over the update's closure batches: the tail words a batch's bound
         // reserved and its relocated blocks took, its candidate components' block words, the
         // terminals it could number, and the terminals it could pop (gross).
@@ -541,6 +545,7 @@ pub const PathfindingCapacity = struct {
 /// considered, `max_solve_admissions_per_step` of them admitted to the solve batch).
 pub const PathfindingConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
     max_solved_requests_per_step: ?usize = null,
@@ -639,6 +644,10 @@ pub const PathfindingStats = struct {
         // byte copy and registration bucketing (`publish_copy`).
         group_field_batch: BatchStats = .{},
         group_field_begin_batch: BatchStats = .{},
+        // The fields each group-field pass sized its rounds from (`RoundDispatch.begin`); its
+        // first round expands every one of them.
+        group_field_step_items: usize = 0,
+        group_field_begin_step_items: usize = 0,
         publish_copy_batch: BatchStats = .{},
         // Path registry entries added and removed by this update's flush.
         registrations_added: usize = 0,

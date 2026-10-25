@@ -78,6 +78,7 @@ pub const AffectConfig = struct {
     /// enforced by this system itself (mirrors PerceptionConfig).
     max_events_per_step: usize = default_max_events_per_step,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -192,6 +193,7 @@ pub const AffectSystem = struct {
 
         const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });

@@ -60,6 +60,7 @@ pub fn coldStepConfig(case: suite.BenchmarkCase, solve_budget: usize, fallback_b
         .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .max_solved_requests_per_step = solve_budget,
         .max_solve_admissions_per_step = fallback_budget,
     };
@@ -88,13 +89,19 @@ pub fn drainPending(system: *PathfindingSystem, thread_system: *ThreadSystem, ag
 }
 
 /// One pathfinding update under `case`; a fixed threaded case runs every update stage of
-/// more than one range on workers. A registry flush that added registrations ran at least
-/// one unit per pair and per add, and a fixed threaded case flushes one range per configured
-/// range of units.
+/// more than one range on workers, the group field passes' rounds at their step selection
+/// (`RoundDispatch`). A registry flush that added registrations ran at least one unit per
+/// pair and per add, and a fixed threaded case flushes one range per configured range of
+/// units.
 pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
     const config = coldStepConfig(case, solve_budget, fallback_budget);
     const stats = try system.update(requests, agent_count, thread_system, config);
-    try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &updateBatches(stats));
+    const perf = stats.perf;
+    try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &.{ perf.intake_batch, perf.solve_batch, perf.publish_copy_batch, perf.registry_flush_batch, perf.resize_copy_batch });
+    // A group field pass's first round expands every field its step sized from, so its step
+    // items are its widest round.
+    try suite.checkRoundsDispatched(case, thread_system, config.items_per_range, perf.group_field_batch, perf.group_field_step_items, perf.group_field_step_items);
+    try suite.checkRoundsDispatched(case, thread_system, config.items_per_range, perf.group_field_begin_batch, perf.group_field_begin_step_items, perf.group_field_begin_step_items);
     // A shrink's registry rename pass and the flush's bound count.
     try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &.{ stats.perf.registry_rename_batch, stats.perf.registry_flush_count_batch });
     const flush = stats.perf.registry_flush_batch;

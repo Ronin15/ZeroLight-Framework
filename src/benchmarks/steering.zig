@@ -408,6 +408,7 @@ fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: *Thre
         .band_items_per_range = bandItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
 }
 
@@ -558,6 +559,7 @@ const SeamFixture = struct {
             .band_items_per_range = bandItemsPerRange(case),
             .max_worker_threads = case.maxWorkerThreads(),
             .adaptive = case.adaptive,
+            .batches_per_participant = case.stageBatchesPerParticipant(),
         });
     }
 };

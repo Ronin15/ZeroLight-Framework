@@ -40,6 +40,7 @@ pub const ParticleSystemConfig = struct {
 
 pub const ParticleUpdateConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -382,6 +383,7 @@ pub const ParticleSystem = struct {
         const particles = self.slice();
         const dispatch = Dispatch.init(thread_system, &self.adaptive_tuner, .{
             .items_per_range = update_config.items_per_range,
+            .batches_per_participant = update_config.batches_per_participant,
             .max_worker_threads = update_config.max_worker_threads,
             .adaptive = update_config.adaptive,
         });

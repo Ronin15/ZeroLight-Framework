@@ -106,6 +106,7 @@ fn runOnce(
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
     return stats.perf.batch;
 }
@@ -228,6 +229,7 @@ fn applyIntentsOnce(
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
     return stats.perf.batch;
 }

@@ -656,6 +656,7 @@ fn runQueries(ctx: *QueryContext, thread_system: *ThreadSystem, tuner: *Adaptive
         .max_worker_threads = case.maxWorkerThreads(),
         .range_alignment_items = pathfinding_range_alignment_items,
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .adaptive_tuner = tuner,
     });
 }

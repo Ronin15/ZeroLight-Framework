@@ -240,6 +240,7 @@ pub const TextureResolver = struct {
 
 pub const SpritePrepConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -498,6 +499,7 @@ pub const SpriteBatch = struct {
             // texture and presentation transitions.
             const prep = Dispatch.init(thread_system, &self.adaptive_tuner, .{
                 .items_per_range = prep_config.items_per_range,
+                .batches_per_participant = prep_config.batches_per_participant,
                 .max_worker_threads = prep_config.max_worker_threads,
                 .adaptive = prep_config.adaptive,
             });

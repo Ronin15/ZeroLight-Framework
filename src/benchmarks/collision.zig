@@ -134,15 +134,16 @@
 //! case's thread system; one sample is the seam's trigger sync time
 //! (`SimulationPipeline.Perf.seam_trigger_sync_ns`:
 //! `CollisionSystem.syncCommittedTriggers`). The pipeline's init builds the cold store;
-//! `reserveFrame` tops up the bound. The fixed threaded cases pin the four patch stages' tuners
-//! (the patch query, insert place and sort at the case's element range, the leaf at one
-//! aligned page range); the tuned case warms until every patch tuner that ran has settled.
+//! `reserveFrame` tops up the bound. Every case sets the seam's trigger controls
+//! (`CollisionSystem.trigger_controls`), so a fixed threaded case runs all four patch stages
+//! (the patch query, insert place, insert sort, and leaf) at its element control; the tuned
+//! case warms until every patch tuner that ran has settled.
 //! The nodes are an ordered merge on main after the leaf (`collision_triggers.NodeMerge`).
 //! Asserts: the cold store's pair count; that each sync changes exactly the changed statics;
 //! that the patch queried only the changes (not a rebuild over the row pool); the stored pair
-//! count after every patch; in a pinned case every patch stage over more than one range on
-//! workers; that each patch writes at most two pages per edit (a drop piece or an insert,
-//! each in one page) and its node merge as many nodes per tree height (the taller of the
+//! count after every patch; in a fixed threaded case every patch stage over more than one
+//! range on workers; that each patch writes at most two pages per edit (a drop piece or an
+//! insert, each in one page) and its node merge as many nodes per tree height (the taller of the
 //! tree before and after); on every measured
 //! patch no store page or level growth, and no patch scratch growth or growth or replay in
 //! the patch query's range slot set, except in the tuned case at a retune: the slot set at a
@@ -246,7 +247,6 @@ const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
-const pinThreadedProfile = @import("../game/simulation_pipeline_test_support.zig").pinThreadedProfile;
 const TriggerStore = @import("../game/systems/collision_triggers.zig").TriggerStore;
 const NodeMerge = @import("../game/systems/collision_triggers.zig").NodeMerge;
 const RefreshFold = @import("../game/systems/collision_triggers.zig").RefreshFold;
@@ -388,8 +388,8 @@ pub const static_trigger_wide_group = suite.BenchmarkGroup{
     .cases = &trigger_patch_cases,
 };
 
-// Fixed cases pin the patch stages; the tuned case settles them.
-const trigger_patch_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-1", "thread-fixed-2", "thread-fixed-auto", "thread-adaptive-tuned-range" });
+// Fixed cases run the patch stages at their controls; the tuned case settles them.
+const trigger_patch_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-1", "thread-fixed-2", "thread-fixed-auto", "thread-clamp-range", "thread-adaptive-tuned-range" });
 
 const FixtureMode = enum {
     dense,
@@ -578,6 +578,7 @@ fn checkPairBoundFlags(allocator: std.mem.Allocator, io: std.Io, case: suite.Ben
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     };
     for (0..3) |step| {
         const stats = try system.update(data, &contacts, &threads, config);
@@ -947,20 +948,15 @@ fn patchTunerSettle(system: *const CollisionSystem) suite.TunerSettle {
     return suite.TunerSettle.ofNamed(&trigger_patch_stage_names, &triggerPatchTuners(system));
 }
 
-// A fixed threaded case pins the patch tuners at its controls, so the seam's sync, which
-// runs production's tuned controls, runs the fixed shape: the query and inserts at the
-// case's element range, the leaf at one aligned page range, as one chunk is for the chunk
-// stages. Serial and tuned cases keep their tuners.
-fn pinTriggerPatchStages(system: *CollisionSystem, case: suite.BenchmarkCase, threads: *const ThreadSystem) void {
-    const workers = threads.workerThreadCount();
-    if (workers == 0) return;
-    const element_range = case.stageItemsPerRange(collision_range_alignment_items) orelse return;
-    const page_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1) orelse return;
-    const tuners = &system.trigger_store.tuners;
-    for ([_]*AdaptiveWorkTuner{ &system.trigger_query_tuner, tuners.getPtr(.insert_place), tuners.getPtr(.insert_sort) }) |tuner| {
-        pinThreadedProfile(tuner, .{ .worker_threads = workers, .items_per_range = element_range });
-    }
-    pinThreadedProfile(tuners.getPtr(.leaf), .{ .worker_threads = workers, .items_per_range = page_range });
+// The seam's trigger sync controls for `case`: a fixed case runs the patch query and the
+// store's stages at its element control, the tuned case on their tuners.
+fn setTriggerControls(system: *CollisionSystem, case: suite.BenchmarkCase) void {
+    system.trigger_controls = .{
+        .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
+    };
 }
 
 // The tallest level tree's height: a page root is height 0, and each node level adds one.
@@ -1002,13 +998,10 @@ fn checkPatchWorkBound(patch: TriggerPatch, height_before: usize) !void {
     if (patch.node_merge.outputs > page_bound * @max(height_before, patch.height)) return error.TriggerPatchNodeMergePastBound;
 }
 
-// A warm patch's dispatch proof: in a pinned fixed threaded case every patch stage over
-// more than one range ran on workers.
+// A warm patch's dispatch proof: in a fixed threaded case every patch stage over more than
+// one range at its element control ran on workers.
 fn checkPatchDispatched(case: suite.BenchmarkCase, threads: *const ThreadSystem, patch: TriggerPatch) !void {
-    const element_range = case.stageItemsPerRange(collision_range_alignment_items);
-    const page_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1);
-    try suite.checkStagesDispatched(case, threads, element_range, patch.batches[0..trigger_patch_leaf]);
-    try suite.checkStageDispatched(case, threads, page_range, patch.batches[trigger_patch_leaf]);
+    try suite.checkStagesDispatched(case, threads, case.stageItemsPerRange(collision_range_alignment_items), &patch.batches);
 }
 
 // The timed syncs of one case, from its last warm patch: main is each sample less the
@@ -1232,8 +1225,8 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
 // Builds the pipeline over a `cells` world, whose init builds the cold trigger store (a
 // rebuild over every row; `reserveFrame` tops up the stored-trigger contact bound), then
 // commits `change`'s static through the production commit seam each step; the sample is
-// each seam's trigger sync. A fixed threaded case pins the patch stages; the tuned case
-// warms until they settle. After the first seam and after the last measured seam, one
+// each seam's trigger sync. A fixed case runs the patch stages at its controls; the tuned
+// case warms until they settle. After the first seam and after the last measured seam, one
 // collision step emits the stored pairs with no pair-bound overflow.
 fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, cells: [2]u32, change: *TriggerPatchChange, shape: TriggerPatchShape) !suite.RunStats {
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
@@ -1242,7 +1235,7 @@ fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suit
     defer seam.deinit();
     if (static_colliders_test_support.liveRowCount(seam.colliders().*) != shape.static_count) return error.WrongStaticCount;
     const system = &seam.pipeline().collision;
-    pinTriggerPatchStages(system, case, &threads);
+    setTriggerControls(system, case);
     // Untimed: the first seam, with the cold store built at init.
     _ = try seam.commit(data, &.{}, &threads);
     if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
@@ -1261,7 +1254,7 @@ fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suit
 
 // One change through the production commit seam, whose trigger sync is the sample: the sync
 // changes only the changed static, and the warm patch queries the shape's items, keeps its
-// pair count, stays in its work bound, and runs each stage on workers where a pinned case
+// pair count, stays in its work bound, and runs each stage on workers where a fixed case
 // dispatches it.
 fn patchChangedStatic(seam: *StaticSeam, data: *DataSystem, change: *TriggerPatchChange, threads: *ThreadSystem, case: suite.BenchmarkCase, shape: TriggerPatchShape) !TriggerPatch {
     const height_before = triggerTreeHeight(&seam.pipeline().collision.trigger_store);
@@ -1783,8 +1776,8 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 }
 
 // The dense-change world with checkered triggers: each step's dense commit through the
-// commit seam, then the timed trigger sync. A fixed threaded case pins the patch stages; the
-// tuned case warms until they settle.
+// commit seam, then the timed trigger sync. A fixed case runs the patch stages at its
+// controls; the tuned case warms until they settle.
 fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
@@ -1792,7 +1785,7 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .checkered_triggers, &threads);
     defer fixture.deinit();
     const system = &fixture.seam.pipeline().collision;
-    pinTriggerPatchStages(system, case, &threads);
+    setTriggerControls(system, case);
     // Untimed: the first seam, with the cold store built at init over every row, every static
     // home, and the stored-trigger contact bound topped up by `reserveFrame`.
     _ = try fixture.seam.commit(&fixture.data, &.{}, &threads);
@@ -1866,6 +1859,7 @@ fn fixedStepConfig(fixture: *const DenseChangeFixture, case: suite.BenchmarkCase
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .strips = CollisionStrips.ofWorld(&fixture.seam.world),
         .static_colliders = fixture.seam.collidersConst().view(),
     };
@@ -1881,7 +1875,7 @@ fn denseTriggerPatch(fixture: *DenseChangeFixture, threads: *ThreadSystem, case:
 
 // The seam's trigger sync after a dense collider sync: the warm patch queries exactly the
 // changed statics, keeps the stored pair count of the region's side, stays in its work
-// bound, and runs each stage on workers where a pinned case dispatches it.
+// bound, and runs each stage on workers where a fixed case dispatches it.
 fn denseTriggerSync(fixture: *DenseChangeFixture, threads: *const ThreadSystem, case: suite.BenchmarkCase, pairs: [2]usize, height_before: usize) !TriggerPatch {
     const patch = try fixture.seam.triggerPatch();
     if (patch.query_items != fixture.moves.len) return error.TriggerPatchMissedQuery;
@@ -2409,6 +2403,7 @@ fn runOnce(
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .static_colliders = view,
     });
 }

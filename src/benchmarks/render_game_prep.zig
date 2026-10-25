@@ -325,6 +325,7 @@ fn emitVertices(
         .items_per_range = case.stageItemsPerRange(sprite_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
 }
 

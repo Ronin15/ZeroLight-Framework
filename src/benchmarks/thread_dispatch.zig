@@ -73,7 +73,8 @@ fn dispatchOnce(
 ) BatchStats {
     const item_count = context.items.len;
     const controls: StageControls = if (case.adaptive) .{} else .{
-        .items_per_range = case.fixedItemsPerRange(range_alignment_items),
+        .items_per_range = case.stageItemsPerRange(range_alignment_items),
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = false,
     };
@@ -91,13 +92,14 @@ fn assertThreadedShape(batch: BatchStats, thread_system: *const ThreadSystem) vo
     std.debug.assert(!batch.forced_inline);
 }
 
-// Fails unless a fixed case's dispatch has its shape: one range per fixed range of items, on
+// Fails unless a fixed case's dispatch has its shape: one range per control range of items
+// (`suite.controlItemsPerRange`, the clamp's resolved from the batch's item count), on
 // workers when there is more than one range (`suite.checkStageDispatched`,
 // `suite.checkFixedRangeCount`), with every worker the case allows up to one per range past
 // the first; inline with no worker otherwise. Checked against every measured batch, in every
 // build mode.
 fn checkFixedShape(batch: BatchStats, thread_system: *const ThreadSystem, case: suite.BenchmarkCase) !void {
-    const items_per_range = case.fixedItemsPerRange(range_alignment_items);
+    const items_per_range = suite.controlItemsPerRange(case, thread_system, case.stageItemsPerRange(range_alignment_items), batch).?;
     if (batch.items_per_range != items_per_range) return error.DispatchFixedRangeSize;
     try suite.checkFixedRangeCount(case, thread_system, items_per_range, batch);
     try suite.checkStageDispatched(case, thread_system, items_per_range, batch);

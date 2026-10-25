@@ -60,6 +60,7 @@ pub const scope_range_alignment_items: usize = movement_range_alignment_items;
 /// explicit `items_per_range` pins the range size and opts out of the tuner.
 pub const ScopeConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -226,6 +227,7 @@ pub const SimulationScopeSystem = struct {
         };
         const derive = Dispatch.init(thread_system, &self.chunk_derive_tuner, .{
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });
@@ -256,6 +258,7 @@ pub const SimulationScopeSystem = struct {
         const selection = thread_system.selectBatchProfile(&self.collision_gather_tuner, .{
             .item_count = n,
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .range_alignment_items = scope_range_alignment_items,
             .adaptive = config.adaptive,
@@ -303,6 +306,7 @@ pub const SimulationScopeSystem = struct {
         const selection = thread_system.selectBatchProfile(&self.ai_gather_tuner, .{
             .item_count = n,
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .range_alignment_items = scope_range_alignment_items,
             .adaptive = config.adaptive,
@@ -352,6 +356,7 @@ pub const SimulationScopeSystem = struct {
         const selection = thread_system.selectBatchProfile(&self.cognition_tuner, .{
             .item_count = entry_count,
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .range_alignment_items = scope_range_alignment_items,
             .adaptive = config.adaptive,
@@ -406,6 +411,7 @@ pub const SimulationScopeSystem = struct {
         const selection = thread_system.selectBatchProfile(&self.tier_policy_tuner, .{
             .item_count = n,
             .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
             .max_worker_threads = config.max_worker_threads,
             .range_alignment_items = scope_range_alignment_items,
             .adaptive = config.adaptive,

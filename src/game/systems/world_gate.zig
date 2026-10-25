@@ -35,6 +35,7 @@ pub const world_gate_range_alignment_items: usize = movement_range_alignment_ite
 /// system's tuner; an explicit `items_per_range` pins the range size.
 pub const WorldGateConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -84,6 +85,7 @@ pub const WorldGateSystem = struct {
         if (row_count > 0) {
             const gate = Dispatch.init(thread_system, &self.tuner, .{
                 .items_per_range = config.items_per_range,
+                .batches_per_participant = config.batches_per_participant,
                 .max_worker_threads = config.max_worker_threads,
                 .adaptive = config.adaptive,
             });

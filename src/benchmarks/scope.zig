@@ -258,5 +258,6 @@ fn scopeConfig(case: suite.BenchmarkCase) ScopeConfig {
         .items_per_range = case.stageItemsPerRange(scope_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     };
 }

@@ -570,7 +570,8 @@ pub fn growPool(
 }
 
 /// Counters of one batch's connectivity stages, for stats and benches. `round_items_min` and
-/// `round_items_max` span the flood's rounds (both zero with no round); `build_visits` counts
+/// `round_items_max` span the flood's rounds (both zero with no round); `step_items` is the
+/// active sets the flood sized its rounds from (`RoundDispatch.begin`); `build_visits` counts
 /// the active sets the main thread's round builds walked; `flood_off_main_ns` is the rounds'
 /// dispatch time on workers. `perf` is kept only with `runtime_perf_log.enabled`.
 pub const ConnectivityCounters = struct {
@@ -587,6 +588,7 @@ pub const ConnectivityCounters = struct {
         merges: usize = 0,
         round_items_min: usize = 0,
         round_items_max: usize = 0,
+        step_items: usize = 0,
         flood_off_main_ns: u64 = 0,
     } else struct {};
 };
@@ -2155,6 +2157,7 @@ pub const Connectivity = struct {
             counters.perf.rounds = round;
             counters.perf.round_items_min = dispatch.round_items_min;
             counters.perf.round_items_max = dispatch.round_items_max;
+            counters.perf.step_items = self.sets.len;
             counters.perf.flood_off_main_ns = dispatch.off_main_ns;
             stats.perf.off_main_stage_ns += dispatch.off_main_ns;
             stats.perf.inline_stage_ns += dispatch.inline_ns;

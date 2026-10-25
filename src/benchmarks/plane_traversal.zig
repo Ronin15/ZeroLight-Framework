@@ -352,12 +352,14 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         .items_per_range = case.stageItemsPerRange(plane_entry_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     };
 
     // The landing carves run on the world's terrain-edit tuners under the case's controls,
     // fresh after the fixture's build, as the nav stages are.
     const carve_controls: StageControls = .{
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .max_worker_threads = case.maxWorkerThreads(),
         .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1),
     };

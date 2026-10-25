@@ -99,6 +99,7 @@ fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thr
         .items_per_range = case.stageItemsPerRange(goal_scan_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
 }
 
@@ -676,11 +677,13 @@ fn checkGoalDispatch(case: suite.BenchmarkCase, thread_system: *ThreadSystem, re
 fn runDispatchResolve(io: std.Io, system: *PathfindingSystem, requests: []const PathRequest, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !struct { elapsed_ns: u64, resolve: GoalResolveStats } {
     const start_ns = suite.nowNs(io);
     // Fixed cases use one item per range, the shape the dispatch bound checks. Adaptive
-    // cases keep the case's own control; the check does not apply to them.
+    // cases keep the case's own control, and the clamp its batch count; the check resolves
+    // the clamp's range from each batch.
     const resolve = try system.resolveGoals(PathRequest, requests, thread_system, .{
-        .items_per_range = if (case.adaptive) case.stageItemsPerRange(goal_scan_range_alignment_items) else 1,
+        .items_per_range = if (case.adaptive or case.stageBatchesPerParticipant() != null) case.stageItemsPerRange(goal_scan_range_alignment_items) else 1,
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     try checkGoalDispatch(case, thread_system, resolve, requests.len);

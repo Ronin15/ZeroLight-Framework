@@ -141,6 +141,7 @@ fn runOnce(system: *AffectSystem, fixture: *Fixture, think_set: ?[]const u32, th
         .items_per_range = case.stageItemsPerRange(affect_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .scope_dense_indices = think_set,
     });
 }

@@ -19,6 +19,7 @@ const default_intent_speed: f32 = 40.0;
 
 pub const MovementConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };

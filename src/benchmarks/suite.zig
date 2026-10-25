@@ -15,6 +15,8 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const rangeCount = @import("../app/thread_system.zig").rangeCount;
+const max_batch_multiplier = @import("../app/thread_system.zig").max_batch_multiplier;
+const defaultWorkerThreadCount = @import("../app/thread_system.zig").defaultWorkerThreadCount;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
@@ -62,8 +64,9 @@ pub const BenchmarkGroup = struct {
     write_workload: WorkloadWriter,
     /// Set only when every fixed-control stage of the group resolves its range from this
     /// one shape. A fixed case that resolves to an earlier case's configuration is then
-    /// reported as that case's duplicate and not timed again; null keeps every case timed.
-    /// Requires the default case list.
+    /// reported as that case's duplicate and not timed again; a case whose range follows
+    /// the item count, and every case under null, stays timed. Requires the default case
+    /// list.
     fixed_range_shape: ?FixedRangeShape = null,
     /// The cases the group's workload runs (`casesNamed`), in default-case order and
     /// holding `serial-direct`; a case the workload has no path for is left out, never
@@ -111,39 +114,52 @@ pub const BenchmarkCase = struct {
         return self.worker_mode != .serial_direct;
     }
 
-    /// The range size a fixed control runs: this case's range mode, or the default size
-    /// aligned to the stage's range alignment.
-    pub fn fixedItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) usize {
+    // The range size a fixed control runs: this case's range mode, or the default size
+    // aligned to the stage's range alignment; null for the clamp.
+    fn fixedItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
         return self.fixedItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
     }
 
     /// A stage's `items_per_range` control: null for adaptive cases so the stage's tuner
-    /// picks the range, otherwise `fixedItemsPerRange`. The serial case's thread system has
-    /// no workers, so its stages run one inline range whatever the control.
+    /// picks the range, and for the clamp, whose stages shape from their item counts
+    /// (`stageBatchesPerParticipant`); otherwise `fixedItemsPerRange`. The serial case's
+    /// thread system has no workers, so its stages run one inline range whatever the control.
     pub fn stageItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
         return self.stageItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
     }
 
     /// `stageItemsPerRange` for a group whose fixed partition is `partition_items` (one
     /// chunk for chunk-partitioned stages) instead of the element default: the range modes
-    /// scale from that partition.
+    /// scale from that partition. The clamp has no range size.
     pub fn stageItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
         if (self.adaptive) return null;
         return self.fixedItemsPerRangeForPartition(partition_items, range_alignment_items);
     }
 
-    fn fixedItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) usize {
-        return self.itemsPerRangeForPartition(partition_items, range_alignment_items) orelse
-            std.mem.alignForwardAnyAlign(usize, partition_items, range_alignment_items);
+    /// A stage's `batches_per_participant` control: the tuner's top batch count per
+    /// participant (`max_batch_multiplier`) for the fixed clamp case, so `ThreadSystem`
+    /// shapes each dispatch from its own item count as the tuner shapes its 4x pool batches;
+    /// null for every other case.
+    pub fn stageBatchesPerParticipant(self: BenchmarkCase) ?f64 {
+        return if (!self.adaptive and self.rangeFollowsItemCount()) max_batch_multiplier else null;
     }
 
-    // Null in the default range mode; small halves the partition and large quadruples it.
-    fn itemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
-        return switch (self.range_mode) {
-            .default => null,
-            .small => std.mem.alignForwardAnyAlign(usize, @max(partition_items / 2, @as(usize, 1)), range_alignment_items),
-            .large => std.mem.alignForwardAnyAlign(usize, partition_items * 4, range_alignment_items),
+    // Whether the resolved range depends on the stage's item count rather than only on the
+    // partition and alignment.
+    fn rangeFollowsItemCount(self: BenchmarkCase) bool {
+        return self.range_mode == .clamp;
+    }
+
+    // The partition in the default range mode, half of it in small and four times it in
+    // large, aligned to the stage's alignment; null for the clamp, which has no range size.
+    fn fixedItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
+        const items = switch (self.range_mode) {
+            .default => partition_items,
+            .small => @max(partition_items / 2, @as(usize, 1)),
+            .large => partition_items * 4,
+            .clamp => return null,
         };
+        return std.mem.alignForwardAnyAlign(usize, items, range_alignment_items);
     }
 };
 
@@ -154,10 +170,14 @@ pub const WorkerMode = enum {
     fixed_auto,
 };
 
+/// The default partition; small halves it, large quadruples it; clamp sets
+/// `batches_per_participant` to `max_batch_multiplier`, the tuner's top batch count over the
+/// case's participants, and no range size.
 pub const RangeMode = enum {
     default,
     small,
     large,
+    clamp,
 };
 
 pub const default_cases = [_]BenchmarkCase{
@@ -190,6 +210,12 @@ pub const default_cases = [_]BenchmarkCase{
         .name = "thread-large-range",
         .worker_mode = .fixed_auto,
         .range_mode = .large,
+        .required_worker_count = 1,
+    },
+    .{
+        .name = "thread-clamp-range",
+        .worker_mode = .fixed_auto,
+        .range_mode = .clamp,
         .required_worker_count = 1,
     },
     .{
@@ -1167,10 +1193,12 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
 
 // The earliest default case that `default_cases[case_index]` runs the same configuration as
 // under `shape`: the same fixed (non-adaptive) threaded worker mode and the same resolved range.
+// A range that follows the stage's item count resolves per stage at dispatch, so a case with
+// one is never matched either way.
 fn sameShapeCaseIndex(shape: FixedRangeShape, case_index: usize) ?usize {
     const case = default_cases[case_index];
     if (case.adaptive or !case.usesThreadSystem()) return null;
-    const range = case.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items);
+    const range = case.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items) orelse return null;
     for (default_cases[0..case_index], 0..) |earlier, earlier_index| {
         if (earlier.adaptive or earlier.worker_mode != case.worker_mode) continue;
         if (earlier.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items) == range) return earlier_index;
@@ -1216,46 +1244,91 @@ pub fn printUsage() void {
     , .{});
 }
 
-pub fn availableWorkerThreads() usize {
-    const cpu_count = std.Thread.getCpuCount() catch return 0;
-    return if (cpu_count > 1) cpu_count - 1 else 0;
+/// The aligned range a fixed threaded case's control dispatched a single `batch` at. Under the
+/// clamp it is production's resolution of the batch's own item count
+/// (`ThreadSystem.fixedBatchesItemsPerRange`), and the control `items_per_range` (null there)
+/// is ignored; otherwise it is `items_per_range` aligned to the batch's alignment, or null.
+pub fn controlItemsPerRange(case: BenchmarkCase, threads: *const ThreadSystem, items_per_range: ?usize, batch: BatchStats) ?usize {
+    const alignment = @max(batch.range_alignment_items, 1);
+    if (case.stageBatchesPerParticipant()) |batches| return threads.fixedBatchesItemsPerRange(batch.item_count, case.maxWorkerThreads(), alignment, batches);
+    const range = items_per_range orelse return null;
+    return std.mem.alignForwardAnyAlign(usize, @max(range, 1), alignment);
 }
 
-/// Fails when a fixed threaded case ran a stage inline that it dispatches: a batch of more
-/// items than one range at `items_per_range` (the stage's range control under `case`,
-/// aligned to the batch's alignment) on a thread system with workers. Adaptive and serial cases, and a null control, pass.
-pub fn checkStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRanInline}!void {
-    const range = items_per_range orelse return;
+/// Fails when a fixed threaded case ran a single-dispatch stage off its control on a thread
+/// system with workers: inline over more than one range at its control
+/// (`controlItemsPerRange`), or, under the clamp, split into other than one range per control
+/// range of its items (`checkFixedRangeCount`). Adaptive and serial cases, and a null control,
+/// pass. A batch folded from several dispatches is checked by `checkFoldedStageDispatched`, a
+/// round-folded one by `checkRoundsDispatched`.
+pub fn checkStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{ BenchStageRanInline, BenchStageRangeShape }!void {
     const threads = thread_system orelse return;
     if (case.adaptive or threads.workerThreadCount() == 0) return;
-    // The dispatch aligns the range forward to the stage's alignment.
-    const aligned = std.mem.alignForwardAnyAlign(usize, @max(range, 1), @max(batch.range_alignment_items, 1));
-    if (batch.item_count > aligned and batch.ran_inline) return error.BenchStageRanInline;
+    const range = controlItemsPerRange(case, threads, items_per_range, batch) orelse return;
+    if (batch.ran_inline and batch.item_count > range) return error.BenchStageRanInline;
+    if (case.stageBatchesPerParticipant() != null) try checkFixedRangeCount(case, thread_system, items_per_range, batch);
 }
 
-/// Fails when a fixed threaded case split a stage into other than one range per
-/// `items_per_range` (aligned to the batch's alignment) of its items, on a thread system with
-/// workers. Adaptive and serial cases, an empty batch, and a null control pass.
-pub fn checkFixedRangeCount(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRangeShape}!void {
+// Fails when a fixed threaded case ran every dispatch folded into `batch`
+// (`accumulateBatch`) inline although one of them held more than one range at its control,
+// on a thread system with workers. Outside the clamp that is a folded batch past one control
+// range. Under the clamp a dispatch runs inline only when it fits one aligned unit
+// (`ThreadSystem.fixedBatchesItemsPerRange`), so an inline fold fails when it holds more
+// items than one aligned unit per range, or a dispatch ran forced inline. Adaptive and serial
+// cases, and a null control, pass.
+fn checkFoldedStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRanInline}!void {
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0 or !batch.ran_inline) return;
+    const alignment = @max(batch.range_alignment_items, 1);
+    if (case.stageBatchesPerParticipant() != null) {
+        if (batch.forced_inline or batch.item_count > batch.range_count * alignment) return error.BenchStageRanInline;
+        return;
+    }
     const range = items_per_range orelse return;
+    if (batch.item_count > std.mem.alignForwardAnyAlign(usize, @max(range, 1), alignment)) return error.BenchStageRanInline;
+}
+
+/// Fails when a fixed threaded case split a stage into other than one range per control
+/// range (`controlItemsPerRange`) of its items, on a thread system with workers. Adaptive and
+/// serial cases, an empty batch, and a null control pass.
+pub fn checkFixedRangeCount(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRangeShape}!void {
     const threads = thread_system orelse return;
     if (case.adaptive or threads.workerThreadCount() == 0 or batch.item_count == 0) return;
-    const aligned = std.mem.alignForwardAnyAlign(usize, @max(range, 1), @max(batch.range_alignment_items, 1));
-    if (batch.range_count != rangeCount(batch.item_count, aligned)) return error.BenchStageRangeShape;
+    const range = controlItemsPerRange(case, threads, items_per_range, batch) orelse return;
+    if (batch.range_count != rangeCount(batch.item_count, range)) return error.BenchStageRangeShape;
 }
 
-/// Fails when a fixed threaded case ran every round of a round-folded stage inline although
-/// its widest round (`round_items_max`) spanned more than one `items_per_range` range, on a
-/// thread system with workers. Adaptive and serial cases and a null control pass.
-pub fn checkRoundsDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats, round_items_max: usize) error{BenchStageRanInline}!void {
-    const range = items_per_range orelse return;
+/// Fails when a fixed threaded case ran a round-folded stage (`RoundDispatch`, alignment 1)
+/// off its range on a thread system with workers: every round inline although its widest
+/// round (`round_items_max`) spanned more than one range, or an inline round past one range.
+/// Rounds that each ran unforced inline were one range apiece, so the inline fold proves a
+/// round inline past one range only when its mean round passes one range, or a round ran
+/// forced inline. Under the clamp the range is production's resolution of the widest step's
+/// item count (`step_items_max`, what `RoundDispatch.begin` sized the rounds from), and every
+/// round reports it: the folded batch's range must equal it (the resolved range does not
+/// shrink as the item count grows, so the widest step's range is the widest of every step's).
+/// Adaptive and serial cases, a null control, and a batch with no round pass.
+pub fn checkRoundsDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats, round_items_max: usize, step_items_max: usize) error{ BenchStageRanInline, BenchStageRangeShape }!void {
     const threads = thread_system orelse return;
-    if (case.adaptive or threads.workerThreadCount() == 0) return;
-    if (round_items_max > @max(range, 1) and batch.worker_thread_ranges == 0) return error.BenchStageRanInline;
+    if (case.adaptive or threads.workerThreadCount() == 0 or batch.item_count == 0) return;
+    const range = if (case.stageBatchesPerParticipant()) |batches| clamp: {
+        const step_range = threads.fixedBatchesItemsPerRange(step_items_max, case.maxWorkerThreads(), 1, batches);
+        if (batch.items_per_range != step_range) return error.BenchStageRangeShape;
+        break :clamp step_range;
+    } else @max(items_per_range orelse return, 1);
+    if (round_items_max > range and batch.worker_thread_ranges == 0) return error.BenchStageRanInline;
+    if (roundsRanInline(range, batch)) return error.BenchStageRanInline;
+}
+
+// Whether the inline rounds folded into `batch` held a round of more than one `range`: a
+// forced-inline round past one range, or a mean round past one range.
+fn roundsRanInline(range: usize, batch: BatchStats) bool {
+    if (!batch.ran_inline or batch.item_count <= range) return false;
+    return batch.forced_inline or @divCeil(batch.item_count, @max(batch.range_count, 1)) > range;
 }
 
 /// `checkStageDispatched` over each of `batches`.
-pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batches: []const BatchStats) error{BenchStageRanInline}!void {
+pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batches: []const BatchStats) error{ BenchStageRanInline, BenchStageRangeShape }!void {
     for (batches) |batch| try checkStageDispatched(case, thread_system, items_per_range, batch);
 }
 
@@ -1282,7 +1355,7 @@ pub fn checkRebuildWork(batches: [std.enums.values(RebuildStage).len]BatchStats,
 
 pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {
     if (case.required_worker_count == 0) return null;
-    if (availableWorkerThreads() >= case.required_worker_count) return null;
+    if (defaultWorkerThreadCount() >= case.required_worker_count) return null;
     return RunStats.skipped("not enough worker threads available");
 }
 
@@ -1321,7 +1394,7 @@ fn printHeader(options: Options) void {
         "\nbenchmark warmup={} iterations={} default_cases={}\n",
         .{ options.warmup_iterations, options.iterations, default_cases.len },
     );
-    std.debug.print("worker_threads_available={}\n", .{availableWorkerThreads()});
+    std.debug.print("worker_threads_available={}\n", .{defaultWorkerThreadCount()});
     std.debug.print("purpose: exercise benchmark flows, prove adaptive behavior, and catch regressions\n", .{});
     std.debug.print("case roles: serial-direct is baseline; thread-fixed-* rows are forced scheduler controls\n", .{});
     std.debug.print("case roles: thread-adaptive-* rows reflect production-style measured scheduling policy\n", .{});
@@ -1551,6 +1624,7 @@ fn bestFixedThreadedResult(results: []const CaseResult) ?CaseResult {
         findResult(results, "thread-fixed-auto"),
         findResult(results, "thread-small-range"),
         findResult(results, "thread-large-range"),
+        findResult(results, "thread-clamp-range"),
     });
 }
 
@@ -1867,8 +1941,10 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
 /// resolve, mask, plan, copy, rows, and landing; and the last reaction, for the counters.
 pub const NavReactionShapes = struct {
     // A stage after the mark: its name, its `NavUpdateStats.perf` batch field, and for a
-    // round-folded stage its widest round's field (`checkNavReactionDispatched`).
-    const PerfStage = struct { name: []const u8, batch: []const u8, round_items_max: ?[]const u8 = null };
+    // round-folded stage its widest round's and widest step's fields
+    // (`checkNavReactionDispatched`).
+    const PerfStage = struct { name: []const u8, batch: []const u8, rounds: ?RoundFields = null };
+    const RoundFields = struct { items_max: []const u8, step_items_max: []const u8 };
     // The one stage-to-field table `add` and `checkNavReactionDispatched` read, in stage order.
     const perf_stages = [_]PerfStage{
         .{ .name = "plan", .batch = "plan_batch" },
@@ -1876,13 +1952,13 @@ pub const NavReactionShapes = struct {
         .{ .name = "patch", .batch = "patch_batch" },
         .{ .name = "conn_seed", .batch = "conn_seed_batch" },
         .{ .name = "conn_gather", .batch = "conn_gather_batch" },
-        .{ .name = "conn_flood", .batch = "conn_flood_batch", .round_items_max = "conn_round_items_max" },
+        .{ .name = "conn_flood", .batch = "conn_flood_batch", .rounds = .{ .items_max = "conn_round_items_max", .step_items_max = "conn_flood_step_items_max" } },
         .{ .name = "closure_candidates", .batch = "conn_closure_candidates_batch" },
         .{ .name = "closure_resolve", .batch = "conn_closure_resolve_batch" },
         .{ .name = "closure_mask", .batch = "conn_closure_mask_batch" },
         .{ .name = "closure_plan", .batch = "conn_closure_plan_batch" },
         .{ .name = "closure_copy", .batch = "conn_closure_copy_batch" },
-        .{ .name = "closure_rows", .batch = "conn_closure_rows_batch", .round_items_max = "closure_rows_round_items_max" },
+        .{ .name = "closure_rows", .batch = "conn_closure_rows_batch", .rounds = .{ .items_max = "closure_rows_round_items_max", .step_items_max = "closure_rows_step_items_max" } },
         .{ .name = "closure_land", .batch = "conn_closure_land_batch" },
     };
     comptime {
@@ -1945,20 +2021,20 @@ pub const NavReactionShapes = struct {
     }
 };
 
-/// Fails when a fixed threaded case ran a nav reaction stage inline that it dispatches: the
-/// chunk-partitioned stages and `mark` past one range (`checkStageDispatched`), the flood
-/// and closure rows when their widest round spans more than one (`checkRoundsDispatched`);
-/// every stage of `NavReactionShapes`. The nav stages share one control, from one item per
-/// range (`chunk_partition_items`).
-pub fn checkNavReactionDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, mark: BatchStats, stats: NavUpdateStats) error{BenchStageRanInline}!void {
+/// Fails when a fixed threaded case ran a nav reaction stage off its control: `mark`, one
+/// dispatch (`checkStageDispatched`); the chunk-partitioned stages, which `NavUpdateStats`
+/// folds over the update's batches (`checkFoldedStageDispatched`); the flood and closure rows
+/// (`checkRoundsDispatched`); every stage of `NavReactionShapes`. The nav stages share one
+/// control, from one item per range (`chunk_partition_items`).
+pub fn checkNavReactionDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, mark: BatchStats, stats: NavUpdateStats) error{ BenchStageRanInline, BenchStageRangeShape }!void {
     if (comptime !diagnostics_enabled) return;
     const range = case.stageItemsPerRangeForPartition(chunk_partition_items, 1);
     try checkStageDispatched(case, thread_system, range, mark);
     inline for (NavReactionShapes.perf_stages) |stage| {
         const batch = @field(stats.perf, stage.batch);
-        if (comptime stage.round_items_max) |round_field| {
-            try checkRoundsDispatched(case, thread_system, range, batch, @field(stats.perf, round_field));
-        } else try checkStageDispatched(case, thread_system, range, batch);
+        if (comptime stage.rounds) |rounds| {
+            try checkRoundsDispatched(case, thread_system, range, batch, @field(stats.perf, rounds.items_max), @field(stats.perf, rounds.step_items_max));
+        } else try checkFoldedStageDispatched(case, thread_system, range, batch);
     }
 }
 
@@ -2246,14 +2322,15 @@ pub fn ItemCode(comptime Fields: type, comptime digits: []const usize) type {
 }
 
 test "default benchmark cases cover required thread modes" {
-    try std.testing.expectEqual(@as(usize, 7), default_cases.len);
+    try std.testing.expectEqual(@as(usize, 8), default_cases.len);
     try std.testing.expectEqualStrings("serial-direct", default_cases[0].name);
     try std.testing.expectEqualStrings("thread-fixed-1", default_cases[1].name);
     try std.testing.expectEqualStrings("thread-fixed-2", default_cases[2].name);
     try std.testing.expectEqualStrings("thread-fixed-auto", default_cases[3].name);
     try std.testing.expectEqualStrings("thread-small-range", default_cases[4].name);
     try std.testing.expectEqualStrings("thread-large-range", default_cases[5].name);
-    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[6].name);
+    try std.testing.expectEqualStrings("thread-clamp-range", default_cases[6].name);
+    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[7].name);
 }
 
 test "a group's named cases keep default-case order, and the default list is every case" {
@@ -2323,7 +2400,7 @@ test "benchmark options reject unknown case filter" {
 test "benchmark case filter includes serial baseline for non-serial cases" {
     try std.testing.expect(shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[0]));
     try std.testing.expect(!shouldIncludeBaselineForFilter("serial-direct", default_cases[0]));
-    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[6]));
+    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[default_cases.len - 1]));
 }
 
 // A tuner settled on a threaded profile with its nudge holding.
@@ -2552,16 +2629,16 @@ test "benchmark fixed and stage range sizes align the range and null out adaptiv
     const wide_alignment = default_items_per_range + 1;
 
     const fixed_auto = cases.named("thread-fixed-auto");
-    try std.testing.expectEqual(wide_alignment, fixed_auto.fixedItemsPerRange(wide_alignment));
+    try std.testing.expectEqual(@as(?usize, wide_alignment), fixed_auto.fixedItemsPerRange(wide_alignment));
     try std.testing.expectEqual(@as(?usize, wide_alignment), fixed_auto.stageItemsPerRange(wide_alignment));
 
     const small = cases.named("thread-small-range");
-    try std.testing.expectEqual(@as(?usize, small.fixedItemsPerRange(16)), small.stageItemsPerRange(16));
+    try std.testing.expectEqual(small.fixedItemsPerRange(16), small.stageItemsPerRange(16));
 
     const adaptive = cases.named("thread-adaptive-tuned-range");
     try std.testing.expect(adaptive.adaptive);
     try std.testing.expectEqual(@as(?usize, null), adaptive.stageItemsPerRange(16));
-    try std.testing.expectEqual(wide_alignment, adaptive.fixedItemsPerRange(wide_alignment));
+    try std.testing.expectEqual(@as(?usize, wide_alignment), adaptive.fixedItemsPerRange(wide_alignment));
 }
 
 test "benchmark range modes scale from the group's partition" {
@@ -2580,10 +2657,91 @@ test "benchmark range modes scale from the group's partition" {
         try std.testing.expectEqual(row.element, case.stageItemsPerRangeForPartition(default_items_per_range, 16));
         try std.testing.expectEqual(row.chunk, case.stageItemsPerRangeForPartition(1, 1));
         try std.testing.expectEqual(row.chunk_aligned, case.stageItemsPerRangeForPartition(1, 16));
+        try std.testing.expect(!case.rangeFollowsItemCount());
     }
 
     try std.testing.expect(findBenchmarkCase("thread-adaptive-tuned-range").?.adaptive);
     try std.testing.expect(!findBenchmarkCase("thread-fixed-auto").?.adaptive);
+}
+
+test "a fixed control's dispatch checks fail an inline batch past one range, folded or in rounds" {
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    const fixed = findBenchmarkCase("thread-fixed-auto").?;
+    // One inline batch of more items than the aligned range; the alignment widens the range.
+    try std.testing.expectError(error.BenchStageRanInline, checkStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .range_alignment_items = 1, .ran_inline = true }));
+    try checkStageDispatched(fixed, &threads, 8, .{ .item_count = 8, .range_count = 1, .range_alignment_items = 1, .ran_inline = true });
+    try checkStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 1, .range_alignment_items = 8, .ran_inline = true });
+    try checkStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .range_alignment_items = 1, .ran_inline = false });
+    // Two plain dispatches of four folded inline: past one range, so one of them ran inline.
+    try std.testing.expectError(error.BenchStageRanInline, checkFoldedStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .range_alignment_items = 1, .ran_inline = true }));
+    try checkFoldedStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 3, .range_alignment_items = 1, .ran_inline = false });
+    // Two rounds of four, each one inline range, pass; a mean round past one range, a widest
+    // round past one range with no worker range, and a forced-inline round fail.
+    try checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .ran_inline = true }, 4, 8);
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 12, .range_count = 2, .ran_inline = true }, 4, 8));
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 3, .ran_inline = true }, 6, 8));
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .ran_inline = true, .forced_inline = true }, 4, 8));
+    // The adaptive case and a thread system with no worker pass.
+    try checkStageDispatched(findBenchmarkCase("thread-adaptive-tuned-range").?, &threads, 4, .{ .item_count = 8, .range_count = 1, .ran_inline = true });
+    var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial.deinit();
+    try checkStageDispatched(fixed, &serial, 4, .{ .item_count = 8, .range_count = 1, .ran_inline = true });
+}
+
+test "the clamp control sets the tuner's top batch count per participant and no range size" {
+    for (default_cases) |case| {
+        const expected: ?f64 = if (std.mem.eql(u8, case.name, "thread-clamp-range")) max_batch_multiplier else null;
+        try std.testing.expectEqual(expected, case.stageBatchesPerParticipant());
+    }
+    const clamp = findBenchmarkCase("thread-clamp-range").?;
+    try std.testing.expect(clamp.rangeFollowsItemCount());
+    try std.testing.expectEqual(@as(?usize, null), clamp.maxWorkerThreads());
+    try std.testing.expectEqual(@as(?usize, null), clamp.fixedItemsPerRange(16));
+    try std.testing.expectEqual(@as(?usize, null), clamp.stageItemsPerRange(16));
+    try std.testing.expectEqual(@as(?usize, null), clamp.stageItemsPerRangeForPartition(chunk_partition_items, 1));
+}
+
+test "the clamp control's dispatch checks hold each batch to production's shape for its item count" {
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    const clamp = findBenchmarkCase("thread-clamp-range").?;
+    // Three workers and main: 16 batches of 1,000 items, aligned to 16, at the production
+    // shape; the control `items_per_range` is ignored.
+    const wide = BatchStats{ .item_count = 1_000, .range_count = 16, .range_alignment_items = 16, .ran_inline = false };
+    const range = controlItemsPerRange(clamp, &threads, 1, wide).?;
+    try std.testing.expectEqual(@as(usize, 64), range);
+    try std.testing.expectEqual(threads.fixedBatchesItemsPerRange(wide.item_count, null, 16, max_batch_multiplier), range);
+    try checkStageDispatched(clamp, &threads, null, wide);
+    // Inline at the clamp's range count, and dispatched at another shape (the fixed default's
+    // 64-item ranges over 1,008 aligned items would be 16, so a 32-item one), fail.
+    var inline_wide = wide;
+    inline_wide.ran_inline = true;
+    try std.testing.expectError(error.BenchStageRanInline, checkStageDispatched(clamp, &threads, null, inline_wide));
+    var reshaped = wide;
+    reshaped.range_count = rangeCount(wide.item_count, 32);
+    try std.testing.expectError(error.BenchStageRangeShape, checkStageDispatched(clamp, &threads, null, reshaped));
+    // One aligned unit is one range: inline is its correct shape.
+    try checkStageDispatched(clamp, &threads, null, .{ .item_count = 16, .range_count = 1, .range_alignment_items = 16, .ran_inline = true });
+    // Ten one-unit dispatches folded inline pass; a fold holding an inline 1,000-item dispatch
+    // at its 64-item ranges, or a forced-inline dispatch, fails.
+    try checkFoldedStageDispatched(clamp, &threads, null, .{ .item_count = 160, .range_count = 10, .range_alignment_items = 16, .ran_inline = true });
+    try std.testing.expectError(error.BenchStageRanInline, checkFoldedStageDispatched(clamp, &threads, null, .{ .item_count = 1_160, .range_count = 26, .range_alignment_items = 16, .ran_inline = true }));
+    try std.testing.expectError(error.BenchStageRanInline, checkFoldedStageDispatched(clamp, &threads, null, .{ .item_count = 16, .range_count = 1, .range_alignment_items = 16, .ran_inline = true, .forced_inline = true }));
+    // Rounds resolve from their step's items: 1,600 on three workers and main is 16 ranges
+    // of 100. Ten rounds of 4 items under it correctly ran inline, though 40 items alone would
+    // resolve to one-item ranges.
+    const step_range = threads.fixedBatchesItemsPerRange(1_600, null, 1, max_batch_multiplier);
+    try std.testing.expectEqual(@as(usize, 100), step_range);
+    try checkRoundsDispatched(clamp, &threads, null, .{ .item_count = 40, .range_count = 10, .items_per_range = 100, .ran_inline = true }, 4, 1_600);
+    // A widest round past the step range that ran inline fails, and so do rounds at a range
+    // other than the step's (a clamp that never reached the stage runs the default 64).
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(clamp, &threads, null, .{ .item_count = 400, .range_count = 2, .items_per_range = 100, .ran_inline = true }, 200, 1_600));
+    try std.testing.expectError(error.BenchStageRangeShape, checkRoundsDispatched(clamp, &threads, null, .{ .item_count = 400, .range_count = 7, .items_per_range = 64, .ran_inline = false, .worker_thread_ranges = 3 }, 200, 1_600));
+    // No round: nothing to check.
+    try checkRoundsDispatched(clamp, &threads, null, .{}, 0, 0);
 }
 
 test "benchmark fixed case resolving to an earlier case's configuration is reported as its duplicate" {
@@ -2605,6 +2763,7 @@ test "benchmark fixed case resolving to an earlier case's configuration is repor
         .{ .name = "thread-fixed-auto", .chunk = null, .chunk_aligned = null },
         .{ .name = "thread-small-range", .chunk = "thread-fixed-auto", .chunk_aligned = "thread-fixed-auto" },
         .{ .name = "thread-large-range", .chunk = null, .chunk_aligned = "thread-fixed-auto" },
+        .{ .name = "thread-clamp-range", .chunk = null, .chunk_aligned = null },
         .{ .name = "thread-adaptive-tuned-range", .chunk = null, .chunk_aligned = null },
     };
     try std.testing.expectEqual(default_cases.len, expected.len);
@@ -2627,6 +2786,9 @@ test "benchmark fixed case resolving to an earlier case's configuration is repor
     };
     try std.testing.expectEqualStrings("thread-fixed-auto", bestFixedThreadedResult(&results).?.case.name);
     try std.testing.expectEqualStrings("thread-fixed-auto", bestMeasured(&results).?.case.name);
+    // The clamp control competes for the best-control pick.
+    const with_clamp = results ++ [_]CaseResult{.{ .case = findBenchmarkCase("thread-clamp-range").?, .stats = .{ .mean_ns = 90 } }};
+    try std.testing.expectEqualStrings("thread-clamp-range", bestFixedThreadedResult(&with_clamp).?.case.name);
 }
 
 test "a warmup runs its steps, then settles an adaptive case until its tuners settle or the limit" {
@@ -2953,7 +3115,7 @@ test "benchmark validation attention flags adaptive regressions against controls
         .stats = .{ .mean_ns = 100 },
     };
     const adaptive = CaseResult{
-        .case = default_cases[6],
+        .case = default_cases[default_cases.len - 1],
         .stats = .{
             .mean_ns = 130,
             .batch = .{ .active_worker_threads = 1, .threaded_batches = 1, .dispatched_batches = 1 },
@@ -2973,7 +3135,7 @@ test "benchmark validation attention flags adaptive regressions against controls
         validationAttention(null, adaptive, threaded_control).?,
     );
     try std.testing.expect(validationAttention(fixed_auto, .{
-        .case = default_cases[6],
+        .case = default_cases[default_cases.len - 1],
         .stats = .{ .mean_ns = 110 },
     }, threaded_control) == null);
 }

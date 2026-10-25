@@ -91,6 +91,7 @@ fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: B
 
     const sort_stage = Dispatch.init(stage.thread_system, &self.grid_sort_tuner, .{
         .items_per_range = stage.config.band_items_per_range,
+        .batches_per_participant = stage.config.batches_per_participant,
         .max_worker_threads = stage.config.max_worker_threads,
         .adaptive = stage.config.adaptive,
     });

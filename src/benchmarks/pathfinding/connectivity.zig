@@ -250,8 +250,6 @@ const ToggleChecks = struct {
     exact_flood: ?usize = null,
     // The block flood's folded batch holds more searches than rounds.
     more_searches_than_rounds: bool = false,
-    // `checkStageDispatched` on the block flood's folded batch.
-    flood_dispatch: bool = false,
 };
 
 // Fails when a reaction's closure passed what its prepare bounded: tail words past its
@@ -321,7 +319,6 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
         if (perf.conn_flood_nodes != nodes) return error.ConnectivitySplitFloodPastBound;
     }
     if (checks.more_searches_than_rounds and stats.perf.conn_flood_batch.item_count <= perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
-    if (checks.flood_dispatch) try suite.checkStageDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.perf.conn_flood_batch);
     const revert = revert: {
         fixtures.swapNavTuners(&fixture.system, revert_tuners);
         defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
@@ -1249,11 +1246,10 @@ fn runPocketsProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
     if (inline_stats.perf.conn_flood_nodes == 0 or case_stats.perf.conn_flood_nodes != inline_stats.perf.conn_flood_nodes) return error.ConnectivitySplitPocketsNotEqual;
     if (inline_stats.perf.conn_flood_batch.item_count <= inline_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
     if (case_stats.perf.conn_flood_batch.item_count <= case_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
-    try suite.checkStageDispatched(ctx.case, ctx.threads, ctx.case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), case_stats.perf.conn_flood_batch);
+    try suite.checkRoundsDispatched(ctx.case, ctx.threads, ctx.case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), case_stats.perf.conn_flood_batch, case_stats.perf.conn_round_items_max, case_stats.perf.conn_flood_step_items_max);
     return timeProof(ctx, &proof, .{
         .exact_flood = inline_stats.perf.conn_flood_nodes,
         .more_searches_than_rounds = true,
-        .flood_dispatch = true,
     });
 }
 

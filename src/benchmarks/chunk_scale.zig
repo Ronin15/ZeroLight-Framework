@@ -1296,7 +1296,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
+        .controls = .{ .adaptive = case.adaptive, .batches_per_participant = case.stageBatchesPerParticipant(), .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
     } else null;
 
     var unused_timing: BatchTiming = .{};
@@ -1914,7 +1914,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .thread_system = thread_ptr,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
+        .controls = .{ .adaptive = case.adaptive, .batches_per_participant = case.stageBatchesPerParticipant(), .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
     };
 
     var unused_timing: NavBatchTiming = .{};

@@ -89,6 +89,7 @@ pub const max_bands: usize = 64;
 
 pub const SteeringConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     // The band stages' range size (grid sort, selection claim), in bands; null lets their
     // tuners pick it.
     band_items_per_range: ?usize = null,

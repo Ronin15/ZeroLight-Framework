@@ -731,6 +731,7 @@ fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, count
     if (counters.perf.rounds != 0) {
         stats.perf.conn_round_items_min = if (stats.perf.conn_round_items_max == 0) counters.perf.round_items_min else @min(stats.perf.conn_round_items_min, counters.perf.round_items_min);
         stats.perf.conn_round_items_max = @max(stats.perf.conn_round_items_max, counters.perf.round_items_max);
+        stats.perf.conn_flood_step_items_max = @max(stats.perf.conn_flood_step_items_max, counters.perf.step_items);
     }
     stats.perf.conn_flood_off_main_ns += counters.perf.flood_off_main_ns;
     accumulateBatch(&stats.perf.conn_seed_batch, conn.perf.last_seed_batch);

@@ -48,8 +48,12 @@ pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, th
     if (!self.graph.valid()) return;
     const threshold = groupFieldThreshold(self);
     queueAdvancePass(self);
+    const advance_fields = self.group_field_slots.items.len;
     const advance_batch = expandGroupFieldSlots(self, threads, &self.tuners.group_field);
-    if (comptime runtime_perf_log.enabled) stats.perf.group_field_batch = advance_batch;
+    if (comptime runtime_perf_log.enabled) {
+        stats.perf.group_field_batch = advance_batch;
+        stats.perf.group_field_step_items = advance_fields;
+    }
     var slots_exhausted = false;
     for (self.group_requests.items) |tally| {
         // Only build/maintain a shared flow field once sustained demand for the
@@ -67,8 +71,12 @@ pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, th
             self.group_field_slots.appendAssumeCapacity(slot);
         }
     }
+    const begin_fields = self.group_field_slots.items.len;
     const begin_batch = expandGroupFieldSlots(self, threads, &self.tuners.group_field_begin);
-    if (comptime runtime_perf_log.enabled) stats.perf.group_field_begin_batch = begin_batch;
+    if (comptime runtime_perf_log.enabled) {
+        stats.perf.group_field_begin_batch = begin_batch;
+        stats.perf.group_field_begin_step_items = begin_fields;
+    }
     // Compact out tallies that decayed to zero this step (they received no new
     // request to keep them alive), so a transient crowd releases its slot.
     var i: usize = 0;

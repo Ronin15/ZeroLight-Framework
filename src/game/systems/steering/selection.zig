@@ -76,6 +76,7 @@ pub fn selectIntents(
 
     const claim_stage = Dispatch.init(stage.thread_system, &self.select_claim_tuner, .{
         .items_per_range = stage.config.band_items_per_range,
+        .batches_per_participant = stage.config.batches_per_participant,
         .max_worker_threads = stage.config.max_worker_threads,
         .adaptive = stage.config.adaptive,
     });

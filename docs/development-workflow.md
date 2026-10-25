@@ -403,7 +403,7 @@ steering, collision and collision response, plane traversal, nav updates,
 chunk-owned terrain and its nav reaction, pathfinding (request load and nav
 scaling), render prep, the world gate, world creation, and the production fixed
 step. The default case set has a serial baseline, fixed-worker, fixed
-small/large-range, and adaptive cases. A group lists the cases its workload runs
+small/large/clamp-range, and adaptive cases. A group lists the cases its workload runs
 (`BenchmarkGroup.cases`, default every case): `suite.casesNamed` builds a subset in
 default-case order (`suite.serial_cases`, `suite.serial_and_tuned_cases`), and a
 case the workload has no path for is left out, never skipped.
@@ -412,10 +412,15 @@ processor-owned batch tuner. Fixed cases are controls for scheduler
 overhead, worker scaling, and range size. Fixed range controls scale from the
 group's partition (the default range size, or one chunk for chunk-partitioned
 stages): default is the partition, small is half of it (at least 1), large is
-4×, each aligned to the stage's range alignment. In a group that declares
+4×, each aligned to the stage's range alignment. `thread-clamp-range` runs the
+tuner's top shape instead: every control's `batches_per_participant` is
+`max_batch_multiplier`, and `ThreadSystem` shapes each dispatch from its own item
+count as the tuner shapes its pool batches, so shared controls and controls
+forwarded through a stage's seam run at the clamp too; the trigger-patch groups
+set their controls through `CollisionSystem.trigger_controls`. In a group that declares
 its `fixed_range_shape` (default case list only), a fixed case that resolves to
 an earlier case's configuration reports `same shape as <case>`, untimed and out
-of the best-control pick. Groups that time an edit and its revert (terrain edits, nav
+of the best-control pick; the clamp case is always timed. Groups that time an edit and its revert (terrain edits, nav
 batch, nav dig and update toggles, connectivity toggles) run each half on its
 own tuner set, so each tuner takes one sample per step as production does
 (`.claude/rules/threading.md`); reported shapes and settle checks follow each

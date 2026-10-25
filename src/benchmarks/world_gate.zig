@@ -213,6 +213,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         .items_per_range = items_per_range,
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     };
 
     var warm = suite.Warmup.init(options, case, 0);

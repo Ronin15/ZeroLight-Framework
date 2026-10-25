@@ -104,6 +104,7 @@ pub const AiMemoryConfig = struct {
     /// `PerceptionConfig.scope_dense_indices` exactly.
     scope_dense_indices: ?[]const u32 = null,
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };

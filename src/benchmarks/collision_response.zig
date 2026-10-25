@@ -203,6 +203,7 @@ fn stageRunOnce(
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
     std.debug.assert(stats.contact_count == fixture.frame.contacts.mergedItems().len);
     std.debug.assert(stats.intent_count == fixture.expected_intents);
