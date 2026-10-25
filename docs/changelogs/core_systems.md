@@ -235,6 +235,28 @@ labelled.
   sanctioned test and bench seam; idiom-lint rule 13 fails production code that
   sets them to anything but a forward of its stage's controls. Steering's band
   stages forward `band_items_per_range`.
+- `f3ee24c`: a fourth fixed-shape seam option, `batches_per_participant`,
+  shapes each dispatch from its item count through the tuner's own pool sizing;
+  the bench adds `thread-clamp-range` (the tuner's top shape) to every group with
+  fixed controls. `CollisionSystem.trigger_controls` forwards the trigger sync's
+  controls; lint 13.4 fails a forward of `items_per_range` that drops the batch
+  count. `defaultWorkerThreadCount` replaces `resolveWorkerThreadCount`.
+- `6b7138e`: the nudge's first comparison trials the clamp top, and its EMA
+  seeds from a median of 3 batches. ReleaseFast `world-gate` 65,536 tuned
+  167.5 to 162.7 us (3 reps, host spread 15-42%); movement 262,144 36.2 to 44.0
+  us, within spread.
+- `a7278ca`: no whole-suite bench runs unless the owner asks; tuner and
+  `ThreadSystem` changes run the targeted groups.
+- `8bfdbfc`: a judged jump covers its count band and reopens after
+  `sample_window` records that move against its stored measurement. Debug
+  `pathfinding-link-fold` 8192 tuned 322.4 to 275.7 us.
+- `bc336f4`: `world-gate` `scattered` and `scattered-sorted` shapes measure
+  store order. Debug serial +0.40 to +1.84 ms scattered at 4,096-65,536; tuned
+  within spread or at its edge; grouping not implemented (slice 89).
+- Slice 89 verdicts (targeted Debug and ReleaseFast runs, `bench-suite-6b7138e`):
+  tuned cases over 25% behind the best control 40 to 24, the rest Debug
+  overhead or open in the slice (fresh first pick, wake posting, world-gate
+  order, drain and elastic-ramp, unsettled tuners, link-fold inline).
 
 ## Other Changes
 
@@ -378,3 +400,8 @@ labelled.
 - `faa3200` Worldgen paint is a tuned one-off stage; collision response place merges on main.
 - `de8d308` Collision triggers: emission without a count pass; node merge on main.
 - `166075c` Lint rule 13: production dispatch shapes only forward stage controls; steering band forward.
+- `f3ee24c` Bench: a clamp control at the tuner's top batch shape, through the fixed-shape seam.
+- `6b7138e` Thread system: the batch nudge trials the clamp shape first and seeds from a median.
+- `a7278ca` Rules: no whole-suite bench runs unless the owner asks.
+- `8bfdbfc` Thread system: a judged jump covers its count band and reopens on evidence.
+- `bc336f4` Bench: world-gate scattered and scattered-sorted shapes measure store order.

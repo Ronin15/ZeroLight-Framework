@@ -474,7 +474,10 @@ that is not a runtime-log cost-driver stage rides a bench-only timer channel
 shipping builds, so `untimed` covers both channels. Every case runs the same
 pre-measure steps (warmup plus the settle limit), so serial and tuned measure the same
 simulated state. `world-gate` has a tuned case, fixed controls, a dispatch check, and an
-`interleaved` shape (non-AI, dormant, and gated rows across two levels).
+`interleaved` shape (non-AI, dormant, and gated rows across two levels), and a
+`scattered` / `scattered-sorted` pair: the identical gated rows on two levels, in
+seeded random store order against `(level, chunk)` order, measuring what store
+order costs the per-row terrain reads (reported, not asserted).
 
 Reading results:
 
@@ -521,8 +524,9 @@ Reading results:
   Fixed-length groups (`chunk-scale-nav-level-add`, `pathfinding-link-fold`) settle
   on ordinary nav reactions, then each untimed and timed op follows one such
   reaction so it arrives as a one-off jump as in play; link-fold runs at least
-  two untimed jump batches whatever `--warmup` is, since a repeated jump count
-  reuses its judged shape (final within two records); level-add's fresh build
+  two untimed jump batches whatever `--warmup` is, since a jump count inside
+  the band reuses its judged shape (final within two records); the tuned case reports
+  patch jumps, their count range, off-count jumps, and re-predictions; level-add's fresh build
   set never takes the jump branch. The fixed-cycle `pathfinding-group-field-*`
   groups settle an identical twin, then carry its tuners to the measured
   fixture. A tuner that fails to settle shows its probing phase and candidate: an adaptive coverage

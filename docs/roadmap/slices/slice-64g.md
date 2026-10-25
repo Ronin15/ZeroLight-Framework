@@ -4,9 +4,9 @@
 
 **Status: sealed (2026-10-14, branch `engine_scale`).** Every acceptance check
 passes (verify, ReleaseFast test, gpu-smoke, the acceptance benches, the owner
-demo). Three follow-ups stay open below: partial-path followers (gated on a crowd
-walk), the measured level-build staging peak, and the result cache's
-capacity-history dependence. Kept as one slice by owner decision (2026-10-08).
+demo). Four follow-ups stay open below: partial-path followers (gated on a crowd
+walk), the measured level-build staging peak, the result cache's
+capacity-history dependence, and the per-participant search scratch reserve. Kept as one slice by owner decision (2026-10-08).
 
 Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
@@ -426,6 +426,18 @@ a design open for this slice):
       cap follows the live agent count, and the victim order does not depend
       on the last resize's probe layout. This follow-up stays on 64G. It is
       not a `core_systems` redo.
+- [ ] Pathfinding search scratch is not reserved per world create at every
+      thread participant. `PathfindingSystem` reserves a `SearchScratch` slot per
+      participant at default caps (`pathfinding/system.zig:540-551`), about 0.95
+      MiB each (derived from `@sizeOf` and the default caps), about 22 MiB on 24
+      participants, on every world create whatever the world's agents
+      (`.claude/reports/slice89-statics-landing.md`). Failure: Debug
+      `world-create-statics` 2,048 (Debug, 750ce0a) tuned 25.82 ms against serial 15.08 ms from
+      the page-faulted, 0xAA-filled reserves (ReleaseFast: 38 us of `rest`, tuned
+      faster than serial); memory is O(participants x caps), not agent count.
+      Pass: the reserve follows the solves that run (lazy at first solve, or
+      shared across worlds), a design the owner approves; world-create memory
+      reported before and after.
 - [x] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage.
 

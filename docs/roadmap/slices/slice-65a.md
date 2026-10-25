@@ -33,7 +33,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
   range; `RangeOutputStream`'s per-range counts and write offsets are dense
   `usize` arrays. Every production event producer writes from the main thread
   today, so this is latent; Slice 56 plans a threaded range-stream emit.
-- `resolveWorkerThreadCount` returns `cpu_count - 1` when unset (VoidLight's
+- `defaultWorkerThreadCount` returns `cpu_count - 1` when unset (VoidLight's
   rule too).
 - Zig 0.17 std: Linux `setpriority` only by raw syscall, Darwin
   `pthread_set_qos_class_self_np`, no Windows `SetThreadPriority` binding.
@@ -80,7 +80,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
       builders).
 - [ ] Lane wiring: config to keep inherited priority, the call at lane entry,
       the result in lane stats, one log line.
-- [ ] `resolveWorkerThreadCount` documents the fixed rule; `Engine.init`
+- [ ] `defaultWorkerThreadCount` documents the fixed rule; `Engine.init`
       passes the threading config unmodified.
 - [ ] `SimulationEvents` per-range stats padded, with a multi-worker parity
       test.

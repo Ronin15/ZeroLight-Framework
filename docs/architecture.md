@@ -475,7 +475,8 @@ fallback, lifecycle, and failure context, and hot paths stay quiet
 work that must finish before the next system or render phase.
 
 Worker threads are pre-spawned at startup. The default worker thread count is based
-on CPU count, with the main/render thread participating as an additional worker
+on CPU count (`defaultWorkerThreadCount`: cores - 1, 0 when the count is
+unknown or 1; the benches read it too), with the main/render thread participating as an additional worker
 while it waits. Batch submission does not allocate after initialization.
 Production worker participation is timing-adaptive: batches start inline and
 move to worker participation only when measured completion time shows the
@@ -564,10 +565,20 @@ sets neither (`.claude/rules/threading.md`).
   min(batches - 1, pool). The shape is stored (`current_profile`) and rewritten
   only when the nudge steps, a probe commits, a restore lands, or an item-count
   shift reshapes it.
-- Nudge: each threaded batch feeds a throughput EMA (items per ns, alpha 0.15);
-  a sample is clipped to ema x [0.9, 1.1] so one outlier never decides. After 7
-  samples the first step goes to fewer batches (the multiplier divides by 1.1);
-  7 samples after each step the EMA is compared with the pre-step reference. A
+- Nudge: each threaded batch feeds a throughput EMA (items per ns, alpha 0.15),
+  seeded from the median of the first 3 threaded batches after a (re)start
+  (`nudge_samples` floors at 3); later samples are clipped to ema x [0.9, 1.1] so
+  one outlier never decides. After 7 samples the first comparison is a clamp
+  trial: one jump to the clamp top (4x the pool's participants) when it dispatches
+  a different shape than the measured one, with the EMA and the reference
+  restarted at the median of the last 3 raw throughputs at the measured shape
+  (the settled EMA still carries the warm-up). After 7 trial samples a gain beyond
+  the stepped band below keeps the top and steps down from it, its EMA restarted
+  at the median of the trial's own last 3 throughputs; a tie or loss returns to
+  the measured shape at its median level and takes the first step to fewer
+  batches (the multiplier divides by 1.1). When the top is the measured shape or
+  nothing threaded is dispatched, the first step is local at once. A demotion,
+  retune, or lost probe during a trial abandons it. 7 samples after each step the EMA is compared with the pre-step reference. A
   gain beyond the stepped band, 5% x (1 - 0.85^7) = 3.4% (the EMA still carries
   the old shape), keeps the direction and steps again; a loss flips the
   direction and steps from the reference shape; inside the band the tuner holds.
@@ -585,11 +596,17 @@ sets neither (`.claude/rules/threading.md`).
   from the multiplier at the new count, and re-decides inline or threaded on the
   next settled window; an inline stage relearns. An unsustained jump up on a
   tuner without a threaded profile runs the shape the per-item model predicts,
-  held per (learned, requested) count and judged by its own skipped records
-  (`judgeJump`): the gate, the bound rule, one inline backprobe when a threaded
-  record is under the gate but its bound is not, and the commit margin between
-  the two measurements; a repeated kind holds the shape it measured. It is
-  final within two records and never trains the window, the nudge, or the model.
+  judged by its own skipped records (`judgeJump`): the gate, the bound rule, one
+  inline backprobe when a threaded record is under the gate but its bound is
+  not, and the commit margin between the two measurements; a repeated kind holds
+  the shape it measured. The judgment covers every requested count inside the 25%
+  band of the jump's own count (`jumpCovers`, anchored, never chained) under the
+  same learned count. It is final within two records and never trains the window,
+  the nudge, or the model, and reopens after `sample_window` consecutive records
+  of the held shape that move against the verdict past the commit margin of its
+  stored measurement, or across the gate where the bound rule held it inline
+  (`contradictsJudgment`); a single, equal, or alternating record never reopens
+  it. The judgment clears on a relearn and when a threaded profile is adopted.
 - Demotion: a settled threaded window demotes to inline only when its median of
   (batch duration x that batch's participants), an upper bound on the inline
   cost, is below the gate. The demoted threaded profile is remembered and the
@@ -639,14 +656,21 @@ included, so no stage trains on another's batch timings
 falls back to `ThreadSystem.adaptive_tuner`: that shared tuner serves only
 generic callers, a `parallelForWithOptions` call that passes none. Batches
 can still force explicit fixed profiles through `items_per_range`,
-`max_worker_threads`, and `adaptive = false`: the one sanctioned test and bench
-seam (`.claude/rules/tests-benchmarks.md`). Production only forwards a stage
+`batches_per_participant`, `max_worker_threads`, and `adaptive = false`: the one
+sanctioned test and bench seam (`.claude/rules/tests-benchmarks.md`).
+`batches_per_participant` shapes each dispatch from its real item count through
+the tuner's own pool sizing (`poolItemsPerRange`; `fixedBatchesItemsPerRange` is
+the one resolver the bench reads); an explicit `items_per_range` wins, and either
+bypasses the tuner. Production only forwards a stage
 config's own fields into it (`ai.zig`'s `separation_items_per_range` and
 `intent_items_per_range`, steering's `band_items_per_range` for the grid sort
-and claim bands, all null in production), and idiom-lint rule 13 fails the
-build otherwise: 13.1 a range or worker field set to anything but a forward of
-a stage config field or a selection's value, 13.2 `adaptive` set to anything
-but the config's, 13.3 a dispatch no tuner records. It scans production files
+and claim bands, `CollisionSystem.trigger_controls` for the commit-seam trigger
+sync, all null or default in production), and idiom-lint rule 13 fails the
+build otherwise: 13.1 a range, batch-count, or worker field set to anything but
+a forward of a stage config or typed `*_controls` field or a selection's value,
+13.2 `adaptive` set to anything but the config's, 13.3 a dispatch no tuner
+records, 13.4 a forward of `items_per_range` that drops the same owner's
+`batches_per_participant`. It scans production files
 outside `thread_system.zig`, tests, and test-only helpers. Worker threads are reused across
 frame batches, parked when idle, and joined during `ThreadSystem` shutdown.
 Processor-specific batches can align range starts to hot-column boundaries
@@ -663,7 +687,7 @@ train that stage, and diagnostics report inline stages as `inline`
 (`.claude/rules/threading.md`).
 
 `thread_system.zig` holds the one copy of the stage pattern: `StageControls`
-(`items_per_range`, `max_worker_threads`, `adaptive`; every stage takes a per-stage
+(`items_per_range`, `batches_per_participant`, `max_worker_threads`, `adaptive`; every stage takes a per-stage
 worker cap, which production leaves unset), `Dispatch` (select a profile under the
 stage's tuner, then run it), `StageThreads(Config)` (a system's thread system plus
 config), `stageShape`/`runShaped`/`runStage` (pre-size range windows for the shape
