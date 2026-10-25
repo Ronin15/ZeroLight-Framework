@@ -17,12 +17,14 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 - `thread_shared_record_alignment` (64) and `paddingForCacheLine` are declared
   once, in `src/app/thread_system.zig`, beside `PaddedSlot`, `SlotList`, and
   `BandPartition`; every system imports them and the private copies are deleted
-  (64G `819d8d8`). No comptime layout gate exists: padded types carry their own
-  size asserts, and no lint rejects a new private copy.
-- Padded slot types: `GatherTallySlot`, `RowCountTally`,
-  `BroadphaseRangeSlot`, `ContactCountTally`, `PerceptionRangeStatsSlot`, the
-  nav reaction's and pathfinding's range tallies, and the tier-1 corridor pool
-  entries; some carry comptime size asserts.
+  (64G `819d8d8`). No lint rejects a new private copy.
+- Padded slot types: `PaddedSlot(T)` is aligned and padded by its type
+  (`4998400`), so `SlotList`s and embedded slot fields need no per-type assert;
+  the collision, nav reaction, and pathfinding range records use it (the old
+  `RowCountTally`, `BroadphaseRangeSlot`, and `ContactCountTally` are gone).
+  `GatherTallySlot` (`simulation_scope.zig:499`) still hand-builds the same
+  shape under its own assert, and the tier-1 corridor pool entries pad
+  separately.
 - `WorkerRecord` (`thread_system.zig`, `{ id, shared, wake, thread }`) is
   56 B with alignment 8 on x86_64-linux (Zig 0.17 probe) and allocated as one
   slice, so records straddle lines and main's post to one worker contends

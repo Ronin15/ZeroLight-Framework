@@ -23,7 +23,10 @@ measured dispatch floor. A bench-only measuring landing then measured today's
 code and wrote each finding into its slice, Slice 83 split steering and the
 pipeline tests and gave every production stage its own tuner, and Slice 84
 rebuilt the shared neighbor index as a level- and faction-keyed chunk index
-built on workers and shared per cell. Measured numbers are Debug unless
+built on workers and shared per cell. A tuner and slot series then gave
+each pass its own tuner, sized collision's range slots from the dispatch, made
+`PaddedSlot` line-aligned by type, and gated the fixed-shape dispatch seam out
+of production with idiom-lint rule 13. Measured numbers are Debug unless
 labelled.
 
 ## Slice 50: Thread System Hardening
@@ -189,6 +192,49 @@ labelled.
 - `d359430`: rules: thread-policy changes get a ReleaseFast run, unsettled
   tuned cases are rerun, layout findings in new code are fixed in their
   landing.
+- `d420933`: the pathfinding registry publish and level open/close cost what
+  changed, never depth: growth is read from the reserve returns,
+  `openRegistryLevels` is O(1) at unchanged counts, `truncateLevels` frees
+  closed levels and halves header storage. Debug `chunk-scale-nav-dig` 256² at
+  8/32/128 levels flat on both sides.
+- `42192b2`, `0012864`: collision's five data-dependent range-slot sets size
+  from the dispatch's own selection through `RangeSlots` (prepare, counted
+  grow, replay); the capacity seam warms only the inline slot, and the bound
+  counters count total-bound overflow only. The trigger patch groups gain the
+  tuned case, pinned controls, and work and growth asserts.
+- `54f8298`, `4eda9f8`, `9c84b9b`, `fbafc72`: bench reporting. Every group
+  reports its stages per measured step (`[threaded/dispatched]`), settles on the
+  tuners its step runs, and proves dispatch with error returns; the census
+  counts a tuner only if it recorded in the measured window (`record_count`,
+  `idle=`); one-off stages measured fresh print `settled=fresh`; the fixed-length
+  nav groups settle on ordinary reactions and then arrive as one-off jumps.
+- `95b9fcd`: pathfinding tuners follow the work: level builds run on their own
+  fresh set (`nav_build`), registry flushes own per-phase sets plus one shared
+  one-off set, the closure copy and registry rename have their own tuners, and
+  the group field's stall rounds fold into their pass. Debug `world-create`
+  1024x8 39.22 to 31.73 ms.
+- `36307ef`: a repeated unsustained jump's own skipped records judge its held
+  shape (`judgeJump`), final within two records. Debug `pathfinding-link-fold`
+  1016008192 tuned 243.2 to 143.1 us; ReleaseFast 1064008192 72.3 to 41.5 us.
+  The earlier bench-settle verdict that the link-fold gap was "planned cost"
+  from a held inline shape learned on one-cell toggles was wrong: the cause was
+  the jump prediction (plan over-predicted threaded, patch under-predicted
+  inline). The 1016 and 1064 gaps sat within run-to-run spread, and 1064 was
+  not rerun at the time.
+- `4998400`: `PaddedSlot` aligns to the cache line by its type, which fixes
+  `PathIndex.counts` sharing lines in ReleaseFast; six pathfinding tallies use
+  `SlotList`.
+- `faa3200`: the worldgen paint is a tuned one-off stage on the world's fresh
+  `ground_build_tuner` at 32-chunk alignment; the collision response place is
+  an ordered merge on main.
+- `de8d308`: collision trigger emission has no count pass (page and node count
+  columns, `emittedCursorAt`); nodes are written by a merge on main; refresh
+  ranges own pages at 1,024-pair alignment. Debug `collision-static-triggers`
+  16,384 pairs 900.2 to 998.5 us (3 reps 939.0 to 977.8, within spread).
+- `19fe22a`, `166075c`: `ThreadSystem`'s fixed-shape options are the one
+  sanctioned test and bench seam; idiom-lint rule 13 fails production code that
+  sets them to anything but a forward of its stage's controls. Steering's band
+  stages forward `band_items_per_range`.
 
 ## Other Changes
 
@@ -318,3 +364,17 @@ labelled.
 - `60d7078` Tuner: no timer re-probe; a settled stage re-tunes only on evidence.
 - `83ef090` Tuner: a batch tuner; workers follow the batches; demote only on the upper bound.
 - `d359430` Rules: thread-policy changes get a release run; unsettled tuned cases are not judged; layout findings are not deferred.
+- `d420933` Pathfinding: registry publish and level open/close cost what changed, never depth (F-75).
+- `42192b2` Collision: per-range slots sized from the selection through ThreadSystem's RangeSlots (slot L1).
+- `0012864` Benches: trigger patch groups get the tuned case, pinned controls, work and growth asserts (trigger store step 5).
+- `54f8298` Benches: shared harness reports the batch tuner per measured step; fresh one-off tuners are judged (bench reporting landing 1).
+- `4eda9f8` Benches: every group reports its stages per measured step, settles on the tuners its step runs, and proves dispatch (bench reporting landing 2).
+- `9c84b9b` Benches: the tuner census counts a tuner only if it recorded in the measured window (bench settle landing 1).
+- `fbafc72` Benches: fixed-length nav groups measure after production's settled state (bench settle landing 2).
+- `19fe22a` Rules: ThreadSystem's fixed-shape dispatch options are the one sanctioned test/bench seam, gated out of production by the idiom lint.
+- `95b9fcd` Pathfinding: each pass owns its tuner; one-off flushes share one set, level builds start fresh.
+- `36307ef` ThreadSystem: a repeated jump's own records judge its held shape.
+- `4998400` ThreadSystem: PaddedSlot carries cache-line alignment; pathfinding tallies use SlotList.
+- `faa3200` Worldgen paint is a tuned one-off stage; collision response place merges on main.
+- `de8d308` Collision triggers: emission without a count pass; node merge on main.
+- `166075c` Lint rule 13: production dispatch shapes only forward stage controls; steering band forward.

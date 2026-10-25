@@ -132,6 +132,22 @@ the current bench.
       toggle's refresh work follows the toggled entities' pairs;
       `collision-static-triggers` refresh work flat in T for a one-entity
       toggle; serial == threaded.
+- [ ] Static query hit rows are O(1) per slot. Failure: each static query
+      slot holds the high-water rows of the widest query it ever ran
+      (`StaticPairBuffer.reserve`, `collision.zig:579-599`, `sizing.hit_rows`),
+      never lowered; measured 66.6 KB at 65,536 statics and 226-438 KB at
+      4,096 trigger pairs, about 15-20 MB derived (not measured) for a
+      10,000-static query. Memory then follows the widest past query, not what
+      exists (`.claude/rules/engine-design.md` § Cost model). Pass: rows are a
+      fixed window or a decaying high water; `static_hit_rows=` in
+      `collision-static-triggers` follows the live query; serial == threaded.
+- [ ] Tuned range slots stay within the per-item bound's trim. Failure:
+      `slot_records` over `b * items` (`RangeSlots.recountHeld`,
+      `thread_system.zig:1654`) reads 4.02 tuned at `collision` 1,024 and
+      4.38 at `collision-thin` (about 1.5 fixed, 2.96-4.38 tuned across
+      1,024-10,000 bodies), over the 3x the L1 landing designed for. Pass: tuned
+      held records at most 3x, or the excess attributed (a retune's
+      geometric grow) and reported.
 - [ ] Rows at rest cost no per-step collision work. Owner: after slice 88.
       Failure scenario: an
       inert row is gathered, sorted, and swept every step it sits in a

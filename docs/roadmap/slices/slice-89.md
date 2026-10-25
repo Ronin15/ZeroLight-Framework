@@ -60,7 +60,7 @@ cost there.
       1,025 / 2,049 batches, none near 4x the pool, so "best control" misses
       the shape the tuner can reach. Pass: a fixed case near 4x the pool.
 - [ ] Wake posting does not delay main's ranges. Failure: main posts all
-      wakes before its first range (`thread_system.zig:1139-1148`), so the
+      wakes before its first range (`thread_system.zig:1206-1209`), so the
       last worker starts 20-27 us after publish and main idles that long.
       Pass: main runs its ranges without waiting for every post, or woken
       workers wake the next; dispatch start skew measured down in ReleaseFast;
@@ -87,7 +87,7 @@ cost there.
       Pass: measure the cause first; `nav-level-add` 1024008 ReleaseFast tuned
       within spread of the persistent-set base; serial == threaded.
 - [ ] A judged jump shape covers what it proves. Failure: the jump judgment
-      (`AdaptiveWorkTuner.judgeJump`, `thread_system.zig:419`) is keyed by the
+      (`AdaptiveWorkTuner.judgeJump`, `thread_system.zig:420`) is keyed by the
       exact (learned, requested) count pair (`:344-346`), so a jump to 65
       items after a judged one to 64 discards the judgment and re-predicts
       from the in-band model, the cause the judgment fixes; link-fold and the
@@ -96,7 +96,7 @@ cost there.
       play-shaped workload first; if it does not repeat, a judged entry covers
       its count band and a bench variant varies the jump count within the band.
 - [ ] A judged jump re-tunes on evidence (`.claude/rules/threading.md`
-      § Building a stage). Failure: once judged (`thread_system.zig:423`), a
+      § Building a stage). Failure: once judged (`thread_system.zig:424`), a
       jump ignores its later records while the counts repeat, so one judged
       inline at 25 us stays inline at 200 us. Pass: a sustained shift in the
       judged shape's own records reopens the judgment, without re-probing on
@@ -113,6 +113,34 @@ cost there.
       (Debug), which a 3-iteration mean carries. Pass: tuned within spread of
       serial where it runs inline; the slow fold attributed and fixed or
       reported.
+- [ ] Tuned collision patch and static-triggers cases match their best
+      control. Measured (Debug, before the node-merge landing `de8d308`, so a
+      re-measure comes first): `collision-static-dense-change` 4,096 tuned
+      5.40 ms against fixed-auto 4.69 ms (query stage 3.74 against 3.07 ms,
+      tuned 16-17 ranges against 64-128); `collision-static-triggers` dormant
+      1,024 tuned 597.7 against 513.4 us (broad, static sort, emit count, and
+      emit under the gate, inline); `world-create-statics` 2,048 tuned +69%
+      over serial on both sides (mostly `rest=`, outside the trigger build).
+      After `de8d308`: static-triggers 1,024 tuned 507.1 to 544.0 us (a store
+      under 2,048 pairs is one refresh range, inline 66 against threaded 21
+      us). Pass: re-measure at the tip; each case tuned within spread of its
+      best control or attributed to a stage and fixed or reported.
+- [ ] Steering's tuned cases settle and match their best control. Measured
+      (Debug, `166075c`): `steering-static-dense` densest config tuned 5.29 ms
+      against the best fixed control 4.11 ms; `steering-shuffled`,
+      `-cluster-outlier`, and `-static-change` did not settle at
+      `--iterations 3` with the default warmup (static-change also unsettled
+      before). Pass: each settles within four times the default warmup, or its
+      stage is merged or removed (`.claude/rules/threading.md` § Building a
+      stage); the dense config within spread of its control.
+- [ ] World-create's surface phase matches its base at small worlds. Measured
+      (Debug, `faa3200` against `4998400`): 2,048 side surface phase 19.16 to
+      21.81 ms (every tree rep at or above base; ReleaseFast faster), +0.35 ms
+      at 256; the paint now runs 47 aligned ranges where it ran 16,384
+      one-chunk ranges (`worldgen.zig:220`). That the range count causes it
+      is a hypothesis. Pass: measure the cause; the surface phase within
+      spread of the base in Debug, or reported as Debug overhead with the
+      ReleaseFast confirmation.
 - [ ] A whole-group Debug smoke run of every bench group under the batch tuner
       (dispatch and settle checks pass or fail), since only 13 groups ran
       after `83ef090`.

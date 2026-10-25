@@ -98,7 +98,8 @@ Designs start here, then read the live structure below (rules:
     reserve seams, batched dense writes as threaded plan and write jobs, sparse
     add/remove, and blocking clears.
   - `worldgen.zig`: the procedural and demo world builds (procedural ground
-    painted per chunk on the thread system) and the underground level stack.
+    painted per chunk on the thread system as a fresh one-off stage at 32-chunk range
+    alignment, `ground_build_tuner`) and the underground level stack.
   - `terrain.zig`: chunk-owned terrain storage: per dense layer a chunk
     directory over a pool of tile blocks, and per level a `LevelTerrain`
     (growable band list and cached floor layer, a composed movement-blocked
@@ -582,7 +583,13 @@ sets neither (`.claude/rules/threading.md`).
   the current profile without being sampled; a full window in a row on the same
   side is a sustained shift. A threaded stage keeps its profile, reshapes it
   from the multiplier at the new count, and re-decides inline or threaded on the
-  next settled window; an inline stage relearns.
+  next settled window; an inline stage relearns. An unsustained jump up on a
+  tuner without a threaded profile runs the shape the per-item model predicts,
+  held per (learned, requested) count and judged by its own skipped records
+  (`judgeJump`): the gate, the bound rule, one inline backprobe when a threaded
+  record is under the gate but its bound is not, and the commit margin between
+  the two measurements; a repeated kind holds the shape it measured. It is
+  final within two records and never trains the window, the nudge, or the model.
 - Demotion: a settled threaded window demotes to inline only when its median of
   (batch duration x that batch's participants), an upper bound on the inline
   cost, is below the gate. The demoted threaded profile is remembered and the
@@ -598,13 +605,20 @@ sets neither (`.claude/rules/threading.md`).
   (`rebuild_tuner_config`: a world-create or static-collider rebuild whose first
   batch is too large for main) dispatches its first batch on the full pool at 2
   batches per participant (measured against 1 and 4 on the rebuild and
-  world-create benches); no nudge follows a one-off.
+  world-create benches); no nudge follows a one-off. The `rebuild_tuner_config`
+  users: the world's procedural paint (`ground_build_tuner`, at 32-chunk range
+  alignment), the static-collider rebuild, pathfinding's level build set
+  (`nav_build`, fresh at every nav build: it samples each stage once per level,
+  too rarely to settle), the shrink's resize copy and registry rename, and the
+  one-off flush set (a shrink's flush, a level rebuild's evictions).
 
 There are no static item-count floors (`.claude/rules/threading.md`); slower
 hardware or expensive small-N processors train their own shape. The tuner counts
 closed probe windows and demotions for `--details` (`probes=`, `demotes=`) and
-also restores and skipped out-of-band batches (`restore_count`,
-`shift_skip_count`); the counters compile to nothing in ReleaseFast and
+also restores, skipped out-of-band batches (`restore_count`,
+`shift_skip_count`), and batches recorded with items (`record_count`, which the
+bench settle census reads); benches report them as deltas over the measured
+window. The counters compile to nothing in ReleaseFast and
 ReleaseSmall and no policy reads them.
 
 The gate, `threaded_batch_ns` (60 µs), is a probe floor: an inline window median
@@ -625,14 +639,25 @@ included, so no stage trains on another's batch timings
 falls back to `ThreadSystem.adaptive_tuner`: that shared tuner serves only
 generic callers, a `parallelForWithOptions` call that passes none. Batches
 can still force explicit fixed profiles through `items_per_range`,
-`max_worker_threads`, and `adaptive = false`. Worker threads are reused across
+`max_worker_threads`, and `adaptive = false`: the one sanctioned test and bench
+seam (`.claude/rules/tests-benchmarks.md`). Production only forwards a stage
+config's own fields into it (`ai.zig`'s `separation_items_per_range` and
+`intent_items_per_range`, steering's `band_items_per_range` for the grid sort
+and claim bands, all null in production), and idiom-lint rule 13 fails the
+build otherwise: 13.1 a range or worker field set to anything but a forward of
+a stage config field or a selection's value, 13.2 `adaptive` set to anything
+but the config's, 13.3 a dispatch no tuner records. It scans production files
+outside `thread_system.zig`, tests, and test-only helpers. Worker threads are reused across
 frame batches, parked when idle, and joined during `ThreadSystem` shutdown.
 Processor-specific batches can align range starts to hot-column boundaries
 through `parallelForWithOptions`.
 
 Systems with multiple independently timed threaded stages own one tuner per
-stage (broadphase and narrowphase; AI gather, separation, and decision
-emission; the index's bucket, sort, and link). A stage
+pass (broadphase and narrowphase; AI gather, separation, and decision
+emission; the index's bucket, sort, and link). Rounds of one pass are one
+sample, a round that runs only in another pass's rare phase folds into that
+pass's sample (the group field's stall rounds), and rare one-off passes of one
+job share one tuner set. A stage
 that preselects a profile passes it with its own tuner, so inline samples still
 train that stage, and diagnostics report inline stages as `inline`
 (`.claude/rules/threading.md`).
@@ -645,21 +670,27 @@ config), `stageShape`/`runShaped`/`runStage` (pre-size range windows for the sha
 the dispatch will use, then run), and `RoundDispatch` (a multi-round stage selects
 once and records one tuner sample per step). Beside them: the 64-byte
 `thread_shared_record_alignment`, `paddingForCacheLine`, `PaddedSlot`/`SlotList`,
-`BandPartition`, `inlineBatch`, `accumulateBatch`, `offMainNs`, and
+`RangeSlots`, `BandPartition`, `inlineBatch`, `accumulateBatch`, `offMainNs`, and
 `compactRowWindows`/`compactSliceWindows` (main's range-order merge of a
 windowed gather's MAL rows or slice items).
 
 `selectBatchProfile` and `parallelForWithOptions` are the raw calls beneath
 `Dispatch`/`StageThreads`; a stage calls them directly only where the wrappers
-do not fit (collision broadphase's replay). A pass with at most one output per
+do not fit (scope's gather stages). A pass with at most one output per
 item tallies into a range tally sized by `maxRangeCount(item_count,
 range_alignment_items)`, the bound on ranges any partition can produce, so a
 retune never allocates in-stage; data-dependent per-range output slots are
 sized from the selection the dispatch uses (`threading.md` § Writes, capacity,
-and determinism). Rows stay dense: each stage's `range_alignment_items` makes
+and determinism): `RangeSlots(Slot)` sizes each range of the dispatch's own
+selection at the per-item bound times the items it covers (`prepare`, main,
+geometric, counted), `run` dispatches with no tuner record, grows each
+overflowing range to its counted need and replays the same ranges, and the
+caller records the final pass once (`prepare_grows`, `replays`). Rows stay dense: each stage's `range_alignment_items` makes
 every range span at least one full cache line in the columns it writes. Per-range and
-per-worker records pad to the 64-byte `thread_shared_record_alignment` (slot
-arrays multiply); a contended singleton
+per-worker records pad to the 64-byte `thread_shared_record_alignment`:
+`PaddedSlot(T)` is aligned to at least that and padded to whole lines by its
+type, so any array, `SlotList`, or embedded field of slots starts each slot on
+its own line and a tally needs no field alignment; a contended singleton
 shared record aligns to `std.atomic.cache_line` (`shared_line`). A batched
 `RangeOutputStream` or `SimulationEvents` calls `finishWrite` once per commit
 after every range has written; it walks all range offsets, so a per-record call
@@ -964,6 +995,33 @@ come from `ColliderView`. Solid static×static pairs are dropped. A static
 trigger over a static is stored until the collider revision changes; that
 refresh runs at the collider sync (`syncStaticColliders`).
 
+The stored pairs live in `TriggerStore` (`collision_triggers.zig`): per level a
+B+-tree of sorted 64-pair pages (the leaves, pooled `PayloadSlabs` slots) under
+inner nodes of up to 62 entries (3,072 B slot class). A page's header holds the
+valid and allowed slot masks (`simd.bytesMatchingMask`); a node keeps prefix
+columns of its children's pairs for each `PairCount` (`start`, `valid_start`,
+`allowed_start`), and `LevelRank` folds the levels' three counts. Emission is
+one dispatch over the emitted contacts through `emittedCursorAt`, with no count
+pass, and never reads a filtered pair. A patch buckets its edits on main, plans
+every tree height from counts, writes the fresh pages in one leaf dispatch
+(each range finds its run once), and writes the nodes on main as an
+O(1)-per-output merge with advancing run and segment cursors (not a stage).
+`refresh` (allow epoch) ranges own pages at 1,024-pair alignment: a range
+holding every page of a height-1 node writes its prefixes and totals, a node
+split at a range edge gets raw per-page counts, and main prefixes only the
+split nodes and folds heights 2 and up, the level counts, and the rank. Perf
+carries the node merge's work proof (`last_node_merge`, `last_rebuild_node_merge`
+{outputs, ns}) and `last_refresh_fold` {entries, ns}.
+
+Range slots follow each dispatch's selection (`RangeSlots`, § Thread System):
+the spill, broadphase, and static-query sets, the trigger patch and rebuild
+query sets (`SlotSet`), with the rebuild set released after the store rebuild.
+The capacity seam warms only the inline slot, so a serial or single-range step
+allocates nothing from the first step. `pair_bound_overflows` and
+`entry_bound_overflows` count total-bound overflow only; range-local growth
+counts in its set's `prepare_grows` and `replays`, logged once per set
+(`slot_growth_logged`).
+
 `packFillRange` writes each slot's position, offset, size, level, and entity
 index once. `fillSlots` loads those columns in lanes; a short tail is that
 kernel with a prefix load. `chooseSplitters` still resolves its fixed sample
@@ -1002,8 +1060,9 @@ vector load and store, and the remainder is that multiply on a prefix
 (`loadFloat4Prefix` / `storeFloat4Prefix`) so it does not read or write past
 the window. With workers, each range groups intents on a direct table keyed
 by `movement_row >> 4` and scatters correction, normal, velocity scale, kind,
-and movement row into `packed_intents` in apply order. `place` is one item on
-the caller and merges those runs so earlier ranges stay first. `apply` (over
+and movement row into `packed_intents` in apply order. `placeRuns` runs on
+main after the gather join, an O(1)-per-run ordered merge (not a stage; perf
+`place_ns`) so earlier ranges stay first. `apply` (over
 occupied 16-row blocks, its own tuner) streams each run as a unit-stride
 prefix. A repeated row flushes before the next intent joins it, a short group
 is the same kernel with a mask, and the open group ends at the run. Movement
@@ -1210,7 +1269,7 @@ cache still does; Slice 64G checklist). The fixed-step work:
   window), or a candidate. Agents that share a goal key share one pending entry.
 - `group_field_expand` advances building fields (one item per field, an advance
   pass before the main-thread slot decisions and a begin pass after; stall rounds
-  have their own tuner).
+  fold into the pass's sample, `queueAdvancePass`).
 - The solve batch admits up to the per-step ceiling (`default_max_solves_per_frame`
   512, a fixed count; at most `max_escalated_solves_per_step` of them tier-1) and
   writes each output at its solve ordinal; branch-heavy A* frontier work stays
@@ -1224,7 +1283,12 @@ cache still does; Slice 64G checklist). The fixed-step work:
   the 16 shard pairs (count weighs a pair's adds plus the inverse nodes its
   retires mark plus one; apply weighs the compacted chunk lengths plus its adds
   plus one), a range runs the pairs whose first unit lies in it, and at most 15
-  workers dispatch. Pending compaction costs the solve window, not the queue.
+  workers dispatch. The flush passes (count, apply) own tuners per phase: the
+  update's, the marks batch's eviction, and one one-off set shared by a shrink's
+  flush and a level rebuild's evictions (`flushSet` routes any flush there while
+  a shrink's truncation is pending); `FlushDispatch` carries the rename pass's
+  dispatch and derives each pass's. Pending compaction costs the solve window,
+  not the queue.
 
 Reachability answers before any search (`pathfinding.md`). Status, intake, and solve
 read, in order, the live goal (the key's cell when open, else its projection from
@@ -1294,6 +1358,12 @@ h = min(max(h_short, crossing distance), long term):
   heuristic nothing. Links are append-only; a future removal seam refolds both
   from the remaining links.
 
+Registry publish costs O(shards): growth is read from the reserve calls'
+return values, never a sum over levels. `openRegistryLevels` is O(1) at
+unchanged level and chunk counts, opens only new levels on an append, and walks
+every level only when the chunk count changed; `ChunkDirectory.truncateLevels`
+drops closed levels and returns header storage once at most half is used.
+
 The result cache (`caches.zig`) is goal-keyed (`.claude/rules/pathfinding.md`): a
 `CacheCore` slot table and entry records (4 results per agent; round-robin victims,
 never a refusal; TTL 300 steps) whose record index is the owner id in the path
@@ -1303,8 +1373,8 @@ long block (`resultBlockWords`) from a paged pool the publish reserve grows, at 
 one per entry, plus its end and goal cell. A grow appends pages and copies nothing; a
 shrink selects survivors by an O(n) radix pass (oldest first, equal to the age
 order), `resize_copy` moves path bytes on workers, tail pages free, and the owner log
-renames registry owners. A shrink's registry flush runs at a fixed one-range-per-pair
-shape outside the flush tuner. The path registry is one padded `ChunkDirectory`
+renames registry owners. A shrink's registry flush records once on the one-off flush set
+(`flushSet`). The path registry is one padded `ChunkDirectory`
 of per-chunk runs (`owner`, `order`, `inverse`) plus 16 inverse pools. A chunk
 key's shard is the top bits of `std.hash.int` of the key. Every published path
 registers each run of consecutive cells on one level in one chunk, so eviction
@@ -1512,8 +1582,12 @@ H-component ids use the full u32.
 Every stage has its own tuner and an inline path: `nav_mark` and the eviction trio
 (`nav_evict_count`, `nav_evict`, `evict_flush`) on `PathfindingSystem`, and the
 graph's `NavStage` tuners (`plan`, `remask`, `patch`, `conn_seed`, `conn_gather`,
-`conn_flood`, `conn_closure_candidates`, `_resolve`, `_mask`, `_plan`, `_rows`,
-`_land`) under one `nav_controls`. The main thread keeps O(1) work per item
+`conn_flood`, `conn_closure_candidates`, `_resolve`, `_mask`, `_plan`, `_copy`
+(the relocated-span copy, before the rows), `_rows`, `_land`) under one
+`nav_controls`. The marks batch runs them on the `nav` set; level builds (world
+create, a full rebuild, a step's level appends and content rebuilds) run on the
+separate `nav_build` set, started fresh on the one-off config at every build
+(`Tuners.startNavBuild`). The main thread keeps O(1) work per item
 (`.claude/rules/threading.md`); a single dominant one-way system's Tarjan is one
 item, so it runs where the thread system places one item, and its rows thread. The
 runtime perf log records `nav_remask`, `nav_connect` (the flood rounds), `nav_closure`

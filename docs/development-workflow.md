@@ -25,8 +25,12 @@ zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreac
 
 `zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) checks
 the mechanical subset of `.claude/rules/zig-style.md` and
-`.claude/rules/memory-performance.md`; the script's docstring lists exactly what
-it enforces. `catch unreachable` and `orelse unreachable` are allowed only on
+`.claude/rules/memory-performance.md` as 13 rules; the script's docstring lists
+exactly what it enforces. Rule 13 gates `ThreadSystem`'s fixed-shape dispatch
+options (`.claude/rules/tests-benchmarks.md`): production code outside
+`thread_system.zig`, tests, test-only helpers, and benches may only forward a
+stage config's own controls (`docs/architecture.md` § Thread System). It runs a
+self-check of must-hit and must-pass cases before the scan. `catch unreachable` and `orelse unreachable` are allowed only on
 the `.init` constructors of the generational handles `TextureId`, `FontId`,
 `TextTextureId`, `EntityId`, and `LeaseHandle` (guarded at every call site),
 inside `test` blocks, or with a `// lint:allow catch-unreachable: <reason>`
@@ -430,9 +434,16 @@ Fields shared by every group:
 
 - `main=` is the sample's main-thread time and share: its wall time minus the
   off-main time of the stages that ran on workers.
-- Threaded stages under `--details`: each stage's busiest shape, and the
-  main-thread time and share (the iteration minus its off-main stage time). The
-  tuner cell adds ` probes=N demotes=M` in Debug and ReleaseSafe.
+- Threaded stages under `--details`: each stage's shape over every measured
+  step as `[threaded/dispatched]`, and the main-thread time and share (the
+  iteration minus its off-main stage time). The workers column prints `a/b[k/n]`
+  for the busiest batch (`[0/n]`: it stayed inline), and the headline is the
+  stage the group is judged on. The tuner cell adds ` probes=N demotes=M` in
+  Debug and ReleaseSafe, counted over the measured window only (a tuner's
+  counters are deltas from the window's start). Nav reaction groups print their
+  stages through one table (`NavReactionShapes`) and a `closure_copy=` entry.
+- Tuned cases also print `secondary_tuning:` (the secondary pass's tuning) and
+  `step_tuners:` lines where a group has them.
 
 Dispatch checks (a threaded stage proven to run on workers, not inline):
 `suite.checkStageDispatched`, `checkStagesDispatched`, `checkRoundsDispatched`
@@ -441,9 +452,10 @@ threaded case splits into one range per `items_per_range`); group-owned checks
 include collision's `checkSweepWork`, `checkEmptyingSyncWork`, and
 `checkFixedPatchStages`, scope-cognition's `checkScopeStagesDispatched`, nav-update
 and `chunk-scale-nav-level-add` remask coverage, connectivity's closure rounds and
-`checkLevelBuildFloodFolds`, the registry flush's units and ranges
-(`RegistryFlushPastPairWorkers`), and the elastic-shrink flush shape
-(`checkShrinkFlushShape`). Stored batch records sit behind each owner's perf switch
+`checkLevelBuildFloodFolds`, the registry flush's units and ranges, and the
+elastic-shrink flush (`checkShrinkFlush`: fixed control shapes; the shrink
+records once on the one-off flush set, a fresh set on workers). Dispatch proofs
+are error returns, never `std.debug.assert`. Stored batch records sit behind each owner's perf switch
 and only benches read them; tests assert observable results.
 
 `production-step --details` census: per top-level stage `wall=`, `off_main=`,
@@ -490,11 +502,28 @@ Reading results:
   windows (inline/threaded decision) plus 16 nudge comparisons
   (`suite.adaptiveSettleIterationLimit`); a tuner is settled when its phase is
   settled and, if threaded, its nudge holds (`suite.tunerSettled`). The work-tuning
-  column prints `settled=yes|no` (settled before measurement) and, for a threaded
-  profile, `final=<workers>/<items per range> x=<batch multiplier>`. A tuner that
-  fails to settle shows its probing phase and candidate: an adaptive coverage
-  failure, not a clean timing; a tuned case with `settled=no` is rerun with more
-  warmup, never judged (`.claude/rules/tests-benchmarks.md`). Inline batches do not reset tuner state for later processors.
+  column prints `settled=yes|no|fresh` (settled before measurement; `fresh`: a
+  one-off stage whose production tuner starts fresh each run, such as
+  `collision-static-rebuild`, `world-create`, and `world-create-statics`, is
+  measured fresh and judged) and, for a threaded profile,
+  `final=<workers>/<items per range> x=<batch multiplier>`. A tuner is settled
+  only with no pending restore or retune. A group judged on several tuners
+  prints a census, `settled=<k>/<n> idle=<m>` (plus ` fresh=<f>` and the first
+  unsettled names): a tuner counts as used only if its `record_count` moved in
+  the measured window (it is judged by its state at the window's start); one
+  that did not record is idle. `Warmup.nextSettled` snapshots the census at the
+  first settle step and stops when the snapshot's tuners settle or at the limit.
+  Fixed-length groups (`chunk-scale-nav-level-add`, `pathfinding-link-fold`) settle
+  on ordinary nav reactions, then each untimed and timed op follows one such
+  reaction so it arrives as a one-off jump as in play; link-fold runs at least
+  two untimed jump batches whatever `--warmup` is, since a repeated jump count
+  reuses its judged shape (final within two records); level-add's fresh build
+  set never takes the jump branch. The fixed-cycle `pathfinding-group-field-*`
+  groups settle an identical twin, then carry its tuners to the measured
+  fixture. A tuner that fails to settle shows its probing phase and candidate: an adaptive coverage
+  failure, not a clean timing; a tuned case with `settled=no` is printed
+  `not judged, rerun with more warmup` and is never judged
+  (`.claude/rules/tests-benchmarks.md`). The summary leads with `adaptive settled=...`. Inline batches do not reset tuner state for later processors.
 - Multi-stage systems are read per stage: a primary batch may thread while a
   secondary stays `inline`. Pathfinding's request preparation can use SIMD lane
   batches while the A* solve stage owns its own tuner and row.

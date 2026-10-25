@@ -143,8 +143,13 @@ instances, dispatches through this pool, so its safety is engine-wide.
 
 ### Open items from the batch tuner and diagnostics landings
 
-- [ ] No stage control exists only for tests and benches
+- [x] No stage control exists only for tests and benches
       (`.claude/rules/tests-benchmarks.md` § Test and production code 1).
+      Superseded by `19fe22a`: `ThreadSystem`'s fixed-shape options are the one
+      sanctioned test and bench seam, and production code may only forward its
+      stage's controls. The steering band stages forward
+      `SteeringConfig.band_items_per_range` (`steering/system.zig:94`),
+      null in production. Original failure text kept below.
       Failure: production passes `.{}` to `WorldGateSystem.apply`
       (`simulation_pipeline.zig:1896`), so `WorldGateConfig.items_per_range` and
       `.max_worker_threads` (`world_gate.zig:36`) are set only by tests and
@@ -154,9 +159,11 @@ instances, dispatches through this pool, so its safety is engine-wide.
       bench fixed-shape controls over `StageControls`, no production config
       field is written by tests or benches alone, and the tuner-pin sites are
       unchanged in behavior.
-- [ ] The idiom lint flags a production literal `items_per_range` or
+- [x] The idiom lint flags a production literal `items_per_range` or
       `max_worker_threads` passed to `Dispatch` outside tests and benches
-      (`tools/lint_idioms.py`).
+      (`tools/lint_idioms.py`). Rule 13 (`166075c`): 13.1 range and worker
+      fields, 13.2 `adaptive`, 13.3 a dispatch no tuner records; production is
+      hit-free with no exemptions.
 - [ ] The 14 `pipeline_*` runtime-log timers are cost-driver stages or move
       to the bench-only channel. Failure: `runtime_perf_log.zig:170-183`
       (`pipeline_spatial_index` through `pipeline_chunk_derive`) time whole
