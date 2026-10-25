@@ -26,10 +26,11 @@ fixture and grouped by chunk only if they cost there.
   dispatch floor in `58ff9e1`; it stays (`49620d9`).
 - World gate: `world_gate.zig` `gateRange` (`:248`) walks movement rows in
   store order; plane entry gathers per slice 88's plane-entry item.
-- Already routed (not repeated here): slice 35's row-order and tuned-versus-fixed
-  items ([35](slice-35.md)), slice 50's open tuner items ([50](slice-50.md)),
-  slice 88's plane-entry gather item ([88](slice-88.md)). Related, not merged:
-  slice 50's first-shape (`:188`), movement (`:193`), and cold-seed (`:197`)
+- Already routed (not repeated here): slice 35's row-order item
+  ([35](slice-35.md)), slice 50's other open tuner items ([50](slice-50.md)),
+  slice 88's plane-entry gather item ([88](slice-88.md)). Merged here (owner
+  2026-10-24): slice 35's tuned-versus-fixed item, and slice 50's first-shape,
+  movement, and cold-seed
   items.
 - Measured (`world-gate` uniform, 65,536 rows, ReleaseFast
   `-Dcpu=x86_64_v2`, copies of `83ef090` with timing instrumentation, host
@@ -79,9 +80,9 @@ fixture and grouped by chunk only if they cost there.
       each slower tuned case a verdict (`.claude/rules/tests-benchmarks.md`),
       light stages that stepped down first (`movement`, `particles`; the
       down-first comment `:153-157`) included; ReleaseFast at the sizes where
-      each touched stage threads (`.claude/rules/build-validation.md`). Related:
-      slice 35 "Tuned versus fixed controls" (`slice-35.md:80`), slice 50
-      cold-seed (`slice-50.md:197`).
+      each touched stage threads (`.claude/rules/build-validation.md`). Merged:
+      slice 35's tuned-versus-fixed item and slice 50's cold-seed hypothesis
+      (owner 2026-10-24: the nudge may change).
 - [ ] Bench controls cover the clamp. Failure: the fixed cases
       (`benchmarks/suite.zig:163-200`) run 64-item ranges and their half and 4x
       (`:141-147`): 1,025 / 2,049 / 257 batches at `world-gate` 65,536, none at
@@ -95,10 +96,10 @@ fixture and grouped by chunk only if they cost there.
       ranges at `:1223`); at 1.0-1.2 us per post (RF, 23 workers) main's own
       first range and the last worker start 22-27 us after publish, about a
       fifth of a 112 us `world-gate` batch. A tree wake was measured slower and
-      is not pursued (slice 50 § Measured and not pursued, `7946511`). Scope:
-      owner question whether interleaved posting or a broadcast wake (a
-      `ThreadSystem` wake-protocol change) is in scope, or the item drops if
-      the skew is gone after the nudge item. Measure after the nudge item:
+      is not pursued (slice 50 § Measured and not pursued, `7946511`). Scope (owner
+      2026-10-24): decided after the nudge item lands; if the skew is gone the
+      item drops, else interleaved posting or a broadcast wake (a `ThreadSystem`
+      wake-protocol change) comes to the owner as a design. Measure after the nudge item:
       shapes at 4x the pool give late starters fewer ranges (hypothesis). Pass:
       a dispatch start-skew counter in `thread-dispatch` `--details` (behind the
       perf switch); skew measured down in ReleaseFast at 1,024 and 16,384 items
@@ -118,10 +119,10 @@ fixture and grouped by chunk only if they cost there.
       (`world_gate.zig:248`, `:317`) reported as a cost or not there, ordered
       against the same rows chunk-sorted (Debug, plus one ReleaseFast run: Debug
       dilutes cache cost with per-row overhead); only if they cost, rows group
-      by `(level, chunk)`, serial == threaded. Owner questions: whether a per-row
-      terrain read at the row's position is an exempt point lookup under the
-      data rule, and whether `build-validation.md`'s ReleaseFast exceptions
-      cover an access order's cache cost. Links slice 35's row-order item and
+      by `(level, chunk)`, serial == threaded. A per-row terrain read at the
+      row's position is an exempt point lookup (owner 2026-10-24); the
+      ReleaseFast run is the access-order exception
+      (`.claude/rules/build-validation.md`). Links slice 35's row-order item and
       slice 88's plane-entry item.
 - [ ] A fresh one-off's first pick fits its work. Failure: a fresh `full_pool`
       tuner's first selection is the whole pool at 2 batches per participant
@@ -143,7 +144,7 @@ fixture and grouped by chunk only if they cost there.
       surface phase within spread of `4998400` in Debug, or reported as Debug
       overhead with the ReleaseFast confirmation; `nav-level-add` 1024008
       ReleaseFast tuned within spread of the persistent-set base; serial ==
-      threaded. Related: slice 50 first-shape (`slice-50.md:188`).
+      threaded. Merged: slice 50's first-shape item.
 - [ ] A judged jump covers its count band and re-tunes on evidence. Failure: the
       judgment (`AdaptiveWorkTuner.judgeJump`, `thread_system.zig:420`) is keyed
       by the exact (learned, requested) count pair (`:344-345`), finer than what
@@ -164,7 +165,7 @@ fixture and grouped by chunk only if they cost there.
       unmeasured. Pass: three runs of 3 reps at 4,096 and 10,000: tuned time
       within spread of the best control in each
       (`.claude/rules/tests-benchmarks.md`); the settled shape is reported, not
-      judged. Related: slice 50 (`slice-50.md:193`).
+      judged. Merged: slice 50's movement item.
 - [ ] An inline tuned case matches serial. Measured: `pathfinding-link-fold`
       1016032768 ReleaseFast, every stage inline in the tuned case, tuned
       13-16% slower than `serial-direct`, on `95b9fcd` and after; cause
@@ -208,7 +209,7 @@ fixture and grouped by chunk only if they cost there.
       (plan, revert_plan, revert_write); `chunk-scale-nav-enclose` 642048001
       (revert_plan, revert_write, nav_mark, revert.nav_mark);
       `steering-shuffled` 1,024 / 16,384; `steering-static-change` 10. Pass:
-      each rerun at four times the default warmup
+      each rerun at four times the default pre-measure
       (`.claude/rules/tests-benchmarks.md`); a tuner still unsettled is merged
       or removed (`.claude/rules/threading.md` § Building a stage), or, for a
       bench-only revert instance, the fixture fixed.

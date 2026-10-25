@@ -185,24 +185,13 @@ instances, dispatches through this pool, so its safety is engine-wide.
       Pass: those reads are bench checks or observable-result asserts.
       `incremental_rebuilds` and `levels_built` stay live (`nav_reaction.zig:340`
       emits `nav_region_invalidated` from them).
-- [ ] Rarely-run passes predict a good first shape. Failure:
-      `chunk-scale-nav-level-add` at 2048 tuned is 50% slower than the best
-      fixed control (measured on the batch tuner before the nudge; about 4 dispatches per stage per run, so the tuner cannot
-      learn within a run). Pass: tuned within spread of the best control, or
-      the gap attributed to a fixed cost.
-- [ ] The `movement` 4,096 Debug case against its reference. Failure:
-      tuned 30.5-42.9 us against a base of 29.3-35.0 us (overlapping ranges,
-      Debug, measured at the nudge review). Pass: one 3-rep re-measure on the final tuner reads within
-      spread, or a verdict per `.claude/rules/tests-benchmarks.md`.
-- [ ] A cold first batch seeding the nudge EMA (untested hypothesis). Failure:
-      the world gate at 65,536 (ReleaseFast) settles 1-3 steps below the pool
-      where fixed controls run far finer shapes; the cause is unmeasured. Pass: a measurement of the seed's
-      effect on the settled shape; no change without it.
+- Moved to slice 89 (owner 2026-10-24): rarely-run passes' first shape (its
+  fresh one-off item), the `movement` 4,096 case (its movement item), and the
+  cold-seed hypothesis (its tuner item).
 
 ### Measured and not pursued
 
-Owner-ruled 2026-10-15; none is an open item (a bench's tuned-vs-control gap
-is not a target).
+Owner-ruled 2026-10-15; none is an open item.
 
 - Tree wake (main posts the root, woken workers post children): slower at
   every worker count up to 23, since a tree level costs a wake round trip

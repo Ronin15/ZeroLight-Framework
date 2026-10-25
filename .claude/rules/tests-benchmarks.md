@@ -98,7 +98,8 @@ The standard Zig layout; every change, plan, and review follows it.
   control, judged only for a worse growth order or added per-item work (a new
   scan or indirection), never for a constant gap. A tuned case whose tuners
   did not settle before measurement (`settled=no`) is rerun with more warmup,
-  never judged; one still unsettled at four times the default warmup is a
+  never judged; one still unsettled at four times the default pre-measure (warmup plus the
+  settle limit) is a
   tuner that never settles (`threading.md` § Building a stage). Exception: a one-off stage whose production tuner starts
   fresh each run (a world, level, or store rebuild) is measured fresh, prints
   `fresh`, and is judged.

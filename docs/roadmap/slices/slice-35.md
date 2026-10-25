@@ -77,14 +77,8 @@ avoidance [85](slice-85.md)'s.
         costs per row what the uniform shape does, about 2x per gated row.
         Pass: a chunk-grouped pass (its own slice, owner 2026-10-23), serial ==
         threaded, `interleaved` per gated row within spread of `uniform`.
-      - Tuned versus fixed controls. Failure: `world-gate` 65,536 uniform,
-        ReleaseFast, the tuned case is 31-44% over fixed controls that run
-        256-1,024 batches (10-43x the pool, past the 4.0 multiplier clamp); the
-        nudge settles 1-3 steps below the pool. Pass: tuned matches or beats the
-        best control within spread at the threading sizes
-        (`.claude/rules/tests-benchmarks.md`), the cause found at the world gate
-        first (per-batch cost by row region, worker wake skew, join wait,
-        write-column sharing), not by retuning the nudge.
+      - Tuned versus fixed controls: moved to slice 89's tuner item (owner
+        2026-10-24; the measured cause points at the nudge).
 - [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path.
 
 ### Acceptance checks
