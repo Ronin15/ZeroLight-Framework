@@ -213,7 +213,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; five items open as data | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); runs first in the core branch |
-| [**90**](roadmap/slices/slice-90.md) | Programming landed; two items open | ThreadSystem Wake Protocol And Startup Calibration — after 89; runs next in the core branch, before 86 (open: unsettled 4,096 tuners, owner's macOS and Windows runs) |
+| [**90**](roadmap/slices/slice-90.md) | Programming landed; four items open | ThreadSystem Wake Protocol And Startup Calibration — after 89; runs next in the core branch, before 86 (open: gate/prior tuned-vs-control checks, unsettled 4,096 tuners, owner's macOS and Windows runs) |
 
 **Recently settled (archive only):** 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 

@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 89](slice-89.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: programming landed (`07b9c9a` wake words, `776c1ec` startup calibration); two
-items open: the 4,096 production-step tuners that stay unsettled, and the owner's macOS and
-Windows runs.** Owner 2026-10-25: slice 89 commits as is; the wake protocol and startup
+**Status: programming landed (`07b9c9a` wake words, `776c1ec` startup calibration); open:
+the gate and prior items' remaining tuned-vs-control checks, the 4,096 production-step
+tuners that stay unsettled, and the owner's macOS and Windows runs.** Owner 2026-10-25: slice 89 commits as is; the wake protocol and startup
 calibration are this separate slice, and slice 50's hold on startup calibration is reversed
 (the `ThreadSystem` is stable). Plan: `.claude/reports/thread-calibration-plan.md`.
 
@@ -91,13 +91,15 @@ the detected machine's measured floor, not from one host's numbers.
       their best control. Constant deleted (`776c1ec`); gate 32.9-37.4 us (ReleaseFast, 4
       runs); `production-step` and `world-gate` tuned within spread or faster against both
       bases (data above). Open: the tuned cases were not compared with their best control
-      after `776c1ec`, and the 4,096 settling item below leaves tuned cases unjudged.
+      after `776c1ec` except `movement` (262,144 tuned beats every control, Validation
+      below), and the 4,096 settling item below leaves tuned cases unjudged.
 - [ ] The participant-overhead prior derives from the same measurement. Pass: first-pick
       and settle behavior in `thread-dispatch`, `movement`, and `production-step` not worse
       beyond spread. Prior is the per-worker cost, 0.49-0.63 us (ReleaseFast); `production-
-      step` and `world-gate` no slower; `movement` and `thread-dispatch` tuned cases were not
-      re-run after L2 (not measured), and settling at 4,096 is worse (item below).
-- [ ] Validation: `zig build verify`; the full `zig build test -Dsanitize-thread=true`;
+      step` and `world-gate` no slower; `movement` 262,144 tuned now threads and is faster
+      (Validation below); `thread-dispatch` tuned not re-run after L2; settling at 4,096 is
+      worse (item below).
+- [x] Validation: `zig build verify`; the full `zig build test -Dsanitize-thread=true`;
       ReleaseFast targeted groups a `ThreadSystem` change can move (`thread-dispatch`,
       `world-gate`, `movement`, `production-step`), serial == threaded. Full suite 2014/2014
       in Debug and under TSan (no reports), `check` and `test-compile` clean, x86_64-windows
