@@ -102,7 +102,10 @@ the detected machine's measured floor, not from one host's numbers.
       `world-gate`, `movement`, `production-step`), serial == threaded. Full suite 2014/2014
       in Debug and under TSan (no reports), `check` and `test-compile` clean, x86_64-windows
       check passes; `thread-dispatch`, `world-gate`, `production-step` benched (data above).
-      `zig build verify` passes at `776c1ec`. Open: the `movement` group was not run in these landings.
+      `zig build verify` passes at `776c1ec`. `movement` (ReleaseFast, 3 interleaved reps, warmup 5 /
+      iterations 30, base `ff2a161` vs `92050ff`): 262,144 tuned 93.8 us inline -> 40.0 us threaded
+      23/23 (faster; beats every control, clamp 77.7 us; matched the fastest control 3/3 vs 2/3);
+      10,000 tuned inline 3.7 -> 3.5 us, matching serial (work under the gate).
 - [x] Docs: `docs/architecture.md` § Thread System describes the protocol and calibration
       as landed. `docs/development-workflow.md` names neither (no change needed there).
 - [ ] Tuners unsettled at `production-step` 4,096: at 4x pre-measure (warmup 360), after
