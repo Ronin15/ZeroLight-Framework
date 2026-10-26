@@ -8,6 +8,7 @@
 //! `parallelForWithOptions` returns.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const insertionSort = @import("../core/sort.zig").insertion;
 const diagnostics_enabled = @import("runtime_perf_log.zig").enabled;
@@ -1071,6 +1072,8 @@ pub const ThreadSystem = struct {
     // Batch state shared with the workers; jobs run over caller-owned ranges.
     shared: *Shared,
     workers: []WorkerRecord = &.{},
+    // One word per `wake_block_width` workers, in worker order.
+    wake_words: []WakeWord = &.{},
     owner_thread_id: std.Thread.Id,
     // Owner-only: read only after the caller matched `owner_thread_id`. True while the
     // owner runs ranges of one of this system's batches.
@@ -1085,20 +1088,26 @@ pub const ThreadSystem = struct {
         const workers = try allocator.alloc(WorkerRecord, worker_thread_count);
         errdefer allocator.free(workers);
 
+        const wake_words = try allocator.alloc(WakeWord, @divCeil(worker_thread_count, wake_block_width));
+        errdefer allocator.free(wake_words);
+        @memset(wake_words, WakeWord{});
+
         var self = ThreadSystem{
             .allocator = allocator,
             .config = normalizeConfig(config),
             .shared = shared,
             .workers = workers,
+            .wake_words = wake_words,
             .owner_thread_id = std.Thread.getCurrentId(),
         };
         @memset(self.workers, WorkerRecord{});
 
         var spawned: usize = 0;
         errdefer {
+            // Spawned workers are a prefix and each has its startup permit.
             self.shared.descriptor.accepting_work.store(false, .release);
+            wake_ops.post(io, self.wake_words, spawned);
             for (self.workers[0..spawned]) |*worker| {
-                worker.wake.post(io);
                 if (worker.thread) |thread| thread.join();
             }
         }
@@ -1106,6 +1115,9 @@ pub const ThreadSystem = struct {
         for (self.workers, 0..) |*worker, index| {
             worker.id = .{ .index = index + 1 };
             worker.shared = self.shared;
+            worker.wake_word = &self.wake_words[index / wake_block_width];
+            // The shift is below `wake_block_width` (at most 32), so it fits `u5`.
+            worker.wake_bit = @as(u32, 1) << @intCast(index % wake_block_width);
             worker.thread = std.Thread.spawn(.{
                 .stack_size = self.config.stack_size,
                 .allocator = allocator,
@@ -1115,7 +1127,7 @@ pub const ThreadSystem = struct {
             };
             spawned += 1;
             // Startup permit: the worker reads `worker.thread` only after taking it.
-            worker.wake.post(io);
+            worker.start.post(io);
         }
 
         log.debug(
@@ -1130,12 +1142,14 @@ pub const ThreadSystem = struct {
         std.debug.assert(std.Thread.getCurrentId() == self.owner_thread_id and !self.owner_in_batch);
         const io = self.shared.descriptor.io;
         std.debug.assert(self.shared.completion.pending.load(.monotonic) == 0);
-        // Shutdown permits are counted, so a pending startup permit never absorbs one.
         self.shared.descriptor.accepting_work.store(false, .release);
+        // With nothing pending every worker has run every flip of its bit, so flipping all
+        // of them wakes each worker into the stopped check.
+        wake_ops.post(io, self.wake_words, self.workers.len);
         for (self.workers) |*worker| {
-            worker.wake.post(io);
             if (worker.thread) |thread| thread.join();
         }
+        self.allocator.free(self.wake_words);
         self.allocator.free(self.workers);
         self.allocator.destroy(self.shared);
         self.* = undefined;
@@ -1330,10 +1344,8 @@ pub const ThreadSystem = struct {
         // Every woken worker has a first range of its own.
         std.debug.assert(range_count >= active_worker_threads + 1);
 
-        // Publish: everything a worker reads is written before its generation's release
+        // Publish: everything a worker reads is written before its wake word's release
         // store, so the acquire load that admits it into the batch also makes them visible.
-        const generation = shared.descriptor.generation + 1;
-        shared.descriptor.generation = generation;
         shared.descriptor.batch = .{
             .item_count = item_count,
             .items_per_range = items_per_range,
@@ -1351,10 +1363,7 @@ pub const ThreadSystem = struct {
         stats.active_worker_threads = active_worker_threads;
         stats.ran_inline = false;
 
-        for (self.workers[0..active_worker_threads]) |*worker| {
-            worker.batch_generation.store(generation, .release);
-            worker.wake.post(io);
-        }
+        wake_ops.post(io, self.wake_words, active_worker_threads);
 
         // Worker 1 starts with range 0, worker N with range N-1, and the main
         // thread steals from `next_range`. That preserves deterministic range
@@ -1457,6 +1466,90 @@ pub const ThreadSystem = struct {
 // (std's per-CPU interference size).
 const shared_line = std.atomic.cache_line;
 
+// Workers per wake word: Linux wakes any subset of a word's 32 waiters in one bitset
+// syscall; elsewhere each worker owns a word and main wakes it with a plain futex wake.
+const wake_block_width: u32 = if (builtin.os.tag == .linux) 32 else 1;
+const wake_ops = WakeWordOps(wake_block_width);
+
+// One block of workers' wake bits. Main is the only writer: per batch it flips the bit of
+// every worker the batch counts (release), and a worker runs a batch only when its bit
+// differs from the value it last ran. A worker's bit flips again only after that worker
+// has decremented the batch that flipped it, so at most one flip is ever outstanding.
+const WakeWord = struct {
+    word: std.atomic.Value(u32) align(shared_line) = .init(0),
+
+    comptime {
+        std.debug.assert(@alignOf(WakeWord) == shared_line);
+        std.debug.assert(@sizeOf(WakeWord) == shared_line);
+    }
+};
+
+// Width 1 is portable (`std.Io`'s futex); width 32 issues Linux bitset futex ops, so only
+// its pure `activeMask` is usable elsewhere.
+fn WakeWordOps(comptime width: u32) type {
+    comptime std.debug.assert(width == 1 or width == 32);
+    return struct {
+        // The bits of block `block`'s workers among the first `active` workers.
+        fn activeMask(block: usize, active: usize) u32 {
+            // At most `width` (32), so it fits `u6`.
+            const in_block: u6 = @intCast(@min(active -| block * width, width));
+            return @truncate((@as(u64, 1) << in_block) - 1);
+        }
+
+        // Sleeps while `wake_word` still holds `expected`, until a wake whose mask holds
+        // `bit` (or any plain wake); returns spuriously, so the caller reloads the word.
+        fn wait(io: std.Io, wake_word: *const WakeWord, expected: u32, bit: u32) void {
+            if (width == 1) {
+                io.futexWaitUncancelable(u32, &wake_word.word.raw, expected);
+            } else {
+                const linux = std.os.linux;
+                const rc = linux.futex(&wake_word.word.raw, .{ .cmd = .WAIT_BITSET, .private = true }, expected, .{ .timeout = null }, null, bit);
+                switch (linux.errno(rc)) {
+                    .SUCCESS, .AGAIN, .INTR => {},
+                    // A misused word would otherwise spin its worker.
+                    else => |err| std.debug.panic("ThreadSystem wake word wait failed: {t}", .{err}),
+                }
+            }
+        }
+
+        // Blocks until `bit` of `wake_word` differs from `seen`, the value its waiter last
+        // ran, and returns the bit's new value. The acquire load that sees the flip makes
+        // everything main wrote before flipping visible.
+        fn awaitFlip(io: std.Io, wake_word: *const WakeWord, bit: u32, seen: u32) u32 {
+            while (true) {
+                const word = wake_word.word.load(.acquire);
+                if (word & bit != seen) return word & bit;
+                wait(io, wake_word, word, bit);
+            }
+        }
+
+        // Wakes the waiters on `wake_word` whose bit is in `mask`; call after flipping them.
+        fn wake(io: std.Io, wake_word: *const WakeWord, mask: u32) void {
+            if (width == 1) {
+                io.futexWake(u32, &wake_word.word.raw, 1);
+            } else {
+                const linux = std.os.linux;
+                const rc = linux.futex(&wake_word.word.raw, .{ .cmd = .WAKE_BITSET, .private = true }, @popCount(mask), .{ .timeout = null }, null, mask);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {},
+                    else => |err| std.debug.panic("ThreadSystem wake word wake failed: {t}", .{err}),
+                }
+            }
+        }
+
+        // Flips the bits of the first `active` workers and wakes them, one store and one
+        // wake per touched word. Main only; everything they read is written before.
+        fn post(io: std.Io, wake_words: []WakeWord, active: usize) void {
+            const block_count = @divCeil(active, width);
+            for (wake_words[0..block_count], 0..) |*wake_word, block| {
+                const mask = activeMask(block, active);
+                wake_word.word.store(wake_word.word.load(.monotonic) ^ mask, .release);
+                wake(io, wake_word, mask);
+            }
+        }
+    };
+}
+
 // One system's batch state, split into blocks that each own whole lines so a range claim
 // invalidates only the claim line, never the descriptor every participant reads or the
 // completion countdown.
@@ -1475,18 +1568,19 @@ const Shared = struct {
 
     // Each worker runs its deterministic first range by ID, then claims the rest from
     // `claim.next_range`, counting what it ran into `completion.worker_ranges` once. A
-    // wake whose generation the worker already ran (a stale permit, or one for a batch
-    // that did not count it) reads nothing else and never decrements.
+    // wake that left its bit as last run (spurious, or another worker's flip) reads
+    // nothing else and never decrements.
     fn workerLoop(self: *Shared, worker: *WorkerRecord) void {
         const io = self.descriptor.io;
         const id = worker.id;
-        var seen_generation: u64 = 0;
+        const wake_word = worker.wake_word;
+        const bit = worker.wake_bit;
+        // The bit's value when this worker last ran; every word starts at zero.
+        var seen: u32 = 0;
         while (true) {
-            worker.wake.waitUncancelable(io);
-            if (!self.descriptor.accepting_work.load(.acquire)) return;
-            const generation = worker.batch_generation.load(.acquire);
-            if (generation == seen_generation) continue;
-            seen_generation = generation;
+            seen = wake_ops.awaitFlip(io, wake_word, bit, seen);
+            // Ordered by the flip's acquire: shutdown stores it before flipping.
+            if (!self.descriptor.accepting_work.load(.monotonic)) return;
 
             // This batch counted this worker, so main rewrites none of it before this
             // worker's decrement below.
@@ -1506,13 +1600,11 @@ const Shared = struct {
 };
 
 // Written only by the main thread: `io` once at init, `batch` at publish, and
-// `accepting_work` at shutdown. Workers read `batch` only after the acquire of a
-// generation assigned to them.
+// `accepting_work` at shutdown. Workers read `batch` only after the acquire load that
+// shows their wake bit flipped.
 const Descriptor = struct {
     io: std.Io,
     accepting_work: std.atomic.Value(bool) = .init(true),
-    // Main-only: the generation of the last published batch.
-    generation: u64 = 0,
     batch: PublishedBatch = .{},
 };
 
@@ -1527,7 +1619,7 @@ const PublishedBatch = struct {
     job_fn: ?JobFn = null,
 
     fn view(batch: *const PublishedBatch) BatchView {
-        // Published non-null before any generation store; the caller's generation acquire
+        // Published non-null before any wake word store; the caller's wake word acquire
         // is what guards against reading a previous batch's fields.
         std.debug.assert(batch.job_fn != null and batch.context != null);
         return .{
@@ -1582,20 +1674,21 @@ const Completion = struct {
     done: std.Io.Event = .unset,
 };
 
-// One worker's record, written by main (`batch_generation`, `wake`) and by its worker
-// (`wake`, `thread_id`) every batch: a per-worker record, so it starts its own
+// One worker's record, written at startup by main and by its worker (`start`,
+// `thread_id`): a per-worker record, so it starts its own
 // `thread_shared_record_alignment` line and the next worker's record never shares one.
 const WorkerRecord = struct {
     id: WorkerId align(thread_shared_record_alignment) = WorkerId.main,
     shared: *Shared = undefined,
-    wake: std.Io.Semaphore = .{},
+    // The word holding this worker's wake bit, and that bit; set before spawn.
+    wake_word: *WakeWord = undefined,
+    wake_bit: u32 = 0,
+    // The startup permit only.
+    start: std.Io.Semaphore = .{},
     thread: ?std.Thread = null,
     // Written once by the worker itself; 0 until then, which is no live thread's id on
     // Linux, Windows, or Darwin.
     thread_id: std.atomic.Value(std.Thread.Id) = .init(0),
-    // Generation of the last batch that counted this worker, stored by main after that
-    // batch is published; 0 before the first.
-    batch_generation: std.atomic.Value(u64) = .init(0),
 
     comptime {
         std.debug.assert(@alignOf(WorkerRecord) == thread_shared_record_alignment);
@@ -1606,7 +1699,7 @@ const WorkerRecord = struct {
 fn workerMain(worker: *WorkerRecord) void {
     worker.thread_id.store(std.Thread.getCurrentId(), .monotonic);
     // The startup permit is posted after init stores `worker.thread`.
-    worker.wake.waitUncancelable(worker.shared.descriptor.io);
+    worker.start.waitUncancelable(worker.shared.descriptor.io);
     nameWorker(worker);
     worker.shared.workerLoop(worker);
 }
@@ -4771,25 +4864,30 @@ test "every counted worker wakes once and runs its first range at every worker c
     }
 }
 
-test "back-to-back batches stay exact as the counted set changes out of order with stale permits" {
+// Wakes every waiter on `worker`'s wake word without flipping any bit: a plain futex
+// wake matches every bitset waiter.
+fn spuriousWake(threads: *const ThreadSystem, worker: *const WorkerRecord) void {
+    threads.shared.descriptor.io.futexWake(u32, &worker.wake_word.word.raw, std.math.maxInt(u32));
+}
+
+test "back-to-back batches stay exact as the counted set changes out of order with spurious wakes" {
     const worker_count = 15;
     const max_ranges = 2 * (worker_count + 1);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
     defer threads.deinit();
-    const io = threads.shared.descriptor.io;
 
     var slots: SlotList(ParticipantRanges) = .empty;
     defer slots.deinit(std.testing.allocator);
     try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
     var hits: [max_ranges]std.atomic.Value(u32) = @splat(.init(0));
 
-    // The counted set grows and shrinks out of order, and every other batch a stale permit
-    // lets one worker, counted or not, wake before main publishes or posts it. A worker
-    // that drops its batch's wake hangs here; one that runs a batch that did not count it
-    // fails the range checks.
+    // The counted set grows and shrinks out of order, and every other batch a spurious
+    // wake lets one worker's word, counted or not, wake its waiters before main publishes
+    // or flips it. A worker that drops its batch's wake hangs here; one that runs a batch
+    // that did not count it fails the range checks.
     for (0..5_000) |batch| {
         const worker_cap = 1 + (batch * 7) % worker_count;
-        if (batch % 2 == 0) threads.workers[(batch / 2) % worker_count].wake.post(io);
+        if (batch % 2 == 0) spuriousWake(&threads, &threads.workers[(batch / 2) % worker_count]);
         const range_count = worker_cap + 1 + batch % (worker_cap + 1);
         try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_cap);
     }
@@ -4873,36 +4971,163 @@ test "a batch a worker finishes last wakes main through the completion event" {
     try std.testing.expect(threads.shared.completion.done.isSet());
 }
 
-test "stale wake permits run no batch and decrement nothing, inside or outside a batch" {
+test "spurious wakes run no batch and decrement nothing, inside or outside a batch" {
     const worker_count = 4;
     const range_count = 32;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
     defer threads.deinit();
-    const io = threads.shared.descriptor.io;
 
     var slots: SlotList(ParticipantRanges) = .empty;
     defer slots.deinit(std.testing.allocator);
     try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
     var hits: [range_count]std.atomic.Value(u32) = @splat(.init(0));
 
-    // Extra permits before the first publish; each is taken before or during an early
-    // batch, depending on timing.
-    for (threads.workers) |*worker| worker.wake.post(io);
+    // Wakes before the first publish, landing before or during an early batch.
+    for (threads.workers) |*worker| spuriousWake(&threads, worker);
     for (0..100) |batch| {
-        // One stale permit per batch for the last worker, which no batch counts, so its
-        // wake lands while main publishes and joins a batch without it.
-        threads.workers[worker_count - 1].wake.post(io);
+        // One spurious wake per batch for the last worker, which no batch counts, so it
+        // lands while main publishes and joins a batch without it.
+        spuriousWake(&threads, &threads.workers[worker_count - 1]);
         try expectExactFixedBatch(&threads, &slots, &hits, range_count, 1 + batch % (worker_count - 1));
     }
 }
 
-test "deinit right after init joins workers with startup and shutdown permits pending" {
+test "an uncounted worker woken amid its neighbours' flips runs only the batch that next counts it" {
+    const worker_count = 4;
+    const range_count = 2 * (worker_count + 1);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
+    defer threads.deinit();
+
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [range_count]std.atomic.Value(u32) = @splat(.init(0));
+
+    // Its word flips for its neighbours every batch while its own bit holds, and each
+    // spurious wake makes it reload that changed word.
+    for (0..8) |_| {
+        spuriousWake(&threads, &threads.workers[worker_count - 1]);
+        try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_count - 1);
+    }
+    try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_count);
+    try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_count - 1);
+    try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_count);
+}
+
+test "a block's wake mask covers exactly the active prefix" {
+    const ops = WakeWordOps(32);
+    const cases = [_]struct { active: usize, masks: [3]u32 }{
+        .{ .active = 0, .masks = .{ 0, 0, 0 } },
+        .{ .active = 1, .masks = .{ 0x1, 0, 0 } },
+        .{ .active = 31, .masks = .{ 0x7FFF_FFFF, 0, 0 } },
+        .{ .active = 32, .masks = .{ 0xFFFF_FFFF, 0, 0 } },
+        .{ .active = 33, .masks = .{ 0xFFFF_FFFF, 0x1, 0 } },
+        .{ .active = 64, .masks = .{ 0xFFFF_FFFF, 0xFFFF_FFFF, 0 } },
+    };
+    for (cases) |case| {
+        for (case.masks, 0..) |mask, block| try std.testing.expectEqual(mask, ops.activeMask(block, case.active));
+    }
+    // The portable instance gives each worker a word of its own.
+    try std.testing.expectEqual(@as(u32, 1), WakeWordOps(1).activeMask(2, 3));
+    try std.testing.expectEqual(@as(u32, 0), WakeWordOps(1).activeMask(3, 3));
+}
+
+// A waiter on one wake word, driven by the workers' `awaitFlip`: it counts each flip of
+// its bit and acks it, until a flip finds `stop` set.
+fn FlipWaiter(comptime width: u32) type {
+    return struct {
+        const Self = @This();
+        io: std.Io,
+        wake_word: *const WakeWord,
+        bit: u32,
+        stop: *const std.atomic.Value(bool),
+        ack: *std.Io.Semaphore,
+        runs: u32 = 0,
+
+        fn run(waiter: *Self) void {
+            var seen: u32 = 0;
+            while (true) {
+                seen = WakeWordOps(width).awaitFlip(waiter.io, waiter.wake_word, waiter.bit, seen);
+                if (waiter.stop.load(.monotonic)) return;
+                waiter.runs += 1;
+                waiter.ack.post(waiter.io);
+            }
+        }
+    };
+}
+
+test "width-1 wake words wake exactly the active prefix and ignore unchanged words" {
+    const width = 1;
+    const ops = WakeWordOps(width);
+    const Waiter = FlipWaiter(width);
+    const io = std.testing.io;
+    const word_count = 3;
+    var wake_words: [word_count]WakeWord = @splat(.{});
+    var stop: std.atomic.Value(bool) = .init(false);
+    var ack: std.Io.Semaphore = .{};
+    var waiters: [word_count]Waiter = undefined;
+    var threads: [word_count]std.Thread = undefined;
+    for (&waiters, &threads, &wake_words) |*waiter, *thread, *wake_word| {
+        waiter.* = .{ .io = io, .wake_word = wake_word, .bit = 1, .stop = &stop, .ack = &ack };
+        thread.* = try std.Thread.spawn(.{}, Waiter.run, .{waiter});
+    }
+
+    // Each round wakes every unchanged word, then posts an active prefix that shrinks and
+    // grows across words. A waiter that ran on a wake without a flip, or a flip outside the
+    // prefix, acks more than its expected runs and fails the counts below.
+    var expected_runs: [word_count]u32 = @splat(0);
+    for (0..60) |round| {
+        const active = 1 + (round * 2) % word_count;
+        for (&wake_words) |*wake_word| io.futexWake(u32, &wake_word.word.raw, 1);
+        ops.post(io, &wake_words, active);
+        for (expected_runs[0..active]) |*runs| runs.* += 1;
+        for (0..active) |_| ack.waitUncancelable(io);
+    }
+    stop.store(true, .monotonic);
+    ops.post(io, &wake_words, word_count);
+    for (threads) |thread| thread.join();
+    for (waiters, expected_runs) |waiter, runs| try std.testing.expectEqual(runs, waiter.runs);
+}
+
+test "a thread system across wake word boundaries wakes exactly its counted workers" {
+    const worker_count = 40;
+    const max_ranges = 4 * (worker_count + 1);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
+    defer threads.deinit();
+
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [max_ranges]std.atomic.Value(u32) = @splat(.init(0));
+
+    // Caps on each side of a 32-worker word, then a sequence that shrinks and grows across
+    // the boundary. A worker wired to the wrong word or bit hangs the join or fails the
+    // range checks.
+    const caps = [_]usize{ 31, 32, 33, 40, 1, 33, 32, 40, 31, 2, 40 };
+    for (caps) |worker_cap| {
+        try expectExactFixedBatch(&threads, &slots, &hits, worker_cap + 1, worker_cap);
+        try expectExactFixedBatch(&threads, &slots, &hits, 4 * (worker_cap + 1), worker_cap);
+    }
+}
+
+test "thread system init frees what it allocated when an allocation fails" {
+    // `shared`, `workers`, then the wake words; the testing allocator reports any leak.
+    for (0..3) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            ThreadSystem.init(failing_allocator.allocator(), std.testing.io, .{ .max_worker_threads = 2 }),
+        );
+    }
+}
+
+test "deinit right after init joins every worker" {
     for (0..32) |_| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
         threads.deinit();
     }
 
-    // And after a batch, once every batch permit is consumed.
+    // And after a batch, once every worker has observed every flip of its bit.
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
     defer threads.deinit();
     var slots: SlotList(ParticipantRanges) = .empty;
@@ -5479,7 +5704,6 @@ test "accumulate batch marks the total forced inline when any batch was" {
 }
 
 test "every woken worker carries its worker name on linux" {
-    const builtin = @import("builtin");
     // Darwin names only the calling thread, so the worker-name check is Linux.
     if (comptime builtin.os.tag != .linux) return;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
