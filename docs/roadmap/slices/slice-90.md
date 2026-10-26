@@ -72,6 +72,21 @@ the detected machine's measured floor, not from one host's numbers.
       `world-gate`, `movement`, `production-step`), serial == threaded.
 - [ ] Docs: `docs/architecture.md` § Thread System and `docs/development-workflow.md`
       describe the protocol and calibration as landed.
+- [ ] Owner runs on macOS and Windows (owner 2026-10-25: the engine targets Linux, macOS,
+      and Windows; owner tests this week). Those builds use the portable per-worker wake
+      (one futex word per worker), not the Linux bitset wake, so their gain is unmeasured.
+      Run on each machine, ReleaseFast, at the L1 base and after L1 and L2:
+      `zig build test -Dsanitize-thread=true` where TSan is supported, else `zig build test`;
+      `tools/bench_ab.py --optimize ReleaseFast --reps 3 --group thread-dispatch -- --items 1024`
+      and `--items 16384` (`thread-fixed-auto`: the dispatch floor);
+      `zig build bench -Doptimize=ReleaseFast -- --group production-step --items 1024008016384`
+      (tuned step time); the calibrated gate and prior from the init line
+      (`-Dlog-level=debug`). Linux reference (7900X3D, 23 workers, ReleaseFast): full-pool
+      floor 26.9 us before L1, 17.2 us with the broadcast-wake diagnostic; production-step
+      16,384 tuned 658.2 us; calibrated gate expected about 34 us (derived). Data: § Current
+      foundation above and commit `2dec3de`; the L1 and L2 commits add the after numbers.
+      Pass: floor not worse than before L1 beyond spread, tests pass, and the
+      calibrated gate reported per machine.
 
 ### Acceptance checks
 
