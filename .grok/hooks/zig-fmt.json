@@ -2,7 +2,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "search_replace|write",
+        "matcher": "search_replace|write|Edit|Write",
         "hooks": [
           {
             "type": "command",
