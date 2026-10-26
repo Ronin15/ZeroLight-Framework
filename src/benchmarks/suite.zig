@@ -2569,7 +2569,7 @@ test "a tuner census reports a fresh one-off tuner the last run selected as fres
     census.addFresh("ran", &fixture.ran);
     census.addFresh("unused", &fixture.unused);
     // The run selected `ran` and left it unsettled; `unused` never ran since its reset.
-    _ = fixture.ran.selectProfile(.{ .item_count = 64, .available_worker_threads = 2, .max_worker_threads = 2, .fallback_items_per_range = 8, .range_alignment_items = 1 });
+    _ = fixture.ran.selectProfile(.{ .item_count = 64, .available_worker_threads = 2, .max_worker_threads = 2, .fallback_items_per_range = 8, .range_alignment_items = 1, .calibration = .fromFloors(20_000, 10_000, 2) });
     const records_now = [3]u64{ census.entries[0].records + 1, 7, 0 };
     const report = census.reportOf(&records_now);
     try std.testing.expectEqual(@as(usize, 1), report.used);

@@ -124,8 +124,9 @@ pub const AdaptiveWorkTunerConfig = struct {
     item_count_reset_percent: u8 = 25,
     /// Window median below which an inline stage stays inline without probing, and the
     /// inline cost below which a settled threaded stage demotes (and above which a
-    /// demoted one restores). Sized from the full-pool wake/join cost, not any stage.
-    threaded_batch_ns: u64 = 60_000,
+    /// demoted one restores). Null reads the serving system's calibrated gate
+    /// (`ThreadCalibration.gate_ns`); a value overrides it.
+    threaded_batch_ns: ?u64 = null,
     /// Settled inline windows at or above the gate that pass before an inline stage
     /// probes again, after its first threaded probe lost or after a demotion.
     inline_probe_cooldown_windows: usize = 120,
@@ -214,10 +215,59 @@ const JumpProfile = struct {
     contradicting_records: usize = 0,
 };
 
-// The default floors the learned participant overhead in the prediction;
-// `min_participant_overhead_ns` floors each learned participant sample.
-const default_participant_overhead_ns: f64 = 1_000;
-const min_participant_overhead_ns: f64 = 100;
+/// Dispatch costs a `ThreadSystem` measures on its own pool at init, and the tuner gate and
+/// participant-overhead terms derived from them. Every tuner the system serves reads it
+/// from its `AdaptiveWorkRequest`.
+pub const ThreadCalibration = struct {
+    /// Median dispatch of a trivial job on every worker (W workers, W + 1 ranges).
+    dispatch_floor_ns: u64,
+    /// Median dispatch of a trivial job on one worker (2 ranges).
+    one_worker_floor_ns: u64,
+    /// Floor added per active worker past the first; with one worker, the whole
+    /// one-worker floor.
+    worker_wake_ns: f64,
+    /// Window median below which an inline stage stays inline without probing, and the
+    /// inline cost below which a settled threaded stage demotes.
+    gate_ns: u64,
+    /// Floors the learned participant overhead in the worker-count prediction.
+    participant_overhead_ns: f64,
+    /// Floors each learned participant-overhead sample.
+    min_participant_overhead_ns: f64,
+
+    /// The floor model is linear in active workers, F(A) = F1 + b (A - 1). The gate is twice
+    /// the full-pool floor, raised where needed so a batch at the gate clears the default
+    /// commit margin at every active count: F(A) / (1 - margin - 1 / (A + 1)).
+    pub fn fromFloors(full_pool_floor_ns: u64, one_worker_floor_ns: u64, worker_count: usize) ThreadCalibration {
+        std.debug.assert(worker_count >= 1);
+        const one_worker_f: f64 = @floatFromInt(one_worker_floor_ns);
+        const worker_wake_ns: f64 = if (worker_count == 1)
+            one_worker_f
+        else
+            @as(f64, @floatFromInt(full_pool_floor_ns -| one_worker_floor_ns)) / @as(f64, @floatFromInt(worker_count - 1));
+        const margin = @as(f64, @floatFromInt((AdaptiveWorkTunerConfig{}).threaded_commit_threshold_percent)) / 100.0;
+        // At A = 1 the break-even denominator is 0.5 - margin; it must stay positive.
+        std.debug.assert(margin < 0.5);
+        var gate_f = 2.0 * @as(f64, @floatFromInt(full_pool_floor_ns));
+        for (1..worker_count + 1) |active| {
+            const active_f: f64 = @floatFromInt(active);
+            const floor_f = one_worker_f + worker_wake_ns * (active_f - 1);
+            gate_f = @max(gate_f, floor_f / (1.0 - margin - 1.0 / (active_f + 1)));
+        }
+        // The 1 ns floor only keeps the prediction's division finite.
+        const participant_overhead_ns = @max(worker_wake_ns, 1.0);
+        return .{
+            .dispatch_floor_ns = full_pool_floor_ns,
+            .one_worker_floor_ns = one_worker_floor_ns,
+            .worker_wake_ns = worker_wake_ns,
+            .gate_ns = std.math.lossyCast(u64, @ceil(gate_f)),
+            .participant_overhead_ns = participant_overhead_ns,
+            .min_participant_overhead_ns = participant_overhead_ns * min_participant_overhead_ratio,
+        };
+    }
+};
+
+// The learned participant-overhead sample floor as a share of the calibrated prior.
+const min_participant_overhead_ratio: f64 = 0.1;
 
 /// Cumulative tuner diagnostic count: `u64` where perf instrumentation is
 /// compiled in, zero-sized (and never written) in ReleaseFast/ReleaseSmall.
@@ -230,6 +280,8 @@ pub const AdaptiveWorkRequest = struct {
     max_worker_threads: usize,
     fallback_items_per_range: usize,
     range_alignment_items: usize,
+    /// The serving system's calibration: the gate and participant-overhead terms.
+    calibration: ThreadCalibration,
 };
 
 pub const AdaptiveWorkTuner = struct {
@@ -451,7 +503,7 @@ pub const AdaptiveWorkTuner = struct {
         const jump = &self.jump_profile.?; // the jump branch sets it at the select
         const request = self.last_request.?; // the select sets it before the jump branch
         std.debug.assert(self.jumpCovers(jump.*, request));
-        const gate = self.config.threaded_batch_ns;
+        const gate = self.gateNs();
         const duration_ns = stats.batch_duration_ns;
         const threaded = stats.active_worker_threads > 0;
         if (jump.judged) {
@@ -499,7 +551,7 @@ pub const AdaptiveWorkTuner = struct {
         const held_threaded = jump.profile.worker_threads > 0;
         const threaded = stats.active_worker_threads > 0;
         if (threaded != held_threaded) return false;
-        const gate = self.config.threaded_batch_ns;
+        const gate = self.gateNs();
         const margin = self.config.threaded_commit_threshold_percent;
         const duration_ns = stats.batch_duration_ns;
         if (!held_threaded) return duration_ns >= gate and (jump.inline_ns == 0 or isMeaningfullyFaster(jump.inline_ns, duration_ns, margin));
@@ -514,7 +566,7 @@ pub const AdaptiveWorkTuner = struct {
     fn finishLearningWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
         const profile = self.sampled_profile orelse self.current_profile;
         self.baseline_mean_batch_duration_ns = sample_mean_ns;
-        if (profile.worker_threads == 0 and sample_mean_ns < self.config.threaded_batch_ns) {
+        if (profile.worker_threads == 0 and sample_mean_ns < self.gateNs()) {
             self.settle();
             return;
         }
@@ -561,14 +613,14 @@ pub const AdaptiveWorkTuner = struct {
                     self.normalizedProfile(restore_profile, request).worker_threads > 0
                 else
                     false;
-                if (!self.has_threaded_profile and dispatches_threaded and sample_mean_ns >= self.config.threaded_batch_ns) {
+                if (!self.has_threaded_profile and dispatches_threaded and sample_mean_ns >= self.gateNs()) {
                     self.restoreThreadedProfile(restore_profile);
                     return;
                 }
             }
             // A threaded profile whose shape normalizes to one range at an in-band count
             // runs this window inline and keeps its profile.
-            if (!self.has_threaded_profile and sample_mean_ns >= self.config.threaded_batch_ns) {
+            if (!self.has_threaded_profile and sample_mean_ns >= self.gateNs()) {
                 if (self.inline_probe_cooldown_windows > 0) {
                     self.inline_probe_cooldown_windows -= 1;
                     return;
@@ -577,7 +629,7 @@ pub const AdaptiveWorkTuner = struct {
             }
             return;
         }
-        if (sample_mean_ns >= self.config.threaded_batch_ns and !self.has_threaded_profile) {
+        if (sample_mean_ns >= self.gateNs() and !self.has_threaded_profile) {
             self.adoptThreaded(profile);
             self.decideThreading();
             return;
@@ -588,7 +640,7 @@ pub const AdaptiveWorkTuner = struct {
         // restores it.
         std.debug.assert(!self.bound_rule_suppressed or self.has_threaded_profile);
         std.debug.assert(!(self.retune_pending and self.bound_rule_suppressed));
-        if (!self.bound_rule_suppressed and self.windowInlineBoundNs() < self.config.threaded_batch_ns) {
+        if (!self.bound_rule_suppressed and self.windowInlineBoundNs() < self.gateNs()) {
             self.demoteToInline();
             return;
         }
@@ -842,6 +894,18 @@ pub const AdaptiveWorkTuner = struct {
         return self.poolProfile(request, self.batch_multiplier);
     }
 
+    // `gateNsFor` the last request. A tuner never selected has been offered no workers, so
+    // without a configured gate it has none to pass.
+    fn gateNs(self: *const AdaptiveWorkTuner) u64 {
+        const request = self.last_request orelse return self.config.threaded_batch_ns orelse std.math.maxInt(u64);
+        return self.gateNsFor(request);
+    }
+
+    // The configured gate, else the calibrated one `request` carries.
+    fn gateNsFor(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) u64 {
+        return self.config.threaded_batch_ns orelse request.calibration.gate_ns;
+    }
+
     fn estimatedWorkNs(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) f64 {
         const item_count_f: f64 = @floatFromInt(request.item_count);
         const work_ns_per_item = if (self.model_work_ns_per_item > 0)
@@ -849,7 +913,7 @@ pub const AdaptiveWorkTuner = struct {
         else if (self.baseline_mean_batch_duration_ns > 0)
             @as(f64, @floatFromInt(self.baseline_mean_batch_duration_ns)) / item_count_f
         else
-            @as(f64, @floatFromInt(self.config.threaded_batch_ns)) / item_count_f;
+            @as(f64, @floatFromInt(self.gateNsFor(request))) / item_count_f;
         return @max(work_ns_per_item * item_count_f, 1);
     }
 
@@ -860,8 +924,8 @@ pub const AdaptiveWorkTuner = struct {
     fn predictsThreaded(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) bool {
         if (request.max_worker_threads == 0) return false;
         const estimated_work_ns = self.estimatedWorkNs(request);
-        if (estimated_work_ns < @as(f64, @floatFromInt(self.config.threaded_batch_ns))) return false;
-        const participant_overhead_ns = @max(self.model_participant_overhead_ns, default_participant_overhead_ns);
+        if (estimated_work_ns < @as(f64, @floatFromInt(self.gateNsFor(request)))) return false;
+        const participant_overhead_ns = @max(self.model_participant_overhead_ns, request.calibration.participant_overhead_ns);
         const ideal_participants_f = @sqrt(estimated_work_ns / participant_overhead_ns);
         const participants = std.math.clamp(roundedUsize(ideal_participants_f), 1, request.max_worker_threads + 1);
         if (participants <= 1) return false;
@@ -907,9 +971,10 @@ pub const AdaptiveWorkTuner = struct {
         const main_thread_wait_ns: f64 = @floatFromInt(stats.main_thread_wait_ns);
         const non_tail_overhead_ns = @max(overhead_ns - main_thread_wait_ns, 0);
         const participant_observed = non_tail_overhead_ns / @as(f64, @floatFromInt(@max(participants, @as(usize, 1))));
+        const min_sample_ns = if (self.last_request) |request| request.calibration.min_participant_overhead_ns else 0;
         self.model_participant_overhead_ns = ewma(
             self.model_participant_overhead_ns,
-            @max(participant_observed, min_participant_overhead_ns),
+            @max(participant_observed, min_sample_ns),
             0.25,
         );
 
@@ -1002,6 +1067,7 @@ pub const AdaptiveWorkTuner = struct {
             .max_worker_threads = max_workers,
             .fallback_items_per_range = self.normalizedItemsPerRange(request.fallback_items_per_range, alignment),
             .range_alignment_items = alignment,
+            .calibration = request.calibration,
         };
     }
 
@@ -1053,6 +1119,23 @@ pub const AdaptiveWorkTuner = struct {
 
 pub const JobFn = *const fn (*anyopaque, ParallelRange, WorkerId) void;
 
+// Dispatches per calibration point: warm-up, then the samples whose median is the floor.
+// Fixed counts, odd so the median is one sample.
+const calibration_warmup: usize = 8;
+const calibration_samples: usize = 31;
+
+// The calibration's no-op job: it only checks its range against the batch.
+const CalibrationJob = struct {
+    item_count: usize,
+    range_count: usize,
+
+    fn run(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
+        _ = worker;
+        const self: *const CalibrationJob = @ptrCast(@alignCast(context)); // the dispatch passes a *CalibrationJob
+        std.debug.assert(range.index < self.range_count and range.end <= self.item_count);
+    }
+};
+
 // How a thread calling into a `ThreadSystem` may run a batch: the owner outside any of
 // its batches dispatches normally; a participant of one of its batches (the owner in its
 // own ranges, or one of its workers) runs the nested batch inline on its own `WorkerId`.
@@ -1078,6 +1161,9 @@ pub const ThreadSystem = struct {
     // Owner-only: read only after the caller matched `owner_thread_id`. True while the
     // owner runs ranges of one of this system's batches.
     owner_in_batch: bool = false,
+    /// Measured on this pool at the end of `init`; null with no workers, where no tuner is
+    /// ever active.
+    calibration: ?ThreadCalibration = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ThreadSystemConfig) !ThreadSystem {
         const worker_thread_count = config.max_worker_threads orelse defaultWorkerThreadCount();
@@ -1130,11 +1216,54 @@ pub const ThreadSystem = struct {
             worker.start.post(io);
         }
 
-        log.debug(
-            "ThreadSystem initialized: worker_threads={} items_per_range={} stack_size={}",
-            .{ self.workers.len, self.config.items_per_range, self.config.stack_size },
-        );
+        if (self.workers.len > 0) {
+            const calibration_start_ns = nowNs(io);
+            const calibration = self.calibrate();
+            const calibration_ns = elapsedNs(calibration_start_ns, nowNs(io));
+            self.calibration = calibration;
+            log.debug(
+                "ThreadSystem initialized: worker_threads={} items_per_range={} stack_size={} dispatch_floor_ns={} one_worker_floor_ns={} worker_wake_ns={d:.1} gate_ns={} participant_overhead_ns={d:.1} calibration_ns={}",
+                .{ self.workers.len, self.config.items_per_range, self.config.stack_size, calibration.dispatch_floor_ns, calibration.one_worker_floor_ns, calibration.worker_wake_ns, calibration.gate_ns, calibration.participant_overhead_ns, calibration_ns },
+            );
+        } else {
+            log.debug(
+                "ThreadSystem initialized: worker_threads=0 items_per_range={} stack_size={}",
+                .{ self.config.items_per_range, self.config.stack_size },
+            );
+        }
         return self;
+    }
+
+    // Measures the dispatch floor at one worker and at the whole pool (the tuner's first
+    // probe shape) with a trivial job, through the batch runner stages use, and derives the
+    // calibration from them. One worker has one shape, so it measures once.
+    fn calibrate(self: *ThreadSystem) ThreadCalibration {
+        const worker_count = self.workers.len;
+        std.debug.assert(worker_count > 0);
+        const one_worker_floor_ns = self.medianDispatchNs(1);
+        const full_pool_floor_ns = if (worker_count == 1) one_worker_floor_ns else self.medianDispatchNs(worker_count);
+        return ThreadCalibration.fromFloors(full_pool_floor_ns, one_worker_floor_ns, worker_count);
+    }
+
+    // Median duration of `calibration_samples` dispatches of a no-op job on `active_workers`
+    // workers over one single-item range each plus main's, after `calibration_warmup`.
+    fn medianDispatchNs(self: *ThreadSystem, active_workers: usize) u64 {
+        const range_count = active_workers + 1;
+        var job: CalibrationJob = .{ .item_count = range_count, .range_count = range_count };
+        var durations_ns: [calibration_samples]u64 = undefined;
+        for (0..calibration_warmup + calibration_samples) |dispatch| {
+            var stats = BatchStats{
+                .item_count = range_count,
+                .range_count = range_count,
+                .items_per_range = 1,
+                .available_worker_threads = self.workers.len,
+                .active_worker_threads = active_workers,
+            };
+            self.runThreadedBatch(&job, CalibrationJob.run, &stats);
+            if (dispatch >= calibration_warmup) durations_ns[dispatch - calibration_warmup] = stats.batch_duration_ns;
+        }
+        insertionSort(u64, &durations_ns, {}, std.sort.asc(u64));
+        return durations_ns[calibration_samples / 2];
     }
 
     /// Owner only, outside any of its batches. Stops and joins every worker.
@@ -1253,6 +1382,8 @@ pub const ThreadSystem = struct {
                 .max_worker_threads = max_worker_threads,
                 .fallback_items_per_range = requested_items_per_range,
                 .range_alignment_items = range_alignment_items,
+                // A tuner is active only with workers, which `init` calibrated.
+                .calibration = self.calibration.?,
             })
         else
             AdaptiveWorkProfile{
@@ -1335,6 +1466,23 @@ pub const ThreadSystem = struct {
             return stats;
         }
 
+        self.runThreadedBatch(context, job_fn, &stats);
+        if (record_tuner) |tuner| {
+            tuner.record(stats);
+        }
+
+        return stats;
+    }
+
+    // Runs one batch on `stats.active_worker_threads` workers plus main over
+    // `stats.range_count` ranges of `stats.items_per_range` items, and fills its timing and
+    // range counts into `stats`. Owner only, outside any of its batches.
+    fn runThreadedBatch(self: *ThreadSystem, context: *anyopaque, job_fn: JobFn, stats: *BatchStats) void {
+        const item_count = stats.item_count;
+        const items_per_range = stats.items_per_range;
+        const range_count = stats.range_count;
+        const active_worker_threads = stats.active_worker_threads;
+        std.debug.assert(active_worker_threads > 0 and active_worker_threads <= self.workers.len);
         const shared = self.shared;
         const io = shared.descriptor.io;
         const batch_start_ns = nowNs(io);
@@ -1360,7 +1508,6 @@ pub const ThreadSystem = struct {
         shared.completion.pending.store(active_worker_threads + 1, .monotonic);
         // No waiter: main, the only one, waits only in its own join below.
         shared.completion.done.reset();
-        stats.active_worker_threads = active_worker_threads;
         stats.ran_inline = false;
 
         wake_ops.post(io, self.wake_words, active_worker_threads);
@@ -1394,11 +1541,6 @@ pub const ThreadSystem = struct {
         stats.main_thread_wait_ns = elapsedNs(wait_start_ns, wait_end_ns);
         stats.batch_duration_ns = elapsedNs(batch_start_ns, batch_end_ns);
         stats.worker_utilization = workerUtilization(stats.worker_thread_ranges, active_worker_threads, range_count);
-        if (record_tuner) |tuner| {
-            tuner.record(stats);
-        }
-
-        return stats;
     }
 
     // The shape a caller's preselected profile dispatches at, as `selectBatchProfile`
@@ -3087,6 +3229,7 @@ test "a batches-per-participant option shapes a fixed batch from its item count 
                 .max_worker_threads = case.cap orelse threads.workerThreadCount(),
                 .fallback_items_per_range = threads.config.items_per_range,
                 .range_alignment_items = alignment,
+                .calibration = threads.calibration.?,
             }, case.batches);
             try std.testing.expectEqual(pool.items_per_range, selection.items_per_range);
             try std.testing.expectEqual(pool.worker_threads, selection.worker_threads);
@@ -3425,7 +3568,7 @@ test "adaptive work tuner default threshold requires full slow inline window" {
     var tuner = AdaptiveWorkTuner.init(.{ .initial_range_items = 64, .smallest_range_items = 16, .largest_range_items = 256 });
     const request = tunerTestRequest(1024, 4, 16, 64);
 
-    // Above the default gate so learning eventually probes threading.
+    // Above the test calibration's gate so learning eventually probes threading.
     for (0..tuner.config.sample_window - 1) |_| {
         const selected = tuner.selectProfile(request);
         try std.testing.expectEqual(@as(usize, 0), selected.worker_threads);
@@ -3450,11 +3593,10 @@ test "adaptive work tuner default threshold keeps cheap inline work settled" {
     try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(request).worker_threads);
 }
 
-test "adaptive work tuner default gate keeps sub gate batches inline" {
-    const request = tunerTestRequest(90, 9, 4, 64);
-    for ([_]u64{ 8_000, 30_000, 59_999 }) |cheap_ns| {
+test "adaptive work tuner a calibrated gate keeps sub gate batches inline" {
+    const request = calibratedTunerTestRequest(90, 9, 4, 64, craftedTestCalibration(40_000, 1_000));
+    for ([_]u64{ 8_000, 30_000, 39_999 }) |cheap_ns| {
         var tuner = AdaptiveWorkTuner.init(.{});
-        try std.testing.expectEqual(@as(u64, 60_000), tuner.config.threaded_batch_ns);
         const inline_profile = tuner.selectProfile(request);
         for (0..tuner.config.sample_window) |_| tuner.record(tunerTestBatchWithProfile(90, inline_profile, cheap_ns));
         try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
@@ -3463,14 +3605,53 @@ test "adaptive work tuner default gate keeps sub gate batches inline" {
     }
 }
 
-test "adaptive work tuner default gate probes batches from the gate up" {
-    const request = tunerTestRequest(1024, 4, 16, 64);
-    for ([_]u64{ 60_000, 100_000, 249_000 }) |gated_ns| {
+test "adaptive work tuner a calibrated gate probes batches from the gate up" {
+    const request = calibratedTunerTestRequest(1024, 4, 16, 64, craftedTestCalibration(40_000, 1_000));
+    for ([_]u64{ 40_000, 100_000, 249_000 }) |gated_ns| {
         var tuner = AdaptiveWorkTuner.init(.{});
         const inline_profile = tuner.selectProfile(request);
         for (0..tuner.config.sample_window) |_| tuner.record(tunerTestBatchWithProfile(1024, inline_profile, gated_ns));
         try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
         try std.testing.expect(tuner.selectProfile(request).worker_threads > 0);
+    }
+}
+
+test "adaptive work tuner an explicit threaded_batch_ns overrides the calibrated gate" {
+    const request = calibratedTunerTestRequest(1024, 4, 16, 64, craftedTestCalibration(40_000, 1_000));
+    // Over the calibrated gate, under the explicit one: settles inline.
+    var raised = AdaptiveWorkTuner.init(.{ .threaded_batch_ns = 100_000 });
+    const raised_profile = raised.selectProfile(request);
+    for (0..raised.config.sample_window) |_| raised.record(tunerTestBatchWithProfile(1024, raised_profile, 60_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, raised.phase);
+    try std.testing.expectEqual(@as(usize, 0), raised.selectProfile(request).worker_threads);
+    // Under the calibrated gate, over the explicit one: probes threading.
+    var lowered = AdaptiveWorkTuner.init(.{ .threaded_batch_ns = 20_000 });
+    const lowered_profile = lowered.selectProfile(request);
+    for (0..lowered.config.sample_window) |_| lowered.record(tunerTestBatchWithProfile(1024, lowered_profile, 30_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, lowered.phase);
+    try std.testing.expect(lowered.selectProfile(request).worker_threads > 0);
+}
+
+test "adaptive work tuner a prediction floors participant overhead at the calibrated prior" {
+    // The same 4 ms modelled jump: a 1 us prior threads it, a 1 s prior keeps it inline.
+    var cheap = try inlineSettledTestTuner();
+    const cheap_jump = cheap.selectProfile(calibratedTunerTestRequest(4096, 4, 16, 64, craftedTestCalibration(60_000, 1_000)));
+    try std.testing.expect(shapeBatch(4096, cheap_jump, 4, 16, true).worker_threads > 0);
+    var costly = try inlineSettledTestTuner();
+    const costly_jump = costly.selectProfile(calibratedTunerTestRequest(4096, 4, 16, 64, craftedTestCalibration(60_000, 1e9)));
+    try std.testing.expectEqual(@as(usize, 0), shapeBatch(4096, costly_jump, 4, 16, true).worker_threads);
+}
+
+test "adaptive work tuner floors learned participant overhead samples at the calibrated sample floor" {
+    const threaded_profile = AdaptiveWorkProfile{ .worker_threads = 4, .items_per_range = 16 };
+    for ([_]f64{ 50, 5_000 }) |sample_floor_ns| {
+        var calibration = test_calibration;
+        calibration.min_participant_overhead_ns = sample_floor_ns;
+        var tuner = AdaptiveWorkTuner.init(.{});
+        _ = tuner.selectProfile(calibratedTunerTestRequest(1024, 4, 16, 64, calibration));
+        // All of the batch is main's wait, so the observed participant overhead is 0.
+        tuner.record(tunerTestBatchWithProfileEx(1024, threaded_profile, 200_000, 200_000));
+        try std.testing.expectEqual(sample_floor_ns, tuner.model_participant_overhead_ns);
     }
 }
 
@@ -5121,6 +5302,42 @@ test "thread system init frees what it allocated when an allocation fails" {
     }
 }
 
+test "thread calibration derives the gate and participant overhead from the floors" {
+    // The full-pool rule: twice the full-pool floor clears the margin at every count.
+    const pool = ThreadCalibration.fromFloors(17_200, 7_500, 23);
+    try std.testing.expectEqual(@as(u64, 34_400), pool.gate_ns);
+    try std.testing.expectApproxEqAbs(@as(f64, 9_700.0 / 22.0), pool.participant_overhead_ns, 1e-9);
+    try std.testing.expectEqual(pool.participant_overhead_ns * 0.1, pool.min_participant_overhead_ns);
+    try std.testing.expectEqual(@as(u64, 17_200), pool.dispatch_floor_ns);
+    try std.testing.expectEqual(@as(u64, 7_500), pool.one_worker_floor_ns);
+    // One worker: the per-worker cost is its floor, and the margin at 2 participants binds.
+    const single = ThreadCalibration.fromFloors(10_000, 10_000, 1);
+    try std.testing.expectEqual(@as(u64, 22_223), single.gate_ns);
+    try std.testing.expectEqual(@as(f64, 10_000), single.participant_overhead_ns);
+    // A large one-worker floor: the check at one active worker binds over twice the pool.
+    const steep = ThreadCalibration.fromFloors(20_000, 19_000, 2);
+    try std.testing.expectEqual(@as(u64, 42_223), steep.gate_ns);
+    try std.testing.expectEqual(@as(f64, 1_000), steep.participant_overhead_ns);
+    // A full-pool floor under the one-worker floor: no per-worker cost, the 1 ns prior.
+    const flat = ThreadCalibration.fromFloors(9_000, 10_000, 8);
+    try std.testing.expectEqual(@as(f64, 0), flat.worker_wake_ns);
+    try std.testing.expectEqual(@as(f64, 1), flat.participant_overhead_ns);
+    try std.testing.expectEqual(@as(f64, 0.1), flat.min_participant_overhead_ns);
+}
+
+test "a thread system without workers skips calibration" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    try std.testing.expect(threads.calibration == null);
+}
+
+test "a thread system with workers stores the calibration its floors derive" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const calibration = threads.calibration.?;
+    try std.testing.expectEqual(ThreadCalibration.fromFloors(calibration.dispatch_floor_ns, calibration.one_worker_floor_ns, 2), calibration);
+}
+
 test "deinit right after init joins every worker" {
     for (0..32) |_| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
@@ -5723,14 +5940,38 @@ test "every woken worker carries its worker name on linux" {
     }
 }
 
+// A crafted calibration for tuner tests: a 60 us gate and a 1 us participant-overhead prior.
+const test_calibration = ThreadCalibration{
+    .dispatch_floor_ns = 30_000,
+    .one_worker_floor_ns = 7_500,
+    .worker_wake_ns = 1_000,
+    .gate_ns = 60_000,
+    .participant_overhead_ns = 1_000,
+    .min_participant_overhead_ns = 100,
+};
+
 fn tunerTestRequest(item_count: usize, available_worker_threads: usize, range_alignment_items: usize, fallback_items_per_range: usize) AdaptiveWorkRequest {
+    return calibratedTunerTestRequest(item_count, available_worker_threads, range_alignment_items, fallback_items_per_range, test_calibration);
+}
+
+fn calibratedTunerTestRequest(item_count: usize, available_worker_threads: usize, range_alignment_items: usize, fallback_items_per_range: usize, calibration: ThreadCalibration) AdaptiveWorkRequest {
     return .{
         .item_count = item_count,
         .available_worker_threads = available_worker_threads,
         .max_worker_threads = available_worker_threads,
         .fallback_items_per_range = fallback_items_per_range,
         .range_alignment_items = range_alignment_items,
+        .calibration = calibration,
     };
+}
+
+// `test_calibration` with its gate and participant-overhead prior replaced.
+fn craftedTestCalibration(gate_ns: u64, participant_overhead_ns: f64) ThreadCalibration {
+    var calibration = test_calibration;
+    calibration.gate_ns = gate_ns;
+    calibration.participant_overhead_ns = participant_overhead_ns;
+    calibration.min_participant_overhead_ns = participant_overhead_ns * min_participant_overhead_ratio;
+    return calibration;
 }
 
 fn tunerTestBatch(item_count: usize, items_per_range: usize, duration_ns: u64) BatchStats {
