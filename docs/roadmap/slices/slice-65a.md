@@ -47,7 +47,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 - The quantum is 64 B, not `std.atomic.cache_line`, because slot arrays
   multiply; `src/app/thread_system.zig` owns it with a padding helper and a
   comptime layout gate that every padded slot type calls, and an
-  `idiom-lint` rule rejects private copies (`.claude/rules/threading.md`).
+  `idiom-lint` rule rejects private copies (`.grok/rules/threading.md`).
 - `WorkerRecord` is padded unconditionally: two threads write `wake` every
   batch. The bench is a non-regression gate, not the decision.
 - Lane priority is a platform helper (`src/platform/`; app imports it, game
@@ -58,7 +58,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
   once and is never fatal; the result is diagnostics only.
 - Pool rule: `cpu_count − 1` whatever the lane does; a rule that follows
   measured interference would make worker count a function of timing
-  (`.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/simulation.md` § Determinism).
 - VoidLight: keep its `hardware_concurrency − 1` pool; do not port its
   user-space task priority queues, which cannot stop a long task holding a
   core.
@@ -92,7 +92,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
       padding, pool rule) and Background Lane (priority per OS);
       `docs/development-workflow.md` bench group.
 - [ ] Add the thread-shared record rule (owner constant, layout gate, lint) to
-      `.claude/rules/threading.md` when this lands.
+      `.grok/rules/threading.md` when this lands.
 
 ### Acceptance checks
 

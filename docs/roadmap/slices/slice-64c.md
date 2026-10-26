@@ -17,7 +17,7 @@ save.
   `GameDemoState.initProceduralWithRuntimeAssets`, which always spawns
   `battle_scale_demo_mover_count` into `default_world_build_config`. Those are
   demo-harness values, never format, validation, or sizing inputs
-  (`.claude/rules/engine-design.md` § Target scale).
+  (`.grok/rules/engine-design.md` § Target scale).
 - 49 adds the session seed to that chain.
 - Zig 0.17 `std.Io.random` provides seeding entropy (not guaranteed CSPRNG,
   which is fine for an unpredictable game seed).

@@ -22,9 +22,9 @@ static fast paths, as four independently landable sections:
 ### Architecture notes
 
 - None of the four reshapes the utility contract (`scoreBehaviors` /
-  `selectSticky` / `resolveGoal`; `.claude/rules/simulation.md` § AI and
+  `selectSticky` / `resolveGoal`; `.grok/rules/simulation.md` § AI and
   affect), and none adds a world-scaled budget
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Cross-slice pointers already applied in the owning slices: 62's home and
   leash signal and 63's guard theft alert are 71A; 63's AI trade emission
   and 56's AI trade action are 71D.

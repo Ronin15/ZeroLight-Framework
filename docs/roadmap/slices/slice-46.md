@@ -37,7 +37,7 @@ continuing session.
   (75) land first and are included in v1; the format is organized per world
   instance.
 - Payload: stable IDs, slot + generation, enum/scalar columns only
-  (`.claude/rules/simulation.md` § Persistent data). Settings, input bindings,
+  (`.grok/rules/simulation.md` § Persistent data). Settings, input bindings,
   UI/theme, and render/audio/thread state are excluded (Slice 54 owns
   settings).
 - The saved set is exactly 64B's hashed set plus the header, step count, and
@@ -49,7 +49,7 @@ continuing session.
   reference is the uninterrupted run normalized at the save step (64B).
 - Terrain saves per chunk, every chunk of every world (64G): save and load
   cost follow the chunks and content that exist, never level area or world
-  extent (`.claude/rules/budgets-capacities.md`). Saving only edited chunks
+  extent (`.grok/rules/budgets-capacities.md`). Saving only edited chunks
   is 69F's later optimization. The render-only `BlockFill.changed` mark is
   excluded from chunk saves.
 - Exact restore of dense-row order, entity slots, and free lists, because the
@@ -60,9 +60,9 @@ continuing session.
   CRC catches corruption before decode. Validation is strict and nothing is
   installed until it and parity pass.
 - No save-size ceiling: a save is never refused for size and only allocator
-  OOM fails it, leaving the session intact (`.claude/rules/budgets-capacities.md`).
+  OOM fails it, leaving the session intact (`.grok/rules/budgets-capacities.md`).
   The encode buffer is sized from content and reserved once before writing
-  (`.claude/rules/memory-performance.md`); a load trusts no length field
+  (`.grok/rules/memory-performance.md`); a load trusts no length field
   beyond the file's actual size and the format's index widths.
 - Payload encoding matches T3's header: every field at a fixed width in
   little-endian order, floats as their bit patterns, and no in-memory struct
@@ -71,12 +71,12 @@ continuing session.
 - Cold path, but it scales with content: encode runs at the paused quiescent
   point (no structural commands pending), with per-chunk and per-world work on
   the thread system and a deterministic ordered merge where the cost model
-  calls for it (`.claude/rules/threading.md`). File write, read, decode, and
+  calls for it (`.grok/rules/threading.md`). File write, read, decode, and
   slot scan run on the lane, observed with `isDone`, with the inline fallback;
   `Engine.deinit` completes outstanding tickets before the lane deinits.
 - Capture goes through a state hook answered only by the gameplay state; menus
   decline. No gameplay conditionals in `Engine`
-  (`.claude/rules/engine-design.md`).
+  (`.grok/rules/engine-design.md`).
 - Provides: 67C's header-only bump, thumbnail, and named saves.
 - VoidLight: port the slot API (save, load, delete, info, exists), a header
   with version and timestamp, and the pref-path save dir; do not port the
@@ -127,7 +127,7 @@ continuing session.
       size, depth, population, world count).
 - [ ] Docs: `docs/architecture.md` save/load boundary (what is persisted, by
       which identifiers, what is excluded and rebuilt).
-- [ ] Add the new-field save-section rule to `.claude/rules/simulation.md`
+- [ ] Add the new-field save-section rule to `.grok/rules/simulation.md`
       when this lands.
 
 ### Acceptance checks
@@ -142,6 +142,6 @@ continuing session.
 - [ ] Manual: with the lane thread enabled, saving does no file I/O on the main
       thread, and quitting during a save leaves a complete slot file.
 - [ ] `save-encode` / `save-decode` grow linearly with saved content across at
-      least three sizes (`.claude/rules/tests-benchmarks.md`), as does the
+      least three sizes (`.grok/rules/tests-benchmarks.md`), as does the
       post-load derived-state rebuild.
 - [ ] Payload-purity test passes; `zig build verify` passes.

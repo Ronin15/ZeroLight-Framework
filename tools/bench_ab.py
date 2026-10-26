@@ -3,7 +3,7 @@
 
 Runs only the named bench groups (never the full suite), a base git ref
 against the working tree, one run per side by default, and prints per-(group,
-item, case) times and a verdict (`.claude/rules/tests-benchmarks.md`). Base
+item, case) times and a verdict (`.grok/rules/tests-benchmarks.md`). Base
 export, reps and spread, the run cache, cases, the CPU floor, and output
 locations: `tools/README.md` § `bench_ab.py`. A run must name its config with
 `-- --items N` (or pass `--grid` for every config).

@@ -10,7 +10,7 @@ the backend pass (index, merged order).
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile sync's
 per-change copying stays off the main thread. The renderer, sprite batch,
-text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
+text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
 
 ### Current foundation
 
@@ -34,12 +34,12 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
 ### Architecture notes
 
 - Render visibility is the camera chunk window plus AABB
-  (`.claude/rules/render.md`). Collect cost follows what is visible
-  (`.claude/rules/engine-design.md` § Cost model).
+  (`.grok/rules/render.md`). Collect cost follows what is visible
+  (`.grok/rules/engine-design.md` § Cost model).
 - The record and command capacities grow at the pre-reserve before the
-  submission pass (`.claude/rules/memory-performance.md`), and the GPU tile
-  sync's byte copying threads (`.claude/rules/threading.md`).
-- Render state and draw records are per world (`.claude/rules/render.md`);
+  submission pass (`.grok/rules/memory-performance.md`), and the GPU tile
+  sync's byte copying threads (`.grok/rules/threading.md`).
+- Render state and draw records are per world (`.grok/rules/render.md`);
   74 binds presentation to the viewed world.
 - The backend pass is review-only (`zig-best-practices-review`), followed by
   local fixes.
@@ -53,7 +53,7 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       collect resolves each row's level by slot (`render_prep.zig:388`)
       before its chunk test (`:395`). Constraint: the per-visible-chunk
       source reads each (level, chunk)'s rows as one contiguous run
-      (contiguity audit H4; `.claude/rules/memory-performance.md`
+      (contiguity audit H4; `.grok/rules/memory-performance.md`
       § Data-oriented design); the source is this slice's design.
       Measured: `render-game-prep-offview` above. Pass: collect time and the
       record and command capacities flat in off-view rows (group doc); the
@@ -70,7 +70,7 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       chunk's list, reading `cell_index` from scattered pool rows;
       `addSparseTile` appends in call order (`world/edit.zig:726`), so
       worldgen order already interleaves chunks
-      (`.claude/rules/memory-performance.md` § Data-oriented design). Failure
+      (`.grok/rules/memory-performance.md` § Data-oriented design). Failure
       scenario: the walk reruns whenever the window crosses a tile edge
       (`world/system.zig:277-280`), walking fragments, more scattered after
       dig and build churn. Pass: the window walk reads each chunk's sparse
@@ -83,7 +83,7 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       `records[record_index]` through it (`:270-271`); the sparse window sorts
       row ids over three pool columns (`world/render.zig:231`), and
       `emitSparseRange` (`:627`) reads each row by id
-      (`.claude/rules/memory-performance.md` § Data-oriented design, § Hot
+      (`.grok/rules/memory-performance.md` § Data-oriented design, § Hot
       paths). Failure scenario: every frame reads the visible records out of
       order, and the sort chases two records per compare. Pass: the dynamic
       submit and the sparse emit each read their sorted rows in memory order;

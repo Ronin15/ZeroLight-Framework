@@ -59,14 +59,14 @@ content across world sizes.
 ### Architecture notes
 
 - No `stage_order`, `PipelineResource`, or `stageContract()` change.
-- Growth points (`.claude/rules/memory-performance.md`): population storage
+- Growth points (`.grok/rules/memory-performance.md`): population storage
   in `syncPopulationCapacity`; per-frame render storage on the main thread
   before the threaded emit; gates compare stored logical limits.
-- Storage follows content (`.claude/rules/budgets-capacities.md`): a
+- Storage follows content (`.grok/rules/budgets-capacities.md`): a
   world-extent sizing item is rewritten to size by content, or moved into
   64G, never landed as extent sizing.
 - New growth and drop counters log once and are perf metrics
-  (`.claude/rules/zig-style.md`).
+  (`.grok/rules/zig-style.md`).
 - Each item lands with its tests and bench run; cross-slice text edits land
   in the same change as their item.
 
@@ -171,7 +171,7 @@ content across world sizes.
 - [ ] Every capacity-dependent-behavior site is fixed or justified at its
       site.
 - [ ] Every item that can move a hot path is benched before and after on
-      adjacent commits (`.claude/rules/tests-benchmarks.md`) with no
+      adjacent commits (`.grok/rules/tests-benchmarks.md`) with no
       regression beyond run-to-run spread; new groups record baselines.
 - [ ] `footprint-*` at three world sizes shows memory following content, not
       extent, before and after F and G; numbers in the landing commits.

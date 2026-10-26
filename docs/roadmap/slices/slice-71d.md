@@ -44,7 +44,7 @@ Out of scope, decided: AI buying (no AI consumer for bought goods), AI gifts
 - Merchants are found through a spatial query with a fixed per-query
   budget and deterministic order, never a prefix of the merchant store, so
   no merchant becomes invisible as merchant count grows
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Surplus and quantity thresholds and the search radius are fixed
   constants, never world- or population-derived.
 - The sale is quoted from committed relations and ledger, so a stale quote
@@ -54,7 +54,7 @@ Out of scope, decided: AI buying (no AI consumer for bought goods), AI gifts
   add them as carried where needed.
 - The trade gain is hashed and saved with the AI agent store; relative
   version bumps; per-step scratch excluded (64B).
-- Serial == threaded (`.claude/rules/threading.md`).
+- Serial == threaded (`.grok/rules/threading.md`).
 - VoidLight reference: the forage → sell loop with profile acceptance and
   attitude-based price; not string resource ids, float prices, per-NPC
   trade timers, or immediate trade commits.

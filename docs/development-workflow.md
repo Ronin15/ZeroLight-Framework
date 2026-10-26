@@ -24,10 +24,10 @@ zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreac
 ```
 
 `zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) checks
-the mechanical subset of `.claude/rules/zig-style.md` and
-`.claude/rules/memory-performance.md` as 13 rules; the script's docstring lists
+the mechanical subset of `.grok/rules/zig-style.md` and
+`.grok/rules/memory-performance.md` as 13 rules; the script's docstring lists
 exactly what it enforces. Rule 13 gates `ThreadSystem`'s fixed-shape dispatch
-options (`.claude/rules/tests-benchmarks.md`): production code outside
+options (`.grok/rules/tests-benchmarks.md`): production code outside
 `thread_system.zig`, tests, test-only helpers, and benches may only forward a
 stage config's own controls (`docs/architecture.md` § Thread System). It runs a
 self-check of must-hit and must-pass cases before the scan. `catch unreachable` and `orelse unreachable` are allowed only on
@@ -62,7 +62,7 @@ the binary. The asset root is a relative, traversal-safe path (default
 ## Release Modes
 
 The default optimize mode is `Debug`. Release modes (when to use them:
-`.claude/rules/build-validation.md`):
+`.grok/rules/build-validation.md`):
 
 ```sh
 zig build --release=safe
@@ -76,7 +76,7 @@ not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
 **Packaged builds ship `ReleaseFast`** (no safety checks; why reserves need
-proofs: `.claude/rules/memory-performance.md`).
+proofs: `.grok/rules/memory-performance.md`).
 
 CPU floor: every optimize mode, Debug included, defaults to the shipped CPU
 minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64, `apple_m1` on macOS arm64,
@@ -95,7 +95,7 @@ libc/libm symbols, while non-LTO ReleaseFast links and emits its PDB). Debug,
 ReleaseSafe, and ReleaseSmall leave LTO off.
 
 **Release gate:** a multi-hour `--release=safe` soak precedes every ReleaseFast
-release candidate (`.claude/rules/build-validation.md`).
+release candidate (`.grok/rules/build-validation.md`).
 
 ## Build Options
 
@@ -200,13 +200,13 @@ safety, behavior and unit work. Not the authority for scale timing.
 
 **Soaks and stage ranking:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
 one 60s dump after load when you want a stage ranking (diagnostic trend data,
-not a perf claim; `.claude/rules/tests-benchmarks.md`). Longer compile; usage
-limits are in `.claude/rules/build-validation.md`.
+not a perf claim; `.grok/rules/tests-benchmarks.md`). Longer compile; usage
+limits are in `.grok/rules/build-validation.md`.
 
 **Ship:** ReleaseFast packages (runtime perf fully compiled out).
 
 The dump's batch stages (`runtime_perf_log.BatchStage`) are the per-step load
-stages plus each change path's cost driver (`.claude/rules/threading.md`); every
+stages plus each change path's cost driver (`.grok/rules/threading.md`); every
 other stage is bench-only (`--details`):
 
 - per-step load: `spatial_index_build`, `perception`, `ai_separation`,
@@ -322,11 +322,11 @@ tests whose names contain the text; names carry their module path, so
 that matches nothing compiles an empty stub and does not type-check the suite.
 `zig build test-compile` type-checks the test root and does not run it; pass
 no filter when the whole root must compile. Test rules:
-`.claude/rules/tests-benchmarks.md`.
+`.grok/rules/tests-benchmarks.md`.
 
 ## Validation Cadence
 
-The cadence (which step when) is `.claude/rules/build-validation.md`.
+The cadence (which step when) is `.grok/rules/build-validation.md`.
 `zig build verify` runs compile coverage, unit tests, shader compilation, atlas
 lint, idiom lint, and a `zig fmt --check` over `build.zig`, `build.zig.zon`, and
 `src/` (files edited outside the format hook fail here; `zig build fmt` fixes
@@ -355,11 +355,11 @@ by one; the first report halts the run (exit 66) and fails the step. The value
 is always set, so a changed `TSAN_OPTIONS` reruns a cached passing run.
 A sanitizing build reconfigures on every invocation (configure cache:
 [Windows SDL Packages](#windows-sdl-packages)). No suppressions ship
-(`.claude/rules/threading.md`).
+(`.grok/rules/threading.md`).
 
 The full suite takes about 3 minutes under TSan (x86_64 Linux, Debug), and
 the option is not part of `verify`. When it runs:
-`.claude/rules/build-validation.md`.
+`.grok/rules/build-validation.md`.
 
 ## Profiling
 
@@ -380,7 +380,7 @@ Read the stage's own inclusive line in `callgrind_annotate --inclusive=yes`,
 not the program total, which includes process startup. It answers which
 functions execute the instructions and how often each is called; it does not
 answer wall time or threading (valgrind runs one thread at a time, so profile
-serial cases), SIMD or inlining choices (`.claude/rules/memory-performance.md`
+serial cases), SIMD or inlining choices (`.grok/rules/memory-performance.md`
 § SIMD and core math), or cache stalls. Callgrind runs about 25× slower than the plain
 binary, so use low entity counts only: about 256 to 1,024 items, one warmup,
 one iteration.
@@ -423,14 +423,14 @@ an earlier case's configuration reports `same shape as <case>`, untimed and out
 of the best-control pick; the clamp case is always timed. Groups that time an edit and its revert (terrain edits, nav
 batch, nav dig and update toggles, connectivity toggles) run each half on its
 own tuner set, so each tuner takes one sample per step as production does
-(`.claude/rules/threading.md`); reported shapes and settle checks follow each
+(`.grok/rules/threading.md`); reported shapes and settle checks follow each
 set's own half. A group runs its own `item_counts` list; the processor and
 render-prep groups share `suite.event_scale_counts` (1,024, 4,096, and 10,000).
 `--items N` runs one config of any group.
 
 Each group's doc comment, beside its `BenchmarkGroup` in `src/benchmarks/`, is
 the full statement of its fixture, what one sample times, its item code, its pass
-shape, and its `--details` fields (`.claude/rules/tests-benchmarks.md`); the
+shape, and its `--details` fields (`.grok/rules/tests-benchmarks.md`); the
 index below names each group and its file. An item code packs a config's fields in
 decimal, most significant first, and the report header prints the group's layout
 (`suite.ItemCode`).
@@ -497,7 +497,7 @@ Reading results:
   a 4-lane normalize at 790 Ir against 90 for one scalar normalize. A serial gap
   after an off-main or SIMD landing is therefore expected; whether it is a
   verdict or a control's gap depends on which path the tuned case reports as
-  production at that size (`.claude/rules/tests-benchmarks.md` § Benchmarks).
+  production at that size (`.grok/rules/tests-benchmarks.md` § Benchmarks).
 - `worker_threads` is `active/available` background workers, excluding the main
   thread (which also processes ranges). `0/10` means adaptive stayed inline; it
   can still trail `serial-direct` in tiny ReleaseFast movement workloads because
@@ -532,7 +532,7 @@ Reading results:
   fixture. A tuner that fails to settle shows its probing phase and candidate: an adaptive coverage
   failure, not a clean timing; a tuned case with `settled=no` is printed
   `not judged, rerun with more warmup` and is never judged
-  (`.claude/rules/tests-benchmarks.md`). The summary leads with `adaptive settled=...`. Inline batches do not reset tuner state for later processors.
+  (`.grok/rules/tests-benchmarks.md`). The summary leads with `adaptive settled=...`. Inline batches do not reset tuner state for later processors.
 - Multi-stage systems are read per stage: a primary batch may thread while a
   secondary stays `inline`. Pathfinding's request preparation can use SIMD lane
   batches while the A* solve stage owns its own tuner and row.
@@ -594,7 +594,7 @@ Group index (files under `src/benchmarks/`):
   its figure, never skips.
 
 Shared harness pieces live once, each in its owning file; a group declares its
-label and formatter in its definition (`.claude/rules/tests-benchmarks.md`).
+label and formatter in its definition (`.grok/rules/tests-benchmarks.md`).
 `suite.zig` owns options, cases, item codes, labels, stage shapes, and
 reporting, including `suite.Warmup` (a case's warmup and adaptive settle loop)
 and `suite.DetailLines` (a case's extra report lines, printed under its row by
@@ -607,7 +607,7 @@ run under `zig build test`; no group file is called from a test, and fixture
 correctness rests on the asserts that fire in a real bench run.
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
-(`.claude/rules/tests-benchmarks.md`); the full-suite forms (bare `zig build bench`,
+(`.grok/rules/tests-benchmarks.md`); the full-suite forms (bare `zig build bench`,
 bare `--details`) are for requested sweeps:
 
 ```sh

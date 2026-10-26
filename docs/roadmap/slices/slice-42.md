@@ -25,7 +25,7 @@ signal primitives they need, never a second emotion system.
 ### Architecture notes
 
 - Every drive lands with a real producer signal and at least one behavior
-  term; no placeholder drives (`.claude/rules/simulation.md` § AI and
+  term; no placeholder drives (`.grok/rules/simulation.md` § AI and
   affect). Candidates: `pain` on 56's damage signal, `morale` from ally
   density and faction, `contentment` from low threat and high familiarity.
 - Appraisal gains are per-archetype content, so timid and bold agents feel
@@ -45,7 +45,7 @@ signal primitives they need, never a second emotion system.
 - New hashed state is classified in Slice 49's lists and saved by Slice 46
   with relative version bumps (Tables T3/T6).
 - Serial == threaded; SIMD == scalar where vectorized
-  (`.claude/rules/threading.md`, `.claude/rules/memory-performance.md`).
+  (`.grok/rules/threading.md`, `.grok/rules/memory-performance.md`).
 - Non-goals: full psychological simulation, emotion graphs as runtime
   structures, per-entity heap emotion stacks, string emotion names on the
   hot path, an FSM of named moods.

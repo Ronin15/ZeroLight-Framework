@@ -7,7 +7,7 @@ as recorded data (owner 2026-10-25: recorded, not chased); the wake-posting item
 [slice 90](slice-90.md).** Owner 2026-10-23: a slice for the
 world-gate and batch-tuner follow-ups. Ordered first in the core branch (owner delegated to the
 criteria 2026-10-24): its tuner fixes change how every later slice's tuned cases are judged
-(`.claude/rules/tests-benchmarks.md` § Benchmarks). The `750ce0a` baseline predates its tuner
+(`.grok/rules/tests-benchmarks.md` § Benchmarks). The `750ce0a` baseline predates its tuner
 change; the one whole-suite Debug run after it is `.claude/reports/bench-suite-6b7138e.txt`
 (later tuner changes ran targeted groups; verdicts in `.claude/reports/slice89-verdicts.md`).
 
@@ -113,8 +113,8 @@ fixture and grouped by chunk only if they cost there.
       (`.claude/reports/slice89-wake-diag.md`). Data and pass conditions are in
       slice 90.
 - [ ] World gate access order under the data rules
-      (`.claude/rules/memory-performance.md` § Data-oriented design,
-      `.claude/rules/engine-design.md` § Target scale: the chunk is the unit).
+      (`.grok/rules/memory-performance.md` § Data-oriented design,
+      `.grok/rules/engine-design.md` § Target scale: the chunk is the unit).
       Measured (`bc336f4`, scattered minus scattered-sorted; Debug 3 reps):
       serial +0.40 / +0.52 / +1.84 ms at 4,096 / 16,384 / 65,536 (beyond
       spread), tuned +10 / +37 / +430 us (within spread or at its edge);
@@ -125,7 +125,7 @@ fixture and grouped by chunk only if they cost there.
       `(level, chunk)`. A per-row terrain read at the row's position is an
       exempt point lookup (owner 2026-10-24). Next measure: a variant with
       terrain larger than L2, 3 ReleaseFast reps (the access-order exception,
-      `.claude/rules/build-validation.md`). Pass: the lookups reported as a
+      `.grok/rules/build-validation.md`). Pass: the lookups reported as a
       cost or not there; only if they cost, rows group by `(level, chunk)`,
       serial == threaded. Links slice 35's row-order item and slice 88's
       plane-entry item.
@@ -142,8 +142,8 @@ fixture and grouped by chunk only if they cost there.
       (Debug suite, `6b7138e`): 21 `settled=no` cases, 15 of them
       `production-step`; not rerun at four times the default pre-measure. Pass:
       each rerun at four times the default pre-measure
-      (`.claude/rules/tests-benchmarks.md`); a tuner still unsettled is merged
-      or removed (`.claude/rules/threading.md` § Building a stage), or, for a
+      (`.grok/rules/tests-benchmarks.md`); a tuner still unsettled is merged
+      or removed (`.grok/rules/threading.md` § Building a stage), or, for a
       bench-only revert instance, the fixture fixed.
 - [ ] An inline tuned case matches serial. `pathfinding-link-fold` 1016032768
       ReleaseFast was tuned 13-16% slower than `serial-direct` (every stage

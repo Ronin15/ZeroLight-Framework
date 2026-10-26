@@ -28,11 +28,11 @@ chooses, with no JSON or string names on the hot path.
 
 - Parsing and strict validation are load-time only: unknown keys and
   out-of-range values fail loudly; hot paths see only ids and tables
-  (`.claude/rules/simulation.md` § AI and affect).
+  (`.grok/rules/simulation.md` § AI and affect).
 - Archetypes resolve to stable identifiers and component bundles, never
-  paths or live handles (`.claude/rules/simulation.md` § Persistent data).
+  paths or live handles (`.grok/rules/simulation.md` § Persistent data).
 - The overlay is read-only over simulation: no RNG, events, or mutation, and
-  no draw path in AI benches (`.claude/rules/engine-design.md`).
+  no draw path in AI benches (`.grok/rules/engine-design.md`).
 
 ### Checklist
 

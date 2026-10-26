@@ -51,8 +51,8 @@ Goal:
 - The chunk owns the static-collider rows, so a local change costs its
   chunks and a dense change (explosion region) costs its dirty chunks in
   parallel; no rebuild over every static
-  (`.claude/rules/engine-design.md` § Cost model,
-  `.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/engine-design.md` § Cost model,
+  `.grok/rules/budgets-capacities.md`).
 - Membership matches today's steering walk; order is entity order, so
   steering output equals a full rebuild in that order (today's walk follows
   `DataSystem` dense order, which swap-removes reorder, so no incremental
@@ -62,8 +62,8 @@ Goal:
   spawn anchors); merchants are excluded (they move). Fixed per-step counts
   (one new field, a fixed candidate sweep), a fixed band around the sim
   view, empty slots only, demand evicts prewarm first; no world-scaled
-  sectors (`.claude/rules/budgets-capacities.md`,
-  `.claude/rules/pathfinding.md`).
+  sectors (`.grok/rules/budgets-capacities.md`,
+  `.grok/rules/pathfinding.md`).
 - A nav change drops only the group fields on the chunks or levels it
   affects, never all; this needs Slice 64G's chunked nav.
 - Prewarmed fields are normalized state for the checksum (64B); the
@@ -93,7 +93,7 @@ Goal:
       `pathfinding-prewarm` bench.
 - [ ] Docs: `docs/architecture.md`, `docs/simulation-tiers-and-pipeline.md`,
       bench examples.
-- [x] Add the static-mobility writer rule to `.claude/rules/simulation.md`
+- [x] Add the static-mobility writer rule to `.grok/rules/simulation.md`
       (landed with 64G: a static body changes only through structural
       commands).
 

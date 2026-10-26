@@ -87,9 +87,9 @@ groups measure it.
   - sin/cos become a deterministic polynomial with a fixed op order pinned by
     golden-bit tests, landed as a paired scalar and SIMD form (`math.sinCos`
     and a `simd.zig` `sinCos` over lanes) with parity tests, so the scalar
-    delegates to lane 0 (`.claude/rules/memory-performance.md` § SIMD and core
+    delegates to lane 0 (`.grok/rules/memory-performance.md` § SIMD and core
     math: a missing primitive goes into `core` as a paired scalar and SIMD
-    form; determinism per `.claude/rules/simulation.md` § Determinism).
+    form; determinism per `.grok/rules/simulation.md` § Determinism).
   - Kept: true division and sqrt (no estimates, which differ between vendors),
     scalar-load gather, unaligned loads, SSE2 integer emulations on `compat`,
     unfused lerp/dot.
@@ -146,7 +146,7 @@ groups measure it.
       procedure; `docs/architecture.md` core line; `CLAUDE.md` command.
 - [ ] Add the SIMD codegen and determinism rule (inline Mask4, select-form
       min/max, no libm builtins or estimates, `simd-asm-check`, scalar/SIMD
-      bit identity) to `.claude/rules/memory-performance.md` when this lands.
+      bit identity) to `.grok/rules/memory-performance.md` when this lands.
 
 ### Acceptance checks
 
@@ -156,7 +156,7 @@ groups measure it.
       `compat`, and ReleaseSafe `x86_64_v3` (informational).
 - [ ] `zig build check -Doptimize=ReleaseFast -Dcpu-baseline=compat` compiles.
 - [ ] Each new lint rule fires on a temporary, uncommitted edit.
-- [ ] Bench gate per `.claude/rules/tests-benchmarks.md` § Benchmarks, at
+- [ ] Bench gate per `.grok/rules/tests-benchmarks.md` § Benchmarks, at
       `ship` and `compat`, numbers in the landing commit: the kernels this
       slice rewrites improve across the ladder; normalize and gather-scatter
       hold; the system groups (spatial index, scope-cognition, perception,

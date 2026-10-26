@@ -53,7 +53,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
   (including a participant of a different `ThreadSystem`, whose scratch slot
   can exceed this system's) panics in every build mode, because no safe
   execution exists for it. Forced inline keeps the range set and indices, so
-  output stays deterministic (`.claude/rules/threading.md`).
+  output stays deterministic (`.grok/rules/threading.md`).
 - Consequence: Slice 51's lane thread is a foreign thread, so lane jobs run
   serial code paths, never `parallelFor`.
 - Forced inline is visible: a per-batch stat, a per-system counter, and one
@@ -107,7 +107,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
       forced inline, foreign-thread panic, worker names);
       `docs/development-workflow.md` "Thread Sanitizer" and the bench group
       (the Slice 50 docs commit).
-- [x] Rule additions to `.claude/rules/threading.md`: singleton cache-line
+- [x] Rule additions to `.grok/rules/threading.md`: singleton cache-line
       padding (`a66d87c`); nesting and foreign-thread behavior and the TSan
       suppression policy (the Slice 50 docs commit).
 
@@ -132,7 +132,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
       claim (`a66d87c`).
 - [x] `thread-dispatch` and `movement --case thread-small-range` show no
       regression beyond run-to-run spread on adjacent commits in ReleaseFast
-      (`.claude/rules/tests-benchmarks.md`). `thread-dispatch` ReleaseFast,
+      (`.grok/rules/tests-benchmarks.md`). `thread-dispatch` ReleaseFast,
       3 reps: `a66d87c` nothing slower (262,144 fixed-2 −19.5%, fixed-auto
       −16.5%); `b42ef15` at 16,384 fixed-auto within spread. `movement
       --case thread-small-range` ReleaseFast, 3 reps, `5673672` vs the slice
@@ -144,7 +144,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
 ### Open items from the batch tuner and diagnostics landings
 
 - [x] No stage control exists only for tests and benches
-      (`.claude/rules/tests-benchmarks.md` § Test and production code 1).
+      (`.grok/rules/tests-benchmarks.md` § Test and production code 1).
       Superseded by `19fe22a`: `ThreadSystem`'s fixed-shape options are the one
       sanctioned test and bench seam, and production code may only forward its
       stage's controls. The steering band stages forward
@@ -158,7 +158,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
 - [ ] The 14 `pipeline_*` runtime-log timers are cost-driver stages or move
       to the bench-only channel. Failure: `src/app/runtime_perf_log.zig:170-183`
       (`pipeline_spatial_index` through `pipeline_chunk_derive`) time whole
-      stage calls, which `.claude/rules/threading.md` § Verification and
+      stage calls, which `.grok/rules/threading.md` § Verification and
       diagnostics reserves to bench output. `BatchStage` itself is already
       the 11 change-path cost drivers (`005cdae`,
       `src/app/runtime_perf_log.zig:217-240`); only these timers remain. Pass:
@@ -172,7 +172,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
       `production-step` whose census lists those batches with `ran=` and
       `threaded=`.
 - [ ] Remaining diagnostic counters that tests read sit behind the perf
-      switch (`.claude/rules/tests-benchmarks.md` § Test and production code 4).
+      switch (`.grok/rules/tests-benchmarks.md` § Test and production code 4).
       Failure: tests read `NavUpdateStats.dirty_chunks`, `.chunks_patched`,
       `.records_patched` (`pathfinding/types.zig:311-321`), the
       `PathfindingStats` `*_ns` fields (`types.zig:550`), and `NavGraph` pool grows.

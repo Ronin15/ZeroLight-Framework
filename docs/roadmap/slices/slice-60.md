@@ -35,12 +35,12 @@ and an app-level fade-in on state replacement.
 ### Architecture notes
 
 - The rig is presentation state stepped in the fixed step; alpha, wall clock,
-  and frame count enter only at render (`.claude/rules/render.md`).
+  and frame count enter only at render (`.grok/rules/render.md`).
 - The simulation anchor is a pure function of the observer's target (the
   camera focus, or a player when present) and world bounds at the minimum
   zoom; no camera-feel term, zoom, shake, or alpha
   feeds it, so `sim_view` is invariant under presentation. It sets fidelity
-  bands, never whether anything simulates (`.claude/rules/simulation.md` §
+  bands, never whether anything simulates (`.grok/rules/simulation.md` §
   Scope and tiers); the rendered view stays inside the full-fidelity band.
 - Zoom levels are integers ≥ 1, so the visible area never exceeds the zoom-1
   window and render reservations are unchanged.
@@ -50,7 +50,7 @@ and an app-level fade-in on state replacement.
   menus and grade-free frames are byte-identical to today.
 - The scene texture is fully re-rendered each frame (cycles); it grows only
   in the pre-acquire block from the drawable probe, never while holding the
-  swapchain (`.claude/rules/render.md` § Frame and uploads).
+  swapchain (`.grok/rules/render.md` § Frame and uploads).
 - Fades are an app-level ordered UI rect above stacked states and below
   debug, not a composite term.
 - Zoom actions are gameplay actions; zoom index persists through Slice 54's settings (next schema version,

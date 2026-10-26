@@ -40,7 +40,7 @@ these outcomes.
   pinned through the fixed-shape dispatch options (`adaptive = false`,
   `items_per_range`, `max_worker_threads`; `thread_system.zig:65-70`,
   `:83-90`), the one sanctioned test and bench seam
-  (`.claude/rules/tests-benchmarks.md` § Test and production code 1);
+  (`.grok/rules/tests-benchmarks.md` § Test and production code 1);
   production only forwards a stage's controls (lint rule 13).
 - `GameDemoState.onPause`/`onResume` call `syncInterpolatedState`, which
   overwrites `previous_x/previous_y` and the camera the simulation reads, so a
@@ -60,8 +60,8 @@ these outcomes.
   including far-simulation state; [Slice 74](slice-74.md) (world instances)
   and [Slice 75](slice-75.md) (far simulation) classify their state under this
   slice's completeness checks when they land
-  (`.claude/rules/engine-design.md` § Target scale).
-- Determinism guarantee and inputs: `.claude/rules/simulation.md` §
+  (`.grok/rules/engine-design.md` § Target scale).
+- Determinism guarantee and inputs: `.grok/rules/simulation.md` §
   Determinism. Scope pinned here: same executable (target, CPU features,
   toolchain, runtime libm), same seed root and initial state, same per-step
   input. No multiplayer is planned (owner decision 2026-10-14), so the
@@ -115,7 +115,7 @@ these outcomes.
       churn change it and render visibility does not.
 - [ ] `GameDemoState.simulationChecksum()`.
 - [x] Superseded: no `ThreadSystemConfig.adaptive`. A system-wide switch only
-      tests would set is rejected by `.claude/rules/tests-benchmarks.md`
+      tests would set is rejected by `.grok/rules/tests-benchmarks.md`
       § Test and production code 1; pinning exists per dispatch, with its test
       (`parallel for options cap active workers and align ranges`,
       `thread_system.zig:2446`; `19fe22a`, `166075c`).
@@ -128,8 +128,8 @@ these outcomes.
 - [ ] Docs: "Determinism Contract" in `docs/simulation-tiers-and-pipeline.md`;
       `docs/architecture.md` ownership lines; DW test and bench names.
 - [ ] Rule additions when this lands: determinism contract scope, seed-domain
-      registry, checksum classification and persistence, `StepIndex` (`.claude/rules/simulation.md`); SIMD/scalar bit
-      identity (`.claude/rules/memory-performance.md`).
+      registry, checksum classification and persistence, `StepIndex` (`.grok/rules/simulation.md`); SIMD/scalar bit
+      identity (`.grok/rules/memory-performance.md`).
 
 ### Acceptance checks
 
@@ -143,5 +143,5 @@ these outcomes.
 - [ ] The checksum takes no allocator.
 - [ ] `zig build -Doptimize=ReleaseFast bench -- --group simulation-checksum
       --details` shows cost linear in hashed state across at least three sizes
-      (`.claude/rules/tests-benchmarks.md`); 64B's gate supersedes it.
+      (`.grok/rules/tests-benchmarks.md`); 64B's gate supersedes it.
 - [ ] Docs updated; `zig build verify` passes.

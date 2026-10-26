@@ -47,10 +47,10 @@ observer's environment; low-volume transition events feed audio and camera.
   (Slices 74, 75).
 - Tint split: Slice 60 owns the GPU mechanism (`SceneGrade`, composite);
   this slice owns the pure environment → grade mapping in `src/game/`.
-  The renderer knows nothing of time or weather (`.claude/rules/render.md`).
+  The renderer knows nothing of time or weather (`.grok/rules/render.md`).
 - The clock advances by an integer per step, never wall clock or frame
   count; paused gameplay runs no steps. Simulation-affecting outputs use
-  integer math and IEEE basic ops only (`.claude/rules/simulation.md` §
+  integer math and IEEE basic ops only (`.grok/rules/simulation.md` §
   Determinism); trig feeds presentation only.
 - Weather is a pure function of time and seed (no stored state), so any time
   skip lands on the weather stepping would reach. Weather rolls draw from
@@ -62,12 +62,12 @@ observer's environment; low-volume transition events feed audio and camera.
 - Sky exposure is a per-level fact set at the level-append seam; Slice 38
   derives it from elevation.
 - One new stage at the front of `stage_order`; perception and AI movement
-  read its resource (`.claude/rules/simulation.md` § One scheduler, declared dependencies). Transition
+  read its resource (`.grok/rules/simulation.md` § One scheduler, declared dependencies). Transition
   events are bounded per step and published as one range.
 - Weather particles extend the existing particle system with drag and wind
   (no fork); a separate presentation pool sized from the authored emitter
   table, so weather never starves debris and overflow drops are counted
-  (`.claude/rules/budgets-capacities.md`). Emission covers the observer's
+  (`.grok/rules/budgets-capacities.md`). Emission covers the observer's
   `sim_view`, never the render window.
 - Persistent: the clock and sky exposure are hashed and saved; derived
   snapshots are excluded (Slices 49 / 46, same change).

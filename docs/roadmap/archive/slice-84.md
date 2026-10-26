@@ -34,14 +34,14 @@ that does not grow with them.
 ### Architecture notes
 
 - A neighbor result is stored at the unit it covers and shared by every
-  requester (`.claude/rules/engine-design.md` § Cost model), built once per
+  requester (`.grok/rules/engine-design.md` § Cost model), built once per
   step. Its order follows its hot queries' filter keys
-  (`.claude/rules/memory-performance.md` § Data-oriented design), so an observer
+  (`.grok/rules/memory-performance.md` § Data-oriented design), so an observer
   never pays for allies or other-level rows to reach a hostile.
-- Neighbor queries use the shared index (`.claude/rules/simulation.md`). The
+- Neighbor queries use the shared index (`.grok/rules/simulation.md`). The
   build sorts, which is per-item work that grows, so it threads with a serial
-  path and bitwise parity (`.claude/rules/threading.md`).
-- Per-query budgets stay fixed counts (`.claude/rules/budgets-capacities.md`).
+  path and bitwise parity (`.grok/rules/threading.md`).
+- Per-query budgets stay fixed counts (`.grok/rules/budgets-capacities.md`).
 - 75 owns indexing the whole population in every band; this index takes any
   population 75 hands it at the same per-row cost.
 
@@ -105,7 +105,7 @@ that does not grow with them.
 - [x] Production per-step and per-change sorts use `core/sort.zig`'s
       whole-element swaps (`320023a`; 43 sites in 22 files at the sweep);
       tests, benches, cold sorts, and the tie-holding `std.mem.sort` sites
-      keep std (`.claude/rules/zig-style.md` § Style).
+      keep std (`.grok/rules/zig-style.md` § Style).
 - [x] Docs: `docs/architecture.md` spatial index;
       `docs/simulation-tiers-and-pipeline.md` stage list.
 - [x] Docs commit: the foundation and checklist describe the landed code.
@@ -147,7 +147,7 @@ that does not grow with them.
 - [x] `spatial_index` at three sizes follows its pass shape with the sort off
       main (184 / 474 / 952 µs tuned at 1,024 / 4,096 / 10,000, `c52a5ff`);
       `perception` and `ai` tuned faster at 2,048 (`3efa1e4`), serial a
-      control there (`.claude/rules/tests-benchmarks.md`).
+      control there (`.grok/rules/tests-benchmarks.md`).
 - [x] `zig build verify` passes (exit 0, and the full test under
       `-Dsanitize-thread=true` exit 0 with no reports, on `908ac83`; docs-only
       changes since).

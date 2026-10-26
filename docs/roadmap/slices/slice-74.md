@@ -10,7 +10,7 @@ terrain and nav, entities, pipeline state, per-step scratch) and releases it
 on destroy; every existing world steps each fixed step whether or not the
 observer is in it; entities (NPCs, and a player when present) move between
 worlds; nothing is shared, capped, or sized across worlds
-(`.claude/rules/budgets-capacities.md`, `docs/architecture.md` § Target
+(`.grok/rules/budgets-capacities.md`, `docs/architecture.md` § Target
 Model).
 
 ### Current foundation
@@ -79,18 +79,18 @@ One world per gameplay state; nothing models a set of worlds.
 
 - Owner direction (2026-10-08): worlds are created and destroyed in play and
   own their storage; everything in every world keeps advancing
-  (`.claude/rules/engine-design.md` § Target scale).
+  (`.grok/rules/engine-design.md` § Target scale).
 - The world set and its stepping live in gameplay (`src/game/`), never in
   `main.zig` or `Engine` conditionals; `SimulationPipeline.update` stays each
-  world's only fixed-step scheduler (`.claude/rules/engine-design.md`
-  § Ownership boundaries, `.claude/rules/simulation.md`).
+  world's only fixed-step scheduler (`.grok/rules/engine-design.md`
+  § Ownership boundaries, `.grok/rules/simulation.md`).
 - Creating a world costs its own content; destroying it releases what it
   held; a step costs the sum of each world's work, never world count ×
   extent. No global or cross-world tables or caps
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Independent worlds step through the thread system with a serial path and a
   fixed merge order; no result depends on worker count or the order worlds
-  finish (`.claude/rules/threading.md`, `.claude/rules/simulation.md`
+  finish (`.grok/rules/threading.md`, `.grok/rules/simulation.md`
   § Determinism). Under 50's reentrancy decision a batch nested in a job runs
   inline, so the design pass chooses where parallelism lives (across worlds,
   within each world, or both) with a cost model for each.
@@ -100,12 +100,12 @@ One world per gameplay state; nothing models a set of worlds.
   all-or-fail; OOM leaves every world intact for retry.
 - Destroying a world never hands renderer, audio, or GPU services to
   gameplay teardown; its GPU resources are released per world through the
-  render boundary (`.claude/rules/engine-design.md` § Ownership boundaries).
+  render boundary (`.grok/rules/engine-design.md` § Ownership boundaries).
 - Presentation (render prep, audio, camera) follows the viewed world; worlds
   without a viewer run simulation only.
 - Creating a world in play is never refused for capacity; 64G retired the
   level-sized load gates (dense GPU budget, nav memory), and no platform check
-  refuses a world (`.claude/rules/budgets-capacities.md`).
+  refuses a world (`.grok/rules/budgets-capacities.md`).
 - Owner decision (2026-10-08): entities (NPCs, and a player when present)
   move between worlds; what identity crosses is decided at the design pass.
 - Needs from 64G: terrain, nav, and links owned per chunk, so a world is
@@ -131,10 +131,10 @@ One world per gameplay state; nothing models a set of worlds.
       each pay the tuner's gate and wake floor, so many small worlds thread
       little or not at all. Pass: a bench at three or more world counts with
       dispatches per pass flat in worlds, results independent of world count
-      per dispatch and of worker count (`.claude/rules/threading.md`).
+      per dispatch and of worker count (`.grok/rules/threading.md`).
 - [ ] The observer (camera focus, or a player when present) and presentation
       bound to the viewed world; a mini view may show another world
-      (`.claude/rules/render.md`); worlds in no view step without
+      (`.grok/rules/render.md`); worlds in no view step without
       presentation at 75's lowest band.
 - [ ] Entities (NPCs, and a player when present) move between worlds at a
       between-step seam.
@@ -146,14 +146,14 @@ One world per gameplay state; nothing models a set of worlds.
 - [ ] Level destroy keeps reachability exact at its own cost: the level's
       connectivity nodes, components, terminals, and closure blocks go with it,
       and the connections its links carried are removed at the reachability
-      maintenance cost (`.claude/rules/budgets-capacities.md`), never a
+      maintenance cost (`.grok/rules/budgets-capacities.md`), never a
       world-wide rebuild.
 - [ ] The per-world step itself runs the commit seam, so every world (and any
       second gameplay state) runs the same order with no caller to replicate
-      (`.claude/rules/engine-design.md` § Target scale: every world advances,
+      (`.grok/rules/engine-design.md` § Target scale: every world advances,
       worlds are created and destroyed in play; § Ownership boundaries:
       gameplay sequencing lives in the pipeline's controllers, not a state;
-      `.claude/rules/simulation.md` § One scheduler). Today the seam is
+      `.grok/rules/simulation.md` § One scheduler). Today the seam is
       `SimulationPipeline.commitStructuralAndReact`
       (`simulation_pipeline.zig:1358`) but `GameDemoState` calls it after the
       step (`game_demo_state.zig:634`), so the step is not self-contained.
@@ -164,7 +164,7 @@ One world per gameplay state; nothing models a set of worlds.
       `commitStaticsForTest` (`steering/test_support.zig:97-111`) still copies
       the collider reserve, commit, capture, and sync, so its users
       (`avoidance.zig:623`, `:750`; `steering/system.zig:861`) pass on an old
-      order (`.claude/rules/tests-benchmarks.md` § Tests). Pass: the per-world
+      order (`.grok/rules/tests-benchmarks.md` § Tests). Pass: the per-world
       step runs the seam; the demo state's call and the fixture copy go; every
       caller steps through it.
 - [ ] A world's create-time memory follows its content. Failure scenario:
@@ -186,7 +186,7 @@ One world per gameplay state; nothing models a set of worlds.
       `DataSystem.applyStructuralCommands` outside the commit seam (`:377`),
       syncing only the population seam (`:398`), and the `stacked` shape
       writes `always_active` and `stagger_phase` itself (`:386-387`)
-      (`.claude/rules/tests-benchmarks.md` § Tests). Failure scenario: a
+      (`.grok/rules/tests-benchmarks.md` § Tests). Failure scenario: a
       change to the spawn defaults or the seam order drifts the census with no
       failure. Pass: the bench sets no post-create field itself; it calls the
       production function that does, and commits through the moved seam.
@@ -205,7 +205,7 @@ One world per gameplay state; nothing models a set of worlds.
 
 - [ ] `world-instances` matches the cost model: create and destroy follow the
       world's own content, and one world's step cost is flat in world count
-      (`.claude/rules/tests-benchmarks.md`).
+      (`.grok/rules/tests-benchmarks.md`).
 - [ ] Manual (display, Debug): a second world created in play steps beside
       the first while only one is viewed, then is destroyed and its memory
       returns.

@@ -41,14 +41,14 @@ preferences, never save data and never simulation input (Ground Rules).
 
 - Settings live in `settings.zon` under the pref dir; Slice 46 has no
   settings section. A settings value never feeds simulation state or the
-  checksum (`.claude/rules/simulation.md` § Determinism).
+  checksum (`.grok/rules/simulation.md` § Determinism).
 - The store is an `Engine` field, never a global; methods that do I/O take
-  the user-storage owner explicitly (`.claude/rules/engine-design.md`).
+  the user-storage owner explicitly (`.grok/rules/engine-design.md`).
   User-storage (pref dir, bounded read, atomic write, rejected-file backup)
   is one app-layer owner that Slices 46 and 66A reuse.
 - The schema grows by appending fields, each with its consumer and an
   upgrade step, bumping relative to the live value (Table T2,
-  `.claude/rules/simulation.md` § Persistent data). Every field has a
+  `.grok/rules/simulation.md` § Persistent data). Every field has a
   runtime consumer; no field is added for a future slice.
 - Load never fails init: a missing file gives defaults; any rejection
   backs up the file and uses defaults with one warning; an unavailable pref
@@ -59,7 +59,7 @@ preferences, never save data and never simulation input (Ground Rules).
 - Saves run only on explicit request (leaving settings dirty, reset, rebind
   commit) and at shutdown, never per frame. The payload is tiny and fixed,
   so the write is a cold main-thread action; it is not a scaling workload
-  (`.claude/rules/threading.md`).
+  (`.grok/rules/threading.md`).
 - App identity: one human org string and the existing app name name the
   pref path (SDL requires they never change once shipped); the packaged
   bundle id derives from them, with an explicit `-Dbundle-id` still winning.
@@ -102,7 +102,7 @@ preferences, never save data and never simulation input (Ground Rules).
       user storage; `docs/state-stack-and-input.md` settings and pause
       menus; `docs/development-workflow.md` org option, identity table,
       settings locations, reset; Table T2 v1; `src/tests.zig`.
-- [ ] Add the settings-field append rule to `.claude/rules/input-state.md`
+- [ ] Add the settings-field append rule to `.grok/rules/input-state.md`
       when this lands.
 
 ### Acceptance checks

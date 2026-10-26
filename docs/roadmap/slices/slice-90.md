@@ -58,16 +58,16 @@ the detected machine's measured floor, not from one host's numbers.
 
 ### Constraints
 
-- Threading and the wake protocol: `.claude/rules/threading.md`; a `ThreadSystem` change
+- Threading and the wake protocol: `.grok/rules/threading.md`; a `ThreadSystem` change
   merges only after a clean ThreadSanitizer run (§ Verification and diagnostics).
 - Thresholds derive from the cost of the operation they gate, never world size
-  (`.claude/rules/budgets-capacities.md`); a change to one states its benefit against
+  (`.grok/rules/budgets-capacities.md`); a change to one states its benefit against
   hot-path cost and determinism.
-- Serial == threaded results (`.claude/rules/tests-benchmarks.md`); calibration reads
+- Serial == threaded results (`.grok/rules/tests-benchmarks.md`); calibration reads
   only timing and never changes simulation results.
 - No calibration cache file (slice 50, owner 2026-10-15): the engine measures at run time.
-- Cost model before code (`.claude/rules/engine-design.md` § Cost model); validation modes
-  and targeted groups: `.claude/rules/build-validation.md`.
+- Cost model before code (`.grok/rules/engine-design.md` § Cost model); validation modes
+  and targeted groups: `.grok/rules/build-validation.md`.
 
 ### Checklist
 
@@ -116,8 +116,8 @@ the detected machine's measured floor, not from one host's numbers.
       `07b9c9a`); 16,384 leaves 1-4 unsettled before and after (collision, steering, scope,
       pathfinding stages; pre-existing). Hypothesis, untested: the stages sit at the lower
       gate, where the settled-window rules flap. Failure scenario: the tuned case is not
-      judged (`.claude/rules/tests-benchmarks.md`) and the stage re-probes forever
-      (`.claude/rules/threading.md` § Building a stage). Pass: they settle, or are merged or
+      judged (`.grok/rules/tests-benchmarks.md`) and the stage re-probes forever
+      (`.grok/rules/threading.md` § Building a stage). Pass: they settle, or are merged or
       removed per `threading.md`.
 - [ ] Owner runs on macOS and Windows (owner 2026-10-25: the engine targets Linux, macOS,
       and Windows; owner tests this week). Those builds use the portable per-worker wake
