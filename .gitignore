@@ -11,3 +11,4 @@ source_assets/
 .claude/settings.local.json
 .claude/worktrees/
 .claude/reports/
+.grok/reports/

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "search_replace|write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zig-fmt.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
