@@ -25,12 +25,12 @@ fixture and grouped by chunk only if they cost there.
   clamp top (`startClampTrial`, `:771`) and the EMA seeds from a median of 3
   (`:170`). A fresh `full_pool` tuner's first selection is 2 batches per
   participant (`:189`, `:361`). Policy: `docs/architecture.md` § Thread System.
-- Dispatch posts each active worker's wake in turn on main
-  (`thread_system.zig:1353-1356`); main starts its own ranges after the loop
-  (`:1370`). A tree wake was measured slower and is not pursued (slice 50
-  § Measured and not pursued, owner 2026-10-15).
-- `threaded_batch_ns` is 60_000 (`thread_system.zig:127`), set from the measured
-  dispatch floor in `58ff9e1`; it stays (`49620d9`).
+- Dispatch flips the active workers' wake bits and wakes once per wake word
+  (slice 90, `07b9c9a`; `thread_system.zig:1513`); it was a per-worker semaphore
+  post when measured below. A tree wake was measured slower and is not pursued
+  (slice 50 § Measured and not pursued, owner 2026-10-15).
+- The gate (`threaded_batch_ns`) was 60_000, set from the measured dispatch floor in
+  `58ff9e1`; slice 90 (`776c1ec`) calibrates it at startup. Numbers below are at 60_000.
 - World gate: `systems/world_gate.zig` `gateRange` (`:250`) walks movement rows in
   store order; plane entry gathers per slice 88's plane-entry item. The bench's
   `scattered` / `scattered-sorted` pair (`benchmarks/world_gate.zig`) holds the

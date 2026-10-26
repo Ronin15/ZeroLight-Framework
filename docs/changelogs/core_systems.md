@@ -266,6 +266,26 @@ labelled.
   broadcast wake cut the full-pool dispatch floor 26.9 to 17.2 us
   (`thread-fixed-auto` 16,384, 3 runs); no gain at 15 active workers;
   `production-step` within spread. Docs only.
+- `07b9c9a`: toggle-bit wake words (slice 90). Each worker owns one bit of a
+  cache-line wake word (32 per word on Linux, one per word elsewhere); a dispatch
+  XORs the active workers' bits in with a release store and wakes once per word
+  (`FUTEX_WAKE_BITSET` on Linux, `std.Io`'s futex elsewhere). Shared batch state
+  is three blocks (384 B); `batch_generation`, `Descriptor.generation`, and the
+  per-worker semaphore wake are gone (the semaphore stays as the startup permit).
+  ReleaseFast `thread-dispatch` `thread-fixed-auto` 16,384 (23 workers) 26.0 to
+  16.3 us, 1,024 (15 workers) 19.0 to 14.3 us (3 interleaved reps, warmup 5 /
+  iterations 30); `thread-fixed-1` within spread. TSan clean.
+- `776c1ec`: startup calibration (slice 90). `ThreadSystem.init` times a no-op
+  job at one worker and at the full pool (8 warm-up + 31 dispatches each, median);
+  `ThreadCalibration.fromFloors` derives the gate (`58ff9e1`'s rule, 2 x the
+  full-pool floor), the participant-overhead prior, and its sample floor; tuners
+  read them through `AdaptiveWorkRequest`. The 60 us gate, 1 us prior, and 100 ns
+  sample floor are deleted; an explicit `threaded_batch_ns` overrides. 23 workers:
+  calibration 1.21 ms, ReleaseFast gate 32.9-37.4 us. ReleaseFast tuned
+  `production-step` 4,096 280.8 to 234.6 us (faster), 16,384 653.7 to 578.1 us
+  (within spread), `world-gate` 65,536 127.9 to 127.8 us (3 reps; warmup 360 /
+  iterations 300 for `production-step`). Open (slice 90): three tuners stay
+  unsettled at `production-step` 4,096 in 2 of 3 runs.
 
 ## Other Changes
 
@@ -414,3 +434,5 @@ labelled.
 - `a7278ca` Rules: no whole-suite bench runs unless the owner asks.
 - `8bfdbfc` Thread system: a judged jump covers its count band and reopens on evidence.
 - `bc336f4` Bench: world-gate scattered and scattered-sorted shapes measure store order.
+- `07b9c9a` Thread system: toggle-bit wake words wake exactly the active workers.
+- `776c1ec` Thread system: startup calibration derives the gate and overhead prior per machine.

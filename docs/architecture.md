@@ -496,11 +496,10 @@ caller (O(1) for the owner, O(workers) for any other thread):
   build mode: the selected profile's ranges, or the untuned fixed shape when
   none is given, never consulting or recording a tuner (`Dispatch.select` and
   `RoundDispatch` included). The range set and indices are kept, so output
-  stays deterministic. Forced inline sets `BatchStats.forced_inline`, adds to
-  `forcedInlineBatchCount()`, and logs one warning per system lifetime, in
-  shipped builds too. On a worker its ranges count as worker ranges with
-  `ran_inline` set, so a proof that a batch ran on workers checks
-  `!ran_inline`;
+  stays deterministic. Forced inline sets `BatchStats.forced_inline`, which
+  benches assert is false on the stages they measure. On a worker its ranges
+  count as worker ranges with `ran_inline` set, so a proof that a batch ran on
+  workers checks `!ran_inline`;
 - any other thread (a participant of a different `ThreadSystem` included)
   panics in every build mode before touching shared or tuner state. Slice
   51's lane thread is foreign, so lane jobs run serial code paths
@@ -510,13 +509,15 @@ Workers name themselves `zl-worker-<index>` after their startup permit
 (Darwin can name only the calling thread); the main thread is never renamed,
 since on Linux that renames the process.
 
-Shared batch state is four blocks, each one `std.atomic.cache_line` (128 B on
-x86_64 and aarch64; comptime asserts pin the layout, 512 B per system;
+Shared batch state is three blocks, each one `std.atomic.cache_line` (128 B on
+x86_64 and aarch64; comptime asserts pin the layout, 384 B per system;
 `.claude/rules/threading.md`): the descriptor (written only by main: `io`,
-`accepting_work`, the published batch), the claim (`next_range` alone), the
-completion state (`pending`, `worker_ranges`, the `done` event), and a cold
-control block (the forced-inline counter and warning flag). Each participant
-copies the batch into a private `BatchView` once and counts its ranges
+`accepting_work`, the published batch), the claim (`next_range` alone), and
+the completion state (`pending`, `worker_ranges`, the `done` event). Wake
+words (`WakeWord`) are one cache line each, written only by main and built at
+init beside the shared state (freed at `deinit`): each worker owns one bit of
+one word. On Linux a word serves 32 workers (`wake_block_width`); elsewhere
+each worker has a word of its own. Each participant copies the batch into a private `BatchView` once and counts its ranges
 locally; a worker adds its count to `worker_ranges` once, main keeps its own.
 The claim is the claim loop's only atomic RMW.
 
@@ -524,25 +525,34 @@ Dispatch is lock-free:
 
 - publish: main writes the descriptor and resets `next_range`,
   `worker_ranges`, `pending` (active workers + 1, main included), and `done`;
-  then, per counted worker, it stores that worker's `batch_generation`
-  (release) and posts its semaphore;
-- worker: after the wake it loads `accepting_work`, then its generation
-  (acquire). An unchanged generation (a stale permit, or a wake for a batch
-  that did not count it) reads nothing shared and waits again. Otherwise it
-  runs its first range (worker *i* runs range *i* − 1), claims the rest, adds
-  its range count, and decrements `pending` (acq_rel); the last finisher sets
-  `done`;
+  then, per wake word holding a counted worker, it XORs the counted workers'
+  bits into the word in one store (release) and issues one wake for those bits
+  (`WakeWordOps.post`): `FUTEX_WAKE_BITSET` with that mask on Linux, a plain
+  `std.Io` futex wake of the word's one worker elsewhere;
+- worker: it loads its word (acquire) and runs only when its bit differs from
+  the value it last ran (`WakeWordOps.awaitFlip`); otherwise it waits on the
+  word with the loaded value (and its bit, on Linux). A spurious wake, or a
+  wake whose flip was another worker's, reads nothing shared and waits again.
+  After a flip it checks `accepting_work`, then runs its first range (worker
+  *i* runs range *i* − 1), claims the rest, adds its range count, and
+  decrements `pending` (acq_rel); the last finisher sets `done`. A worker's
+  bit flips again only after it has decremented the batch that flipped it, so
+  at most one flip is outstanding and no counter wraps;
 - join: main claims ranges too, then decrements; it waits on `done` only when
   it was not last;
-- shutdown: `accepting_work` stored false (release), then one counted permit
-  per worker before the join.
+- shutdown: `accepting_work` stored false (release), then every worker's bit
+  flipped and woken before the join. The one startup permit per worker
+  (`WorkerRecord.start`, a semaphore) is the only semaphore left.
 
-Workers park on their semaphore after every batch. Spin-within-step-then-park
+Workers park on their wake word after every batch. Spin-within-step-then-park
 was measured and rejected (`13a2a67`): at the release shape it saved 0.04–0.07
 ms per step (within spread) while roughly doubling worker CPU and slowing
-main's serial work 9–41% from a waiting SMT sibling. The flat wake floor is
-about 6.6 µs + 0.9 µs per worker in ReleaseFast, 8.5 µs at 1 worker to 29.8 µs
-at 23 in Debug (`7946511`).
+main's serial work 9–41% from a waiting SMT sibling. Measured dispatch floor
+(`thread-dispatch` `thread-fixed-auto`, ReleaseFast `-Dcpu=x86_64_v2`, 23
+workers, 3 interleaved reps, warmup 5 / iterations 30): 16,384 items (23 active
+workers) 26.0 µs with a semaphore post per worker, 16.3 µs with wake words
+(`07b9c9a`); 1,024 items (15 active) 19.0 to 14.3 µs. The startup calibration
+below measures the floor of the machine it runs on.
 
 Adaptive work tuning is a batch tuner: `AdaptiveWorkTuner` decides inline or
 threaded, and for a threaded stage tunes one value, the batch count; workers
@@ -638,13 +648,29 @@ bench settle census reads); benches report them as deltas over the measured
 window. The counters compile to nothing in ReleaseFast and
 ReleaseSmall and no policy reads them.
 
-The gate, `threaded_batch_ns` (60 µs), is a probe floor: an inline window median
-below it settles inline without probing, and it bounds demotion and restore. It
-never decides that threading wins; that is measured on the host, where a first
-threaded profile commits only at the 5% commit margin. Derivation (`58ff9e1`):
-break-even is T ≥ F / (0.95 − 1/P) for dispatch floor F at P participants, and
-60 µs is twice the measured Debug full-pool floor, so a batch at the gate clears
-the margin at every worker count.
+The gate is a probe floor: an inline window median below it settles inline
+without probing, and it bounds demotion and restore. It never decides that
+threading wins; that is measured on the host, where a first threaded profile
+commits only at the 5% commit margin. The gate is calibrated at startup
+(`ThreadSystem.calibration`, null with no workers): `init` spawns the workers,
+then `calibrate` times a no-op job through `runThreadedBatch`, the runner
+stages use, at one active worker (2 ranges) and at the full pool (W + 1 ranges),
+8 warm-up and 31 timed dispatches each, taking the median (W = 1 measures
+once). `ThreadCalibration.fromFloors` models the floor as linear in active
+workers, F(A) = F1 + b (A − 1) with b = (F_W − F1) / (W − 1), and derives the
+gate by `58ff9e1`'s rule: break-even is T ≥ F / (0.95 − 1/P) for dispatch floor
+F at P participants, and the gate is 2 × F_W, raised only where that check
+fails at some active count. The participant-overhead prior is max(b, 1 ns) and
+the floor on each learned overhead sample is 0.1 × the prior. Every tuner
+reads them through `AdaptiveWorkRequest.calibration` (`gateNsFor`); a
+`threaded_batch_ns` set in `AdaptiveWorkTunerConfig` overrides the gate (tests
+and benches). Calibration reads only timing and picks dispatch shapes, never
+simulation state, and runs once. The init debug line reports
+`dispatch_floor_ns`, `one_worker_floor_ns`, `worker_wake_ns`, `gate_ns`,
+`participant_overhead_ns`, and `calibration_ns`. Measured on the 23-worker dev
+host (init line, `thread-dispatch`): calibration 1.21 ms in Debug and
+ReleaseFast (one run each); ReleaseFast floors F_W 16.5–18.7 µs and F1
+4.8–6.0 µs, gate 32.9–37.4 µs (4 runs); Debug gate 37.6–49.1 µs (3 runs).
 
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
