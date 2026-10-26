@@ -2,8 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: the core-branch review work (`f4c4844`); runs first in the core branch, ahead of 86, 85, 35's tile gate, 87, and 88 · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: programming landed (`f3ee24c`, `6b7138e`, `8bfdbfc`, `bc336f4`); six items stay open
-as recorded data (owner 2026-10-25: recorded, not chased).** Owner 2026-10-23: a slice for the
+**Status: programming landed (`f3ee24c`, `6b7138e`, `8bfdbfc`, `bc336f4`); five items stay open
+as recorded data (owner 2026-10-25: recorded, not chased); the wake-posting item moved to
+[slice 90](slice-90.md).** Owner 2026-10-23: a slice for the
 world-gate and batch-tuner follow-ups. Ordered first in the core branch (owner delegated to the
 criteria 2026-10-24): its tuner fixes change how every later slice's tuned cases are judged
 (`.claude/rules/tests-benchmarks.md` § Benchmarks). The `750ce0a` baseline predates its tuner
@@ -34,6 +35,11 @@ fixture and grouped by chunk only if they cost there.
   store order; plane entry gathers per slice 88's plane-entry item. The bench's
   `scattered` / `scattered-sorted` pair (`benchmarks/world_gate.zig`) holds the
   same gated rows in random store order against `(level, chunk)` order.
+- Measured (`production-step` 1024-side, 8 levels, ReleaseFast
+  `-Dcpu=x86_64_v2`, one run each, this host): 4,096 population serial 318.8 us,
+  tuned 329.4 us, 0.5 threaded dispatches per step (collision 121 us, steering
+  78 us, and world gate 38 us run inline under the 60 us gate); 16,384 serial
+  1.30 ms, tuned 658.2 us, 9 threaded dispatches per step at 26-50 us each.
 - Fixed controls: every group with fixed cases also runs `thread-clamp-range`
   (`batches_per_participant = max_batch_multiplier`, `docs/development-workflow.md`
   § Benchmarks).
@@ -100,17 +106,12 @@ fixture and grouped by chunk only if they cost there.
       best control; the world-create surface phase within spread of `4998400`
       in Debug or reported as Debug overhead with the ReleaseFast confirmation;
       serial == threaded. Merged: slice 50's first-shape item.
-- [ ] Wake posting does not delay main's ranges. Measured: main posts 23 wakes
-      in 22-27 us (RF, `.claude/reports/world-gate-rf-debug.md`); on small
-      batches main gets no range (`slice89-seed-landing.md` trace). A tree wake
-      was measured slower (slice 50 § Measured and not pursued, `7946511`).
-      Interleaved posting or a broadcast wake is a `ThreadSystem` wake-protocol
-      change and an owner design question; recorded, not chased. Pass: a
-      dispatch start-skew counter in `thread-dispatch` `--details` (behind the
-      perf switch); skew measured down in ReleaseFast at 1,024 and 16,384 items
-      and at `world-gate` 65,536; serial == threaded; ThreadSanitizer clean
-      (`.claude/rules/threading.md` § Verification); the targeted groups a
-      `ThreadSystem` change can move.
+- [x] Wake posting does not delay main's ranges: moved to [slice 90](slice-90.md)
+      (owner 2026-10-25, with startup calibration). Measured: main posts 23 wakes
+      in 22-27 us (RF, `.claude/reports/world-gate-rf-debug.md`); a broadcast
+      wake cut the full-pool dispatch floor 26.9 -> 17.2 us in a scratch version
+      (`.claude/reports/slice89-wake-diag.md`). Data and pass conditions are in
+      slice 90.
 - [ ] World gate access order under the data rules
       (`.claude/rules/memory-performance.md` § Data-oriented design,
       `.claude/rules/engine-design.md` § Target scale: the chunk is the unit).

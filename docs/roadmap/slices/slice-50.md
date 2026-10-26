@@ -196,7 +196,7 @@ Owner-ruled 2026-10-15; none is an open item.
   pure park keeps race-to-idle (`13a2a67`).
 - Startup calibration of wake and post costs (a derived gate, a calibrated
   predictor floor, a range count from claim cost): stopped before landing to
-  keep the branch stable; the 60 µs derived default stays, and each host's
-  threading decisions are measured against the commit margin.
+  keep the branch stable. The owner reversed the hold 2026-10-25 (the
+  `ThreadSystem` is stable); it is [slice 90](slice-90.md)'s checklist.
 - A per-machine calibration cache file: no saved file; the engine measures
   at run time or uses a good default.

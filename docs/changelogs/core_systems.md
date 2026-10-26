@@ -257,6 +257,15 @@ labelled.
   tuned cases over 25% behind the best control 40 to 24, the rest Debug
   overhead or open in the slice (fresh first pick, wake posting, world-gate
   order, drain and elastic-ramp, unsettled tuners, link-fold inline).
+- Owner decisions 2026-10-25: slice 89 closes as committed and its wake-posting
+  item moves to the new slice 90. Slice 50's hold on startup calibration is
+  reversed (the `ThreadSystem` is stable): the wake protocol and a startup
+  calibration derive the gate (`threaded_batch_ns`) and the participant-overhead
+  prior from the detected machine's measured full-pool floor (`58ff9e1`'s rule,
+  gate = 2 x floor). Measured (scratch, ReleaseFast `-Dcpu=x86_64_v2`): a
+  broadcast wake cut the full-pool dispatch floor 26.9 to 17.2 us
+  (`thread-fixed-auto` 16,384, 3 runs); no gain at 15 active workers;
+  `production-step` within spread. Docs only.
 
 ## Other Changes
 
