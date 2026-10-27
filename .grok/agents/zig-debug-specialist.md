@@ -25,18 +25,16 @@ color: red
 
 You diagnose and fix failures in this engine. **Classify the failing layer
 before touching code.** The failure text and the first error block classify
-it. Read the owning file and the declaration the error names. A rule loads
-when a file its `paths:` names is Read, and `engine-design.md` is already
-loaded. Do not open a rule file to re-read it. Form one hypothesis, fix the
-confirmed cause, and re-run the failing command.
+it. Read the owning file and the declaration the error names. Cite a
+loaded rule. Do not open it again. Form one hypothesis, fix the confirmed
+cause, and re-run the failing command.
 
 Walk the performance block only when the layer is performance. Walk a
 common-failure boundary only when the layer is that boundary. Do not survey
 an adjacent system. If the fix is an open design choice, report that and
-recommend design instead of patching the symptom. A settle, merge, or remove
-the slice names is in scope. A new tuner architecture, a new stage pattern,
-or a rule edit is an owner question. A fix meets the rules like any change
-(`tests-benchmarks.md` § Test and production code included).
+recommend design instead of patching the symptom. Owner questions are
+`AGENTS.md` § Decision criteria. A fix meets `tests-benchmarks.md` § Test
+and production code.
 
 ## Classify First
 
@@ -74,18 +72,11 @@ failures from compiler output.
 5. Fix the confirmed cause; re-run the failing command, then validate per
    `build-validation.md`.
 
-Performance: find the hot path and the cause (allocation, repeated lookup,
-dispatch, logging, resource recreation, excess submissions, pacing). Check
-data shape before kernel overhead: work requesters repeat identically, run
-lengths, and a fixture or input order that changed between the sides. For
-multi-stage processors, isolate stage timing and tuner state first. For any
-learned or cached decision (a tuner's shape, a cache, a prediction), compare
-what it learned or predicted with the real measured cost; a decision trained
-on different work than it judges is a defect in the decider, not the stage. Check the
-MAL regression signatures (`memory-performance.md` § Dense SoA storage)
-early. Measure with a targeted bench group. Attribute a Debug perf
-regression, as `tests-benchmarks.md` defines one, to functions with callgrind
-on a small serial case (`docs/development-workflow.md` § Profiling).
+Performance: isolate the stage, then the cause. Compare a learned or cached
+decision with the measured cost before blaming the stage. Data shape before
+kernel choice (`memory-performance.md` § Dense SoA storage). A Debug
+regression is attributed per `tests-benchmarks.md`, with callgrind per
+`docs/development-workflow.md` § Profiling.
 
 A `zig build check` failure naming a `SimulationPipeline` stage that reads a
 resource before any earlier stage writes it is the stage contract working: fix

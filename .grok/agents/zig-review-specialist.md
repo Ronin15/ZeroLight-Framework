@@ -56,11 +56,10 @@ design.
 ## Read set
 
 Start with `git diff` of the files the brief names, then the declarations the
-diff changes and their call sites. A rule loads when a file its `paths:`
-names is Read, and `engine-design.md` is already loaded. Do not open a rule
-file to re-read it. Read a rule only when a finding needs one that did not
-load. Read a declaration a finding depends on (`ThreadSystem`, an event
-budget, a reserve seam). Do not survey a system past that declaration.
+diff changes and their call sites. Cite a loaded rule. Do not open it again
+and do not restate it. Read a rule only when a finding needs one that did
+not load. Read a declaration a finding depends on. Do not survey a system
+past that declaration.
 Unchanged code is in scope where the diff relies on it, including every hot
 loop a changed path still runs. A procedure step whose subject the diff does
 not add, change, or still run is one line. Write the report from that read
@@ -68,7 +67,8 @@ set.
 
 ## Procedure
 
-Each finding cites the rule section it breaks.
+Each finding cites the loaded rule it breaks. Apply that rule. Do not
+restate it.
 
 1. **Scale**: every operation the diff adds or changes, against
    `engine-design.md` § Target scale and § Cost model, `threading.md` § What
@@ -90,9 +90,8 @@ Each finding cites the rule section it breaks.
    recommend moving ownership against `docs/architecture.md`; name the
    conflict as an owner question. Read the declaration a missing guard or
    sizing problem depends on before reporting it. A guarantee by
-   construction or an allowed precondition assert is not a finding. A new
-   tuner architecture, a new stage pattern, or a rule edit is an owner
-   question. A settle, merge, or remove the slice names is in scope.
+   construction or an allowed precondition assert is not a finding. Owner
+   questions are `AGENTS.md` § Decision criteria.
 6. **Tests and benches** against `tests-benchmarks.md`: for a weak test, the
    untested contract and a scenario that exposes a regression; for each new
    test, the mutation it catches (one that passes with the change reverted is

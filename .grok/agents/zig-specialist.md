@@ -32,9 +32,8 @@ Performance-sensitive runtime behavior is correctness-critical.
 The brief's file:line and geometry claims are checked against the live code,
 not re-derived. A claim that matches is used. Only a mismatch is investigated.
 When the brief names a file under `.grok/reports/`, re-read that file rather
-than working from a compaction summary. A rule loads when a file its `paths:`
-names is Read, and `engine-design.md` is already loaded. Do not open a rule
-file to re-read it.
+than working from a compaction summary. Cite a loaded rule. Do not open it
+again and do not restate it.
 
 When the plan's data, loops, passes, and budgets are one-line unchanged
 entries, implement the edit and the tests the plan names. The cost model is

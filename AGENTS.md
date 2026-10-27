@@ -50,8 +50,12 @@ decision criteria, and reports.
   the cost-model questions. It cites a plan and lists only its overrides;
   every fact in it is checked against live code or a cited source, and a
   hypothesis is labelled one; every validation step and bench size it names
-  exercises the changed code. A review brief names the diff, its sources,
-  and what to check, never anyone's conclusions.
+  exercises the changed code. When the owner already exists, the first line
+  says so and the brief names the line ranges to read. It states the
+  decision and does not tour the module. A review brief names the diff, its
+  sources, and what to check, never anyone's conclusions.
+- Agents cite a loaded rule by name. They do not open it again and do not
+  restate it. A repeated constraint belongs in `.grok/rules/`.
 - **Design** (`zig-design-specialist`) only when a design is open or the
   structure fails the cost model, right before implementation. A known fix or
   a call already made goes straight to `zig-specialist`.

@@ -12,8 +12,10 @@ description: >-
 
 # Zig Workflows (Grok-native)
 
-The pipeline is `AGENTS.md` § Agent Pipeline. Agents are `.grok/agents/`.
-Presets are [references/module-presets.md](references/module-presets.md).
+The constraints are `.grok/rules/`. The pipeline is `AGENTS.md` § Agent
+Pipeline. Agents are `.grok/agents/`. Presets are
+[references/module-presets.md](references/module-presets.md). This file only
+routes and bounds the read.
 
 Do not restate a rule or the brief in a spawn prompt. Agents load `AGENTS.md`.
 The brief file is the child's whole task. The prompt cites that path.
@@ -34,13 +36,9 @@ test fix stays inline.
 | The slice's programming is done | Docs |
 | Pathfinder / best-practices / deep-correctness / architecture | That skill |
 
-A decision inside an existing owner adds no stored result, hot loop, pass, or
-budget. The brief's first line says the owner already exists. The brief
-states the decision, the measurement that decides, the measurement that
-reopens it, the proof, and the line ranges to read. It does not list a file
-tour or a host log. The agent reads those ranges and writes the plan from
-that code. A settle, merge, or remove the slice names is that design. A new
-tuner architecture, a new stage pattern, or a rule edit stops for the owner.
+A short-path brief is `AGENTS.md` § Briefs. The agent reads the named ranges
+and writes the plan from that code. Owner questions are `AGENTS.md`
+§ Decision criteria.
 
 When unsure, implement. Review a substantive diff. Debug a failing command.
 

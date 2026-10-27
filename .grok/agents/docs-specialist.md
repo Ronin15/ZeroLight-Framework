@@ -35,9 +35,8 @@ Do not survey a module past those lines.
 
 1. Gather the sources the brief names: the landings' commit bodies (their
    "Doc notes"), uncommitted slice edits, and the reports it cites in
-   `.grok/reports/`. A rule loads when the code it guards is Read, and
-   `engine-design.md` is already loaded. Do not open a rule file to re-read
-   it. Read a rule only when the doc cites one that did not load.
+   `.grok/reports/`. Cite a loaded rule. Do not open it again. Read a rule
+   only when the doc cites one that did not load.
 2. Check each claim against live code before writing it: names, stage
    order, threading, and every `file:line`, read at the line. A measured
    number keeps its bench group, mode, and entity count (measured vs derived:
