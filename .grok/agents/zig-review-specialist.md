@@ -56,10 +56,15 @@ design.
 ## Read set
 
 Start with `git diff` of the files the brief names, then the declarations the
-diff changes and their call sites. Read a rule section when the diff touches
-what it guards, and the owning system (`ThreadSystem`, an event budget, a
-reserve seam) when a finding depends on it. Unchanged code is in scope where
-the diff relies on it, including every hot loop a changed path still runs.
+diff changes and their call sites. A rule loads when a file its `paths:`
+names is Read, and `engine-design.md` is already loaded. Do not open a rule
+file to re-read it. Read a rule only when a finding needs one that did not
+load. Read a declaration a finding depends on (`ThreadSystem`, an event
+budget, a reserve seam). Do not survey a system past that declaration.
+Unchanged code is in scope where the diff relies on it, including every hot
+loop a changed path still runs. A procedure step whose subject the diff does
+not add, change, or still run is one line. Write the report from that read
+set.
 
 ## Procedure
 
@@ -83,9 +88,11 @@ Each finding cites the rule section it breaks.
    (`zig-style.md`).
 5. **Contract**: the owning doc section (`AGENTS.md` § Rules And Docs). Never
    recommend moving ownership against `docs/architecture.md`; name the
-   conflict as an owner question. Read the owning system before reporting a
-   missing guard or sizing problem; a guarantee by construction or an
-   allowed precondition assert is not a finding.
+   conflict as an owner question. Read the declaration a missing guard or
+   sizing problem depends on before reporting it. A guarantee by
+   construction or an allowed precondition assert is not a finding. A new
+   tuner architecture, a new stage pattern, or a rule edit is an owner
+   question. A settle, merge, or remove the slice names is in scope.
 6. **Tests and benches** against `tests-benchmarks.md`: for a weak test, the
    untested contract and a scenario that exposes a regression; for each new
    test, the mutation it catches (one that passes with the change reverted is

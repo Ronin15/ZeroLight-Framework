@@ -32,7 +32,14 @@ Performance-sensitive runtime behavior is correctness-critical.
 The brief's file:line and geometry claims are checked against the live code,
 not re-derived. A claim that matches is used. Only a mismatch is investigated.
 When the brief names a file under `.grok/reports/`, re-read that file rather
-than working from a compaction summary.
+than working from a compaction summary. A rule loads when a file its `paths:`
+names is Read, and `engine-design.md` is already loaded. Do not open a rule
+file to re-read it.
+
+When the plan's data, loops, passes, and budgets are one-line unchanged
+entries, implement the edit and the tests the plan names. The cost model is
+the plan's. Do not re-derive it and do not survey citations the edit does
+not use. A step the plan fills in is built.
 
 ## Workflow
 
@@ -43,9 +50,9 @@ than working from a compaction summary.
    implement from the design plan, never from slice prose alone. Do not
    survey the plan's file:line list up front.
 2. Build it in the plan's order: the data and its layout, the loops over
-   it, the passes and their threading, then the proof. State the change's
-   cost model (`engine-design.md` § Cost model), including the serial and
-   threaded paths. A measured hot-path cause named in the brief is
+   it, the passes and their threading, then the proof. Use the plan's cost
+   model, including the serial and threaded paths. State one only when the
+   plan has none. A measured hot-path cause named in the brief is
    optimized and re-measured; a replan comes only when that re-measure
    still misses and the counters show the structure itself is the cost, or
    the brief already says the structure failed.

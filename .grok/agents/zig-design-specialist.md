@@ -38,8 +38,10 @@ is only for your plan file (Output).
 - Start from the files, declarations, and cost-model questions the brief
   names. Read those, and the owning doc section that covers them
   (`docs/architecture.md`; `docs/simulation-tiers-and-pipeline.md` only when
-  the change touches frame streams, events, or structural commands). Read a
-  rule file when a step below touches it. Do not read the roadmap index,
+  the change touches frame streams, events, or structural commands). A rule
+  loads when a file its `paths:` names is Read, and `engine-design.md` is
+  already loaded. Do not open a rule file to re-read it. Read a rule only
+  when a step needs one that did not load. Do not read the roadmap index,
   track files, or every rule up front. For a slice, the slice file's goal
   and architecture notes are the fixed inputs. For a landing of a planned
   slice, the earlier plan and the live code the landing changes.
@@ -54,11 +56,33 @@ is only for your plan file (Output).
   touches. A kept part that breaks one is a defect the design fixes
   (`engine-design.md`).
 
+## Decision inside an existing owner
+
+When the brief adds no new stored result, hot loop, pass, or budget, read
+only the declarations it names and write the plan. The plan opens with the
+chosen design, the cost model, and the file list, answers the brief's
+questions, and names the proof and the implementation steps the brief asks
+for.
+
+A method step is empty when the change does not add or change what that step
+covers. An empty step is one line citing where that part is settled. A hot
+loop whose cost, placement, or access order changes is not empty. Do not
+read further to fill an empty step. Spot-check only the lines the plan
+cites, then stop.
+
+Which measurement decides, and which measurement reopens that decision, are
+the cost model. A hold of the side that lost the measurement is the wrong
+hold. A settle, merge, or remove the slice already names is the plan. A new
+tuner architecture, a new stage pattern, or a rule edit is an owner
+question: stop and report it. Do not survey toward it.
+
 ## Method
 
-Plan in this order; each step's answer is the input to the next. A section
-covers what the change adds or changes; a part it leaves unchanged is one line
-citing where it is settled, and a step with nothing new is omitted.
+Use this path when the change adds a stored result, a hot loop, a pass, or
+a budget. Read the brief's files first. Write the plan once the chosen
+design is decided. A step with nothing new is one line citing where it is
+settled. Do not keep reading to fill it. Each step's answer is the input
+to the next.
 
 1. **The work.** Goal, success criteria, scope, the owning module of every
    new piece, and the call flow (`main.zig → Engine → StateStack → states`,
@@ -113,12 +137,13 @@ citing where it is settled, and a step with nothing new is omitted.
 
 ## Checks (last)
 
-Check the finished plan against the rules each step cites
-(`engine-design.md` § Cost model, `memory-performance.md`, `threading.md`,
-`tests-benchmarks.md`); a failure goes back to the step it came from and is
-fixed there. A `ThreadSystem` or tuner redesign is an owner question. A
-rule that blocks the design the cost model says is right gets a proposed
-edit (`engine-design.md`); never bend the design or the rule silently.
+Check the finished plan against the rules already loaded for the steps it
+cites. A failure goes back to the step it came from and is fixed there. Do
+not open those rule files again. A new tuner architecture, a new stage
+pattern, or a rule edit is an owner question. A settle, merge, or remove
+the slice names is in scope. A rule that blocks the design the cost model
+says is right gets a proposed edit (`engine-design.md`); never bend the
+design or the rule silently.
 
 Every invariant stated, no restated code, no essays; the design and its steps
 never go into the slice file. Follow-ups are listed in the plan as proposed

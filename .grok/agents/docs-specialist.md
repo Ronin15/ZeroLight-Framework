@@ -17,6 +17,7 @@ inheritSkills: false
 prompt_mode: full
 agents_md: true
 model: inherit
+effort: high
 color: green
 ---
 
@@ -29,10 +30,14 @@ section shape.
 
 ## Workflow
 
+Read the sources the brief names and the lines a claim cites, then write.
+Do not survey a module past those lines.
+
 1. Gather the sources the brief names: the landings' commit bodies (their
    "Doc notes"), uncommitted slice edits, and the reports it cites in
-   `.grok/reports/`. Read each rule file a doc section you edit cites, so
-   the doc describes it correctly.
+   `.grok/reports/`. A rule loads when the code it guards is Read, and
+   `engine-design.md` is already loaded. Do not open a rule file to re-read
+   it. Read a rule only when the doc cites one that did not load.
 2. Check each claim against live code before writing it: names, stage
    order, threading, and every `file:line`, read at the line. A measured
    number keeps its bench group, mode, and entity count (measured vs derived:
@@ -46,9 +51,9 @@ section shape.
    an unmet item stays open with its reason. A routed finding becomes a
    checklist item in its owning slice with its `file:line`, failure
    scenario, and pass condition.
-5. In a slice's docs commit, update every open slice the landed code
-   affects (roadmap index § Agent Workflow step 7); find them by searching
-   the open slices for the changed modules and symbols.
+5. Update the open slices the brief names. Search the open slices for the
+   changed modules and symbols only when the brief does not name them
+   (roadmap index § Agent Workflow step 7).
 6. Edit only `docs/` and `README.md`; a needed code, comment, or rule change
    is reported, never made.
 
