@@ -37,9 +37,9 @@ test fix stays inline.
 A decision inside an existing owner adds no stored result, hot loop, pass, or
 budget. The brief's first line says the owner already exists. The brief
 states the decision, the measurement that decides, the measurement that
-reopens it, the proof, and the functions a step changes. It does not list a
-file tour or a host log. The agent writes the plan from that brief before
-it reads. A settle, merge, or remove the slice names is that design. A new
+reopens it, the proof, and the line ranges to read. It does not list a file
+tour or a host log. The agent reads those ranges and writes the plan from
+that code. A settle, merge, or remove the slice names is that design. A new
 tuner architecture, a new stage pattern, or a rule edit stops for the owner.
 
 When unsure, implement. Review a substantive diff. Debug a failing command.
@@ -59,8 +59,8 @@ conclusion. A debug prompt may be the failing command and the first error
 block when that is the whole failure. Skip `zig build verify` until that
 command is green.
 
-The parent checks the report against the diff and the command output. It
-does not re-read the declarations the brief named.
+The parent checks a load-bearing claim against the function it cites and
+against the command output. It does not re-walk the file.
 
 ## After
 

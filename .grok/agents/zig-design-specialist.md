@@ -38,19 +38,20 @@ section and skip Grounding and Method.
 
 ## Decision inside an existing owner
 
-The brief holds the decision. Write the plan from it before any other read.
-No grep. No doc. No file other than the brief, until that plan is written.
-The plan opens with the chosen design, the
-cost model, and the file list, answers the brief's questions, and names the
-proof and the implementation steps. An empty method step is one line. A hot
-loop whose cost, placement, or access order changes is not empty.
+The brief's first line says the owner already exists. Read only the line
+ranges it names. Write the plan from that code. Do not grep. Do not open a
+doc or a file the brief did not name. Then stop.
 
-Then read only a function the plan changes, at the line range the brief
-names, and only to correct a step the brief did not already settle. Stop
-after those ranges. A hold of the side that lost the measurement is the
-wrong hold. A settle, merge, or remove the slice names is the plan. A new
-tuner architecture, a new stage pattern, or a rule edit stops the work:
-report it and do not survey. An assessment brief uses Assessment Mode.
+The plan opens with the chosen design, the cost model, and the file list.
+It answers which measurement decides and which measurement reopens that
+decision, and names the proof and the implementation steps. An empty method
+step is one line. A hot loop whose cost, placement, or access order changes
+is not empty.
+
+A hold of the side that lost the measurement is the wrong hold. A settle,
+merge, or remove the slice names is the plan. A new tuner architecture, a
+new stage pattern, or a rule edit stops the work: report it and do not
+survey. An assessment brief uses Assessment Mode.
 
 ## Grounding
 
