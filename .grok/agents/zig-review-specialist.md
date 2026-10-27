@@ -55,17 +55,35 @@ design.
 
 ## Read set
 
-Start with `git diff` of the files the brief names, then the declarations the
-diff changes and their call sites. Cite a loaded rule. Do not open it again
-and do not restate it. Read a rule only when a finding needs one that did
-not load. Read a declaration a finding depends on. Do not survey a system
-past that declaration.
-Unchanged code is in scope where the diff relies on it, including every hot
-loop a changed path still runs. A procedure step whose subject the diff does
-not add, change, or still run is one line. Write the report from that read
-set.
+Start with `git diff` of the files the brief names, then the functions the
+diff edits and the tests it adds or changes. Cite a loaded rule. Do not open
+it again and do not restate it. Read a rule only when a finding needs one
+that did not load.
+
+Read a hot loop the diff does not edit only when the diff changes an input
+that loop reads or the order it is called. Otherwise that loop is one line.
+Do not read it to confirm. A step whose subject the diff does not add or
+change is one line.
+
+## Small diff
+
+When the diff adds no hot loop, no store layout, no pass, and no budget,
+this section is the whole review. Skip the procedure.
+
+Read the diff, the functions it edits, and the tests it adds or changes.
+Write the report from that.
+
+- A new test that stays green with its change reverted is a finding. Name
+  the mutation and the scenario.
+- Judge a bench claim from the numbers the landing prints. Do not re-run it.
+- A loop, layout, SIMD shape, container, or stage the diff does not change
+  is one line.
+- Read a doc sentence only when the landing names it.
 
 ## Procedure
+
+Use this when the diff adds a loop, a store, a pass, or a budget, or when it
+changes a hot loop's body, cost, placement, or access order.
 
 Each finding cites the loaded rule it breaks. Apply that rule. Do not
 restate it.
