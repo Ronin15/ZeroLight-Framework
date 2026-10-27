@@ -73,12 +73,15 @@ this section is the whole review. Skip the procedure.
 Read the diff, the functions it edits, and the tests it adds or changes.
 Write the report from that.
 
+- Apply each loaded rule that governs a line the diff changes. Cite the
+  rule a finding breaks. A rule the diff does not touch is one line.
+- Read the architecture sentence that describes those functions. A sentence
+  about a system the diff does not touch stays unread.
 - A new test that stays green with its change reverted is a finding. Name
   the mutation and the scenario.
 - Judge a bench claim from the numbers the landing prints. Do not re-run it.
 - A loop, layout, SIMD shape, container, or stage the diff does not change
   is one line.
-- Read a doc sentence only when the landing names it.
 
 ## Procedure
 
