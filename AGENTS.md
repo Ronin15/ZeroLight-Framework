@@ -52,7 +52,8 @@ decision criteria, and reports.
   hypothesis is labelled one; every validation step and bench size it names
   exercises the changed code. When the owner already exists, the first line
   says so and the brief names the line ranges to read. It states the
-  decision and does not tour the module. A review brief names the diff, its
+  decision and does not tour the module. An implement brief names the test
+  helper a new test calls. A review brief names the diff, its
   sources, and what to check, never anyone's conclusions.
 - Agents cite a loaded rule by name. They do not open it again and do not
   restate it. A repeated constraint belongs in `.grok/rules/`.

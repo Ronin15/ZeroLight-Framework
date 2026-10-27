@@ -65,7 +65,8 @@ failures from compiler output.
 1. Capture the command, failure text, and timing class; identify the layer.
 2. Run the narrowest relevant command (`check`, `test`, `shaders`; `run` only
    when behavior needs the app; `gpu-smoke` per `build-validation.md`);
-   inspect the owning file and its tests or build steps.
+   read the declaration the error names and the failing test. Do not read
+   the file's other tests.
 3. Test one hypothesis.
 4. At a runtime/integration boundary, add or keep diagnostics that make the
    failure class diagnosable next time.

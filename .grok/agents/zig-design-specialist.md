@@ -42,11 +42,11 @@ The brief's first line says the owner already exists. Read only the line
 ranges it names. Write the plan from that code. Do not grep. Do not open a
 doc or a file the brief did not name. Then stop.
 
-The plan opens with the chosen design, the cost model, and the file list.
-It answers which measurement decides and which measurement reopens that
-decision, and names the proof and the implementation steps. An empty method
-step is one line. A hot loop whose cost, placement, or access order changes
-is not empty.
+The plan is four parts: the decision, the condition, the proof, and the
+steps. It answers which measurement decides and which reopens that
+decision. Omit an empty section. Do not write the big-feature plan. A hot
+loop whose cost, placement, or access order changes is not empty, and that
+loop is named in the condition.
 
 A hold of the side that lost the measurement is the wrong hold. A settle,
 merge, or remove the slice names is the plan. A new tuner architecture, a
@@ -114,6 +114,8 @@ to the next. Cite the rule for the step. Do not restate it.
 
 ## Checks (last)
 
+This check is the big-feature path. The decision path above already stopped.
+
 Check the finished plan against the rules already loaded for the steps it
 cites. A failure goes back to the step it came from and is fixed there. Do
 not open those rule files again. Owner questions are `AGENTS.md`
@@ -130,13 +132,14 @@ existing **Deferred By Owner** entry, never add one.
 
 ## Output
 
-Write the full plan to the path the brief names, else
+Write the plan to the path the brief names, else
 `.grok/reports/<slice>-<topic>-design.md` (overwrite your own file on a
-rerun), and write nothing else. The file opens with the chosen design, the
-cost-model table, and the file list. Return the path, that table, the chosen
-design in a few lines, the implementation steps, any rule edit or owner
-question, and handoff recommendations: **zig-specialist** to implement,
-**zig-review-specialist** for the diff.
+rerun), and write nothing else. The big-feature file opens with the chosen
+design, the cost-model table, and the file list. A decision inside an
+existing owner is the four parts from that section and nothing else. Return
+the path, the decision, the steps, any rule edit or owner question, and
+handoff: **zig-specialist** to implement, **zig-review-specialist** for the
+diff.
 
 ## Assessment Mode
 

@@ -62,7 +62,10 @@ that did not load.
 
 Read a hot loop the diff does not edit only when the diff changes an input
 that loop reads or the order it is called. Otherwise that loop is one line.
-Do not read it to confirm. The bound is the read. It is not a check you skip.
+Do not read it to confirm. Do not grep the module. Apply each step below to
+the diff already read. One extra read only when that step needs a
+declaration the diff does not show. The bound is the read. It is not a
+check you skip.
 
 ## Procedure
 

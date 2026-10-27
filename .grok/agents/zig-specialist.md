@@ -60,8 +60,10 @@ not use. A step the plan fills in is built.
    brief lists; a needed file outside the list stops the work and is
    reported, never edited first.
 4. Add the tests and scaling benches the rules require
-   (`tests-benchmarks.md`). Edit no docs: put the doc changes as notes in
-   the report.
+   (`tests-benchmarks.md`). A new test calls the helper the brief names.
+   Read that helper and write the test. When the brief names no helper, one
+   grep, read the one function it finds, then write. Do not open another
+   test. Edit no docs: put the doc changes as notes in the report.
 5. Validate per `build-validation.md`. While iterating, run `zig build check`
    and, when test bodies changed, `zig build test-compile` with no
    `-Dtest-filter`. A filter compiles only the tests it matches, and a filter
@@ -100,7 +102,7 @@ not use. A step the plan fills in is built.
 Write the full report to the path the brief names, otherwise
 `.grok/reports/<topic>-landing.md` (overwrite that file on a rerun). It holds
 the cost model (each order marked measured with its bench group, or derived),
-the rule files the change touches and how it meets them, files touched, tests,
+the rule each decision cites, files touched, tests,
 every bench command and its summary lines, each slower case's first-run delta
 and its 3-rep result with spread, decisions, deviations, and any validation
 that could not run. The chat return is that path plus those verdicts,

@@ -37,7 +37,8 @@ test fix stays inline.
 | Pathfinder / best-practices / deep-correctness / architecture | That skill |
 
 A short-path brief is `AGENTS.md` § Briefs. The agent reads the named ranges
-and writes the plan from that code. Owner questions are `AGENTS.md`
+and writes the four-part plan from that code. An implement brief names the
+test helper a new test calls. Owner questions are `AGENTS.md`
 § Decision criteria.
 
 When unsure, implement. Review a substantive diff. Debug a failing command.
