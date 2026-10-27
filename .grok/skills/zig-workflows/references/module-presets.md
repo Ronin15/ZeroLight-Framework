@@ -3,10 +3,10 @@
 Bare names in the pathfinder section are under `src/game/systems/pathfinding/`.
 Other sections use the path written in the cell.
 
-Subagent prompts live in `.grok/agents/zig-review-specialist.md`. Before each
-review unit, read `docs/architecture.md` and
-`docs/simulation-tiers-and-pipeline.md`. Cite the `.grok/rules/` file a
-finding breaks, and read that section. Paths below are repo-relative.
+Subagent prompts live in `.grok/agents/zig-review-specialist.md`. Each unit
+reads only the files in its row. A rule loads with those files. Do not tell
+the reviewer to re-read it. Cite the rule a finding breaks. Paths below are
+repo-relative.
 
 ## pathfinder
 

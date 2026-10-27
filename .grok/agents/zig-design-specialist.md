@@ -58,8 +58,9 @@ is only for your plan file (Output).
 
 ## Decision inside an existing owner
 
-When the brief adds no new stored result, hot loop, pass, or budget, read
-only the declarations it names and write the plan. The plan opens with the
+When the brief is an implementation design and it adds no new stored result,
+hot loop, pass, or budget, read only the declarations it names and write
+the plan. An assessment brief uses Assessment Mode instead. The plan opens with the
 chosen design, the cost model, and the file list, answers the brief's
 questions, and names the proof and the implementation steps the brief asks
 for.
@@ -166,5 +167,5 @@ question, and handoff recommendations: **zig-specialist** to implement,
 
 When a brief asks for an assessment or an output schema rather than a plan
 (for example `/architecture-assessment`), return the analysis in the shape the
-brief asks for, with the same grounding and cost-model reasoning, and no
-implementation plan.
+brief asks for. Read only the files the brief names. Do not use the
+decision path above, and do not write an implementation plan.

@@ -71,8 +71,9 @@ decision criteria, and reports.
   speed; never what today's code happens to produce or less work. Make calls
   without asking and report them; a departure from a rule's letter follows
   `engine-design.md`'s first paragraph. The owner decides
-  scope added or dropped, product/gameplay behavior, rule edits, a major or
-  `ThreadSystem`/tuner redesign, and anything that doesn't make sense. No
+  scope added or dropped, product/gameplay behavior, rule edits, a new tuner
+  architecture or stage pattern, and anything that doesn't make sense. A
+  settle, merge, or remove an owning slice already names is in scope. No
   model/effort overrides unless the owner asks.
 - Read-only agents for independent pieces run together; let each finish
   before using it. Implementation agents run one at a time in the main tree,

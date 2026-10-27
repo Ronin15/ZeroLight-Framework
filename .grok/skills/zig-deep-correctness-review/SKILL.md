@@ -19,7 +19,9 @@ Themes: `.grok/skills/zig-workflows/references/module-presets.md` →
 ## Phase 1 — Per-theme review (parallel)
 
 One `zig-review-specialist` per theme unit (`background: true`). Use the
-preset focus text as the unit brief.
+preset focus text as the unit brief. Each unit reads only its preset files.
+Do not tell it to re-read a rule that loaded with those files, and do not
+survey past the unit.
 
 For each finding give **concrete failure**: inputs/state → wrong behavior / crash /
 leak / nondeterminism. Cite real `file:line`. Prefer few high-confidence findings

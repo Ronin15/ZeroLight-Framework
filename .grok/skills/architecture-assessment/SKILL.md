@@ -11,7 +11,9 @@ description: >-
 
 Multi-phase read-only assessment. Parent spawns all subagents (depth limit 1).
 Prefer `zig-design-specialist` for analysis units; synthesis may be parent or one
-final design specialist.
+final design specialist. Each unit reads only the files in its row. The brief
+says it is an assessment, so the agent does not take the implementation
+short path and does not write a plan.
 
 ## Phase 1 — Docs scan (parallel)
 

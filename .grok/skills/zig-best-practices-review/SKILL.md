@@ -18,7 +18,9 @@ Units: `.grok/skills/zig-workflows/references/module-presets.md` →
 
 ## Phase 1 — Per-unit review (parallel)
 
-One `zig-review-specialist` per preset unit (`background: true`).
+One `zig-review-specialist` per preset unit (`background: true`). Each
+unit reads only its preset files. Do not tell it to re-read a rule that
+loaded with those files, and do not survey past the unit.
 
 Hunt for:
 

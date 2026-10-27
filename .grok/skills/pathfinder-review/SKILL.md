@@ -19,10 +19,9 @@ Unit table: `.grok/skills/zig-workflows/references/module-presets.md` → **path
 ## Standards preamble (include in every unit prompt)
 
 ```text
-Before reviewing, read docs/architecture.md and
-docs/simulation-tiers-and-pipeline.md. Cite the .grok/rules/ file a finding
-breaks (memory-performance.md, threading.md, pathfinding.md, zig-style.md,
-tests-benchmarks.md). Read that section. Do not read every rule up front.
+Read only this unit's files. A rule loads with them. Do not open a rule
+file to re-read it. Cite the .grok/rules/ file a finding breaks. Read the
+doc section this unit implements, not both architecture docs in full.
 ```
 
 ## Lenses (every unit)
