@@ -285,6 +285,11 @@ pub const AdaptiveWorkRequest = struct {
 };
 
 pub const AdaptiveWorkTuner = struct {
+    // Side the existing window tests already took. Null is learning. Not read by
+    // profile selection or dispatch. `.threaded_hold` is the committed threaded
+    // profile; `.inline_hold` is the inline demotion.
+    const HeldSide = enum { inline_hold, threaded_hold };
+
     config: AdaptiveWorkTunerConfig,
     // The tuner starts with inline measurement and probes threading when the inline
     // window reaches the gate; a threaded stage then nudges its batch count by measured
@@ -351,6 +356,9 @@ pub const AdaptiveWorkTuner = struct {
     // Set by a sustained item-count shift on a threaded stage: the next threaded settled
     // window re-decides inline or threaded at the new count.
     retune_pending: bool = false,
+    held_side: ?HeldSide = null,
+    // Consecutive settled-window outcomes that would change the held winner.
+    winner_change_records: u32 = 0,
     // The shape the last unsustained jump up holds, reused while its learned count repeats
     // and the requested count stays in the reset band of the jump's, so the same jump
     // dispatches alike under model jitter: the model's prediction until the jump's own
@@ -584,9 +592,17 @@ pub const AdaptiveWorkTuner = struct {
         };
         const sampled_threaded = if (self.sampled_profile) |sampled| sampled.worker_threads > 0 else false;
         if (sampled_threaded and isMeaningfullyFaster(sample_mean_ns, self.baseline_mean_batch_duration_ns, self.config.threaded_commit_threshold_percent)) {
+            // The inline baseline, before this window replaces it. Hold threaded only when
+            // that cost is at the gate and this window's bound is not under it.
+            const inline_cost_ns = self.baseline_mean_batch_duration_ns;
+            const bound_under_gate = self.windowInlineBoundNs() < self.gateNs();
             self.adoptThreaded(candidate);
             self.baseline_mean_batch_duration_ns = sample_mean_ns;
             self.inline_probe_cooldown_windows = 0;
+            if (inline_cost_ns >= self.gateNs() and !bound_under_gate) {
+                self.held_side = .threaded_hold;
+                self.winner_change_records = 0;
+            }
         } else {
             self.inline_probe_cooldown_windows = self.config.inline_probe_cooldown_windows;
             self.abandonClampTrial();
@@ -625,11 +641,20 @@ pub const AdaptiveWorkTuner = struct {
                     self.inline_probe_cooldown_windows -= 1;
                     return;
                 }
+                // One window at the gate does not probe a held inline side. A full
+                // sample window of them does.
+                if (self.held_side == .inline_hold and self.winnerChangeAbsorbed()) {
+                    self.winner_change_records += 1;
+                    return;
+                }
                 self.decideThreading();
+            } else if (self.held_side == .inline_hold and sample_mean_ns < self.gateNs()) {
+                self.winner_change_records = 0;
             }
             return;
         }
-        if (sample_mean_ns >= self.gateNs() and !self.has_threaded_profile) {
+        // A held threaded side skips this adopt: it is not the margin commit.
+        if (sample_mean_ns >= self.gateNs() and !self.has_threaded_profile and self.held_side != .threaded_hold) {
             self.adoptThreaded(profile);
             self.decideThreading();
             return;
@@ -637,12 +662,21 @@ pub const AdaptiveWorkTuner = struct {
         // Bound rule, with no inline backprobe: a settled threaded window whose median
         // batch duration x its participants, an upper bound on its inline cost, is below
         // the gate demotes. A wrong demotion is judged by the first inline window, which
-        // restores it.
+        // restores it. A pending shift keeps that demote; a held side records the crossing.
         std.debug.assert(!self.bound_rule_suppressed or self.has_threaded_profile);
         std.debug.assert(!(self.retune_pending and self.bound_rule_suppressed));
-        if (!self.bound_rule_suppressed and self.windowInlineBoundNs() < self.gateNs()) {
-            self.demoteToInline();
-            return;
+        // Suppressed keeps today's skip: the hold count cannot move while the demote is off.
+        if (!self.bound_rule_suppressed) {
+            const bound_under_gate = self.windowInlineBoundNs() < self.gateNs();
+            if (bound_under_gate) {
+                if (!self.retune_pending and self.held_side == .threaded_hold and self.winnerChangeAbsorbed()) {
+                    self.winner_change_records += 1;
+                    return;
+                }
+                self.demoteToInline();
+                return;
+            }
+            if (self.held_side == .threaded_hold) self.winner_change_records = 0;
         }
         if (self.retune_pending) {
             self.retune_pending = false;
@@ -651,6 +685,11 @@ pub const AdaptiveWorkTuner = struct {
         }
         // A threaded window the tuner did not select is adopted as the threaded profile.
         if (!self.has_threaded_profile) self.adoptThreaded(profile);
+    }
+
+    // True while one more winner-changing window would still be short of a full sample window.
+    fn winnerChangeAbsorbed(self: *const AdaptiveWorkTuner) bool {
+        return @as(usize, self.winner_change_records) + 1 < self.config.sample_window;
     }
 
     // Inline or threaded, from the model: a threaded tuner that predicts inline demotes
@@ -667,20 +706,26 @@ pub const AdaptiveWorkTuner = struct {
                 self.demoteToInline();
             } else {
                 self.settle();
+                if (self.held_side == .inline_hold) self.winner_change_records = 0;
             }
             return;
         }
         if (self.has_threaded_profile) {
             self.settle();
+            if (self.held_side == .threaded_hold) self.winner_change_records = 0;
             return;
         }
         const candidate = self.batchShape(request);
         if (candidate.worker_threads == 0) {
             self.settle();
+            if (self.held_side == .inline_hold) self.winner_change_records = 0;
             return;
         }
         self.candidate_profile = candidate;
         self.phase = .probing;
+        // The probe learns; the side it commits is recorded when that window lands.
+        self.held_side = null;
+        self.winner_change_records = 0;
     }
 
     fn adoptThreaded(self: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
@@ -1013,6 +1058,8 @@ pub const AdaptiveWorkTuner = struct {
         self.candidate_profile = null;
         self.inline_probe_cooldown_windows = self.config.inline_probe_cooldown_windows;
         self.restartNudge();
+        self.held_side = .inline_hold;
+        self.winner_change_records = 0;
     }
 
     // The judging inline window measured at least the dispatch floor, so the demotion
@@ -1025,6 +1072,8 @@ pub const AdaptiveWorkTuner = struct {
         self.inline_probe_cooldown_windows = 0;
         self.bound_rule_suppressed = true;
         self.retune_pending = false;
+        self.held_side = .threaded_hold;
+        self.winner_change_records = 0;
     }
 
     // A sustained item-count shift keeps a won threaded profile, reshapes it from the
@@ -1035,6 +1084,8 @@ pub const AdaptiveWorkTuner = struct {
         self.reshapeThreaded(request);
         self.retune_pending = true;
         self.resetSamples();
+        self.held_side = null;
+        self.winner_change_records = 0;
         self.restartNudge();
     }
 
@@ -1048,6 +1099,8 @@ pub const AdaptiveWorkTuner = struct {
         self.bound_rule_suppressed = false;
         self.retune_pending = false;
         self.has_threaded_profile = false;
+        self.held_side = null;
+        self.winner_change_records = 0;
         self.baseline_mean_batch_duration_ns = 0;
         self.inline_probe_cooldown_windows = 0;
         self.batch_multiplier = 1;
@@ -4279,6 +4332,243 @@ test "adaptive work tuner a correct bound demotion stays inline" {
     try std.testing.expect(!tuner.has_threaded_profile);
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
     try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(request).worker_threads);
+}
+
+// Gate overridden on the tuner. Durations are this gate, one nanosecond to either side,
+// or the production commit margin below it. Participants put duration x participants
+// over or under the gate. No host floor.
+const hold_gate_ns: u64 = 10_000;
+const hold_item_count: usize = 1024;
+
+fn holdTestRequest(item_count: usize) AdaptiveWorkRequest {
+    return calibratedTunerTestRequest(item_count, 4, 16, 64, craftedTestCalibration(hold_gate_ns, 1));
+}
+
+fn holdTestTuner() AdaptiveWorkTuner {
+    return AdaptiveWorkTuner.init(.{
+        .sample_window = 2,
+        .threaded_batch_ns = hold_gate_ns,
+        .inline_probe_cooldown_windows = 0,
+    });
+}
+
+fn holdCommitNs(gate_ns: u64, margin_percent: u8) u64 {
+    return gate_ns - (gate_ns * @as(u64, margin_percent)) / 100;
+}
+
+// One nanosecond slower than the production commit cut: inside the margin.
+fn holdInsideMarginNs(gate_ns: u64, margin_percent: u8) u64 {
+    return holdCommitNs(gate_ns, margin_percent) + 1;
+}
+
+// `duration x participants` is at most `gate - 1`.
+fn holdBoundUnderNs(gate_ns: u64, worker_threads: usize) u64 {
+    return (gate_ns - 1) / (worker_threads + 1);
+}
+
+fn commitHoldThreaded(tuner: *AdaptiveWorkTuner) !AdaptiveWorkProfile {
+    const request = holdTestRequest(hold_item_count);
+    const margin = tuner.config.threaded_commit_threshold_percent;
+    try std.testing.expectEqual(@as(usize, 0), recordTunerWindow(tuner, request, hold_gate_ns).worker_threads);
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
+    const committed = recordTunerWindow(tuner, request, holdCommitNs(hold_gate_ns, margin));
+    try std.testing.expect(committed.worker_threads > 0);
+    try std.testing.expect(holdCommitNs(hold_gate_ns, margin) * (committed.worker_threads + 1) >= hold_gate_ns);
+    try std.testing.expect(tuner.phase == .settled and tuner.has_threaded_profile);
+    try std.testing.expect(tuner.held_side == .threaded_hold);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    return committed;
+}
+
+// Bound-under windows for a full sample window demote. One inline window under the gate
+// confirms it: the restore is consumed and the side stays inline, cooldown already 0.
+fn commitHoldInline(tuner: *AdaptiveWorkTuner) !void {
+    const committed = try commitHoldThreaded(tuner);
+    const request = holdTestRequest(hold_item_count);
+    const cheap = holdBoundUnderNs(hold_gate_ns, committed.worker_threads);
+    try std.testing.expect(cheap > 0 and cheap * (committed.worker_threads + 1) < hold_gate_ns);
+    for (0..tuner.config.sample_window) |_| _ = recordTunerWindow(tuner, request, cheap);
+    try std.testing.expect(!tuner.has_threaded_profile);
+    try std.testing.expect(tuner.held_side == .inline_hold);
+    _ = recordTunerWindow(tuner, request, hold_gate_ns - 1);
+    try std.testing.expect(tuner.restore_threaded_profile == null);
+    try std.testing.expect(!tuner.has_threaded_profile and tuner.phase == .settled);
+    try std.testing.expect(tuner.held_side == .inline_hold);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    try std.testing.expectEqual(@as(usize, 0), tuner.inline_probe_cooldown_windows);
+}
+
+test "thread_system hold threaded while windows stay inside the commit margin" {
+    var tuner = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    const committed = try commitHoldThreaded(&tuner);
+    const nudge_state = tuner.nudge_state;
+    const nudge_samples = tuner.nudge_samples;
+    const margin = tuner.config.threaded_commit_threshold_percent;
+    _ = recordTunerWindow(&tuner, request, holdInsideMarginNs(hold_gate_ns, margin));
+    _ = recordTunerWindow(&tuner, request, hold_gate_ns + 1);
+    try std.testing.expect(profilesEqual(committed, tuner.selectProfile(request)));
+    try std.testing.expect(tuner.phase == .settled and tuner.has_threaded_profile);
+    try std.testing.expect(tuner.held_side == .threaded_hold);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    try std.testing.expectEqual(nudge_state, tuner.nudge_state);
+    try std.testing.expectEqual(nudge_samples + 2 * tuner.config.sample_window, tuner.nudge_samples);
+}
+
+test "thread_system hold inline and do not probe under the gate" {
+    var tuner = holdTestTuner();
+    try commitHoldInline(&tuner);
+    const request = holdTestRequest(hold_item_count);
+    _ = recordTunerWindow(&tuner, request, hold_gate_ns - 1);
+    try std.testing.expect(!tuner.has_threaded_profile);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expect(tuner.phase != .probing);
+    try std.testing.expect(tuner.held_side == .inline_hold);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(request).worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), tuner.inline_probe_cooldown_windows);
+}
+
+test "thread_system one crossing window does not flip" {
+    var threaded = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    const committed = try commitHoldThreaded(&threaded);
+    const nudge_state = threaded.nudge_state;
+    const nudge_samples = threaded.nudge_samples;
+    const cheap = holdBoundUnderNs(hold_gate_ns, committed.worker_threads);
+    _ = recordTunerWindow(&threaded, request, cheap);
+    try std.testing.expect(profilesEqual(committed, threaded.selectProfile(request)));
+    try std.testing.expect(threaded.phase == .settled and threaded.has_threaded_profile);
+    try std.testing.expect(threaded.held_side == .threaded_hold);
+    try std.testing.expectEqual(@as(u32, 1), threaded.winner_change_records);
+    try std.testing.expectEqual(nudge_state, threaded.nudge_state);
+    try std.testing.expectEqual(nudge_samples + threaded.config.sample_window, threaded.nudge_samples);
+
+    var inline_hold = holdTestTuner();
+    try commitHoldInline(&inline_hold);
+    const inline_samples = inline_hold.nudge_samples;
+    const inline_state = inline_hold.nudge_state;
+    _ = recordTunerWindow(&inline_hold, request, hold_gate_ns);
+    try std.testing.expect(!inline_hold.has_threaded_profile);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, inline_hold.phase);
+    try std.testing.expect(inline_hold.held_side == .inline_hold);
+    try std.testing.expectEqual(@as(u32, 1), inline_hold.winner_change_records);
+    try std.testing.expectEqual(@as(usize, 0), inline_hold.selectProfile(request).worker_threads);
+    try std.testing.expectEqual(inline_state, inline_hold.nudge_state);
+    try std.testing.expectEqual(inline_samples, inline_hold.nudge_samples);
+}
+
+test "thread_system full sample window of winner-changing records flips" {
+    var threaded = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    const committed = try commitHoldThreaded(&threaded);
+    const cheap = holdBoundUnderNs(hold_gate_ns, committed.worker_threads);
+    for (0..threaded.config.sample_window - 1) |_| {
+        _ = recordTunerWindow(&threaded, request, cheap);
+        try std.testing.expect(threaded.has_threaded_profile and threaded.held_side == .threaded_hold);
+    }
+    _ = recordTunerWindow(&threaded, request, cheap);
+    try std.testing.expect(!threaded.has_threaded_profile);
+    try std.testing.expect(threaded.held_side == .inline_hold);
+    try std.testing.expect(threaded.restore_threaded_profile != null);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, threaded.phase);
+    try std.testing.expectEqual(@as(usize, 0), threaded.selectProfile(request).worker_threads);
+
+    var inline_hold = holdTestTuner();
+    try commitHoldInline(&inline_hold);
+    // `gate + 1` is over the gate, so the window would probe, and the per-item
+    // model stays over the gate after the confirming `gate - 1` window.
+    for (0..inline_hold.config.sample_window - 1) |_| {
+        _ = recordTunerWindow(&inline_hold, request, hold_gate_ns + 1);
+        try std.testing.expect(!inline_hold.has_threaded_profile and inline_hold.phase == .settled);
+        try std.testing.expect(inline_hold.held_side == .inline_hold);
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(inline_hold.config.sample_window - 1)), inline_hold.winner_change_records);
+    _ = recordTunerWindow(&inline_hold, request, hold_gate_ns + 1);
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, inline_hold.phase);
+    try std.testing.expect(inline_hold.held_side == null);
+}
+
+test "thread_system sustained item-count shift retunes a held side" {
+    var tuner = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    const committed = try commitHoldThreaded(&tuner);
+    try std.testing.expect(profilesEqual(committed, tuner.selectProfile(request)));
+    var shifted = request;
+    shifted.item_count = hold_item_count * 2;
+    try std.testing.expect(outsideBand(hold_item_count, shifted.item_count, tuner.config.item_count_reset_percent));
+    _ = tuner.selectProfile(shifted);
+    try std.testing.expect(tuner.held_side == .threaded_hold and !tuner.retune_pending);
+    const selected = tuner.selectProfile(shifted);
+    try std.testing.expect(selected.worker_threads > 0);
+    try std.testing.expect(tuner.held_side == null and tuner.retune_pending);
+    const stays_threaded = tuner.predictsThreaded(tuner.normalizeRequest(shifted));
+    for (0..tuner.config.sample_window) |_| {
+        tuner.record(tunerTestBatchWithProfile(shifted.item_count, tuner.selectProfile(shifted), hold_gate_ns));
+    }
+    try std.testing.expect(!tuner.retune_pending);
+    try std.testing.expectEqual(stays_threaded, tuner.has_threaded_profile);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expect(tuner.held_side == null);
+}
+
+test "thread_system an agreeing window zeros a winner streak" {
+    var threaded = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    const committed = try commitHoldThreaded(&threaded);
+    const cheap = holdBoundUnderNs(hold_gate_ns, committed.worker_threads);
+    const margin = threaded.config.threaded_commit_threshold_percent;
+    _ = recordTunerWindow(&threaded, request, cheap);
+    try std.testing.expectEqual(@as(u32, 1), threaded.winner_change_records);
+    _ = recordTunerWindow(&threaded, request, holdInsideMarginNs(hold_gate_ns, margin));
+    try std.testing.expectEqual(@as(u32, 0), threaded.winner_change_records);
+    try std.testing.expect(threaded.has_threaded_profile and threaded.held_side == .threaded_hold);
+    _ = recordTunerWindow(&threaded, request, cheap);
+    try std.testing.expect(threaded.has_threaded_profile and threaded.held_side == .threaded_hold);
+    try std.testing.expectEqual(@as(u32, 1), threaded.winner_change_records);
+
+    var inline_hold = holdTestTuner();
+    try commitHoldInline(&inline_hold);
+    _ = recordTunerWindow(&inline_hold, request, hold_gate_ns);
+    try std.testing.expectEqual(@as(u32, 1), inline_hold.winner_change_records);
+    _ = recordTunerWindow(&inline_hold, request, hold_gate_ns - 1);
+    try std.testing.expectEqual(@as(u32, 0), inline_hold.winner_change_records);
+    _ = recordTunerWindow(&inline_hold, request, hold_gate_ns);
+    try std.testing.expect(inline_hold.phase == .settled and inline_hold.held_side == .inline_hold);
+    try std.testing.expect(!inline_hold.has_threaded_profile);
+}
+
+test "thread_system the judging window restores a held demotion at once" {
+    var tuner = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    const committed = try commitHoldThreaded(&tuner);
+    const cheap = holdBoundUnderNs(hold_gate_ns, committed.worker_threads);
+    for (0..tuner.config.sample_window) |_| _ = recordTunerWindow(&tuner, request, cheap);
+    try std.testing.expect(tuner.restore_threaded_profile != null and tuner.held_side == .inline_hold);
+    _ = recordTunerWindow(&tuner, request, hold_gate_ns);
+    try std.testing.expect(tuner.has_threaded_profile and tuner.held_side == .threaded_hold);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+}
+
+test "thread_system reset for learning clears an inline hold" {
+    var tuner = holdTestTuner();
+    const request = holdTestRequest(hold_item_count);
+    try commitHoldInline(&tuner);
+    var shifted = request;
+    shifted.item_count = hold_item_count * 2;
+    try std.testing.expect(outsideBand(hold_item_count, shifted.item_count, tuner.config.item_count_reset_percent));
+    _ = tuner.selectProfile(shifted);
+    try std.testing.expect(tuner.held_side == .inline_hold);
+    _ = tuner.selectProfile(shifted);
+    try std.testing.expect(tuner.held_side == null and tuner.phase == .learning);
+    _ = recordTunerWindow(&tuner, shifted, hold_gate_ns - 1);
+    try std.testing.expect(tuner.phase == .settled and tuner.held_side == null);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    _ = recordTunerWindow(&tuner, shifted, hold_gate_ns);
+    try std.testing.expect(tuner.held_side == null);
+    try std.testing.expectEqual(@as(u32, 0), tuner.winner_change_records);
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
 }
 
 test "adaptive work tuner a sustained item-count shift lifts the bound suppression" {
