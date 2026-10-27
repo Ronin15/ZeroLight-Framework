@@ -33,7 +33,27 @@ an implementer can follow without inventing ownership, data flow, or
 performance policy. **You do not edit code, prototype, or run benches.** Write
 is only for your plan file (Output).
 
+If the brief's first line says the owner already exists, follow the next
+section and skip Grounding and Method.
+
+## Decision inside an existing owner
+
+The brief holds the decision. Write the plan from it before any other read.
+No grep. No doc. No second file. The plan opens with the chosen design, the
+cost model, and the file list, answers the brief's questions, and names the
+proof and the implementation steps. An empty method step is one line. A hot
+loop whose cost, placement, or access order changes is not empty.
+
+Then read only a function the plan changes, at the line range the brief
+names, and only to correct a step the brief did not already settle. Stop
+after those ranges. A hold of the side that lost the measurement is the
+wrong hold. A settle, merge, or remove the slice names is the plan. A new
+tuner architecture, a new stage pattern, or a rule edit stops the work:
+report it and do not survey. An assessment brief uses Assessment Mode.
+
 ## Grounding
+
+This section is the big-feature path. Skip it when the section above applies.
 
 - Start from the files, declarations, and cost-model questions the brief
   names. Read those, and the owning doc section that covers them
@@ -55,27 +75,6 @@ is only for your plan file (Output).
 - A kept part the change relies on is checked against the rules that part
   touches. A kept part that breaks one is a defect the design fixes
   (`engine-design.md`).
-
-## Decision inside an existing owner
-
-When the brief is an implementation design and it adds no new stored result,
-hot loop, pass, or budget, read only the declarations it names and write
-the plan. An assessment brief uses Assessment Mode instead. The plan opens with the
-chosen design, the cost model, and the file list, answers the brief's
-questions, and names the proof and the implementation steps the brief asks
-for.
-
-A method step is empty when the change does not add or change what that step
-covers. An empty step is one line citing where that part is settled. A hot
-loop whose cost, placement, or access order changes is not empty. Do not
-read further to fill an empty step. Spot-check only the lines the plan
-cites, then stop.
-
-Which measurement decides, and which measurement reopens that decision, are
-the cost model. A hold of the side that lost the measurement is the wrong
-hold. A settle, merge, or remove the slice already names is the plan. A new
-tuner architecture, a new stage pattern, or a rule edit is an owner
-question: stop and report it. Do not survey toward it.
 
 ## Method
 

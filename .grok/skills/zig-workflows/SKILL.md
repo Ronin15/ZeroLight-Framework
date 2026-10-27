@@ -35,9 +35,12 @@ test fix stays inline.
 | Pathfinder / best-practices / deep-correctness / architecture | That skill |
 
 A decision inside an existing owner adds no stored result, hot loop, pass, or
-budget. The brief's first line says so. A settle, merge, or remove the slice
-names is that design. A new tuner architecture, a new stage pattern, or a
-rule edit stops for the owner.
+budget. The brief's first line says the owner already exists. The brief
+states the decision, the measurement that decides, the measurement that
+reopens it, the proof, and the functions a step changes. It does not list a
+file tour or a host log. The agent writes the plan from that brief before
+it reads. A settle, merge, or remove the slice names is that design. A new
+tuner architecture, a new stage pattern, or a rule edit stops for the owner.
 
 When unsure, implement. Review a substantive diff. Debug a failing command.
 
