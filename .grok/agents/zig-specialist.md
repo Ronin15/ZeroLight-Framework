@@ -78,8 +78,9 @@ not use. A step the plan fills in is built.
    change cannot move a hot path, skip `bench_ab` and record the skip;
    otherwise run the landing's one before/after with `tools/bench_ab.py` on
    the groups the brief names (`--items N`; `--grid` only for a scaling
-   group), read only the summary lines, and give each slower case its
-   verdict. A new scaling bench also runs tree-only (`--base none --grid
+   group). The brief's command is the command. Do not open `bench_ab.py`,
+   `build.zig`, or a group's item encoder to reconstruct it. Read only the
+   summary lines, and give each slower case its verdict. A new scaling bench also runs tree-only (`--base none --grid
    --all-cases`) for its pass shape.
    Do not profile: a timing dispute goes to the main session, which settles
    it per DW § Profiling. A crash, hang, or

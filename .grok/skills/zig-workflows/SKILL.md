@@ -38,7 +38,7 @@ test fix stays inline.
 
 A short-path brief is `AGENTS.md` § Briefs. The agent reads the named ranges
 and writes the four-part plan from that code. An implement brief names the
-test helper a new test calls. Owner questions are `AGENTS.md`
+test helper a new test calls and the exact bench command. Owner questions are `AGENTS.md`
 § Decision criteria.
 
 When unsure, implement. Review a substantive diff. Debug a failing command.
