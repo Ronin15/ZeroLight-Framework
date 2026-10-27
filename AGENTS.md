@@ -53,8 +53,9 @@ decision criteria, and reports.
   exercises the changed code. When the owner already exists, the first line
   says so and the brief names the line ranges to read. It states the
   decision and does not tour the module. An implement brief names the test
-  helper a new test calls, and the exact bench command when a bench runs.
-  A review brief names the diff, its
+  helper a new test calls, and the bench groups when a bench runs. The
+  implementer reads `tools/bench_ab.py --list` for that group's items and
+  cases. A review brief names the diff, its
   sources, and what to check, never anyone's conclusions.
 - Agents cite a loaded rule by name. They do not open it again and do not
   restate it. A repeated constraint belongs in `.grok/rules/`.

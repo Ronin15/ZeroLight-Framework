@@ -46,6 +46,8 @@ pub const Options = struct {
     item_count_filter: ?usize = null,
     fallback_budget: ?usize = null,
     details: bool = false,
+    /// Print each selected group's items and cases, and do not run them.
+    list_groups: bool = false,
 };
 
 pub const BenchmarkGroup = struct {
@@ -1141,6 +1143,8 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.fallback_budget = try parsePositiveUsize(value);
         } else if (std.mem.eql(u8, arg, "--details")) {
             options.details = true;
+        } else if (std.mem.eql(u8, arg, "--list")) {
+            options.list_groups = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else {
@@ -1225,6 +1229,32 @@ fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_c
     return group.item_counts;
 }
 
+/// One group per block: its name, what an item counts, the `--items` values it
+/// accepts, and the cases it runs. `--group` and `--group-prefix` narrow it.
+pub fn printGroupList(groups: []const BenchmarkGroup, options: Options) !void {
+    const filtered = options.group_filter != null or options.group_prefix != null;
+    var matched = false;
+    for (groups) |group| {
+        if (filtered and !groupSelected(options, group.name)) continue;
+        matched = true;
+        std.debug.print("group={s}\nlabel={s}\nitems=", .{ group.name, group.item_label });
+        for (group.item_counts, 0..) |count, index| {
+            if (index != 0) std.debug.print(" ", .{});
+            std.debug.print("{d}", .{count});
+        }
+        std.debug.print("\ncases=", .{});
+        for (group.cases, 0..) |case, index| {
+            if (index != 0) std.debug.print(",", .{});
+            std.debug.print("{s}", .{case.name});
+        }
+        std.debug.print("\n", .{});
+    }
+    if (filtered and !matched) {
+        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter orelse options.group_prefix.?});
+        return error.InvalidArgument;
+    }
+}
+
 pub fn printUsage() void {
     std.debug.print(
         \\Usage: zig build bench -- [options]
@@ -1238,6 +1268,7 @@ pub fn printUsage() void {
         \\  --items N
         \\  --fallback-budget N
         \\  --details
+        \\  --list
         \\
         \\Default runs every benchmark case for every registered workload.
         \\
@@ -2369,6 +2400,10 @@ test "benchmark options parse scaling and filtering arguments" {
     try std.testing.expectEqual(@as(usize, 65_536), options.item_count_filter.?);
     try std.testing.expectEqual(@as(usize, 64), options.fallback_budget.?);
     try std.testing.expect(options.details);
+
+    const listed = try parseOptions(&.{"--list"});
+    try std.testing.expect(listed.list_groups);
+    try std.testing.expect(listed.group_filter == null);
 }
 
 test "benchmark group prefix selects a family and combines with an exact group" {

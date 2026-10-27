@@ -16,6 +16,8 @@ Usage:
     tools/bench_ab.py --group pathfinding -- --items 2000         # forward bench args
     tools/bench_ab.py --optimize ReleaseFast --group movement-apply-intents -- --items 16384
     tools/bench_ab.py --cpu native --group ai -- --items 1024         # both sides at the host CPU
+    tools/bench_ab.py --list                                         # each group's items and cases
+    tools/bench_ab.py --list --group world-gate
 """
 
 from __future__ import annotations
@@ -156,6 +158,23 @@ def cached_texts(path: Path, reps: int) -> list[str] | None:
     return entry["texts"][:reps]
 
 
+def list_groups(args: argparse.Namespace) -> int:
+    """Print the bench binary's groups. Items and cases come from the groups, not this script."""
+    forwarded = ["--list"]
+    for name in args.group:
+        forwarded += ["--group", name]
+    for prefix in args.group_prefix:
+        forwarded += ["--group-prefix", prefix]
+    root = repo_root()
+    code, text = run_bench(root, forwarded, root / ".zig-cache", "Debug", shipped_cpu_floor())
+    kept = [line for line in text.splitlines() if line.startswith(("group=", "label=", "items=", "cases="))]
+    if code != 0 or not kept:
+        sys.stderr.write(text)
+        return code or 1
+    print("\n".join(kept))
+    return 0
+
+
 def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str, cpu: str) -> tuple[int, str]:
     # Both sides share the repo's local cache: it is content-addressed, so a base
     # export of a new parent commit rebuilds only what differs instead of cold.
@@ -251,8 +270,16 @@ def main() -> int:
         help="-Dcpu for both sides (default: the host's shipped CPU floor, %(default)s; e.g. native)",
     )
     parser.add_argument("--fresh", action="store_true", help="ignore cached reps and rerun both sides")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print each group's items and cases from the bench binary, then exit",
+    )
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
     args = parser.parse_args()
+
+    if args.list:
+        return list_groups(args)
 
     if not args.group and not args.group_prefix:
         parser.error("name at least one --group or --group-prefix; full-suite sweeps run zig build bench")

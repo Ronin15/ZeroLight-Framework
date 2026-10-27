@@ -67,7 +67,9 @@ to the floor still compares like for like. The CPU is part of the cache key. Cas
 `serial-direct` and `thread-adaptive-tuned-range` (`--all-cases` for every
 scheduler case) and to `--warmup 1 --iterations 3` per run (forward
 `-- --iterations N` to override). A run must name its config with `-- --items N`, or
-pass `--grid` for every config; one config answers a regression question. Both sides build with the repo's `.zig-cache`, so a new
+pass `--grid` for every config; one config answers a regression question.
+`--list` prints each group's `items` and `cases` from the bench binary and runs
+nothing; `--list --group name` prints one. Pick `--items` from that list. Both sides build with the repo's `.zig-cache`, so a new
 base rebuilds only what differs.
 
 ```sh
@@ -76,6 +78,7 @@ tools/bench_ab.py --group chunk-scale-cave-in -- --items 2561024032
 tools/bench_ab.py --group chunk-scale-gpu-sync-dig --case serial-direct --base 5439e36 -- --items 1024032
 tools/bench_ab.py --base none --grid --group chunk-scale-dig  # shape: tree only, every config
 tools/bench_ab.py --group pathfinding -- --items 2000          # forward bench args
+tools/bench_ab.py --list --group world-gate                 # that group's items and cases
 ```
 
 ## Asset pipeline at a glance

@@ -164,5 +164,12 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
+    if (options.list_groups) {
+        suite.printGroupList(&benchmark_groups, options) catch {
+            std.process.exit(1);
+        };
+        return;
+    }
+
     try suite.runAll(init.gpa, init.io, &benchmark_groups, options);
 }

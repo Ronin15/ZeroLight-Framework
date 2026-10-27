@@ -77,9 +77,9 @@ not use. A step the plan fills in is built.
 6. Benchmark per `tests-benchmarks.md` § Benchmarks: when the brief says the
    change cannot move a hot path, skip `bench_ab` and record the skip;
    otherwise run the landing's one before/after with `tools/bench_ab.py` on
-   the groups the brief names (`--items N`; `--grid` only for a scaling
-   group). The brief's command is the command. Do not open `bench_ab.py`,
-   `build.zig`, or a group's item encoder to reconstruct it. Read only the
+   the groups the brief names. Run `tools/bench_ab.py --list --group <name>`
+   and pick `--items` from that group's `items` line and a case from its
+   `cases` line. Do not open the harness or an item encoder. Read only the
    summary lines, and give each slower case its verdict. A new scaling bench also runs tree-only (`--base none --grid
    --all-cases`) for its pass shape.
    Do not profile: a timing dispute goes to the main session, which settles
