@@ -53,8 +53,8 @@ spawn together. Implement and debug run one at a time in the main tree. Do
 not run design and implement together on the same files.
 
 A review brief names the diff, its sources, and what to check. It carries no
-conclusion. A diff that adds no loop, store, pass, or budget is the review
-agent's small-diff path. A debug prompt may be the failing command and the first error
+conclusion. The review enforces the rules and the architecture on the lines
+the diff changes. The read stays on those lines. A debug prompt may be the failing command and the first error
 block when that is the whole failure. Skip `zig build verify` until that
 command is green.
 

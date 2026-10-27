@@ -62,31 +62,14 @@ that did not load.
 
 Read a hot loop the diff does not edit only when the diff changes an input
 that loop reads or the order it is called. Otherwise that loop is one line.
-Do not read it to confirm. A step whose subject the diff does not add or
-change is one line.
-
-## Small diff
-
-When the diff adds no hot loop, no store layout, no pass, and no budget,
-this section is the whole review. Skip the procedure.
-
-Read the diff, the functions it edits, and the tests it adds or changes.
-Write the report from that.
-
-- Apply each loaded rule that governs a line the diff changes. Cite the
-  rule a finding breaks. A rule the diff does not touch is one line.
-- Read the architecture sentence that describes those functions. A sentence
-  about a system the diff does not touch stays unread.
-- A new test that stays green with its change reverted is a finding. Name
-  the mutation and the scenario.
-- Judge a bench claim from the numbers the landing prints. Do not re-run it.
-- A loop, layout, SIMD shape, container, or stage the diff does not change
-  is one line.
+Do not read it to confirm. The bound is the read. It is not a check you skip.
 
 ## Procedure
 
-Use this when the diff adds a loop, a store, a pass, or a budget, or when it
-changes a hot loop's body, cost, placement, or access order.
+This is the review, on every diff. You are enforcing the rules and the
+architecture on the lines the diff changes. A step whose subject the diff
+does not touch is one line naming the rule. Cite the rule a finding breaks.
+Do not restate it.
 
 Each finding cites the loaded rule it breaks. Apply that rule. Do not
 restate it.
@@ -107,16 +90,19 @@ restate it.
    not touch is one line) and each container, heap, bitset, sort, search,
    hash, or parse it adds or changes against the installed 0.17 `lib/std`
    (`zig-style.md`).
-5. **Contract**: the owning doc section (`AGENTS.md` § Rules And Docs). Never
-   recommend moving ownership against `docs/architecture.md`; name the
-   conflict as an owner question. Read the declaration a missing guard or
+5. **Contract**: read the architecture sentence that describes the functions
+   the diff edits, and check the diff against it. A sentence about a system
+   the diff does not touch stays unread. Never recommend moving ownership
+   against `docs/architecture.md`; name the conflict as an owner question.
+   Read the declaration a missing guard or
    sizing problem depends on before reporting it. A guarantee by
    construction or an allowed precondition assert is not a finding. Owner
    questions are `AGENTS.md` § Decision criteria.
 6. **Tests and benches** against `tests-benchmarks.md`: for a weak test, the
    untested contract and a scenario that exposes a regression; for each new
    test, the mutation it catches (one that passes with the change reverted is
-   a finding).
+   a finding). Judge a bench claim from the numbers the landing prints. Do
+   not re-run it.
 7. **Scope**: changed files against the brief's list. **Roadmap docs**, when
    edited, against the roadmap index § Ground Rules.
 
