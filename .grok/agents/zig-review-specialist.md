@@ -71,16 +71,13 @@ architecture on the lines the diff changes. A step whose subject the diff
 does not touch is one line naming the rule. Cite the rule a finding breaks.
 Do not restate it.
 
-Each finding cites the loaded rule it breaks. Apply that rule. Do not
-restate it.
-
 1. **Scale**: every operation the diff adds or changes, against
    `engine-design.md` § Target scale and § Cost model, `threading.md` § What
    runs where, and `budgets-capacities.md`. For a plan, its hot-loop table
    covers every loop the change adds or changes; each claimed order is
    measured or marked derived (`engine-design.md` § Cost model).
 2. **Data layout and SIMD**: for each hot loop, store, or index the diff adds,
-   touches, or still runs, name the data it reads, its read order, and its
+   touches, or whose input or call order it changes, name the data it reads, its read order, and its
    filter keys, and check them against `memory-performance.md`
    § Data-oriented design and § SIMD and core math. A failure is a High
    structural finding.
