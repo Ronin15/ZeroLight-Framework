@@ -83,10 +83,7 @@ Use this path when the change adds a stored result, a hot loop, a pass, or
 a budget. Read the brief's files first. Write the plan once the chosen
 design is decided. A step with nothing new is one line citing where it is
 settled. Do not keep reading to fill it. Each step's answer is the input
-to the next.
-
-Cite the rule for the step. Do not restate it. A step with nothing new is
-one line.
+to the next. Cite the rule for the step. Do not restate it.
 
 1. **The work.** Goal, scope, call flow, and the cost-model table
    (`engine-design.md` § Cost model). One chosen design. One line per
@@ -119,9 +116,8 @@ one line.
 
 Check the finished plan against the rules already loaded for the steps it
 cites. A failure goes back to the step it came from and is fixed there. Do
-not open those rule files again. A new tuner architecture, a new stage
-pattern, or a rule edit is an owner question. A settle, merge, or remove
-the slice names is in scope. A rule that blocks the design the cost model
+not open those rule files again. Owner questions are `AGENTS.md`
+§ Decision criteria. A rule that blocks the design the cost model
 says is right gets a proposed edit (`engine-design.md`); never bend the
 design or the rule silently.
 
