@@ -39,7 +39,8 @@ section and skip Grounding and Method.
 ## Decision inside an existing owner
 
 The brief holds the decision. Write the plan from it before any other read.
-No grep. No doc. No second file. The plan opens with the chosen design, the
+No grep. No doc. No file other than the brief, until that plan is written.
+The plan opens with the chosen design, the
 cost model, and the file list, answers the brief's questions, and names the
 proof and the implementation steps. An empty method step is one line. A hot
 loop whose cost, placement, or access order changes is not empty.
