@@ -4,7 +4,7 @@
 
 **Status: programming landed (`07b9c9a` wake words, `776c1ec` startup calibration); open:
 the gate and prior items' remaining tuned-vs-control checks, the 4,096 production-step
-tuners that stay unsettled, and the owner's macOS and Windows runs.** Owner 2026-10-25: slice 89 commits as is; the wake protocol and startup
+tuners that stay unsettled, and the owner's Windows run (macOS recorded 2026-10-26).** Owner 2026-10-25: slice 89 commits as is; the wake protocol and startup
 calibration are this separate slice, and slice 50's hold on startup calibration is reversed
 (the `ThreadSystem` is stable). Plan: `.claude/reports/thread-calibration-plan.md`.
 
@@ -40,6 +40,29 @@ the detected machine's measured floor, not from one host's numbers.
     234.6 us vs pre-L1 (within spread); 16,384 653.7 -> 578.1 us vs L1, 646.5 -> 578.1 us
     vs pre-L1 (within spread; the 16,384 base is unsettled in 3 of 3 reps). `world-gate`
     65,536 tuned 127.9 -> 127.8 us vs L1, 150.0 -> 127.8 us vs pre-L1 (within spread).
+- macOS owner run (2026-10-26, Apple M3 Pro, 11 CPUs, 10 workers, ReleaseFast
+  `-Dcpu=apple_m1`, head `1ac549a`; the portable wake, one futex word per worker).
+  `thread-fixed-auto`, 3 interleaved reps, warmup 5 / iterations 30, 10/10 workers:
+  - After L1 (`07b9c9a`) vs pre-L1 (`ff2a161`): 1,024 24.0 -> 22.8 us (within
+    spread; the base spread is 55.7%, one rep at 13.6 us); 16,384 29.8 -> 33.8 us
+    (+13.4%, within spread).
+  - After L2 vs pre-L1: 1,024 23.1 -> 21.0 us (within spread); 16,384 32.9 ->
+    32.6 us (within spread). The full-pool floor is within spread of pre-L1.
+  - Calibration, 4 ReleaseFast inits: full-pool floor 20.3-26.3 us, one worker
+    3.5-7.0 us, per-worker wake 1.83-2.47 us, gate 40.6-52.5 us (2 x the
+    full-pool floor in every run), prior the per-worker wake, startup 1.02-1.27 ms.
+  - `production-step` 16,384, one run, default warmup (`settled=no`): pre tuned
+    639 us, serial 1.01 ms (33/34, `directions_tuner`); after L1 636 us, serial
+    1.03 ms (31/34, `grid_sort_tuner`, `world_gate.tuner`, `plane_entry.tuner`);
+    after L2 646 us, serial 1.02 ms (33/34, `steering.adaptive_tuner`).
+  - After L2 at 4x pre-measure (warmup 360 / iterations 300, one run): tuned
+    616 us, serial 1.00 ms, main 238 us (38%). 35/36 tuners settled, including
+    `steering.adaptive_tuner`. `plane_entry.tuner` stayed unsettled: serial
+    63 us, threaded 37 us, against the 40.6-52.5 us gate. Stages under the gate
+    stayed inline (movement 7 us, pathfinding, scope gathers, spatial index
+    41 us). Collision, steering, and the world gate ran on workers every
+    measured call (serial 355 / 282 / 117 us). The case stays `settled=no`.
+  - `zig build test -Dsanitize-thread=true` exited 0.
 - Measured wake diagnostics (scratch versions, ReleaseFast `-Dcpu=x86_64_v2`, this host;
   `.claude/reports/slice89-wake-diag.md`):
   - A broadcast wake cut the full-pool dispatch floor 26.9 -> 17.2 us
@@ -114,8 +137,11 @@ the detected machine's measured floor, not from one host's numbers.
       `776c1ec` `state.pipeline.world_gate.tuner`, `steering.grid_bucket_tuner`, and
       `steering.adaptive_tuner` stay unsettled in 2 of 3 runs (all 36 tuners settled at
       `07b9c9a`); 16,384 leaves 1-4 unsettled before and after (collision, steering, scope,
-      pathfinding stages; pre-existing). Hypothesis, untested: the stages sit at the lower
-      gate, where the settled-window rules flap. Failure scenario: the tuned case is not
+      pathfinding stages; pre-existing). On macOS at 16,384 and 4x pre-measure,
+      `steering.adaptive_tuner` settled and `plane_entry.tuner` did not: its
+      serial cost is 63 us and its threaded cost 37 us, against a 40.6-52.5 us
+      gate (one run, M3 Pro). Hypothesis: the stages sit at the lower gate,
+      where the settled-window rules flap. Failure scenario: the tuned case is not
       judged (`.grok/rules/tests-benchmarks.md`) and the stage re-probes forever
       (`.grok/rules/threading.md` § Building a stage). Pass: they settle, or are merged or
       removed per `threading.md`.
@@ -135,6 +161,11 @@ the detected machine's measured floor, not from one host's numbers.
       above and commits `07b9c9a`, `776c1ec`.
       Pass: floor not worse than before L1 beyond spread, tests pass, and the
       calibrated gate reported per machine.
+      macOS (2026-10-26, M3 Pro, 10 workers): after L2 the full-pool floor is
+      within spread of pre-L1 at 1,024 and 16,384; gate 40.6-52.5 us; the TSan
+      run exited 0. `production-step` 16,384 at 4x pre-measure is 616 us tuned
+      against 1.00 ms serial, 35/36 settled; `plane_entry.tuner` is still
+      unsettled, so the tuned case is not judged. Windows still open.
 
 ### Acceptance checks
 
