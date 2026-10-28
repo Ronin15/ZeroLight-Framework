@@ -97,8 +97,12 @@ decision criteria, and reports.
 
 ## Commands
 
-Zig 0.17.0 minimum. `zig build -l` lists the steps;
-`zig build bench -- --group <name>` targets one bench group. Details: DW.
+Zig 0.17.0 minimum. `zig build -h` lists the steps and the `-D` options; stop
+at System Integration Options. `tools/bench_ab.py --help` lists that script's
+flags and the bench flags it forwards, and runs nothing. `tools/bench_ab.py
+--list` lists each group's items and cases. Do not open `build.zig`,
+`tools/bench_ab.py`, or `src/benchmarks/` to find a flag or a group. Open a
+DW section only when a rule names it.
 Validation cadence and modes: `build-validation.md`.
 
 ## Grok Tooling (`.grok/`)

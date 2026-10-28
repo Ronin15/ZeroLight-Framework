@@ -9,6 +9,8 @@ tools:
   - grep
   - list_dir
   - run_terminal_command
+  - search_tool
+  - use_tool
 disallowedTools:
   - spawn_subagent
 injectDefaultTools: false
@@ -64,8 +66,11 @@ failures from compiler output.
 
 1. Capture the command, failure text, and timing class; identify the layer.
 2. Run the narrowest relevant command (`check`, `test`, `shaders`; `run` only
-   when behavior needs the app; `gpu-smoke` per `build-validation.md`);
-   read the declaration the error names and the failing test. Do not read
+   when behavior needs the app; `gpu-smoke` per `build-validation.md`). A
+   step or `-D` option not named there: `zig build -h`, and stop at System
+   Integration Options. A bench flag: `tools/bench_ab.py --help`. Do not open
+   `build.zig`, the bench sources, or DW except a section a loaded rule names.
+   Read the declaration the error names and the failing test. Do not read
    the file's other tests.
 3. Test one hypothesis.
 4. At a runtime/integration boundary, add or keep diagnostics that make the
@@ -77,8 +82,13 @@ Performance: isolate the stage, then the cause. Compare a learned or cached
 decision with the measured cost before blaming the stage. Data shape before
 kernel choice (`memory-performance.md` § Data-oriented design, then § Dense
 SoA storage). A Debug
-regression is attributed per `tests-benchmarks.md`, with callgrind per
-`docs/development-workflow.md` § Profiling.
+regression is attributed per `tests-benchmarks.md`. The profile is
+`docs/development-workflow.md` § Profiling: callgrind on Linux, the natprof
+MCP on macOS. On macOS, `search_tool` for the natprof schema, then the call.
+If that server is not connected, report it. Do not run `-Dcallgrind` on
+macOS, and do not open the natprof source for a flag. A panic's trace is
+the one Zig prints. A crash or hang that printed none is gdb on Linux and
+lldb on macOS (`docs/development-workflow.md` § Stack traces).
 
 A `zig build check` failure naming a `SimulationPipeline` stage that reads a
 resource before any earlier stage writes it is the stage contract working: fix

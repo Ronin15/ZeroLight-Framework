@@ -75,13 +75,17 @@ not use. A step the plan fills in is built.
    missed by `-Dtest-filter=collision`. Write that output to a file and
    judge it by the exit code; a
    "failed command:" line echoing warn output is not a failure; on a real
-   failure keep the failing test's name and message.
+   failure keep the failing test's name and message. A step or `-D` option
+   not named here or in `build-validation.md`: `zig build -h`, and stop at
+   System Integration Options. Do not open `build.zig` or DW to find one.
 6. Benchmark per `tests-benchmarks.md` § Benchmarks: when the brief says the
    change cannot move a hot path, skip `bench_ab` and record the skip;
    otherwise run the landing's one before/after with `tools/bench_ab.py` on
    the groups the brief names. Run `tools/bench_ab.py --list --group <name>`
    and pick `--items` from that group's `items` line and a case from its
-   `cases` line. Do not open the harness or an item encoder. Read only the
+   `cases` line. A group name the brief does not give: `--list` with no
+   group. A flag not named here: `tools/bench_ab.py --help`. Do not open
+   the script, the harness, an item encoder, or DW to find one. Read only the
    summary lines, and give each slower case its verdict. A new scaling bench also runs tree-only (`--base none --grid
    --all-cases`) for its pass shape.
    Do not profile: a timing dispute goes to the main session, which settles

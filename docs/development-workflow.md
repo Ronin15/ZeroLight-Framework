@@ -391,6 +391,23 @@ self cost by instruction address, with its call sites as landmarks. That needs
 valgrind's `--dump-instr=yes`, which `-Dcallgrind` does not pass: run valgrind on
 the bench binary directly for it.
 
+On macOS, `-Dcallgrind` is refused. A wall-time profile or a debugger session
+uses the connected `natprof` MCP. `search_tool` returns its schema.
+`launch_session` starts the Debug bench binary; `record`, then `record_status`
+until it reports done, then `hotspots`, is the profile. `debug` runs one lldb
+command on that session. `backtrace_all` freezes the process. `hotspots` is
+sampled wall time, threads included. It does not answer the instruction counts
+callgrind answers. Leak stacks need `launch_session` with `mem_debug`. The
+server is the user's. This repo does not vendor it. A session where natprof
+did not connect reports that and does not invent a `sample` command.
+
+## Stack traces
+
+A panic in Debug or ReleaseSafe prints its own trace. That is the trace.
+gdb on Linux and lldb on macOS are for a crash or a hang that printed none.
+On a Debug binary, `bt` shows the Zig function and the source line.
+ReleaseFast does not keep that debug info.
+
 ## Benchmarks
 
 `zig build bench` pins its default log level to `warn` in every optimize mode
