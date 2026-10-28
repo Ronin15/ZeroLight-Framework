@@ -75,7 +75,8 @@ failures from compiler output.
 
 Performance: isolate the stage, then the cause. Compare a learned or cached
 decision with the measured cost before blaming the stage. Data shape before
-kernel choice (`memory-performance.md` § Dense SoA storage). A Debug
+kernel choice (`memory-performance.md` § Data-oriented design, then § Dense
+SoA storage). A Debug
 regression is attributed per `tests-benchmarks.md`, with callgrind per
 `docs/development-workflow.md` § Profiling.
 

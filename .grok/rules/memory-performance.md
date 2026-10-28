@@ -104,7 +104,7 @@ paths:
 - Hot gather loops capture the row slice once and add rows on it, never
   `appendAssumeCapacity`; a per-row store append reserves one row, then
   appends assuming capacity, never reserves `n` and then appends (both
-  patterns: `docs/architecture.md` § Gameplay Data).
+  patterns: `docs/architecture.md` § Component stores).
 - Compact with `swapRemove` when order does not matter; keep `deinit`,
   `clearRetainingCapacity`, and capacity helpers on the owning store.
 - Publish hot float columns as `[]f32`, never `[]align(64) f32`; MAL does not

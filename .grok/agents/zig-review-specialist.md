@@ -90,9 +90,10 @@ Do not restate it.
    not touch is one line) and each container, heap, bitset, sort, search,
    hash, or parse it adds or changes against the installed 0.17 `lib/std`
    (`zig-style.md`).
-5. **Contract**: read the architecture sentence that describes the functions
-   the diff edits, and check the diff against it. A sentence about a system
-   the diff does not touch stays unread. Never recommend moving ownership
+5. **Contract**: read the `docs/architecture.md` heading that describes the
+   functions the diff edits, and stop at the next heading of the same level.
+   Check the diff against that heading. A heading the diff does not touch
+   stays unread. Never recommend moving ownership
    against `docs/architecture.md`; name the conflict as an owner question.
    Read the declaration a missing guard or
    sizing problem depends on before reporting it. A guarantee by

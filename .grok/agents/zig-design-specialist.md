@@ -40,13 +40,17 @@ section and skip Grounding and Method.
 
 The brief's first line says the owner already exists. Read only the line
 ranges it names. Write the plan from that code. Do not grep. Do not open a
-doc or a file the brief did not name. Then stop.
+doc or a file the brief did not name, except the rule the condition cites
+when that section did not load. Then stop.
 
 The plan is four parts: the decision, the condition, the proof, and the
 steps. It answers which measurement decides and which reopens that
 decision. Omit an empty section. Do not write the big-feature plan. A hot
 loop whose cost, placement, or access order changes is not empty, and that
-loop is named in the condition.
+loop is named in the condition. Name what it reads, its read order, and its
+filter keys, and cite `memory-performance.md` § Data-oriented design. Do not
+restate it. A layout that fails it, with no exemption named, is the decision.
+Open that rule only when the section did not load.
 
 A hold of the side that lost the measurement is the wrong hold. A settle,
 merge, or remove the slice names is the plan. A new tuner architecture, a
@@ -58,9 +62,10 @@ survey. An assessment brief uses Assessment Mode.
 This section is the big-feature path. Skip it when the section above applies.
 
 - Start from the files, declarations, and cost-model questions the brief
-  names. Read those, and the owning doc section that covers them
-  (`docs/architecture.md`; `docs/simulation-tiers-and-pipeline.md` only when
-  the change touches frame streams, events, or structural commands). Cite a
+  names. Read the `docs/architecture.md` heading that covers them, and stop
+  at the next heading of the same level. Read
+  `docs/simulation-tiers-and-pipeline.md` only when the change touches frame
+  streams, events, or structural commands, and stop the same way. Cite a
   loaded rule. Do not open it again. Read a rule only when a step needs one
   that did not load. Do not read the roadmap index,
   track files, or every rule up front. For a slice, the slice file's goal

@@ -753,6 +753,10 @@ bench output (`--details`).
 
 ## Gameplay Data
 
+Hot-column order follows `.grok/rules/memory-performance.md` § Data-oriented design.
+
+### Component stores
+
 Gameplay states own their own `DataSystem`; it is not an app singleton. The
 system stores persistent world entities, per-entity component masks for system
 membership queries, and typed SoA data such as movement bodies, facing,
@@ -807,12 +811,16 @@ re-slicing per row. There is no shared helper: each row type carries its own
 copy (`appendAffectGatherRow` in `systems/affect.zig`, `appendParticleRow` in
 `systems/particle.zig`, `appendProxyRow` in `systems/collision.zig`).
 
+### Fixed-step pipeline
+
 Gameplay states own their `DataSystem`, a transient `SimulationFrame`, and a
 state-owned `SimulationPipeline` for each fixed step. The state clears the
 frame, runs main-thread input writes, delegates fixed-step processor dispatch to
 the pipeline, and applies deferred structural commands at explicit main-thread
 commit points. `DataSystem` remains persistent storage, not the simulation
 scheduler.
+
+### World surfaces
 
 Large world surfaces belong to state-owned world storage rather than
 `DataSystem` entities or the simulation pipeline. `GameDemoState` owns its
@@ -858,6 +866,8 @@ interpolated sub-pixel camera, and asks `WorldSystem` to expose only
 camera-visible chunks to render prep. Simulation scope uses the fixed-step
 `sim_view` region, never the render window; `SimulationPipeline` owns no tile
 storage, runtime atlas metadata, or camera policy.
+
+### Stage order and commit seam
 
 The current gameplay fixed-step pipeline is:
 
@@ -906,6 +916,8 @@ features are concrete pipeline-owned controllers; the pipeline is a thin
 composer and each controller and system owns its own internals
 (`.grok/rules/simulation.md`).
 
+### Tiers and scope
+
 Simulation tiers and active scope belong in the same pipeline boundary. Tier and
 chunk metadata are dense SoA columns on the movement-body store
 (`tier`, `chunk_x/y`, `stagger_phase`, `always_active`), in lockstep with the
@@ -941,6 +953,8 @@ requests. Scope then decides which worlds, chunks, chunk halos, or
 staggered/reduced-cadence groups enter those tiered stages for the current
 fixed step.
 
+### Affect
+
 Emergent NPC behavior layers on the cognition tier. Perception, memory, and
 **affect (feelings / emotion drives)** are durable per-entity concepts that live
 as SoA components in `DataSystem` and are advanced by cognition-gated processor
@@ -971,6 +985,8 @@ by `affect_update`, per `stage_order`). Adding a feeling:
 `.grok/rules/simulation.md` § AI and affect (roadmap
 [Slice 42](roadmap/slices/slice-42.md)). See the
 [Emergent AI Track Overview](roadmap/tracks/emergent-ai.md).
+
+### Controllers
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
@@ -1005,6 +1021,8 @@ Non-locomotion player/AI requests flow through `SimulationFrame.action_intents`
 pathfinder. Locomotion stays on `navigation_intents` → steering → `intents`
 (movement).
 
+### Processor handoff
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are
@@ -1019,6 +1037,8 @@ through `Renderer`. `DataSystem` does not own SDL handles, GPU handles,
 SDL_mixer handles, live renderer texture IDs, prepared sprite records, asset
 leases, audio command buffers, input frame state, thread-system state,
 transient events, tile maps, or scratch buffers.
+
+### Movement
 
 `MovementSystem` updates movement-body slices as an ordered gameplay data
 processor, using SIMD lanes inside each assigned range and
@@ -1035,6 +1055,8 @@ one movement intent per entity per step (steering's first claim), asserted at th
 stage; main keeps O(ranges) dispatch. The rows are scattered across the velocity
 columns, which `threading.md` allows: `movement-apply-intents-sorted` is its
 row-order control.
+
+### Collision
 
 `CollisionSystem` generates contacts for entities that have both a movement
 body and collision bounds. `update` runs the banded fill, sort, sweep, and
@@ -1126,6 +1148,8 @@ contacts in range order (O(1) per record), and reserves everything before
 dispatch. `observerContacts` (the contacts naming the observer) serves player
 impacts and collision audio, replacing two scans of every contact.
 
+### Spatial index
+
 `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) is the pipeline's one
 neighbor index. `spatial_index_build` builds it each step from the unstaggered
 cognition halo at the previous step's positions and levels, and every neighbor
@@ -1180,6 +1204,8 @@ query that step reads it (`.grok/rules/simulation.md`).
   calling thread. Only the sort, the build's cost driver, records
   `.spatial_index_build` in the runtime perf log (`.grok/rules/threading.md`).
 
+### Perception
+
 `PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
 think set's `AiPerception` rows. Each observer queries the shared index for the
 factions hostile to it on its own level; the player joins as a candidate only on
@@ -1213,6 +1239,8 @@ hot columns; only acquisition/loss transitions emit low-volume
 against the pipeline's real per-step event capacity, not a floating library
 default) with drops surfaced through event stats rather than an unhandled
 capacity error.
+
+### AI
 
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
 It receives const AiAgent + movement prior-position slices and the read-only
@@ -1253,6 +1281,8 @@ sweep-and-prune broadphase (see above) is intentionally not ported onto this
 index — it is a different, already-tuned algorithm, not a duplicate grid
 build.
 
+### Steering
+
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
 component data, movement slices, the shared static-collider rows, and
 frame-delayed `PathfindingSystem` status. It owns runtime path-following rows
@@ -1282,6 +1312,8 @@ Priority arbitration chooses the highest-priority navigation intent per entity
 with stable stream order as the tie-breaker.
 Player movement remains direct input with no steering component, while collision
 response still resolves after movement.
+
+### Path requests
 
 `PathfindingSystem` (`src/game/systems/pathfinding/`) is a frame-delayed, Z-aware
 grid pathfinding processor (rules: `.grok/rules/pathfinding.md`). It runs two
@@ -1462,11 +1494,15 @@ The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects are
 plain entities processed by enemy, movement, collision, AI, or render systems.
 
+### Particles
+
 `ParticleSystem` is the transient visual-effect exception. It is owned by the
 game state instead of `DataSystem`, because particles are short-lived effect
 rows rather than persistent world entities. Particle emission and expired row
 swap-removal run on the state/main thread; threaded jobs only update assigned
 SoA ranges and render submits rectangles through `Renderer`.
+
+### Frame outputs
 
 Simulation outputs coordinate determinism, performance, and efficiency as one
 contract. Threaded processors that produce events, intents, contacts, or

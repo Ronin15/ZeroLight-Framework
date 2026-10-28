@@ -56,7 +56,9 @@ not use. A step the plan fills in is built.
    still misses and the counters show the structure itself is the cost, or
    the brief already says the structure failed.
 3. Make the change in the owning module (`docs/architecture.md` § Source
-   Layout; `engine-design.md` § Changes and docs). Touch only the files the
+   Layout; `engine-design.md` § Changes and docs). When the brief or the plan
+   cites an architecture heading, read that heading and stop at the next
+   heading of the same level. Touch only the files the
    brief lists; a needed file outside the list stops the work and is
    reported, never edited first.
 4. Add the tests and scaling benches the rules require

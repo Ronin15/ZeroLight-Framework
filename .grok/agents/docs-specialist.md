@@ -45,7 +45,11 @@ Do not survey a module past those lines.
 3. Write each fact once, in the doc that owns it; elsewhere, link to it. Keep
    it terse: what the code does and its contracts, no history, no process
    notes. Describe a system in the order it is designed: what it does and
-   grows with, its data, its passes and threading, then its constraints.
+   grows with, its data, its passes and threading, then its constraints. A
+   hot loop's data or a new store cites `memory-performance.md`
+   § Data-oriented design. Read that rule when it did not load. When editing
+   `docs/architecture.md`, change the heading that owns the fact and stop at
+   the next heading of the same level.
 4. Check off a checklist item only when live code meets its pass condition;
    an unmet item stays open with its reason. A routed finding becomes a
    checklist item in its owning slice with its `file:line`, failure
