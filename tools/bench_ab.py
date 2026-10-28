@@ -8,6 +8,16 @@ export, reps and spread, the run cache, cases, the CPU floor, and output
 locations: `tools/README.md` § `bench_ab.py`. A run must name its config with
 `-- --items N` (or pass `--grid` for every config).
 
+Forwarded to the bench binary after `--` (`tools/bench_ab.py -- --help` prints
+this help and runs nothing):
+    --warmup N
+    --iterations N
+    --case name
+    --items N
+    --fallback-budget N
+    --details
+This script owns `--group`, `--group-prefix`, `--case`, and `--list`.
+
 Usage:
     tools/bench_ab.py --group chunk-scale-dig -- --items 1024032
     tools/bench_ab.py --group chunk-scale-cave-in -- --items 2561024032
@@ -278,11 +288,15 @@ def main() -> int:
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
     args = parser.parse_args()
 
+    if args.bench_args in (["--help"], ["-h"]):
+        parser.print_help()
+        return 0
+
     if args.list:
         return list_groups(args)
 
     if not args.group and not args.group_prefix:
-        parser.error("name at least one --group or --group-prefix; full-suite sweeps run zig build bench")
+        parser.error("name at least one --group or --group-prefix (flags: --help); full-suite sweeps run zig build bench")
     names_items = any(a.startswith("--items") for a in args.bench_args)
     if not names_items and not args.grid:
         parser.error("name the config that answers the question (-- --items N), or pass --grid for every config")

@@ -68,8 +68,10 @@ to the floor still compares like for like. The CPU is part of the cache key. Cas
 scheduler case) and to `--warmup 1 --iterations 3` per run (forward
 `-- --iterations N` to override). A run must name its config with `-- --items N`, or
 pass `--grid` for every config; one config answers a regression question.
-`--list` prints each group's `items` and `cases` from the bench binary and runs
-nothing; `--list --group name` prints one. Pick `--items` from that list. Both sides build with the repo's `.zig-cache`, so a new
+`--help` prints this script's flags and the bench flags it forwards, and runs
+nothing; `-- --help` prints the same text. `--list` prints each group's `items`
+and `cases` from the bench binary and runs nothing else; `--list --group name`
+prints one. Pick `--items` from that list. Both sides build with the repo's `.zig-cache`, so a new
 base rebuilds only what differs.
 
 ```sh
