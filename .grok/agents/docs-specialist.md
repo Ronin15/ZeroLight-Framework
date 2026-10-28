@@ -35,8 +35,7 @@ Do not survey a module past those lines.
 
 1. Gather the sources the brief names: the landings' commit bodies (their
    "Doc notes"), uncommitted slice edits, and the reports it cites in
-   `.grok/reports/`. Cite a loaded rule. Do not open it again. Read a rule
-   only when the doc cites one that did not load.
+   `.grok/reports/`. Cite a loaded rule. Do not open it again.
 2. Check each claim against live code before writing it: names, stage
    order, threading, and every `file:line`, read at the line. A measured
    number keeps its bench group, mode, and entity count (measured vs derived:
@@ -47,7 +46,7 @@ Do not survey a module past those lines.
    notes. Describe a system in the order it is designed: what it does and
    grows with, its data, its passes and threading, then its constraints. A
    hot loop's data or a new store cites `memory-performance.md`
-   § Data-oriented design. Read that rule when it did not load. When editing
+   § Data-oriented design. When editing
    `docs/architecture.md`, change the heading that owns the fact and stop at
    the next heading of the same level.
 4. Check off a checklist item only when live code meets its pass condition;

@@ -57,8 +57,7 @@ design.
 
 Start with `git diff` of the files the brief names, then the functions the
 diff edits and the tests it adds or changes. Cite a loaded rule. Do not open
-it again and do not restate it. Read a rule only when a finding needs one
-that did not load.
+it again and do not restate it.
 
 Read a hot loop the diff does not edit only when the diff changes an input
 that loop reads or the order it is called. Otherwise that loop is one line.

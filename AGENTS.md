@@ -10,9 +10,8 @@ multi-world colony simulator (target and the demo's role:
 ## Rules And Docs
 
 - **Rules** live only in `.grok/rules/`, one topic per file
-  (`engine-design.md`). `engine-design.md` loads every session; each other
-  rule loads when a file its `paths:` frontmatter names is Read, so Read a
-  file you only grepped before relying on its rules.
+  (`engine-design.md`). Every rule loads every session. Cite a loaded rule
+  and do not open it again.
 - Agent definitions, docs, briefs, plans, and reports cite rule files by name
   and never restate them; a plan cites the rule each decision meets, a review
   the rule each standards finding breaks.
@@ -115,4 +114,3 @@ Validation cadence and modes: `build-validation.md`.
 - `.grok/hooks/zig-fmt.sh` runs `zig fmt` on each `.zig`/`.zon` file a
   `search_replace` or `write` just edited (`.grok/hooks/zig-fmt.json`; needs
   `jq`); it does not replace validation.
-- `CLAUDE.md` and `.claude/` are the Claude Code copies of this contract.

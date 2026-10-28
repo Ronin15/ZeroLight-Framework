@@ -17,7 +17,7 @@ native target and do not require an external MinGW or Visual Studio toolchain.
 - Python 3 for `zig build verify` (`idiom-lint` and `assets-lint` are Python
   scripts); Pillow as well for atlas packing, source-art export, and
   placeholder generation
-- `jq` for the `zig fmt` hook (`.claude/hooks/zig-fmt.sh` does nothing without it)
+- `jq` for the `zig fmt` hook (`.grok/hooks/zig-fmt.sh` does nothing without it)
 
 The app uses core SDL3 PNG loading through `SDL_LoadPNG`; it does not require
 `SDL3_image`.

@@ -1,22 +1,3 @@
----
-paths:
-  - "src/render/**"
-  - "src/platform/**"
-  - "src/game/render_prep.zig"
-  - "src/game/*_state.zig"
-  - "src/game/menu_view.zig"
-  - "src/game/ai_debug_overlay.zig"
-  - "src/game/render_depth.zig"
-  - "src/game/world/system.zig"
-  - "src/game/world/render.zig"
-  - "src/game/world/edit.zig"
-  - "src/game/world/worldgen.zig"
-  - "src/game/world/gpu_tiles.zig"
-  - "src/game/world/terrain.zig"
-  - "assets/shaders/**"
-  - "build.zig"
----
-
 # Rendering And Shaders
 
 How the renderer works: `docs/rendering-assets-shaders.md`.

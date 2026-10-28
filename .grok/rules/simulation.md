@@ -1,11 +1,3 @@
----
-paths:
-  - "src/game/**/*.zig"
-  - "src/benchmarks/**/*.zig"
-  - "src/core/**/*.zig"
-  - "src/app/**/*.zig"
----
-
 # Simulation, Events, Persistent Data
 
 How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,

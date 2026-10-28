@@ -1,15 +1,3 @@
----
-paths:
-  - "src/game/systems/pathfinding/**"
-  - "src/game/systems/pathfinding.zig"
-  - "src/benchmarks/pathfinding/**"
-  - "src/benchmarks/nav_size.zig"
-  - "src/benchmarks/nav_update.zig"
-  - "src/benchmarks/plane_traversal.zig"
-  - "src/benchmarks/chunk_scale.zig"
-  - "src/game/systems/plane_entry.zig"
----
-
 # Pathfinding And Nav
 
 How it works: `docs/architecture.md` (pathfinding sections).

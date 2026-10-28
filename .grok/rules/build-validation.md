@@ -1,12 +1,3 @@
----
-paths:
-  - "src/**"
-  - "build.zig"
-  - "build.zig.zon"
-  - "tools/**"
-  - "assets/shaders/**"
----
-
 # Build, Validation, Release
 
 Commands and options: `docs/development-workflow.md`.

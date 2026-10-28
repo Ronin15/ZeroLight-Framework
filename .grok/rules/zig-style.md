@@ -1,9 +1,3 @@
----
-paths:
-  - "**/*.zig"
-  - "**/*.zon"
----
-
 # Zig Style, Errors, Comments, Logging
 
 ## Style

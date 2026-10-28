@@ -1,9 +1,3 @@
----
-paths:
-  - "src/**/*.zig"
-  - "tools/bench_ab.py"
----
-
 # Tests And Benchmarks
 
 ## Test and production code

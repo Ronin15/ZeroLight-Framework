@@ -1,9 +1,3 @@
----
-paths:
-  - "src/**/*.zig"
-  - "build.zig"
----
-
 # Memory And Performance
 
 ## Data-oriented design

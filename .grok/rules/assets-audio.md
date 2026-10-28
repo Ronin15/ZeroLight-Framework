@@ -1,13 +1,3 @@
----
-paths:
-  - "src/assets/**"
-  - "src/app/audio.zig"
-  - "src/game/audio_controller.zig"
-  - "src/game/ai_archetypes.zig"
-  - "assets/**"
-  - "tools/**"
----
-
 # Assets, Atlases, Audio
 
 How the pipeline works: `docs/atlas-asset-workflow.md`,

@@ -1,8 +1,3 @@
----
-paths:
-  - "src/**/*.zig"
----
-
 # Threading
 
 How the thread system works: `docs/architecture.md` § Thread System.

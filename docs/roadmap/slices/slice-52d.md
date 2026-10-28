@@ -143,7 +143,7 @@ groups measure it.
 - [ ] Determinism contract header on `simd.zig` and corrected doc comments.
 - [ ] Docs: Determinism Contract (scalar/SIMD identity; residual hazards
       owned by 64A, 64B, 64D); DW `simd-asm-check` and bench
-      procedure; `docs/architecture.md` core line; `CLAUDE.md` command.
+      procedure; `docs/architecture.md` core line; `AGENTS.md` command.
 - [ ] Add the SIMD codegen and determinism rule (inline Mask4, select-form
       min/max, no libm builtins or estimates, `simd-asm-check`, scalar/SIMD
       bit identity) to `.grok/rules/memory-performance.md` when this lands.
