@@ -1,10 +1,10 @@
 ## Slice 89: Thread-System Batch Follow-Ups And The World Gate Under The Rules
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: the core-branch review work (`f4c4844`); runs first in the core branch, ahead of 86, 85, 35's tile gate, 87, and 88 · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: the core-branch review work (`f4c4844`); ahead of 86, 85, 35's tile gate, 87, and 88 · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: programming landed (`f3ee24c`, `6b7138e`, `8bfdbfc`, `bc336f4`); five items stay open
 as recorded data (owner 2026-10-25: recorded, not chased); the wake-posting item moved to
-[slice 90](slice-90.md).** Owner 2026-10-23: a slice for the
+[slice 90](../archive/slice-90.md).** Owner 2026-10-23: a slice for the
 world-gate and batch-tuner follow-ups. Ordered first in the core branch (owner delegated to the
 criteria 2026-10-24): its tuner fixes change how every later slice's tuned cases are judged
 (`.grok/rules/tests-benchmarks.md` § Benchmarks). The `750ce0a` baseline predates its tuner
@@ -22,11 +22,11 @@ fixture and grouped by chunk only if they cost there.
   compares a step against `nudge_stepped_band` (`:155`, about 3.4%), holds
   inside the 5% band (`:152`), and takes its first local step down (`:163`); the
   multiplier clamps at 0.25-4.0 (`:157`, `:172`). The first comparison trials the
-  clamp top (`startClampTrial`, `:771`) and the EMA seeds from a median of 3
+  clamp top (`startClampTrial`, `:869`) and the EMA seeds from a median of 3
   (`:170`). A fresh `full_pool` tuner's first selection is 2 batches per
-  participant (`:189`, `:361`). Policy: `docs/architecture.md` § Thread System.
+  participant (`:189`, `:422`). Policy: `docs/architecture.md` § Thread System.
 - Dispatch flips the active workers' wake bits and wakes once per wake word
-  (slice 90, `07b9c9a`; `thread_system.zig:1513`); it was a per-worker semaphore
+  (slice 90, `07b9c9a`; `thread_system.zig:1566`); it was a per-worker semaphore
   post when measured below. A tree wake was measured slower and is not pursued
   (slice 50 § Measured and not pursued, owner 2026-10-15).
 - The gate (`threaded_batch_ns`) was 60_000, set from the measured dispatch floor in
@@ -94,9 +94,9 @@ fixture and grouped by chunk only if they cost there.
       build is a one-off of about 80 us: RF `nav-level-add` 256008 tuned 85.9
       against serial 16.1 us (23/23 workers; Debug 256-side configs +92 to +138
       us over fixed-2). A fresh `full_pool` tuner picks the whole pool at 2
-      batches per participant (`thread_system.zig:361`, `Tuners.startNavBuild`,
+      batches per participant (`thread_system.zig:422`, `Tuners.startNavBuild`,
       `pathfinding/system.zig:298`); the per-item seed from the first threaded
-      batch is duration x participants (`thread_system.zig:899-900`, about 24x
+      batch is duration x participants (`thread_system.zig:1009-1010`, about 24x
       high) and is never corrected, because main runs no range in that shape and
       its work cannot seed it
       (`.claude/reports/slice89-fresh-pick-landing.md`,
@@ -106,7 +106,7 @@ fixture and grouped by chunk only if they cost there.
       best control; the world-create surface phase within spread of `4998400`
       in Debug or reported as Debug overhead with the ReleaseFast confirmation;
       serial == threaded. Merged: slice 50's first-shape item.
-- [x] Wake posting does not delay main's ranges: moved to [slice 90](slice-90.md)
+- [x] Wake posting does not delay main's ranges: moved to [slice 90](../archive/slice-90.md)
       (owner 2026-10-25, with startup calibration). Measured: main posts 23 wakes
       in 22-27 us (RF, `.claude/reports/world-gate-rf-debug.md`); a broadcast
       wake cut the full-pool dispatch floor 26.9 -> 17.2 us in a scratch version

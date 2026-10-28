@@ -212,10 +212,9 @@ the [archive](framework-implementation-slices-archive.md).
 | [**86**](roadmap/slices/slice-86.md) | In progress | Collision Subsystem Pass — four items open, inert rows after 88 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
-| [**89**](roadmap/slices/slice-89.md) | Programming landed; five items open as data | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); runs first in the core branch |
-| [**90**](roadmap/slices/slice-90.md) | Programming landed; four items open | ThreadSystem Wake Protocol And Startup Calibration — after 89; runs next in the core branch, before 86 (open: gate/prior tuned-vs-control checks, unsettled 4,096 tuners, owner's Windows run; macOS recorded) |
+| [**89**](roadmap/slices/slice-89.md) | Programming landed; five items open as data | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); five items stay recorded |
 
-**Recently settled (archive only):** 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
 **Benches:** `.grok/rules/tests-benchmarks.md`. `production-step` (extended by Slice 52C with CPU render prep, a state digest,
 and a NaN count) tracks the full fixed step's scaling shape across commits; 66E
@@ -279,12 +278,11 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    `13e88ad`; `verify` passes); 84 landed (archived). Order:
    [83](roadmap/archive/slice-83.md) prep →
    [84](roadmap/archive/slice-84.md) spatial index →
-   [89](roadmap/slices/slice-89.md) batch-tuner and world-gate follow-ups (runs
-   first among the open core-branch slices: its tuner fixes change how every later
+   [89](roadmap/slices/slice-89.md) batch-tuner and world-gate follow-ups (programming
+   landed; five items stay recorded. Its tuner fixes change how every later
    slice's tuned cases are judged, `.grok/rules/tests-benchmarks.md` § Benchmarks) →
-   [90](roadmap/slices/slice-90.md) wake protocol and startup calibration (owner
-   2026-10-25; runs next, so later slices judge tuned cases on the final gate) →
-   [86](roadmap/slices/slice-86.md) collision →
+   [90](roadmap/archive/slice-90.md) wake protocol and startup calibration (landed) →
+   [86](roadmap/slices/slice-86.md) collision (next) →
    [85](roadmap/slices/slice-85.md) steering → tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items) →
    [87](roadmap/slices/slice-87.md) render prep →
@@ -439,9 +437,9 @@ order.
 4. **50** Thread System Hardening (opens the core-systems branch) — landed on `core_systems`.
 5. **83** Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — landed on `core_systems` (archived).
 6. **84** Level-Aware Shared Neighbor Index — after 83 (core-systems branch).
-6a. **89** Thread-System Batch Follow-Ups And The World Gate Under The Rules — runs first among the open core-branch slices (core-systems branch).
-6b. **90** ThreadSystem Wake Protocol And Startup Calibration — after 89, before 86 (core-systems branch).
-7. **86** Collision Subsystem Pass — after 83, 84 (core-systems branch).
+6a. **89** Thread-System Batch Follow-Ups And The World Gate Under The Rules — programming landed; five items stay recorded (core-systems branch).
+6b. **90** ThreadSystem Wake Protocol And Startup Calibration — landed (archived).
+7. **86** Collision Subsystem Pass — next in the core branch, after 83, 84, 89, and 90.
 8. **85** Steering On The Shared Neighbor Index — after 84, 86 (core-systems branch).
 8a. **35's `world_gate` items** — after 85 (core-systems branch; the rest of 35 is line 22).
 9. **87** Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items (core-systems branch).

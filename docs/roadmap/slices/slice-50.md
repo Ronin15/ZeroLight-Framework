@@ -197,7 +197,7 @@ Owner-ruled 2026-10-15; none is an open item.
 - Startup calibration of wake and post costs (a derived gate, a calibrated
   predictor floor, a range count from claim cost): stopped before landing to
   keep the branch stable. The owner reversed the hold 2026-10-25 (the
-  `ThreadSystem` is stable); it landed in [slice 90](slice-90.md) (`776c1ec`): the gate,
+  `ThreadSystem` is stable); it landed in [slice 90](../archive/slice-90.md) (`776c1ec`): the gate,
   the participant-overhead prior, and its sample floor derive from floors measured at init.
 - A per-machine calibration cache file: no saved file; the engine measures
   at run time or uses a good default.

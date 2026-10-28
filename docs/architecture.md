@@ -623,8 +623,16 @@ sets neither (`.grok/rules/threading.md`).
   first inline window judges it: at or above the gate, with the profile still
   dispatching threaded at that count, it is restored at once and the bound rule
   is suppressed until a sustained item-count shift or a relearn; otherwise the
-  demotion stands and the cooldown applies. Main waiting on workers never
-  demotes a stage.
+  demotion stands and the cooldown applies. A demotion holds the inline side. A
+  threaded commit whose inline baseline is at or above the gate and whose bound
+  is not under the gate, and a restore, hold the threaded side. While a side is
+  held, one winner-changing settled window increments a count and returns. The
+  window that fills `sample_window` consecutive winner-changing records demotes,
+  or takes the inline decision: a probe when the model still predicts threading,
+  otherwise the same side. An agreeing window zeros the count. The first inline
+  window after a demotion still restores at once. A sustained item-count shift
+  clears the hold. The gate, commit margin, reset band, and cooldown are
+  unchanged. Main waiting on workers never demotes a stage.
 - No timer re-probe: a settled stage re-tunes only on evidence (a sustained
   item-count shift, a sustained 5% throughput departure while holding), never on
   elapsed windows (`.grok/rules/threading.md`).
@@ -665,9 +673,12 @@ the floor on each learned overhead sample is 0.1 × the prior. Every tuner
 reads them through `AdaptiveWorkRequest.calibration` (`gateNsFor`); a
 `threaded_batch_ns` set in `AdaptiveWorkTunerConfig` overrides the gate (tests
 and benches). Calibration reads only timing and picks dispatch shapes, never
-simulation state, and runs once. The init debug line reports
-`dispatch_floor_ns`, `one_worker_floor_ns`, `worker_wake_ns`, `gate_ns`,
-`participant_overhead_ns`, and `calibration_ns`. Measured on the 23-worker dev
+simulation state, and runs once. The medians are this process's, so the gate
+and a tuner's inline or threaded choice can differ from one start to the next
+(`gateNsFor`, `predictsThreaded`); that choice is a dispatch shape only. The init
+debug line reports `dispatch_floor_ns`, `one_worker_floor_ns`, `worker_wake_ns`,
+`gate_ns`, `participant_overhead_ns`, and `calibration_ns`. Measured on the
+23-worker dev
 host (init line, `thread-dispatch`): calibration 1.21 ms in Debug and
 ReleaseFast (one run each); ReleaseFast floors F_W 16.5–18.7 µs and F1
 4.8–6.0 µs, gate 32.9–37.4 µs (4 runs); Debug gate 37.6–49.1 µs (3 runs).

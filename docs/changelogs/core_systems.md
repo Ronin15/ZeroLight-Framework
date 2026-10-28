@@ -284,8 +284,22 @@ labelled.
   calibration 1.21 ms, ReleaseFast gate 32.9-37.4 us. ReleaseFast tuned
   `production-step` 4,096 280.8 to 234.6 us (faster), 16,384 653.7 to 578.1 us
   (within spread), `world-gate` 65,536 127.9 to 127.8 us (3 reps; warmup 360 /
-  iterations 300 for `production-step`). Open (slice 90): three tuners stay
-  unsettled at `production-step` 4,096 in 2 of 3 runs.
+  iterations 300 for `production-step`). At `production-step` 4,096, three tuners
+  stay unsettled in 2 of 3 runs (the close below).
+- `375c7c3`: macOS record for slice 90 (Apple M3 Pro). Stays the Mac record.
+- `1e00a05`: a held tuner side waits a full sample window of consecutive
+  winner-changing records before a demotion or an inline probe (slice 90;
+  `docs/architecture.md` § Thread System). `zig build test -Dtest-filter=thread_system`
+  passed 160. ReleaseFast `-Dcpu=x86_64_v2`: `thread-dispatch` 16,384 tuned 2.0 to
+  2.0 us and `movement` 4,096 tuned 1.6 to 1.6 us, both inline; `world-gate` 4,096
+  tuned 20.0 to 22.2 us, then 20.6 to 21.4 us over 3 reps inside a 40% and 73%
+  spread. `production-step` 4,096 was not judged (the tuned case was unsettled on
+  one side in each run).
+- Owner 2026-10-28: slice 90 closes. The tuned-versus-control remainder, and a
+  tuner that stays unsettled because the gate moved, are the accepted startup
+  spread. Tuners are not merged or removed for it. The `production-step` 4,096
+  run stays not judged. macOS stays the `375c7c3` record. Windows was not run
+  and is not a close condition.
 
 ## Other Changes
 

@@ -1,12 +1,14 @@
 ## Slice 90: ThreadSystem Wake Protocol And Startup Calibration
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 89](slice-89.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 89](../slices/slice-89.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: programming landed (`07b9c9a` wake words, `776c1ec` startup calibration); open:
-the gate and prior items' remaining tuned-vs-control checks, the 4,096 production-step
-tuners that stay unsettled, and the owner's Windows run (macOS recorded 2026-10-26).** Owner 2026-10-25: slice 89 commits as is; the wake protocol and startup
-calibration are this separate slice, and slice 50's hold on startup calibration is reversed
-(the `ThreadSystem` is stable). Plan: `.claude/reports/thread-calibration-plan.md`.
+**Status: landed (`07b9c9a` wake words, `776c1ec` startup calibration, `1e00a05` the
+hold; macOS record `375c7c3`).** `zig build verify` passed at `776c1ec`. The hold's
+test is `zig build test -Dtest-filter=thread_system` (160). Owner 2026-10-28: a
+different gate from one process start to the next is accepted startup spread, and
+Windows was not run and is not a close condition. Owner 2026-10-25: slice 89 commits
+as is; the wake protocol and startup calibration are this slice, and slice 50's hold
+on startup calibration is reversed (the `ThreadSystem` is stable).
 
 Goal: a dispatch wakes only its active workers at lower cost, and every
 hardware-timing constant (the gate and the participant-overhead prior) derives at startup from
@@ -15,18 +17,21 @@ the detected machine's measured floor, not from one host's numbers.
 ### Current foundation
 
 - Dispatch flips the active workers' bits in the wake words and wakes once per word
-  (`src/app/thread_system.zig:1513`, `WakeWordOps.post` `:1684`); main starts its own
-  ranges after it (`:1515-1525`). Each worker owns one bit of a cache-line `WakeWord`
-  (`:1620`; `wake_block_width` `:1613`, 32 per word on Linux, one elsewhere; `WorkerRecord`
-  `:1822`). Before `07b9c9a` main posted a per-worker semaphore in turn, 26.0 us at the
+  (`src/app/thread_system.zig:1566`, `WakeWordOps.post` `:1737`); main starts its own
+  ranges after it (`:1568-1578`). Each worker owns one bit of a cache-line `WakeWord`
+  (`:1673`; `wake_block_width` `:1666`, 32 per word on Linux, one elsewhere; `WorkerRecord`
+  `:1875`). Before `07b9c9a` main posted a per-worker semaphore in turn, 26.0 us at the
   full pool (below).
-- `ThreadSystem.init` calibrates once (`calibrate` `:1240`, `medianDispatchNs` `:1250`,
-  called `:1221`); `ThreadCalibration.fromFloors` (`:240`) derives the gate, the
+- `ThreadSystem.init` calibrates once (`calibrate` `:1293`, `medianDispatchNs` `:1303`,
+  called `:1274`); `ThreadCalibration.fromFloors` (`:240`) derives the gate, the
   participant-overhead prior, and its sample floor. Tuners read them through
-  `AdaptiveWorkRequest.calibration` (`gateNs` `:899`, `gateNsFor` `:905`; prior `:928`;
-  sample floor `:974`); `AdaptiveWorkTunerConfig.threaded_batch_ns` (`:129`) is an
+  `AdaptiveWorkRequest.calibration` (`gateNs` `:944`, `gateNsFor` `:950`; prior `:973`;
+  sample floor `:1019`); `AdaptiveWorkTunerConfig.threaded_batch_ns` (`:129`) is an
   override. The 60_000 gate (twice the Debug full-pool floor, `58ff9e1`), the 1,000
   prior, and the 100 sample floor are deleted.
+- Held-side window landed `1e00a05` (`finishSettledWindow` `:619`,
+  `winnerChangeAbsorbed` `:691`; `docs/architecture.md` § Thread System). The
+  `production-step` 4,096 run in that landing stays not judged.
 - Landed data (ReleaseFast `-Dcpu=x86_64_v2`, this host, 23 workers):
   - Wake words (`07b9c9a`, `thread-dispatch`, 3 interleaved reps, warmup 5 / iterations 30,
     base `ff2a161`): `thread-fixed-auto` 16,384 (23 active) 26.0 -> 16.3 us; 1,024 (15
@@ -108,20 +113,15 @@ the detected machine's measured floor, not from one host's numbers.
       `776c1ec`: 8 + 31 dispatches at one worker and at the full pool, 1.21 ms at 23
       workers; the init debug line reports both floors, `worker_wake_ns`, the gate, the
       prior, and `calibration_ns`.
-- [ ] The gate (`threaded_batch_ns`) derives from the measured floor by `58ff9e1`'s rule
-      (gate = 2 x full-pool floor) under the new protocol. Pass: the 60_000 constant
-      is removed or only a fallback; tuned cases of the targeted groups within spread of
-      their best control. Constant deleted (`776c1ec`); gate 32.9-37.4 us (ReleaseFast, 4
-      runs); `production-step` and `world-gate` tuned within spread or faster against both
-      bases (data above). Open: the tuned cases were not compared with their best control
-      after `776c1ec` except `movement` (262,144 tuned beats every control, Validation
-      below), and the 4,096 settling item below leaves tuned cases unjudged.
-- [ ] The participant-overhead prior derives from the same measurement. Pass: first-pick
-      and settle behavior in `thread-dispatch`, `movement`, and `production-step` not worse
-      beyond spread. Prior is the per-worker cost, 0.49-0.63 us (ReleaseFast); `production-
-      step` and `world-gate` no slower; `movement` 262,144 tuned now threads and is faster
-      (Validation below); `thread-dispatch` tuned not re-run after L2; settling at 4,096 is
-      worse (item below).
+- [x] The gate (`threaded_batch_ns`) derives from the measured floor by `58ff9e1`'s rule
+      (gate = 2 x full-pool floor) under the new protocol. The 60_000 constant is deleted
+      (`776c1ec`); the gate is 32.9-37.4 us (ReleaseFast, 4 runs, data above). The
+      tuned-versus-control remainder is the accepted startup spread (owner 2026-10-28).
+      The `production-step` 4,096 run stays not judged.
+- [x] The participant-overhead prior derives from the same measurement (`776c1ec`): the
+      per-worker cost, 0.49-0.63 us (ReleaseFast). The tuned-versus-control remainder is
+      the same accepted startup spread (owner 2026-10-28). No tuner is merged or removed
+      for it.
 - [x] Validation: `zig build verify`; the full `zig build test -Dsanitize-thread=true`;
       ReleaseFast targeted groups a `ThreadSystem` change can move (`thread-dispatch`,
       `world-gate`, `movement`, `production-step`), serial == threaded. Full suite 2014/2014
@@ -131,46 +131,28 @@ the detected machine's measured floor, not from one host's numbers.
       iterations 30, base `ff2a161` vs `92050ff`): 262,144 tuned 93.8 us inline -> 40.0 us threaded
       23/23 (faster; beats every control, clamp 77.7 us; matched the fastest control 3/3 vs 2/3);
       10,000 tuned inline 3.7 -> 3.5 us, matching serial (work under the gate).
-- [x] Docs: `docs/architecture.md` § Thread System describes the protocol and calibration
-      as landed. `docs/development-workflow.md` names neither (no change needed there).
-- [ ] Tuners unsettled at `production-step` 4,096: at 4x pre-measure (warmup 360), after
-      `776c1ec` `state.pipeline.world_gate.tuner`, `steering.grid_bucket_tuner`, and
-      `steering.adaptive_tuner` stay unsettled in 2 of 3 runs (all 36 tuners settled at
-      `07b9c9a`); 16,384 leaves 1-4 unsettled before and after (collision, steering, scope,
-      pathfinding stages; pre-existing). On macOS at 16,384 and 4x pre-measure,
-      `steering.adaptive_tuner` settled and `plane_entry.tuner` did not: its
-      serial cost is 63 us and its threaded cost 37 us, against a 40.6-52.5 us
-      gate (one run, M3 Pro). Hypothesis: the stages sit at the lower gate,
-      where the settled-window rules flap. Failure scenario: the tuned case is not
-      judged (`.grok/rules/tests-benchmarks.md`) and the stage re-probes forever
-      (`.grok/rules/threading.md` § Building a stage). Pass: they settle, or are merged or
-      removed per `threading.md`.
-- [ ] Owner runs on macOS and Windows (owner 2026-10-25: the engine targets Linux, macOS,
-      and Windows; owner tests this week). Those builds use the portable per-worker wake
-      (one futex word per worker), not the Linux bitset wake, so their gain is unmeasured.
-      Run on each machine, ReleaseFast, at the L1 base and after L1 and L2:
-      `zig build test -Dsanitize-thread=true` where TSan is supported, else `zig build test`;
-      `tools/bench_ab.py --optimize ReleaseFast --reps 3 --group thread-dispatch -- --items 1024`
-      and `--items 16384` (`thread-fixed-auto`: the dispatch floor);
-      `zig build bench -Doptimize=ReleaseFast -- --group production-step --items 1024008016384`
-      (tuned step time); the calibrated gate and prior from the init line
-      (`-Dlog-level=debug`: `dispatch_floor_ns`, `one_worker_floor_ns`, `worker_wake_ns`,
-      `gate_ns`, `participant_overhead_ns`, `calibration_ns`). Linux reference (7900X3D, 23 workers, ReleaseFast): full-pool
-      floor 26.0-26.9 us before L1, 16.3 us after; production-step 16,384 tuned 646.5-658.2
-      us before, 578.1 us after; calibrated gate 32.9-37.4 us. Data: § Current foundation
-      above and commits `07b9c9a`, `776c1ec`.
-      Pass: floor not worse than before L1 beyond spread, tests pass, and the
-      calibrated gate reported per machine.
-      macOS (2026-10-26, M3 Pro, 10 workers): after L2 the full-pool floor is
-      within spread of pre-L1 at 1,024 and 16,384; gate 40.6-52.5 us; the TSan
-      run exited 0. `production-step` 16,384 at 4x pre-measure is 616 us tuned
-      against 1.00 ms serial, 35/36 settled; `plane_entry.tuner` is still
-      unsettled, so the tuned case is not judged. Windows still open.
+- [x] Docs: `docs/architecture.md` § Thread System describes the protocol, calibration,
+      and the held-side window as landed. `docs/development-workflow.md` names neither
+      (no change needed there).
+- [x] Tuners at `production-step` 4,096. After `776c1ec`, `state.pipeline.world_gate.tuner`,
+      `steering.grid_bucket_tuner`, and `steering.adaptive_tuner` stayed unsettled in 2 of
+      3 runs at 4x pre-measure (all 36 settled at `07b9c9a`). The hold (`1e00a05`) stops
+      one crossing from flipping (`docs/architecture.md` § Thread System). A tuner that
+      stays unsettled because the gate moved is the accepted startup spread (owner
+      2026-10-28); tuners are not merged or removed for it. The landing's `production-step`
+      4,096 run stays not judged. On macOS, `plane_entry.tuner` at 16,384 stays the
+      `375c7c3` record.
+- [x] macOS stays the `375c7c3` record (Current foundation): after L2 the full-pool floor
+      is within spread of pre-L1, the calibrated gate is reported, and the TSan run
+      exited 0. `production-step` 16,384 at 4x pre-measure stays `settled=no`
+      (`plane_entry.tuner`). Windows was not run and is not a close condition (owner
+      2026-10-28).
 
 ### Acceptance checks
 
-- [ ] Every checklist item is landed or routed with its `file:line` and failure scenario
-      (two open above).
+- [x] Every checklist item is landed or closed on the owner decision of 2026-10-28
+      (startup spread accepted; the `production-step` 4,096 run not judged; Windows
+      not run and not a close condition).
 - [x] Touched groups within run-to-run spread or faster, ReleaseFast (`thread-dispatch`,
       `production-step`, `world-gate`; data above).
 - [x] ThreadSanitizer clean (full suite 2014/2014, no reports); `zig build verify` passes at `776c1ec`.
