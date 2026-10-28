@@ -21,7 +21,7 @@ discoverSkills: false
 inheritSkills: false
 prompt_mode: full
 agents_md: true
-model: inherit
+model: grok-4.7-build-fast
 effort: high
 color: purple
 ---
