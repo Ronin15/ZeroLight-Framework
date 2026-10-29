@@ -1,10 +1,12 @@
 ## Slice 85: Steering On The Shared Neighbor Index
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 84](../archive/slice-84.md), [Slice 86](../archive/slice-86.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 84](slice-84.md), [Slice 86](slice-86.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Routed by the 64G combined review (area D M1, M4,
-L10) and the movement intent measurement. Landed: the movement and particle
-masked last batch (`da2adfb`); the rest is open.
+**Status: landed** (`21851e4`, `608337b`, `50225b9`, `0aabf95`, `8244f75`,
+`76646ef`). Debug, `x86_64_v2`. The index switch's `production-step`
+(`1024008016384`) was not judged: both sides stayed unsettled at warmup 484
+on tuners that change does not own. `zig build verify --summary all` passed
+after `55720b8`: 28/28 steps, 2032/2032 tests.
 
 Goal: steering queries 84's shared index instead of building and sorting a
 private grid; an entity create or destroy invalidates only what it changed in
@@ -13,170 +15,97 @@ keeps the apply local.
 
 ### Current foundation
 
-- Private grid, whole in `src/game/systems/steering/agent_grid.zig`:
-  `buildAgentGrid` (`:37`), `buildAgentGridDirect` (`:49`), banded build
-  (`:64`), `sortCellEntries` (`:265`).
-  It sorts the positions the spatial index already sorted.
-- Grid state outside `agent_grid.zig` that goes with it (`steering/system.zig`):
-  - the grid buffers' `deinit` (`:203-210`) and reserve (`:494-499`;
-    `band_rows` at `:507` is shared with `select_resolve`);
-  - the grid tuners (`:195-196`), stats (`grid_ns` `:112`), and step timer
-    (`:313`);
-  - `spatial_cell_size` (`:181`, `:382-384`), `largestReach` (`:711`), and
-    `AgentsTally.largest_reach` (`:571`);
-  - test expectations on the grid tuners and `grid_ns` (`system.zig:1226-1233`,
-    `:1354`).
-- The grid sort and claim stages forward `SteeringConfig.band_items_per_range`
-  (null in production; `system.zig:94`, `166075c`). The obstacle push is
-  lane-kept (`65c60ab`).
-- `changeInvalidatesSteeringMovementIndexCache` (`system.zig:728`, used at `:236`) drops the
-  whole movement-index cache on any `entity_created`.
-- `accumulateAgentAvoidanceBounded` (`steering/avoidance.zig:386`) is scalar
-  over up to 64 candidates per agent and states no SIMD verdict; the sibling
-  obstacle push is SIMD.
-- Steering writes the movement intents (`avoidance.zig:213`) that
-  `apply_ai_movement_intents` applies.
-- 84's shared index (`docs/architecture.md`, `SpatialIndexSystem`): a query
-  reads one level and a faction set within a world radius, skips `self`
-  without a check, and visits in lane groups (`NeighborLanes`) through a
-  per-key `NeighborBlock`; `capLanes` caps a visitor. It indexes any
-  `IndexPopulation`. Its scan order at its own cell size replaces the grid's
-  `(cell_y, cell_x, row)` at `largest_reach` cells, so avoidance's sample
-  order changes (stated under Tests). AI emits navigation intents in the
-  think set's cell-major order, so steering's agents arrive grouped by cell
-  and can share blocks. The per-neighbor radius and a lane `lengthDirection`
-  are 85's.
-- Measured:
-  - `production-step` tuned `--details` (Debug, `5d5a089`): `steering_grid`
-    0.59 ms at spread P 16,384; steering 0.84 ms on main of a 9.8 ms step.
-  - `movement-apply-intents` vs `movement-apply-intents-sorted`, 16,384
-    intents, serial, ReleaseFast (`639f55d`): 61.5 vs 38.5 µs, with no false
-    sharing between ranges.
+Landed behavior. Measured numbers below are Debug, `x86_64_v2`.
+
+- Avoidance queries the shared index (`avoidance.zig:272`, `visitLanes`
+  `:444`). The private grid, its tuners, and the movement-index cache are
+  gone. One `NeighborBlock` per avoidance range; the other agent's radius is
+  an index entry column, masked-gathered.
+- `steering_update` reads `spatial_index` and carries `movement_positions`
+  and `world_level` (`simulation_pipeline.zig:246-249`). `reserve` past
+  `max_step_items` returns `OutOfMemory` (`system.zig:219`); the step keeps
+  the assert (`:252`).
+- `select_resolve` and `select_claim` are the only selection path, inline
+  when no worker is available (`selection.zig:38-44`). Claim's items are the
+  placed intents (`:78-80`); a range owns whole bands (`:220`).
+- Avoidance writes movement intents in selected order, then a place and a
+  sort order them by `movement_row` (`avoidance.zig:99-111`). The apply reads
+  that row (`movement.zig:128`). Path requests stay in selected order, which
+  is steering-row order (`76646ef`).
+- `directions` walks steering rows and writes runtime columns only for
+  claimed rows in that span (`directions.zig:218-286`). The smooth tail is
+  `smoothDirectionLanes` (`:369`). Agents align at 32, directions at 64,
+  other steering stages at 16 (`system.zig:54-57`).
+- An empty batch shapes to zero ranges (`thread_system.zig:2449`).
+- `stuck_step_threshold` above `max_steering_cooldown_steps` is
+  `InvalidSteeringAgent` (`agents.zig:58`). The two `validateAiAgent` gaps
+  (`last_score`, `commitment_remaining`) stay on the AI findings in the
+  roadmap index.
 
 ### Architecture notes
 
-- Neighbor queries use the shared index (`.grok/rules/simulation.md`);
-  steering's private grid is not an allowed exception.
+- Neighbor queries use the shared index (`.grok/rules/simulation.md`).
 - A create costs work in what it changed (`.grok/rules/engine-design.md`
   § Cost model).
 - Each hot loop carries a SIMD verdict (`.grok/rules/memory-performance.md`
   § SIMD).
-- Serial == threaded bitwise (`.grok/rules/threading.md`).
+- The serial path is the stage run inline (`.grok/rules/threading.md`,
+  `.grok/rules/tests-benchmarks.md`).
 
 ### Checklist
 
-- [ ] Steering reads 84's index; its grid and sort are deleted. Failure
-      scenario: two sorts of the same positions every step. The grid has no
-      level key: entries hold only cell and row index (`agent_grid.zig:249`),
-      sorted by `(cell_y, cell_x, row)` (`:265`), and
-      `accumulateAgentAvoidanceBounded` counts each entry against
-      `max_agent_candidate_checks` (64, `avoidance.zig:41`) at `:421`, before
-      its level gate at `:426`, then reads 5 snapshot columns per candidate
-      through the row index (contiguity audit H1, code audit H2;
-      `.grok/rules/memory-performance.md` § Data-oriented design,
-      `.grok/rules/simulation.md` § Controllers and processors). Failure
-      scenario (derived): a shaft of L levels with k agents per cell at the
-      same xy; checks per agent grow with L up to the 64 cap, and with L·k >
-      64 the cap is spent on other-level rows, so a same-level neighbor gives
-      no avoidance push. Measured: `steering_grid` 0.59 ms above. Pass: one
-      sort per step in the `production-step` census; `steering` within spread
-      or faster; a levels axis on the `steering` bench with avoidance samples
-      and checks per agent flat in L. The grid's false "nearly sorted"
-      comment (`agent_grid.zig:267`; keys are rebuilt in slot order every
-      build) goes with it.
-- [ ] A create or destroy invalidates only the cache entries it affects
-      (`system.zig:728`). Failure scenario (derived): a spawn burst makes every
-      steering row re-resolve its movement index that step, nanoseconds per
-      row, threaded. Pass: a test that unrelated rows keep their cached
-      index; a spawn-churn `steering` case flat in population for a fixed
-      churn.
-- [ ] The agent avoidance accumulate is vectorized (moved from 35; docs audit
-      M9). Failure: `accumulateAgentAvoidanceBounded` (`avoidance.zig:386`),
-      which this slice rewrites onto 84's index, runs its per-neighbor float
-      math scalar with no verdict at the site; the rewritten loop is a
-      gather-bound per-agent loop, so it ships SIMD
-      (`.grok/rules/memory-performance.md` § Data-oriented design, § SIMD
-      and core math). Failure scenario: avoidance's per-neighbor math stays
-      scalar at population scale. Pass: the accumulate runs through `simd.zig`
-      over the index's lane groups, ending in their masked last batch,
-      bit-identical to its scalar form; scalar/SIMD and
-      serial/threaded parity tests; any scratch it reserves has a
-      `FailingAllocator` proof over the real multi-worker `ThreadSystem`
-      (`.grok/rules/memory-performance.md` § Allocator discipline).
-- [ ] Movement intents reach the apply in movement-row order. Failure
-      scenario: `frame.intents` is written in steering's selected order
-      (`avoidance.zig:213`), so the apply resolves each intent's movement row
-      (`movement.zig:132`) and writes the rows scattered (contiguity audit M3;
-      `.grok/rules/memory-performance.md` § Data-oriented design,
-      `.grok/rules/threading.md`). Measured gain above (ReleaseFast only;
-      Debug numbers come first, `.grok/rules/build-validation.md`). Pass:
-      the apply walks its intents in row order with no per-intent row lookup;
-      `movement-apply-intents` within spread of `-sorted`, with the ordering
-      cost counted in steering.
+- [x] Steering reads the shared index; the private grid and its sort are
+      gone (`21851e4`). `steering` tuned faster at 128, 512, and 1024;
+      `steering-levels` keeps 63 checks and 0 samples per selected intent at
+      1, 4, and 16 levels. `production-step` was not judged (acceptance).
+- [x] The movement-index cache and its post-commit reaction left with the
+      snapshot (`21851e4`). Selection resolves each intent's movement row;
+      runtime rows rekey only the rows a commit moved.
+- [x] The agent avoidance accumulate is `visitLanes` over the index's lane
+      groups, ending in the masked last batch (`avoidance.zig:444`).
+- [x] Movement intents reach the apply in movement-row order (`0aabf95`).
+      The apply reads the stored row and does not look one up
+      (`movement.zig:128`). Ordering is the steering place and sort.
 - [x] Movement and particle updates drop the scalar remainder (`da2adfb`).
-      The last batch is the lane kernel with a mask, inactive lanes do not
-      write past the range (`movement.zig:255-276`, `particle.zig:456-514`,
-      `IntentLanes.flush` masked).
-- [ ] `steering_update` declares its carried inputs (84's audit). Failure:
-      steering reads the previous step's positions and levels
-      (`steering/system.zig:352`) before `apply_ai_movement_intents` writes
-      positions, but its arm (`simulation_pipeline.zig:246`) declares only
-      `carried static_colliders` (`.grok/rules/simulation.md` § Pipeline and stage
-      ordering). Failure scenario: moved after a position or level writer, it
-      still compiles and reads this step's poses against the previous step's
-      index. Pass: the arm carries `movement_positions` and `world_level`
-      (and reads `spatial_index` once steering queries it), so the reorder
-      fails the comptime check.
-- [ ] No per-step width error (84's L1 review). Failure: the step returns
-      `error.Overflow` past `max_step_items` (`steering/system.zig:293`)
-      behind an assert, a distinct per-step error where the bound is a format
-      width (`.grok/rules/budgets-capacities.md`). Failure scenario: a
-      caller that handles growth failures as `OutOfMemory` meets a different
-      error from the hot path. Pass: the width is proven where rows grow
-      (the population seam or `reserve`, as `OutOfMemory`) and the step keeps
-      only the assert.
-- [ ] `select_claim` dispatches items that track its work (84's audit).
-      Failure: its items are bands (`steering/selection.zig:82`, `claim_stage.select(bands.band_count, 1)`), at
-      most a fixed band count of `BandPartition` at scale, whatever the
-      intents behind them (`.grok/rules/threading.md`: never a fixed
-      partition count whose work varies behind it). Failure scenario: at
-      large populations the tuner samples a fixed band count while each
-      band's intents grow. Pass: the stage's items are units whose count
-      tracks its intents; `steering --details` shows the stage's shape
-      following intent count.
-- [ ] The whole subsystem checked against the cost model and the rules
-      (owner 2026-10-16), not only the items above: every file in
-      `src/game/systems/steering/` (selection, directions, avoidance, the
-      movement-intent write), `systems/movement.zig`, `systems/particle.zig`,
-      and the `data_system/movement.zig` and `data_system/agents.zig` stores.
-      Each finding becomes an item here. The two `validateAiAgent` gaps
-      (`last_score`, `commitment_remaining`) are recorded on the AI branch
-      findings in `docs/framework-implementation-slices.md`, not items here.
-      `stuck_step_threshold` stays here.
-- [ ] `buildAgentGridDirect` (`steering/agent_grid.zig:49`) is a separate
-      no-worker entry from `buildAgentGrid` (`.grok/rules/tests-benchmarks.md`
-      § Test and production code, point 1). If this slice keeps the grid it is
-      deleted; the grid itself goes with the first item. Deleting it makes the
-      one-band fast path (`steering/avoidance.zig:406-410`) dead, and
-      `src/benchmarks/steering.zig:290` (`largestGridBand`) counts bands from
-      the one-band form; both move to the banded form. Deleting it adds a
-      constant band search per avoidance cell lookup. Pass: that cost checked
-      by `steering` at three sizes, inline and threaded, same mode.
-- [ ] A no-worker serial branch in steering selection
-      (`steering/selection.zig:53`, the `orelse` of `withWorkers` calling
-      `resolveAndClaim` once;
-      `.grok/rules/tests-benchmarks.md` § Test and production code, point
-      1). Pass: removed after a cost check that the stage run inline does no
-      worse (`steering`, same mode).
-- [ ] Tests: steering output on today's fixtures unchanged, or changed only by
-      a stated order; serial == threaded; allocation-free warmed step.
-- [ ] Docs: `docs/architecture.md` steering;
-      `docs/simulation-tiers-and-pipeline.md` stage list.
+- [x] `steering_update` carries positions and level and reads
+      `spatial_index` (`simulation_pipeline.zig:246-249`).
+- [x] No per-step width error. `reserve` returns `OutOfMemory` past
+      `max_step_items` (`system.zig:219`, `608337b`).
+- [x] `select_claim` counts placed intents, and a range owns whole bands
+      (`selection.zig:78-80`, `:220`, `50225b9`). The `steering` bench
+      asserts the claim item count equals the navigation intent count
+      (`src/benchmarks/steering.zig:517`).
+- [x] Directions writes the claimed rows' runtime columns in its steering-row
+      window; the smooth tail is `smoothDirectionLanes` (`76646ef`). Path
+      requests follow that steering-row order.
+- [x] An empty batch shapes to zero ranges (`thread_system.zig:2449`,
+      `8244f75`).
+- [x] Subsystem check (owner 2026-10-16). The two `validateAiAgent` gaps
+      stay on the AI findings in the roadmap index. `stuck_step_threshold`
+      is capped with the other cooldown fields (`agents.zig:58`).
+- [x] `buildAgentGridDirect` left with the grid (`21851e4`).
+- [x] The zero-worker selection pass is gone (`608337b`). Serial `steering`
+      at 128, 512, and 1024 stayed within noise.
+- [x] Tests: serial equals threaded, including no workers
+      (`system.zig:1013`); allocation-free after reserve on the real
+      multi-worker system (`:843`).
+- [x] Docs: `docs/architecture.md` steering and movement;
+      `docs/simulation-tiers-and-pipeline.md` commit seam.
 
 ### Acceptance checks
 
-- [ ] `steering` at three sizes shows no regression beyond run-to-run spread
-      (tuned-versus-control measured after slice 89's tuner change, which gets
-      its own whole-suite run; the `750ce0a` baseline predates it);
-      `production-step` steering main time no higher than at `5d5a089`.
-- [ ] `zig build verify` passes.
+- [x] `steering` tuned, Debug, `x86_64_v2`, index switch: 128 agents 193.6
+      to 131.2 µs, 512 664.6 to 390.1 µs, 1024 644.4 to 445.3 µs. Serial
+      +6.9% to +8.9%, within noise. Later landings on the same host: one
+      selection path, serial 128 +5.9%, 512 +3.6%, 1024 +3.6%, within noise;
+      tuned 512 within spread over 3 reps. Claim items, `steering-shuffled`
+      tuned 1024, 4096, and 16384 within noise; tuned 128 and 512 within
+      spread over 3 reps; tuned 1024 593.0 to 473.2 µs. Apply,
+      `movement-apply-intents` serial: 1024 51.3 to 36.1 µs, 4096 206.8 to
+      144.8 µs, 16384 922.8 to 560.6 µs; the sorted control fell by the same
+      kind of amount, and the two tree medians at 4096 sit inside each
+      other's spread. Directions, tuned: `steering` 1024 612.1 to 524.2 µs;
+      `steering-shuffled` 4096 1.52 to 1.58 ms, within noise.
+      `production-step` for the index switch was not judged (status).
+- [x] `zig build verify` passes. After `55720b8`, `--summary all`: 28/28 steps,
+      2032/2032 tests.

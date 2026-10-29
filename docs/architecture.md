@@ -167,7 +167,7 @@ Designs start here, then read the live structure below (rules:
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
   pipeline-shared neighbor index, built each step on workers from a handed
   population into per-chunk records keyed by level and faction, and read by
-  AI separation and cohere and by perception (steering after Slice 85);
+  AI separation and cohere, perception, and steering;
   `spatial_index_test_support.zig` holds its test-only fixtures.
 - `src/game/systems/perception.zig` owns `PerceptionSystem`: vision
   (range/FOV/LOS/faction-stance gating) and hearing (transient world
@@ -190,16 +190,15 @@ Designs start here, then read the live structure below (rules:
   drives, memory, active behavior) under the existing debug toggle; never
   mutates simulation.
 - `src/game/systems/steering/` consumes navigation intents and path status,
-  then emits final NPC movement intents with local avoidance (same-level agent
-  neighbor gating mirrors collision). One file per stage, with no facade;
-  each stage file holds free functions over `*SteeringSystem`:
+  then emits final NPC movement intents with local avoidance. One file per
+  stage, with no facade; each stage file holds free functions over
+  `*SteeringSystem`:
   - `system.zig`: `SteeringSystem`, its lifecycle and reserve, the step, and the
     `agents` stage;
   - `selection.zig`: `select_resolve` and `select_claim`;
   - `directions.zig`: `directions` (path status and base direction);
-  - `agent_grid.zig`: the agent grid (`grid_bucket`, `grid_sort`); a private
-    grid that Slice 85 replaces with the shared spatial index;
-  - `avoidance.zig`: the avoidance pass and the movement-intent write;
+  - `avoidance.zig`: the avoidance pass, the movement-intent write, and the
+    movement-row place and sort;
   - `test_support.zig`: test-only fixtures shared across the files.
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
@@ -481,9 +480,11 @@ while it waits. Batch submission does not allocate after initialization.
 Production worker participation is timing-adaptive: batches start inline and
 move to worker participation only when measured completion time shows the
 threaded profile is worthwhile. Structural limits still force inline execution
-when there is no work, no available worker, only one splittable range, an
-explicit serial override, or a processor range-alignment constraint leaves no
-safe split.
+when no worker is available, only one splittable range exists, an explicit
+serial override is set, or a processor range-alignment constraint leaves no
+safe split. An empty batch (`item_count == 0`) is not that path: `shapeBatch`
+gives it zero ranges and keeps the caller's alignment as the width, so a
+later range count does not divide by zero.
 
 The thread that calls `init` owns the system and must outlive it:
 `deinit` runs on the owner, outside any batch, with nothing pending. Every
@@ -700,9 +701,8 @@ the tuner's own pool sizing (`poolItemsPerRange`; `fixedBatchesItemsPerRange` is
 the one resolver the bench reads); an explicit `items_per_range` wins, and either
 bypasses the tuner. Production only forwards a stage
 config's own fields into it (`ai.zig`'s `separation_items_per_range` and
-`intent_items_per_range`, steering's `band_items_per_range` for the grid sort
-and claim bands, `CollisionSystem.trigger_controls` for the commit-seam trigger
-sync, all null or default in production), and idiom-lint rule 13 fails the
+`intent_items_per_range`, `CollisionSystem.trigger_controls` for the commit-seam
+trigger sync, all null or default in production), and idiom-lint rule 13 fails the
 build otherwise: 13.1 a range, batch-count, or worker field set to anything but
 a forward of a stage config or typed `*_controls` field or a selection's value,
 13.2 `adaptive` set to anything but the config's, 13.3 a dispatch no tuner
@@ -911,11 +911,12 @@ The current gameplay fixed-step pipeline is:
    budgeted all-or-fail commit, capture the step's static changes into the
    collider's dirty list, run `SimulationPipeline.syncPopulationCapacity` (the
    population growth seam), sync the static colliders (recording their nav marks;
-   it runs even when the growth seam failed), then the post-commit reactions:
+   it runs even when the growth seam failed), then the post-commit nav reaction
    `reactToPostCommitNavEvents` (only after a successful growth seam and collider
-   sync, else every mark stays for the next step) and
-   `reactToPostCommitSteeringEvents` (always). The first growth, collider, or nav
-   error is returned only after the steering reaction has run. The demo state holds
+   sync, else every mark stays for the next step). Steering has no post-commit
+   reaction: it reads the synced collider rows on its own step, so a growth or
+   nav failure still leaves it on the committed statics, and a failed collider
+   sync keeps it on the pre-commit rows. The demo state holds
    this order (`commitStructuralAndReact`).
 7. Render current `WorldSystem`, `DataSystem`, and particle state with
    interpolation.
@@ -1057,15 +1058,15 @@ processor, using SIMD lanes inside each assigned range and
 batch is large enough. Worker ranges are aligned to movement cache-line
 boundaries and only write their assigned movement rows.
 `MovementSystem.applyIntents` (`apply_ai_movement_intents`) runs over the step's
-merged movement intents as a threaded stage with its own tuner and an inline path:
-one dense-index resolve per intent (`DataSystem.aiMovementDenseIndex`), a 4-lane
-SIMD velocity block (default speed where speed is not positive) with a
-bit-identical scalar finish, and velocity written in place at each intent's
-movement row. Rows are disjoint because `SimulationFrame.intents` carries at most
-one movement intent per entity per step (steering's first claim), asserted at the
-stage; main keeps O(ranges) dispatch. The rows are scattered across the velocity
-columns, which `threading.md` allows: `movement-apply-intents-sorted` is its
-row-order control.
+merged movement intents as a threaded stage with its own tuner, inline when the
+tuner or a zero-worker pool stays on the caller. Each intent already carries its
+movement row (stored at steering resolve; [Steering](#steering)); the apply does
+not look one up. A full group is a 4-lane velocity write (`direction * speed`,
+speed 40 where speed is not positive), and a short group is that kernel with a
+mask. Ranges write in parallel. The stream carries at most one movement intent
+per row (steering's first claim), so the written rows are disjoint; main keeps
+O(ranges) dispatch. Steering has already sorted the merged intents by
+`movement_row`, so the walk is in row order.
 
 ### Collision
 
@@ -1189,8 +1190,9 @@ query that step reads it (`.grok/rules/simulation.md`).
   chunk group entries by their storage unit; faction orders them ahead of
   position inside the chunk because every hot query filters on it
   (`.grok/rules/memory-performance.md` § Data-oriented design). The entry
-  columns (`x`, `y`, `entity_index`, `entity_generation`, `population_row`,
-  `cognition_phase`) are dense in key order. Each populated chunk has one
+  columns (`x`, `y`, `agent_radius`, `entity_index`, `entity_generation`,
+  `population_row`, `cognition_phase`) are dense in key order. `agent_radius`
+  is 0 when the body has no steering component. Each populated chunk has one
   `ChunkRecord`: per faction, a 64-bit row mask (bit y set when the faction holds
   a cell on local row y) and its first `RowPart`, one (chunk, faction, local row)'s
   occupied cells as a 64-bit mask. A cell's entries are one contiguous run. Each
@@ -1212,8 +1214,8 @@ query that step reads it (`.grok/rules/simulation.md`).
   `NeighborBlock`, a stack copy of the key's entry stream filled on demand, so the
   agents of one cell walk their neighborhood once (`.grok/rules/engine-design.md`
   § Cost model) while each still tests its own position, radius, budget, and FOV.
-  AI keeps one block per query kind per range, perception one per range; each
-  counts its fills.
+  AI keeps one block per query kind per range, perception one per range, and
+  steering one per avoidance range; AI and perception each count their fills.
 - **Think set.** `ai_cognition_order` (`SimulationScopeSystem.compactCognition`)
   keeps the indexed rows whose `cognition_phase` is this step's (or
   `always_active`; every row with no cognition region), in cell-major order: records in key order, each by (local_y, local_x, faction, slot).
@@ -1311,34 +1313,47 @@ build.
 ### Steering
 
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
-component data, movement slices, the shared static-collider rows, and
-frame-delayed `PathfindingSystem` status. It owns runtime path-following rows
-(indexed by steering row; an O(k) main-thread rekey follows the rows a commit
-swap-removed), replan cooldowns, unavailable-path backoff, stuck counters, and its
-agent grid outside `DataSystem`. Its prepare phase runs as threaded stages, each
-with its own tuner and an inline path: `agents` (runtime tick, agent snapshot,
-movement-index refresh), `select_resolve` and `select_claim` (one intent per
-steering row, banded first-appearance and best-intent claims with per-step
-stamps), `directions` (path status and base direction, SIMD tail, per-item path
-request prefixes), and `grid_bucket`/`grid_sort` (the agent grid in 64
-count-balanced cell-key bands whose splitters are quantiles of up to 256 rows
-sampled on main in a golden-ratio sequence, so clustered and corridor crowds split
-like uniform ones; a cell never straddles bands). With threads, a stage its tuner
-keeps inline runs the same job as threaded; the serial and zero-worker paths keep
-the single pass and single sort. Main keeps per-range and per-band bookkeeping,
-the splitters, and the rekey. The avoidance pass emits final NPC
-`MovementIntent`s through deterministic threaded range writes to
-`SimulationFrame.intents`, and the movement job writes path requests per range
-from the prefixes. Static avoidance queries `ColliderView.queryBox` (largest size
-class first, at most 64 box hits and 512 probes per agent) and pushes with SIMD
-over the packed hits, so a static change costs steering nothing; agent-agent
-avoidance reads the agent grid. Steering follows a `.partial` path like
-`.available`, requests the next hop on its replan cooldown once inside the end's
-refresh window, and holds at the end with no direction.
-Priority arbitration chooses the highest-priority navigation intent per entity
-with stable stream order as the tie-breaker.
-Player movement remains direct input with no steering component, while collision
-response still resolves after movement.
+component data, the previous step's movement positions and levels, the shared
+spatial index, the shared static-collider rows, and frame-delayed
+`PathfindingSystem` status. It owns runtime path-following rows outside
+`DataSystem`, one per steering row (replan cooldown, unavailable backoff, stuck
+counter, waypoint hint, previous direction). A commit that moves steering rows
+is rekeyed on the main thread after `agents`: O(rows the commit moved, added,
+or removed). `reserve` past `max_step_items` (the `u32` width) returns
+`OutOfMemory` before any growth; the step only asserts that width.
+
+Each stage has its own tuner and runs inline when the tuner or a zero-worker
+pool stays on the caller. There is no separate zero-worker pass.
+`agents` walks steering rows (32-row alignment) and ticks runtime cooldowns.
+`select_resolve` and `select_claim` keep one intent per steering row: the first
+in source order and the best by priority, ties to the earlier. Resolve places
+intents by steering-row band; claim's items are the placed intents, and a range
+owns every nonempty band whose start lies in its span, so a band is never split.
+`directions` walks steering rows (64-row alignment). A claimed row writes its
+selected intent into that range's window and writes only the runtime columns it
+changes; an unclaimed row in the span is left alone. Path status stays scalar.
+The direction smooth, including a short tail, is one masked lane kernel
+(`smoothDirectionLanes`). The other steering stages stay at 16-item alignment.
+Path requests are flagged here and merge in that steering-row order.
+
+The avoidance pass walks the selected intents. Agent avoidance queries the
+shared index on the agent's level (`visitLanes` over `NeighborLanes`, one
+`NeighborBlock` per range). The other agent's radius is masked-gathered from
+the index. Static avoidance queries `ColliderView.queryBox` (largest size class first,
+at most 64 box hits and 512 probes per agent) and pushes with SIMD over the
+packed hits, so a static change costs steering nothing on the step it commits. The pass writes
+movement intents in selected order, then a place and a sort (each its own
+tuner) order them by the movement row stored at resolve. Path requests are not
+part of that sort. An empty batch is zero ranges
+([Thread System](#thread-system)).
+
+`steering_update` reads `navigation_intents`, `path_goals`, and `spatial_index`,
+writes `movement_intents` and `path_requests`, and carries `static_colliders`,
+`movement_positions`, and `world_level`. Priority arbitration is the claim
+above. A `.partial` path is followed like `.available`: the next hop is
+requested on the replan cooldown once inside the end's refresh window, and the
+agent holds at the end with no direction. Player movement stays direct input
+with no steering component. Collision response still resolves after movement.
 
 ### Path requests
 

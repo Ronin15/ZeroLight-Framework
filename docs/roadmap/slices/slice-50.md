@@ -147,9 +147,9 @@ instances, dispatches through this pool, so its safety is engine-wide.
       (`.grok/rules/tests-benchmarks.md` § Test and production code 1).
       Superseded by `19fe22a`: `ThreadSystem`'s fixed-shape options are the one
       sanctioned test and bench seam, and production code may only forward its
-      stage's controls. The steering band stages forward
-      `SteeringConfig.band_items_per_range` (`steering/system.zig:94`),
-      null in production.
+      stage's controls. The steering band stages forwarded
+      `SteeringConfig.band_items_per_range`, null in production. That override
+      was removed in `50225b9`; claim counts placed intents.
 - [x] The idiom lint flags a production literal `items_per_range` or
       `max_worker_threads` passed to `Dispatch` outside tests and benches
       (`tools/lint_idioms.py`). Rule 13 (`166075c`): 13.1 range and worker

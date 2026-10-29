@@ -6,11 +6,10 @@ Range: `main..core_systems`
 
 Base: `5673672` (`Merge pull request #12 from Ronin15/module_layout`)
 
-Tip: in progress. Slice 50 landed (programming complete); its ReleaseFast
-`zig build test` and the owner's Windows and Mac runs are open in the slice.
-The measuring landing benched the branch's baseline; Slice 83 landed
-(`verify` passes at `13e88ad`); Slice 84's programming landed, with its open
-items in the slice.
+Tip: in progress. Slice 85 landed (archived). Slice 50's ReleaseFast
+`zig build test` and the owner's Windows and Mac runs stay open in that
+slice. The measuring landing is the branch baseline. Slices 83, 84, 86, and
+90 are archived.
 
 ## Summary
 
@@ -26,8 +25,9 @@ rebuilt the shared neighbor index as a level- and faction-keyed chunk index
 built on workers and shared per cell. A tuner and slot series then gave
 each pass its own tuner, sized collision's range slots from the dispatch, made
 `PaddedSlot` line-aligned by type, and gated the fixed-shape dispatch seam out
-of production with idiom-lint rule 13. Measured numbers are Debug unless
-labelled.
+of production with idiom-lint rule 13. Slice 85 moved steering onto the shared
+neighbor index and ordered movement intents by movement row. Measured numbers
+are Debug unless labelled.
 
 ## Slice 50: Thread System Hardening
 
@@ -309,6 +309,30 @@ labelled.
   best control within spread (the one-rep +20% and +14% at 10,000 did not
   survive the 3-rep rerun). Rows at rest moved to slice 75
   (`docs/roadmap/archive/slice-86.md`).
+
+## Slice 85: Steering On The Shared Neighbor Index
+
+- `21851e4`, `608337b`, `50225b9`, `0aabf95`, `8244f75`, `76646ef`: avoidance
+  queries the shared index (the private grid, its tuners, and the movement-index
+  cache are gone); selection is one path, inline with no workers, and `reserve`
+  past `max_step_items` is `OutOfMemory`; `select_claim` counts placed intents
+  and a range owns whole bands; movement intents sort by `movement_row` after
+  avoidance and the apply reads that row; an empty batch is zero ranges;
+  directions writes its steering-row window, and the smooth tail is
+  `smoothDirectionLanes`. `stuck_step_threshold` uses the cooldown cap. Debug,
+  `x86_64_v2`. Index switch, `steering` tuned: 128 agents 193.6 to 131.2 µs,
+  512 664.6 to 390.1 µs, 1024 644.4 to 445.3 µs; serial +6.9% to +8.9%, within
+  noise. One selection path, serial: 128 +5.9%, 512 +3.6%, 1024 +3.6%, within
+  noise; tuned 512, 3 reps, within spread. Claim items, `steering-shuffled`
+  tuned 1024, 4096, and 16384 within noise; tuned 128 and 512, 3 reps, within
+  spread; tuned 1024 593.0 to 473.2 µs. Apply, `movement-apply-intents` serial:
+  1024 51.3 to 36.1 µs, 4096 206.8 to 144.8 µs, 16384 922.8 to 560.6 µs; the
+  sorted control serial fell by the same kind of amount; tuned 4096, 3 reps,
+  both groups faster; tuned 1024 sorted, 3 reps, within spread; the two tree
+  medians at 4096 sit inside each other's spread. Directions, tuned: `steering`
+  1024 612.1 to 524.2 µs; `steering-shuffled` 4096 1.52 to 1.58 ms, within
+  noise. `production-step` `1024008016384` for the index switch was not judged:
+  both sides stayed unsettled at warmup 484 on tuners that change does not own.
 
 ## Other Changes
 

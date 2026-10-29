@@ -102,8 +102,9 @@ a threaded pass under its own tuner, which may keep it inline below its gate:
    each on workers. Carries positions, levels, and interest markers.
 9. `path_goal_resolve` → `steering_update` → `pathfinding_update` →
    `apply_ai_movement_intents` → `movement_integrate`: the step's goal table,
-   steering and path status, frame-delayed pathfinding, sparse movement-intent
-   application, and movement.
+   steering and path status (the shared index; carried positions and level),
+   frame-delayed pathfinding, movement intents in movement-row order, and
+   movement.
 10. The late-stage pose order below, then `chunk_derive` → `action_react` →
     `tier_policy`. The **simulation-LOD tier policy** assigns each entity a
     cognition/locomotion/kinematic/dormant tier by cube distance and emits
@@ -185,9 +186,9 @@ before it is written fails the build instead of silently corrupting behavior.
   authoring, `structural_events` from the post-step commit) or a later stage's
   write consumed as previous-step state (`affect_update` carries `ai_behavior`,
   which `ai_decide` writes later in the same step; `spatial_index_build`,
-  `perception_update`, and `ai_decide` carry the previous step's
-  `movement_positions` and `world_level`, so a reorder past a position or
-  level writer fails the build). A carried resource that an
+  `perception_update`, `ai_decide`, and `steering_update` carry the previous
+  step's `movement_positions` and `world_level`, so a reorder past a position
+  or level writer fails the build). A carried resource that an
   earlier stage writes is a compile error; declare it as a read.
 - Event payloads are four tags. `perception_events` (`entity_perceived`,
   `entity_lost`) is written by `perception_update` and read by
@@ -440,13 +441,13 @@ capacity fails.
 
 ## Post-Commit Reactions
 
-The commit seam (`GameDemoState`'s `commitStructuralAndReact`) runs, in order:
-`reserveStaticColliders` (collider rows and static nav marks, before the commit),
-the budgeted commit, `captureStaticColliderChanges` (the step's entity changes into
-the collider's persistent dirty list), `syncPopulationCapacity`,
-`syncStaticColliders` (run even when the growth seam failed, so the step's static
-changes land and reach nav; it records their nav marks), then two independent
-reactions against the same committed state:
+The commit seam (`SimulationPipeline.commitStructuralAndReact`, called from
+`GameDemoState`) runs, in order: `reserveStaticColliders` (collider rows and
+static nav marks, before the commit), the budgeted commit,
+`captureStaticColliderChanges` (the step's entity changes into the collider's
+persistent dirty list), `syncPopulationCapacity`, `syncStaticColliders` (run
+even when the growth seam failed, so the step's static changes land and reach
+nav; it records their nav marks), then the post-commit nav reaction:
 
 - `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, which applies
   every pending nav change (marks the terrain writers and the collider sync
@@ -454,17 +455,13 @@ reactions against the same committed state:
   transaction per step and emits one `nav_region_invalidated` when the graph
   changed. It runs only after a successful growth seam and collider sync; else
   every mark stays for the next step.
-- `reactToPostCommitSteeringEvents` delegates to `SteeringSystem`, marking its
-  steering-to-movement index cache stale when the commit renumbered dense rows.
-  Steering reads the synced collider rows directly, so a static change rebuilds
-  nothing steering-side. It always runs.
 
-The reactions are side effects on fully disjoint state. The first growth,
-collider, or nav error is returned only after the steering reaction has run. A
-growth or nav failure still leaves steering on the committed statics; a failed
-collider sync keeps steering on the pre-commit rows and keeps its changes for the
-next step's sync. Perception has no reaction: line of sight reads the world's
-chunk terrain directly.
+Steering has no post-commit reaction. It reads the synced collider rows on its
+own step, so a static change rebuilds nothing steering-side, a growth or nav
+failure still leaves it on the committed statics, and a failed collider sync
+keeps it on the pre-commit rows and keeps its changes for the next step's sync.
+Perception has no reaction: line of sight reads the world's chunk terrain
+directly.
 
 Nav, the static-collider splice, and the terrain edit stages take their range
 controls as one `StageControls` each (`PathfindingSystem.nav_controls`,
@@ -480,8 +477,7 @@ other threaded stage; production leaves them at their defaults.
 - writes player input and audio commands at the main-thread boundary;
 - delegates reusable fixed-step systems and stage order to `SimulationPipeline`;
 - applies structural commands at the fixed-step commit boundary and runs the
-  commit seam above (collider sync, population seam, nav and steering
-  reactions);
+  commit seam above (collider sync, population seam, and the nav reaction);
 - reserves renderer command capacity after structural commits and before render
   submission.
 

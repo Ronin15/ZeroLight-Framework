@@ -227,8 +227,8 @@ ended in a result; an `.unavailable` answered at solve is not one),
 `path_solve_admissions`, `path_admission_deferred_requests`, `path_partial_results`,
 `path_goal_projected` (accepted requests whose goal cell was blocked),
 `path_group_field_evictions`, and `path_max_distinct_group_keys`. Pipeline timings include `path_goals` (`pipeline_path_goals`, the
-goal resolve), and the `steering_setup` line reports select, snapshot, directions,
-and the agent grid (`steering_grid`) separately. The `pathfinding` line's
+goal resolve), and the `steering_setup` line reports select, snapshot, and
+directions. The `pathfinding` line's
 `resize_avg_ms`/`resize_max_ms` time the update's own elastic resize (a shrink, or a
 grow after a failed population seam), recorded only on steps that resized; pipeline
 init and the population seam do the grows, and a seam grow shows in

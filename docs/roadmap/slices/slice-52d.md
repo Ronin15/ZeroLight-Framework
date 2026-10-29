@@ -37,8 +37,8 @@ groups measure it.
   (`systems/spatial_index.zig:1347-1348`, divisor `grid.cells_per_chunk`, any
   integer in `[1, 64]`, not a power of two); `floorToI4` through
   `worldPosToCell4` (spatial index, scope, `static_colliders.zig:1473-1474`)
-  and directly in `steering/agent_grid.zig:324-325`,
-  `pathfinding/goal_table.zig:204-205`, `world/system.zig:800`; `math.sinCos` in `rng.unitVec2`
+  and directly in `pathfinding/goal_table.zig:204-205`, `world/system.zig:800`;
+  `math.sinCos` in `rng.unitVec2`
   (AI wander), perception `cos_half_fov`, sprite rotation, and the debug
   overlay; raw `@sin` in `ai_debug_overlay.zig`; runtime-bound
   `math.clampMinMax` in steering.

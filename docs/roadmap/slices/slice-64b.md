@@ -32,8 +32,9 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   path registry, group fields, and the nav graph with its connectivity ids and
   one-way closure; `StaticColliderSystem` rows; `CollisionSystem.trigger_store`
   (per-level stored-trigger page trees, `collision.zig:879`,
-  `collision_triggers.zig`); steering's movement-index cache;
-  tuners, scratch, and the audio controller. Perception holds no LOS state.
+  `collision_triggers.zig`); tuners, scratch, and the audio controller.
+  Perception holds no LOS state. The steering movement-index cache was
+  removed in `21851e4`.
 - Terrain is chunk-owned (64G), so the chunk is the hashing unit.
 
 ### Architecture notes

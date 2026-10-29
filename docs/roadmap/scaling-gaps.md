@@ -36,7 +36,7 @@ density.
 | movers (per step) | ~2000–2050 |
 
 Known costs inside the band: the full agent snapshot each cognition step
-(~0.33 ms) and the avoidance batch (~0.40 ms; [Slice 85](slices/slice-85.md)).
+(~0.33 ms) and the avoidance batch (~0.40 ms; [Slice 85](archive/slice-85.md)).
 
 - [ ] **Perception tail.** Stage avg ~0.16 ms, max ~2.4 ms (earlier
       ReleaseSafe dump). A later single demo run showing max 0.549 ms does

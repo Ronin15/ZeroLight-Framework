@@ -15,7 +15,7 @@ working; links to sibling open slices become `../slices/slice-<id>.md`), move
 its row from the index's Open Frontier table to the table below, and keep its
 acceptance history intact.
 
-**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48, 81, 82, 83, 84, 86, 90.
+**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48, 81, 82, 83, 84, 85, 86, 90.
 
 > Residual follow-ups from archived slices are never incomplete archive
 > checklists. Where they live today: Slice 30's deferred `memory_expired`
@@ -81,6 +81,7 @@ acceptance history intact.
 | [82](roadmap/archive/slice-82.md) | Split The World Module | World files into `src/game/world/`; `world_system.zig` split into system, render, edit, worldgen. |
 | [83](roadmap/archive/slice-83.md) | Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners | Steering split into `src/game/systems/steering/`, pipeline fixtures into `pipeline_test_support.zig`, every production stage on its own tuner. |
 | [84](roadmap/archive/slice-84.md) | Level-Aware Shared Neighbor Index | One level- and faction-major chunk index per step built on workers; lane-group neighbor queries over per-cell shared blocks; cell-major think set; AI memory and gathers on workers. |
+| [85](roadmap/archive/slice-85.md) | Steering On The Shared Neighbor Index | Avoidance queries the shared index. Movement intents reach the apply in movement-row order. Selection, claim, and directions are one inline-or-threaded path. |
 | [86](roadmap/archive/slice-86.md) | Collision Subsystem Pass | Broadphase follows local density, gather and sort are off main, trigger refresh follows the changed entities, static hit rows follow the live query, and range slots stay inside the harmonic bound. Rows at rest moved to 75. |
 | [90](roadmap/archive/slice-90.md) | ThreadSystem Wake Protocol And Startup Calibration | Toggle-bit wake words; the gate and participant-overhead prior derive from dispatch floors measured at startup. A held side waits a full sample window before it flips. |
 

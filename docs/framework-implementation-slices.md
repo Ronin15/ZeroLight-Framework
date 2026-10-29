@@ -208,12 +208,11 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**85**](roadmap/slices/slice-85.md) | In progress | Steering On The Shared Neighbor Index — after 84, 86 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; five items open as data | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); five items stay recorded |
 
-**Recently settled (archive only):** 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 85, 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
 **Benches:** `.grok/rules/tests-benchmarks.md`. `production-step` (extended by Slice 52C with CPU render prep, a state digest,
 and a NaN count) tracks the full fixed step's scaling shape across commits; 66E
@@ -282,8 +281,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    slice's tuned cases are judged, `.grok/rules/tests-benchmarks.md` § Benchmarks) →
    [90](roadmap/archive/slice-90.md) wake protocol and startup calibration (landed) →
    [86](roadmap/archive/slice-86.md) collision (landed) →
-   [85](roadmap/slices/slice-85.md) steering (next collision-adjacent) → tile gate
-   ([35](roadmap/slices/slice-35.md)'s `world_gate` items) →
+   [85](roadmap/archive/slice-85.md) steering (landed) → tile gate
+   ([35](roadmap/slices/slice-35.md)'s `world_gate` items, next) →
    [87](roadmap/slices/slice-87.md) render prep →
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
    inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
@@ -291,13 +290,13 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    2026-10-23 and ordered first 2026-10-24. Items the 64G combined
    review routed here (refs at `e2b9b2c`):
    - Tile gate on main (area D H1): 35 (threaded, `f0adc9a`); row order and chunk grouping: 89.
-   - Halo agents sorted twice (M1): 84, then 85.
-   - Missing SIMD verdicts (M4): agent avoidance 85, response gather 86 (landed: slice 86's `gatherRange` verdict).
+   - Halo agents sorted twice (M1): 84, then 85 (landed).
+   - Missing SIMD verdicts (M4): agent avoidance 85 (landed: `visitLanes`), response gather 86 (landed: slice 86's `gatherRange` verdict).
    - Commit-seam order in the demo state (L5): 74.
-   - Any create re-resolves every steering row (L10): 85.
+   - Any create re-resolves every steering row (L10): 85 (landed: the movement-index cache is gone).
    - File splits (L11) and per-system tuner fields: 83 (landed).
    - Render collect and GPU sync copying (area C): 87.
-   - Movement intent order: 85.
+   - Movement intent order: 85 (landed).
    - World creation and worldgen: measured; its findings are in 74; the world paint's first pick: 89.
    - Collision, whole subsystem: 86.
    - Render backend pass: 87, last.
@@ -306,8 +305,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    (tags name findings in that review's local reports). Every
    ref is re-checked right before implementation
    (`.grok/rules/engine-design.md` § Cost model).
-   - 85: steering grid level key (contiguity H1, code H2); the vectorized
-     avoidance accumulate, moved from 35 (docs M9); intent order
+   - 85 (landed): steering on the shared index (contiguity H1, code H2); the
+     vectorized avoidance accumulate, moved from 35 (docs M9); intent order
      (contiguity M3).
    - 87: visible-chunk source (contiguity H4); sparse tile lists (contiguity
      M1); submit reads in sort order (contiguity M2).
@@ -324,7 +323,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - Core branch:
      - 84: spatial index;
      - 86: collision, response, static colliders, destructibles;
-     - 85: steering, movement, particles;
+     - 85 (landed): steering, movement, particles;
      - 35: tile gate;
      - 87: render prep, GPU tile sync, world render, and the render backend;
      - 88: `DataSystem`, step contracts, pipeline, `src/core` kernels;
@@ -340,8 +339,9 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      `sensory_bus`, `ai_archetypes`, `ai_debug_overlay`, `world/interest`, and
      the AI stores. Slice 85's subsystem check (2026-10-29) routed two
      validator gaps on the AI store here; they are under AI findings below.
-     `stuck_step_threshold` in the same file is a steering tunable and stays
-     on 85.
+     `stuck_step_threshold` in the same file is a steering tunable and landed
+     with 85 (`validateSteeringAgent` rejects a value above
+     `max_steering_cooldown_steps`).
    - Item 4: states and menus, `audio_controller`, `player`, `src/app` apart
      from `ThreadSystem`, `src/assets`, `src/platform`.
 
@@ -400,7 +400,7 @@ writes the findings into slice checklists or new slice files.
   `last_score`, or a `commitment_remaining` above
   `max_ai_commitment_max_steps`, is stored and read by arbitration
   (`.grok/rules/zig-style.md` § Errors and resources). Open when this branch
-  starts. `stuck_step_threshold` beside it is steering and stays on slice 85.
+  starts. `stuck_step_threshold` beside it landed with slice 85.
 
 ## Deferred By Owner
 
@@ -450,8 +450,8 @@ order.
 6a. **89** Thread-System Batch Follow-Ups And The World Gate Under The Rules — programming landed; five items stay recorded (core-systems branch).
 6b. **90** ThreadSystem Wake Protocol And Startup Calibration — landed (archived).
 7. **86** Collision Subsystem Pass — landed (archived), after 83, 84, 89, and 90.
-8. **85** Steering On The Shared Neighbor Index — next in the core branch, after 84, 86.
-8a. **35's `world_gate` items** — after 85 (core-systems branch; the rest of 35 is line 22).
+8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
+8a. **35's `world_gate` items** — next in the core branch, after 85 (the rest of 35 is line 22).
 9. **87** Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items (core-systems branch).
 9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's collect items (core-systems branch).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.
