@@ -2444,6 +2444,13 @@ const BatchShape = struct {
 // collapse to one full-width range a batch no worker may take or one the tuner selected
 // inline. A fixed inline batch with workers allowed keeps its requested range size.
 fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_threads: usize, range_alignment_items: usize, tuner_active: bool) BatchShape {
+    // An empty batch has no range. Collapsing its width to the item count would
+    // divide by zero in rangeCount.
+    if (item_count == 0) return .{
+        .items_per_range = @max(range_alignment_items, 1),
+        .worker_threads = 0,
+        .range_count = 0,
+    };
     const aligned = std.mem.alignForwardAnyAlign(usize, @max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
     const aligned_range_count = rangeCount(item_count, aligned);
     const worker_threads = if (aligned_range_count <= 1)
@@ -6239,6 +6246,13 @@ fn tunerTestBatch(item_count: usize, items_per_range: usize, duration_ns: u64) B
         .worker_threads = 1,
         .items_per_range = items_per_range,
     }, duration_ns);
+}
+
+test "an empty batch shapes to zero ranges" {
+    const shape = shapeBatch(0, .{ .worker_threads = 0, .items_per_range = 0 }, 0, 16, false);
+    try std.testing.expectEqual(@as(usize, 0), shape.range_count);
+    try std.testing.expectEqual(@as(usize, 0), shape.worker_threads);
+    try std.testing.expect(shape.items_per_range > 0);
 }
 
 // One engine step as the dispatch path records it: the tuner's selection shaped by
