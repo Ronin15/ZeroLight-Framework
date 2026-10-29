@@ -42,56 +42,31 @@ not use. A step the plan fills in is built.
 
 ## Workflow
 
-1. When the brief names a first type and a file, write that type in that
-   file before reading any other file. Then read only the declarations the
-   brief names for the edit you are making, and their call sites. Read past
-   that only when a claim does not match the live code. For a slice,
-   implement from the design plan, never from slice prose alone. Do not
-   survey the plan's file:line list up front.
-2. Build it in the plan's order: the data and its layout, the loops over
-   it, the passes and their threading, then the proof. Use the plan's cost
-   model, including the serial and threaded paths. State one only when the
-   plan has none. A measured hot-path cause named in the brief is
-   optimized and re-measured; a replan comes only when that re-measure
-   still misses and the counters show the structure itself is the cost, or
-   the brief already says the structure failed.
-3. Make the change in the owning module (`docs/architecture.md` § Source
-   Layout; `engine-design.md` § Changes and docs). When the brief or the plan
-   cites an architecture heading, read that heading and stop at the next
-   heading of the same level. Touch only the files the
-   brief lists; a needed file outside the list stops the work and is
-   reported, never edited first.
-4. Add the tests and scaling benches the rules require
-   (`tests-benchmarks.md`). A new test calls the helper the brief names.
-   Read that helper and write the test. When the brief names no helper, one
-   grep, read the one function it finds, then write. Do not open another
-   test. Edit no docs: put the doc changes as notes in the report.
-5. Validate per `build-validation.md`. While iterating, run `zig build check`
-   and, when test bodies changed, `zig build test-compile` with no
-   `-Dtest-filter`. A filter compiles only the tests it matches, and a filter
-   that matches nothing does not type-check the rest. Run the brief's module filter, and run
-   each new test under its own `-Dtest-filter` when the test name does not
-   contain that module text. A name like `statics committed at the seam` is
-   missed by `-Dtest-filter=collision`. Write that output to a file and
-   judge it by the exit code; a
-   "failed command:" line echoing warn output is not a failure; on a real
-   failure keep the failing test's name and message. A step or `-D` option
-   not named here or in `build-validation.md`: `zig build -h`, and stop at
-   System Integration Options. Do not open `build.zig` or DW to find one.
-6. Benchmark per `tests-benchmarks.md` § Benchmarks: when the brief says the
-   change cannot move a hot path, skip `bench_ab` and record the skip;
-   otherwise run the landing's one before/after with `tools/bench_ab.py` on
-   the groups the brief names. Run `tools/bench_ab.py --list --group <name>`
-   and pick `--items` from that group's `items` line and a case from its
-   `cases` line. A group name the brief does not give: `--list` with no
-   group. A flag not named here: `tools/bench_ab.py --help`. Do not open
-   the script, the harness, an item encoder, or DW to find one. Read only the
-   summary lines, and give each slower case its verdict. A new scaling bench also runs tree-only (`--base none --grid
-   --all-cases`) for its pass shape.
-   Do not profile: a timing dispute goes to the main session, which settles
-   it per DW § Profiling. A crash, hang, or
-   leak goes to zig-debug-specialist through the main session. Never tune
-   for a bench number unless the brief names that case.
+The design plan the brief cites is the work. The brief lists only its
+overrides, the `file:line` list, and the commands. A stated fix with no
+plan is the brief itself.
+
+1. Read the brief and the plan it cites. Write each of the plan's steps, in
+   its order: data and layout, loops, passes and threading, then the proof.
+   The `file:line` list is where those steps are. A declaration a step needs
+   and the list does not have is read once and named in the landing. A claim
+   that does not match the live code is the one you re-check.
+2. The files are the ones the brief lists. A file outside that list is
+   named in the landing and left unedited. An architecture heading the brief
+   cites is that heading, through the next heading of the same level.
+3. The new test calls the helper the brief names. Read that helper and write
+   the test. Doc changes are notes in the landing.
+4. Run `zig build check` while editing, and `zig build test-compile` with no
+   filter after a test body changes. Then run the test command and the bench
+   command the brief names (`build-validation.md`, `tests-benchmarks.md`).
+   Write each run to a file and judge it by the exit code. On a failure, keep
+   that test's name and message. A bench summary is read for its verdict
+   lines. A crash, hang, or leak is reported for zig-debug-specialist. A
+   timing dispute is reported for the main session.
+5. The cost model is the plan's. A measured hot-path cause the brief names
+   is optimized and re-measured. A replan is only when that re-measure still
+   misses and the counters show the structure is the cost, or the brief says
+   the structure failed.
 
 ## Checks (before the report)
 

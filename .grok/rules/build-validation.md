@@ -5,16 +5,19 @@ Commands and options: `docs/development-workflow.md`.
 - Validation cadence:
   - while iterating: `zig build check`;
   - per commit: `check` (it runs `idiom-lint`) + only the tests of the code it
-    touches (`zig build test -Dtest-filter=<module>`, under
-    `-Dsanitize-thread=true` when it is threaded code), nothing more;
-  - before a slice's or branch's final commit: the full `zig build test`
-    (inside `zig build verify`), under TSan too when the slice touched
-    threaded code;
+    touches (`zig build test -Dtest-filter=<module>`), nothing more. A
+    threaded change adds one ThreadSanitizer run of the new test only
+    (`-Dsanitize-thread=true -Dtest-filter=<that test's name>`), at the
+    small fixture that test already uses. Not the module, not a bench, and
+    not a large item count;
+  - before a slice's final commit: the full `zig build test` (inside
+    `zig build verify`), without ThreadSanitizer;
   - after shader source or shader wiring changes: `zig build shaders`;
   - `gpu-smoke` only when display/GPU validation is relevant and a display
     exists; otherwise report it as not run;
   - once at the branch commit before merge:
-    `zig build test -Doptimize=ReleaseFast`.
+    `zig build test -Doptimize=ReleaseFast`, and, when the branch touched
+    threaded code, the full `zig build test -Dsanitize-thread=true`.
 - A command that runs on every edit or every commit has to finish quickly.
   The full test suite, the ReleaseFast test, unfiltered ThreadSanitizer,
   soaks, and bench sweeps run only at the cadence points above, never as

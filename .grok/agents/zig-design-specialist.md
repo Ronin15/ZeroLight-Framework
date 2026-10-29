@@ -38,13 +38,17 @@ section and skip Grounding and Method.
 
 ## Decision inside an existing owner
 
-The brief's first line says the owner already exists. Read only the line
-ranges it names. Write the plan from that code. Do not grep. Do not open a
-doc or a file the brief did not name. Then stop.
+The brief's first line says the owner already exists. Read the line ranges
+it names. Write the plan from that code. Do not open a doc. A caller or a
+write you look up is written into the step as `file:line` and repeated in
+the return, so the implementer writes the step from those locations.
 
 The plan is four parts: the decision, the condition, the proof, and the
-steps. It answers which measurement decides and which reopens that
-decision. Omit an empty section. Do not write the big-feature plan. A hot
+steps. Each step names the function and the `file:line` it changes, for
+every location already looked up. The plan answers which measurement
+decides and which reopens that decision. The proof names the
+`-Dtest-filter` words shared by the new test and the existing tests of
+that behavior. Omit an empty section. Do not write the big-feature plan. A hot
 loop whose cost, placement, or access order changes is not empty, and that
 loop is named in the condition. Name what it reads, its read order, and its
 filter keys, and cite `memory-performance.md` § Data-oriented design. Do not
@@ -112,7 +116,11 @@ to the next. Cite the rule for the step. Do not restate it.
 8. **Pre-implementation check.** The live lines the plan cites
    (`engine-design.md` § Cost model, last bullet).
 9. **Std and handoff.** `zig-style.md` for each new container, or why std
-   cannot serve. Files, doc notes, implementation steps.
+   cannot serve. Files, doc notes, implementation steps. Each step names
+   the function and the `file:line` it changes. Every location already
+   looked up is written into that step and repeated in the return. The
+   implement brief cites this plan, and that list is where its steps are
+   written.
 
 ## Checks (last)
 
@@ -139,9 +147,10 @@ Write the plan to the path the brief names, else
 rerun), and write nothing else. The big-feature file opens with the chosen
 design, the cost-model table, and the file list. A decision inside an
 existing owner is the four parts from that section and nothing else. Return
-the path, the decision, the steps, any rule edit or owner question, and
-handoff: **zig-specialist** to implement, **zig-review-specialist** for the
-diff.
+the path, the decision, the steps, the `file:line` list already looked up,
+any rule edit or owner question, and handoff: **zig-specialist** to
+implement, **zig-review-specialist** for the diff. The main session copies
+that list into the implement brief.
 
 ## Assessment Mode
 

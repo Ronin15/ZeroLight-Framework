@@ -335,10 +335,13 @@ them).
 ## Thread Sanitizer
 
 ```sh
+zig build test -Dsanitize-thread=true -Dtest-filter=<that test's name>
 zig build test -Dsanitize-thread=true
-zig build test -Dsanitize-thread=true -Dtest-filter=thread_system
-zig build bench -Dsanitize-thread=true -- --group thread-dispatch
 ```
+
+Slice work uses the first command, on the new test, at the small fixture
+that test already uses. The unfiltered command is the branch commit
+(`.grok/rules/build-validation.md`).
 
 `-Dsanitize-thread=true` builds the unit-test and bench artifacts with
 ThreadSanitizer and forces the LLVM backend on them (the self-hosted backend

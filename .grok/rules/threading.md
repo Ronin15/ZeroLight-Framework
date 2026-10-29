@@ -102,8 +102,10 @@ How the thread system works: `docs/architecture.md` § Thread System.
 ## Verification and diagnostics
 
 - Threaded code passes ThreadSanitizer with no suppressions for framework
-  code; a change to the thread system, a lane thread, or any threaded write
-  merges only after a clean run.
+  code. Slice work runs it on the new test only, at that test's small
+  fixture (`build-validation.md`). The full run is the branch commit. A
+  change to the thread system, a lane thread, or any threaded write merges
+  only after that clean run.
 - Allocation-free proofs run on the real multi-worker thread system.
 - The runtime perf log records each change path's cost-driver stage only;
   every other stage's timing is bench output. Bench output reports an inline

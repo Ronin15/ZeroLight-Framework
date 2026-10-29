@@ -52,9 +52,16 @@ decision criteria, and reports.
   exercises the changed code. When the owner already exists, the first line
   says so and the brief names the line ranges to read. It states the
   decision and does not tour the module. An implement brief names the test
-  helper a new test calls, and the bench groups when a bench runs. The
+  helper a new test calls, the `-Dtest-filter` words shared by that test
+  and the existing tests of the same behavior, and the bench groups when a
+  bench runs. The words are not the module and not a phrase unique to the
+  new test. The
   implementer reads `tools/bench_ab.py --list` for that group's items and
-  cases. A review brief names the diff, its
+  cases. An implement brief cites the design plan and lists only its
+  overrides. Locations already looked up are copied in with `file:line`,
+  and that list is where the plan's steps are written. A declaration the
+  list lacks is read once and named in the landing. A
+  review brief names the diff, its
   sources, and what to check, never anyone's conclusions.
 - Agents cite a loaded rule by name. They do not open it again and do not
   restate it. A repeated constraint belongs in `.grok/rules/`.
@@ -62,7 +69,11 @@ decision criteria, and reports.
   structure fails the cost model, right before implementation. A known fix or
   a call already made goes straight to `zig-specialist`.
 - **Review** (`zig-review-specialist`) once per landing, before commit,
-  spawned the same turn the code is ready; fixes fold into that commit. A
+  spawned the same turn the code is ready. A large diff is two review
+  agents, spawned together. Each brief names its own files. The split is
+  files that do not share a write. The main session merges the two reports
+  into one finding list. That is one review, not a second round. Fixes fold
+  into that commit. A
   finding with a stated local fix goes to `zig-specialist`, an open choice to
   design. A High structural data-layout finding in new code is fixed in its
   landing. Any finding not fixed becomes a checklist item in its owning slice

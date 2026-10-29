@@ -37,8 +37,11 @@ test fix stays inline.
 | Pathfinder / best-practices / deep-correctness / architecture | That skill |
 
 A short-path brief is `AGENTS.md` § Briefs. The agent reads the named ranges
-and writes the four-part plan from that code. An implement brief names the
-test helper a new test calls and the bench groups. The implementer picks
+and writes the four-part plan from that code. Locations it already looked
+up are copied into the implement brief. The brief cites the design plan,
+lists only its overrides, and that list is where the plan's steps are
+written. An implement brief names the
+test helper a new test calls, the behavior-word test filter, and the bench groups. The implementer picks
 items and cases from `tools/bench_ab.py --list`. Owner questions are `AGENTS.md`
 § Decision criteria.
 
@@ -55,7 +58,9 @@ spawn together. Implement and debug run one at a time in the main tree. Do
 not run design and implement together on the same files.
 
 A review brief names the diff, its sources, and what to check. It carries no
-conclusion. The review enforces the rules and the architecture on the lines
+conclusion. A large diff is two briefs, spawned together, split on files
+that do not share a write. The parent merges the reports into one finding
+list. The review enforces the rules and the architecture on the lines
 the diff changes. The read stays on those lines. A debug prompt may be the failing command and the first error
 block when that is the whole failure. Skip `zig build verify` until that
 command is green.
