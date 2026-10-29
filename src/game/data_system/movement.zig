@@ -55,10 +55,45 @@ const MovementBodyRow = struct {
     level: u16,
     stagger_phase: u8,
     always_active: bool,
+    // Index of this row's drawable run, and its slot in that run. `no_drawable` is none.
+    drawable_run: u32 = no_drawable,
+    drawable_slot: u32 = no_drawable,
 };
+
+const no_drawable: u32 = std.math.maxInt(u32);
+
+const DrawableRow = struct {
+    entity: EntityId,
+    movement_index: u32,
+    previous_x: f32,
+    position_x: f32,
+    previous_y: f32,
+    position_y: f32,
+    position_z: i32,
+};
+
+const DrawableRun = struct {
+    rows: std.MultiArrayList(DrawableRow) = .empty,
+    refreshed_epoch: u32 = 0,
+    key: u128 = 0,
+    live: bool = false,
+    // Slots reserved past `rows.len` and not yet linked. Zero outside a reserve/link.
+    reserved_extra: u32 = 0,
+};
+
+fn drawableKey(level: u16, chunk_x: i32, chunk_y: i32) u128 {
+    const x: u32 = @bitCast(chunk_x);
+    const y: u32 = @bitCast(chunk_y);
+    return (@as(u128, level) << 64) | (@as(u128, x) << 32) | y;
+}
 
 pub const MovementBodyStore = struct {
     rows: std.MultiArrayList(MovementBodyRow) = .{},
+    // One run per occupied (level, chunk) of drawable rows. Map values are indices into `runs`.
+    runs: std.ArrayList(DrawableRun) = .empty,
+    free_runs: std.ArrayList(u32) = .empty,
+    run_of: std.AutoHashMapUnmanaged(u128, u32) = .empty,
+    pose_epoch: u32 = 0,
 
     pub fn len(self: *const MovementBodyStore) usize {
         return self.rows.len;
@@ -99,6 +134,7 @@ pub const MovementBodyStore = struct {
         s.items(.velocity_x)[index] = body.velocity.x;
         s.items(.velocity_y)[index] = body.velocity.y;
         s.items(.speed)[index] = body.speed;
+        self.writeRunPose(index, body);
     }
 
     pub fn get(self: *const MovementBodyStore, index: usize) MovementBody {
@@ -130,8 +166,17 @@ pub const MovementBodyStore = struct {
         return self.rows.slice().items(.tier)[index];
     }
 
-    pub fn setHasPrimitiveVisual(self: *MovementBodyStore, index: usize, has_visual: bool) void {
-        self.rows.slice().items(.has_primitive_visual)[index] = has_visual;
+    pub fn setHasPrimitiveVisual(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize, has_visual: bool) !void {
+        const had = self.rows.slice().items(.has_primitive_visual)[index];
+        if (had == has_visual) return;
+        if (has_visual) {
+            // The flag lands after the link, so a failed place leaves the row unlinked and a retry places it.
+            try self.placeDrawable(allocator, index);
+            self.rows.slice().items(.has_primitive_visual)[index] = true;
+        } else {
+            self.unlinkDrawable(index);
+            self.rows.slice().items(.has_primitive_visual)[index] = false;
+        }
     }
 
     /// Mirrors `bounds` onto row `index` and marks it bounded.
@@ -266,11 +311,229 @@ pub const MovementBodyStore = struct {
 
     pub fn clearRetainingCapacity(self: *MovementBodyStore) void {
         self.rows.clearRetainingCapacity();
+        self.run_of.clearRetainingCapacity();
+        self.free_runs.clearRetainingCapacity();
+        self.pose_epoch = 0;
+        for (self.runs.items, 0..) |*run, index| {
+            run.rows.clearRetainingCapacity();
+            run.live = false;
+            run.key = 0;
+            run.refreshed_epoch = 0;
+            run.reserved_extra = 0;
+            self.free_runs.appendAssumeCapacity(@intCast(index));
+        }
     }
 
     pub fn deinit(self: *MovementBodyStore, allocator: std.mem.Allocator) void {
+        for (self.runs.items) |*run| run.rows.deinit(allocator);
+        self.runs.deinit(allocator);
+        self.free_runs.deinit(allocator);
+        self.run_of.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = .{};
+    }
+
+    pub fn bumpPoseEpoch(self: *MovementBodyStore) void {
+        self.pose_epoch +%= 1;
+    }
+
+    pub fn drawableRunIndex(self: *const MovementBodyStore, level: u16, chunk_x: i32, chunk_y: i32) ?u32 {
+        return self.run_of.get(drawableKey(level, chunk_x, chunk_y));
+    }
+
+    pub fn drawableRunLength(self: *const MovementBodyStore, run_index: u32) usize {
+        return self.runs.items[run_index].rows.len;
+    }
+
+    /// Copies movement poses into a visible run when `pose_epoch` moved. Off-view runs are not called.
+    pub fn refreshRunPose(self: *MovementBodyStore, run_index: u32) void {
+        const run = &self.runs.items[run_index];
+        if (run.refreshed_epoch == self.pose_epoch) return;
+        const drawn = run.rows.slice();
+        const movement = self.rows.slice();
+        for (drawn.items(.movement_index), 0..) |movement_index, slot| {
+            const row = movement_index;
+            drawn.items(.previous_x)[slot] = movement.items(.previous_x)[row];
+            drawn.items(.position_x)[slot] = movement.items(.position_x)[row];
+            drawn.items(.previous_y)[slot] = movement.items(.previous_y)[row];
+            drawn.items(.position_y)[slot] = movement.items(.position_y)[row];
+            drawn.items(.position_z)[slot] = movement.items(.position_z)[row];
+        }
+        run.refreshed_epoch = self.pose_epoch;
+    }
+
+    pub fn drawableRunSlice(self: *MovementBodyStore, run_index: u32) struct {
+        entity: []EntityId,
+        movement_index: []u32,
+        previous_x: []f32,
+        position_x: []f32,
+        previous_y: []f32,
+        position_y: []f32,
+        position_z: []i32,
+    } {
+        const drawn = self.runs.items[run_index].rows.slice();
+        return .{
+            .entity = drawn.items(.entity),
+            .movement_index = drawn.items(.movement_index),
+            .previous_x = drawn.items(.previous_x),
+            .position_x = drawn.items(.position_x),
+            .previous_y = drawn.items(.previous_y),
+            .position_y = drawn.items(.position_y),
+            .position_z = drawn.items(.position_z),
+        };
+    }
+
+    /// The row at `index` moved there from the tail. Its run entry still names the old index.
+    pub fn retieDrawableMovementIndex(self: *MovementBodyStore, index: usize) void {
+        const movement = self.rows.slice();
+        const run_index = movement.items(.drawable_run)[index];
+        if (run_index == no_drawable) return;
+        const slot = movement.items(.drawable_slot)[index];
+        self.runs.items[run_index].rows.slice().items(.movement_index)[slot] = @intCast(index);
+    }
+
+    pub fn unlinkDrawable(self: *MovementBodyStore, index: usize) void {
+        const movement = self.rows.slice();
+        const run_index = movement.items(.drawable_run)[index];
+        if (run_index == no_drawable) return;
+        const slot: usize = movement.items(.drawable_slot)[index];
+        const run = &self.runs.items[run_index];
+        const last = run.rows.len - 1;
+        if (slot != last) {
+            const moved_movement = run.rows.slice().items(.movement_index)[last];
+            run.rows.swapRemove(slot);
+            self.rows.slice().items(.drawable_slot)[moved_movement] = @intCast(slot);
+        } else {
+            run.rows.swapRemove(slot);
+        }
+        const row = self.rows.slice();
+        row.items(.drawable_run)[index] = no_drawable;
+        row.items(.drawable_slot)[index] = no_drawable;
+        if (run.rows.len == 0) self.releaseRun(run_index);
+    }
+
+    pub fn placeDrawable(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
+        const movement = self.rows.slice();
+        if (movement.items(.drawable_run)[index] != no_drawable) return;
+        const level = movement.items(.level)[index];
+        const chunk_x = movement.items(.chunk_x)[index];
+        const chunk_y = movement.items(.chunk_y)[index];
+        try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
+        self.commitDrawableLink(index, level, chunk_x, chunk_y);
+    }
+
+    /// Reserves the run for (`level`, `chunk_x`, `chunk_y`) and one more row slot in it.
+    /// Does not link. On error, drops this pass's reservations and any run that is still empty.
+    pub fn reserveDrawableDestination(self: *MovementBodyStore, allocator: std.mem.Allocator, level: u16, chunk_x: i32, chunk_y: i32) !void {
+        const run_index = self.runForKey(allocator, drawableKey(level, chunk_x, chunk_y)) catch |err| {
+            self.abandonDrawableReservations();
+            return err;
+        };
+        const run = &self.runs.items[run_index];
+        const slots = run.reserved_extra + 1;
+        run.rows.ensureTotalCapacity(allocator, run.rows.len + slots) catch |err| {
+            self.abandonDrawableReservations();
+            return err;
+        };
+        run.reserved_extra = slots;
+    }
+
+    /// Unlinks `index` and links it into a destination `reserveDrawableDestination` already reserved.
+    /// Allocates nothing.
+    pub fn relinkReservedDrawable(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
+        const key = drawableKey(level, chunk_x, chunk_y);
+        const dest = self.run_of.get(key).?;
+        const current = self.rows.slice().items(.drawable_run)[index];
+        if (current == dest) {
+            std.debug.assert(self.runs.items[dest].reserved_extra > 0);
+            self.runs.items[dest].reserved_extra -= 1;
+            return;
+        }
+        self.unlinkDrawable(index);
+        self.commitDrawableLink(index, level, chunk_x, chunk_y);
+    }
+
+    /// Links `index` at (`level`, `chunk_x`, `chunk_y`). The destination run and its row slot are
+    /// reserved before the unlink, so a failure leaves membership unchanged.
+    pub fn retargetDrawable(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize, level: u16, chunk_x: i32, chunk_y: i32) !void {
+        if (!self.rows.slice().items(.has_primitive_visual)[index]) return;
+        try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
+        self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
+    }
+
+    fn writeRunPose(self: *MovementBodyStore, index: usize, body: MovementBody) void {
+        const movement = self.rows.slice();
+        const run_index = movement.items(.drawable_run)[index];
+        if (run_index == no_drawable) return;
+        const slot = movement.items(.drawable_slot)[index];
+        const drawn = self.runs.items[run_index].rows.slice();
+        drawn.items(.previous_x)[slot] = body.previous_position.x;
+        drawn.items(.position_x)[slot] = body.position.x;
+        drawn.items(.previous_y)[slot] = body.previous_position.y;
+        drawn.items(.position_y)[slot] = body.position.y;
+        drawn.items(.position_z)[slot] = body.position_z;
+    }
+
+    fn runForKey(self: *MovementBodyStore, allocator: std.mem.Allocator, key: u128) !u32 {
+        if (self.run_of.get(key)) |index| return index;
+        const index = if (self.free_runs.pop()) |freed| freed else blk: {
+            try self.runs.ensureTotalCapacity(allocator, self.runs.items.len + 1);
+            // One spare so a failed map insert can return the new index to the free list.
+            try self.free_runs.ensureTotalCapacity(allocator, self.runs.items.len + 2);
+            const created: u32 = @intCast(self.runs.items.len);
+            self.runs.appendAssumeCapacity(.{});
+            break :blk created;
+        };
+        errdefer self.free_runs.appendAssumeCapacity(index);
+        try self.run_of.ensureUnusedCapacity(allocator, 1);
+        self.run_of.putAssumeCapacityNoClobber(key, index);
+        const run = &self.runs.items[index];
+        run.key = key;
+        run.live = true;
+        run.refreshed_epoch = self.pose_epoch;
+        run.reserved_extra = 0;
+        return index;
+    }
+
+    fn releaseRun(self: *MovementBodyStore, run_index: u32) void {
+        const run = &self.runs.items[run_index];
+        _ = self.run_of.remove(run.key);
+        run.rows.clearRetainingCapacity();
+        run.live = false;
+        run.key = 0;
+        run.reserved_extra = 0;
+        self.free_runs.appendAssumeCapacity(run_index);
+    }
+
+    fn commitDrawableLink(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
+        const key = drawableKey(level, chunk_x, chunk_y);
+        const run_index = self.run_of.get(key).?;
+        const run = &self.runs.items[run_index];
+        std.debug.assert(run.reserved_extra > 0);
+        std.debug.assert(run.rows.capacity >= run.rows.len + 1);
+        run.reserved_extra -= 1;
+        const movement = self.rows.slice();
+        const slot: u32 = @intCast(run.rows.len);
+        run.rows.appendAssumeCapacity(.{
+            .entity = movement.items(.entity)[index],
+            .movement_index = @intCast(index),
+            .previous_x = movement.items(.previous_x)[index],
+            .position_x = movement.items(.position_x)[index],
+            .previous_y = movement.items(.previous_y)[index],
+            .position_y = movement.items(.position_y)[index],
+            .position_z = movement.items(.position_z)[index],
+        });
+        const row = self.rows.slice();
+        row.items(.drawable_run)[index] = run_index;
+        row.items(.drawable_slot)[index] = slot;
+    }
+
+    fn abandonDrawableReservations(self: *MovementBodyStore) void {
+        for (self.runs.items, 0..) |*run, index| {
+            const empty = run.live and run.rows.len == 0;
+            run.reserved_extra = 0;
+            if (empty) self.releaseRun(@intCast(index));
+        }
     }
 
     fn ensureCapacityForOne(self: *MovementBodyStore, allocator: std.mem.Allocator) !void {
@@ -312,4 +575,85 @@ const data_test_support = @import("test_support.zig");
 
 test "MovementBodyStore fails an append past its u32 row cap as OutOfMemory" {
     try data_test_support.expectRowCapOutOfMemory(MovementBodyStore, MovementBody{});
+}
+
+test "setHasPrimitiveVisual retries a failed place" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const entity = try EntityId.init(0, 1);
+    const index: usize = try store.append(std.testing.allocator, entity, .{});
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, store.setHasPrimitiveVisual(failing.allocator(), index, true));
+    try std.testing.expect(!store.slice().has_primitive_visual[index]);
+    try std.testing.expect(store.drawableRunIndex(0, 0, 0) == null);
+
+    try store.setHasPrimitiveVisual(std.testing.allocator, index, true);
+    try std.testing.expect(store.slice().has_primitive_visual[index]);
+    const run_index = store.drawableRunIndex(0, 0, 0).?;
+    try std.testing.expectEqual(@as(usize, 1), store.drawableRunLength(run_index));
+    try std.testing.expect(store.drawableRunSlice(run_index).entity[0].eql(entity));
+}
+
+test "drawable row append allocates nothing after its run slot is reserved" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const first = try EntityId.init(0, 1);
+    const second = try EntityId.init(1, 1);
+    const first_index: usize = try store.append(std.testing.allocator, first, .{});
+    const second_index: usize = try store.append(std.testing.allocator, second, .{});
+    try store.setHasPrimitiveVisual(std.testing.allocator, first_index, true);
+
+    const run_index = store.drawableRunIndex(0, 0, 0).?;
+    try store.runs.items[run_index].rows.ensureTotalCapacity(std.testing.allocator, store.runs.items[run_index].rows.len + 1);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try store.setHasPrimitiveVisual(failing.allocator(), second_index, true);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(store.slice().has_primitive_visual[second_index]);
+    try std.testing.expectEqual(@as(usize, 2), store.drawableRunLength(run_index));
+}
+
+test "new drawable run append allocates nothing after its list reserve" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    try store.runs.ensureTotalCapacity(std.testing.allocator, 1);
+    try store.free_runs.ensureTotalCapacity(std.testing.allocator, store.runs.items.len + 2);
+    try store.run_of.ensureUnusedCapacity(std.testing.allocator, 1);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const run_index = try store.runForKey(failing.allocator(), drawableKey(1, 2, 3));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(store.runs.items[run_index].live);
+    try std.testing.expectEqual(drawableKey(1, 2, 3), store.runs.items[run_index].key);
+}
+
+test "set copies the pose into the drawable run and refreshRunPose copies it after bumpPoseEpoch" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const entity = try EntityId.init(0, 1);
+    const index: usize = try store.append(std.testing.allocator, entity, .{ .position = .{ .x = 1, .y = 2 }, .position_z = 3 });
+    try store.setHasPrimitiveVisual(std.testing.allocator, index, true);
+    store.set(index, .{
+        .position = .{ .x = 4, .y = 5 },
+        .previous_position = .{ .x = 6, .y = 7 },
+        .position_z = 8,
+    });
+
+    const run_index = store.drawableRunIndex(0, 0, 0).?;
+    const placed = store.drawableRunSlice(run_index);
+    try std.testing.expectEqual(@as(f32, 4), placed.position_x[0]);
+    try std.testing.expectEqual(@as(f32, 5), placed.position_y[0]);
+    try std.testing.expectEqual(@as(f32, 6), placed.previous_x[0]);
+    try std.testing.expectEqual(@as(f32, 7), placed.previous_y[0]);
+    try std.testing.expectEqual(@as(i32, 8), placed.position_z[0]);
+
+    store.bumpPoseEpoch();
+    const columns = store.rows.slice();
+    columns.items(.position_x)[index] = 9;
+    columns.items(.position_z)[index] = 10;
+    try std.testing.expectEqual(@as(f32, 4), store.drawableRunSlice(run_index).position_x[0]);
+    try std.testing.expectEqual(@as(i32, 8), store.drawableRunSlice(run_index).position_z[0]);
+    store.refreshRunPose(run_index);
+    try std.testing.expectEqual(@as(f32, 9), store.drawableRunSlice(run_index).position_x[0]);
+    try std.testing.expectEqual(@as(i32, 10), store.drawableRunSlice(run_index).position_z[0]);
 }

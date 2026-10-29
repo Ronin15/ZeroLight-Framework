@@ -828,9 +828,15 @@ fn runOffviewCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
     var stats = accumulator.finish();
     stats.output_count = fixture.scene_prep.records.items.len;
     stats.sample_count = offview_visible_rows;
+    const scene = fixture.scene();
+    const record_capacity = render_prep.dynamicRecordCapacity(scene);
+    const command_capacity = render_prep.spriteCommandCapacity(scene);
+    const particle_count = fixture.particles.activeCount();
+    std.debug.assert(record_capacity == offview_visible_rows + 1 + particle_count);
+    std.debug.assert(command_capacity == fixture.world.reserveRenderRecords() + offview_visible_rows + 1 + particle_count + @import("../render/renderer.zig").Renderer.k_stacked_state_ui_headroom);
     stats.render_capacities = .{
-        .record_capacity = render_prep.dynamicRecordCapacity(fixture.scene()),
-        .command_capacity = render_prep.spriteCommandCapacity(fixture.scene()),
+        .record_capacity = record_capacity,
+        .command_capacity = command_capacity,
     };
     return stats;
 }

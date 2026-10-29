@@ -296,6 +296,18 @@ pub const DataSystem = struct {
         try self.noteCollisionAllow(id, stored.tier, metadata.tier);
         self.tier_counts[@backingInt(stored.tier)] -= 1;
         self.tier_counts[@backingInt(metadata.tier)] += 1;
+        const old_level = stored.level orelse 0;
+        const new_level = resolved.level orelse old_level;
+        const key_changed = old_level != new_level or stored.chunk.x != metadata.chunk.x or stored.chunk.y != metadata.chunk.y;
+        // Tier lands before the retarget so a retry does not apply it twice. The chunk and level
+        // land after the row is linked, so a failed retarget keeps the old key.
+        if (key_changed) {
+            var staged = resolved;
+            staged.chunk = stored.chunk;
+            staged.level = stored.level;
+            self.movement_bodies.setScopeMetadata(di, staged);
+            try self.movement_bodies.retargetDrawable(self.allocator, di, new_level, metadata.chunk.x, metadata.chunk.y);
+        }
         self.movement_bodies.setScopeMetadata(di, resolved);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
@@ -503,7 +515,7 @@ pub const DataSystem = struct {
         // body re-added after being destroyed while the visual persisted) — sync
         // the new row's flag so render collect doesn't skip it.
         if (slot.primitive_visual_index != null) {
-            self.movement_bodies.setHasPrimitiveVisual(@intCast(dense_index), true);
+            try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(dense_index), true);
         }
         // Bounds and AI rows may already exist: the new row mirrors them for the world gate.
         if (slot.collision_bounds_index) |bounds_index| {
@@ -514,7 +526,7 @@ pub const DataSystem = struct {
         // sync it onto the new scope row.
         if (slot.world_level_index) |world_level_index| {
             const level = self.world_levels.get(@intCast(world_level_index));
-            self.syncScopeLevelFromWorldLevel(id, level);
+            try self.syncScopeLevelFromWorldLevel(id, level);
         }
         // An existing body write does not change static membership. A new body can.
         self.syncDynamicBounds(id);
@@ -635,7 +647,7 @@ pub const DataSystem = struct {
         if (slot.primitive_visual_index) |index| {
             self.primitive_visuals.set(@intCast(index), visual);
             if (slot.movement_body_index) |movement_index| {
-                self.movement_bodies.setHasPrimitiveVisual(@intCast(movement_index), true);
+                try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(movement_index), true);
             }
             return;
         }
@@ -644,7 +656,7 @@ pub const DataSystem = struct {
         slot.primitive_visual_index = dense_index;
         slot.addComponent(.primitive_visual);
         if (slot.movement_body_index) |movement_index| {
-            self.movement_bodies.setHasPrimitiveVisual(@intCast(movement_index), true);
+            try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(movement_index), true);
         }
     }
 
@@ -807,7 +819,7 @@ pub const DataSystem = struct {
             slot.world_level_index = dense_index;
             slot.addComponent(.world_level);
         }
-        self.syncScopeLevelFromWorldLevel(id, level);
+        try self.syncScopeLevelFromWorldLevel(id, level);
     }
 
     pub fn worldLevelConst(self: *const DataSystem, id: EntityId) ?u16 {
@@ -957,11 +969,13 @@ pub const DataSystem = struct {
     }
 
     // Rewrites only the scope row's level; the rest of the row is as stored.
-    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) void {
+    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
         const slot = self.resolveSlotConst(id) orelse return;
         const di: usize = slot.movement_body_index orelse return;
         var metadata = self.movement_bodies.scopeMetadataAt(di);
         if (metadata.level == level) return;
+        // Level lands after the row is linked, so a failed retarget keeps the old level and a retry moves it.
+        try self.movement_bodies.retargetDrawable(self.allocator, di, level, metadata.chunk.x, metadata.chunk.y);
         metadata.level = level;
         self.movement_bodies.setScopeMetadata(di, metadata);
         self.snapInterpolationIfStill(di, metadata.tier);
@@ -1017,10 +1031,14 @@ pub const DataSystem = struct {
         self.collision_allow_epoch +%= 1;
         self.tier_counts[@backingInt(self.movement_bodies.tierAt(index))] -= 1;
         const bounds_index = self.slots.items[@intCast(removed.index)].collision_bounds_index;
+        self.movement_bodies.unlinkDrawable(index);
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
-        if (moved) |entity| self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
+        if (moved) |entity| {
+            self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
+            self.movement_bodies.retieDrawableMovementIndex(index);
+        }
         // Losing the movement body ends a static obstacle. The bounds row stays.
         if (bounds_index) |dense| self.collision_bounds.addDynamic(dense);
     }
@@ -1602,6 +1620,42 @@ test "movement body store is row aligned and compact after removal" {
         try std.testing.expectEqual(expected + 50, slice.velocity_y[index]);
         try std.testing.expectEqual(expected + 60, slice.speed[index]);
     }
+}
+
+test "removeMovementBodyAt reties a non-tail row that shares the drawable run" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const visual: PrimitiveVisual = .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+    try data.setMovementBody(first, .{});
+    try data.setMovementBody(second, .{});
+    try data.setMovementBody(third, .{});
+    try data.setPrimitiveVisual(first, visual);
+    try data.setPrimitiveVisual(second, visual);
+    try data.setPrimitiveVisual(third, visual);
+
+    // `second` is not the tail. The tail `third` shares its drawable run, so removal
+    // swap-removes that tail into `second`'s row and must retie the run entry.
+    try std.testing.expect(try data.destroyEntity(second));
+
+    const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0).?;
+    const run = data.movement_bodies.drawableRunSlice(run_index);
+    try std.testing.expectEqual(@as(usize, 2), run.entity.len);
+    const movement = data.movementBodySliceConst();
+    for (run.entity, run.movement_index) |entity, movement_index| {
+        try std.testing.expect(movement_index < movement.entities.len);
+        try std.testing.expect(movement.entities[movement_index].eql(entity));
+    }
+    try std.testing.expect(data.movementBodyConst(first) != null);
+    try std.testing.expect(data.movementBodyConst(third) != null);
+    try std.testing.expect(data.movementBodyConst(second) == null);
 }
 
 test "movement body ingress rejects invalid payloads without mutating existing rows" {

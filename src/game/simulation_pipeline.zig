@@ -1603,7 +1603,7 @@ pub const SimulationPipeline = struct {
             .collision_respond => try self.stageCollisionRespond(step),
             .bounds_and_tile_gate => try self.stageBoundsAndTileGate(step),
             .plane_traversal => try self.stagePlaneTraversal(step),
-            .chunk_derive => self.stageChunkDerive(step),
+            .chunk_derive => try self.stageChunkDerive(step),
             .action_react => try self.stageActionReact(step),
             .tier_policy => try self.stageTierPolicy(step),
         }
@@ -1901,10 +1901,10 @@ pub const SimulationPipeline = struct {
     /// Recompute each body's chunk from its settled position. Consumers are tier
     /// policy and render prep. `action_react` may sit between this and tier policy;
     /// neither rewrites chunk columns.
-    fn stageChunkDerive(self: *SimulationPipeline, step: *StepState) void {
+    fn stageChunkDerive(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var chunk_derive_timer = StageTimer.start();
-        const chunk_derive = self.scope.deriveChunks(context.data, context.thread_system, .{
+        const chunk_derive = try self.scope.deriveChunks(context.data, context.thread_system, .{
             .tile_size = context.world.tile_size,
             .chunk_size_tiles = context.world.chunk_size_tiles,
             .width = context.world.width,

@@ -34,6 +34,7 @@ const SlotList = @import("../../app/thread_system.zig").SlotList;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../data_system.zig").DataSystem;
+const PrimitiveVisual = @import("../data_system.zig").PrimitiveVisual;
 const EntityId = @import("../data_system.zig").EntityId;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const HotI32Slice = @import("../data_system.zig").HotI32Slice;
@@ -118,6 +119,8 @@ pub const SimulationScopeSystem = struct {
     /// produces (per-range windows on the threaded path). Owned here beside the other
     /// scratch, streamed into the frame's structural-command stream.
     scope_tier_commands: CommandList = .empty,
+    /// Per-range windows of drawable rows whose chunk changed in `deriveChunks`.
+    chunk_changes: ChunkChangeList = .empty,
     /// Per-range tallies (count + diagnostics) for the threaded passes, one padded
     /// record per range. Each worker writes only its own record; the main thread reads
     /// them after the batch. The three passes run sequentially, so they share it.
@@ -153,6 +156,7 @@ pub const SimulationScopeSystem = struct {
     pub fn deinit(self: *SimulationScopeSystem) void {
         self.range_tallies.deinit(self.allocator);
         self.scope_tier_commands.deinit(self.allocator);
+        self.chunk_changes.deinit(self.allocator);
         self.ai_cognition_indices.deinit(self.allocator);
         self.ai_halo_indices.deinit(self.allocator);
         self.collision_indices.deinit(self.allocator);
@@ -168,6 +172,7 @@ pub const SimulationScopeSystem = struct {
         try self.ai_halo_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
+        try self.chunk_changes.ensureTotalCapacity(self.allocator, capacity);
         try self.range_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, scope_range_alignment_items));
     }
 
@@ -205,26 +210,20 @@ pub const SimulationScopeSystem = struct {
     /// once per step, over the full contiguous SoA range. This is the separate pass
     /// that replaces movement's former in-pass chunk write: movement is now a pure
     /// position integrator. Non-moving rows recompute the same chunk from their
-    /// frozen position (harmless). Worker ranges own disjoint rows, so the chunk
-    /// writes are range-disjoint; no pre-sized scratch is needed.
+    /// frozen position (harmless). Worker ranges own disjoint chunk writes.
+    /// `chunk_changes` is reserved before the batch; the main thread retargets
+    /// drawable runs from it after the join.
     pub fn deriveChunks(
         self: *SimulationScopeSystem,
         data: *DataSystem,
         thread_system: *ThreadSystem,
         grid: ChunkGrid,
         config: ScopeConfig,
-    ) BatchStats {
+    ) !BatchStats {
         const move = data.movementBodySliceConst();
         const n = move.entities.len;
         if (n == 0) return .{};
         const scope = data.scopeColumnsSlice();
-        var context = DeriveChunksContext{
-            .position_x = move.position_x,
-            .position_y = move.position_y,
-            .chunk_x = scope.chunk_x,
-            .chunk_y = scope.chunk_y,
-            .grid = grid,
-        };
         const derive = Dispatch.init(thread_system, &self.chunk_derive_tuner, .{
             .items_per_range = config.items_per_range,
             .batches_per_participant = config.batches_per_participant,
@@ -232,7 +231,46 @@ pub const SimulationScopeSystem = struct {
             .adaptive = config.adaptive,
         });
         const selection = derive.select(n, scope_range_alignment_items);
-        return derive.run(selection, n, scope_range_alignment_items, &context, deriveChunkJob);
+        try self.prepareRangeWindows(ChunkChange, &self.chunk_changes, n, selection.range_count);
+        var context = DeriveChunksContext{
+            .position_x = move.position_x,
+            .position_y = move.position_y,
+            .has_visual = move.has_primitive_visual,
+            .chunk_x = scope.chunk_x,
+            .chunk_y = scope.chunk_y,
+            .grid = grid,
+            .changes = self.chunk_changes.items,
+            .items_per_range = selection.items_per_range,
+            .tallies = self.range_tallies.items,
+        };
+        const batch = derive.run(selection, n, scope_range_alignment_items, &context, deriveChunkJob);
+        const tallies = self.range_tallies.items;
+        const changes = self.chunk_changes.items;
+        const items_per_range = selection.items_per_range;
+        const range_count = selection.range_count;
+        const bodies = &data.movement_bodies;
+        // Every destination is reserved before any unlink. A failed reserve writes the old
+        // chunks back and leaves run membership as it was; the link pass then allocates nothing.
+        // Each change is a hash lookup and an append, not a dense float loop.
+        for (tallies[0..range_count], 0..) |*slot, range_index| {
+            const src = range_index * items_per_range;
+            for (changes[src..][0..slot.value.count]) |change| {
+                const row: usize = change.movement_index;
+                bodies.reserveDrawableDestination(data.allocator, scope.level[row], scope.chunk_x[row], scope.chunk_y[row]) catch |err| {
+                    restoreChunkColumns(scope.chunk_x, scope.chunk_y, changes, tallies, items_per_range, range_count);
+                    return err;
+                };
+            }
+        }
+        for (tallies[0..range_count], 0..) |*slot, range_index| {
+            const src = range_index * items_per_range;
+            for (changes[src..][0..slot.value.count]) |change| {
+                const row: usize = change.movement_index;
+                bodies.relinkReservedDrawable(row, scope.level[row], scope.chunk_x[row], scope.chunk_y[row]);
+            }
+        }
+        bodies.bumpPoseEpoch();
+        return batch;
     }
 
     // ---- Collision gather (threaded compaction) ------------------------------
@@ -533,12 +571,24 @@ fn compactIndexWindows(list: *IndexList, tallies: []const GatherTallySlot, items
 
 // ---- Job contexts and functions ---------------------------------------------
 
+const ChunkChange = struct {
+    movement_index: u32,
+    old_chunk_x: i32,
+    old_chunk_y: i32,
+};
+
+const ChunkChangeList = std.array_list.Aligned(ChunkChange, .fromByteUnits(thread_shared_record_alignment));
+
 const DeriveChunksContext = struct {
     position_x: []const f32,
     position_y: []const f32,
+    has_visual: []const bool,
     chunk_x: HotI32Slice,
     chunk_y: HotI32Slice,
     grid: SimulationScopeSystem.ChunkGrid,
+    changes: []ChunkChange,
+    items_per_range: usize,
+    tallies: []GatherTallySlot,
 };
 
 fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -564,16 +614,48 @@ fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         const cx = simd.toIntArray(simd.divInt4(tx, chunk_div));
         const cy = simd.toIntArray(simd.divInt4(ty, chunk_div));
         inline for (0..simd.lane_count) |lane| {
-            job.chunk_x[i + lane] = cx[lane];
-            job.chunk_y[i + lane] = cy[lane];
+            recordChunkChange(job, range, i + lane, cx[lane], cy[lane]);
         }
     }
     while (i < range.end) : (i += 1) {
         const tx = math.worldPosToCell(job.position_x[i], grid.tile_size, grid.width);
         const ty = math.worldPosToCell(job.position_y[i], grid.tile_size, grid.height);
-        job.chunk_x[i] = @intCast(tx / @as(u32, @intCast(chunk_size)));
-        job.chunk_y[i] = @intCast(ty / @as(u32, @intCast(chunk_size)));
+        const cx: i32 = @intCast(tx / @as(u32, @intCast(chunk_size)));
+        const cy: i32 = @intCast(ty / @as(u32, @intCast(chunk_size)));
+        recordChunkChange(job, range, i, cx, cy);
     }
+}
+
+fn restoreChunkColumns(
+    chunk_x: []i32,
+    chunk_y: []i32,
+    changes: []const ChunkChange,
+    tallies: []const GatherTallySlot,
+    items_per_range: usize,
+    range_count: usize,
+) void {
+    for (tallies[0..range_count], 0..) |*slot, range_index| {
+        const src = range_index * items_per_range;
+        for (changes[src..][0..slot.value.count]) |change| {
+            chunk_x[change.movement_index] = change.old_chunk_x;
+            chunk_y[change.movement_index] = change.old_chunk_y;
+        }
+    }
+}
+
+fn recordChunkChange(job: *DeriveChunksContext, range: ParallelRange, index: usize, chunk_x: i32, chunk_y: i32) void {
+    const old_x = job.chunk_x[index];
+    const old_y = job.chunk_y[index];
+    job.chunk_x[index] = chunk_x;
+    job.chunk_y[index] = chunk_y;
+    if (!job.has_visual[index] or (old_x == chunk_x and old_y == chunk_y)) return;
+    const tally = &job.tallies[range.index].value;
+    job.changes[range.index * job.items_per_range + tally.count] = .{
+        .movement_index = @intCast(index),
+        .old_chunk_x = old_x,
+        .old_chunk_y = old_y,
+    };
+    tally.count += 1;
 }
 
 /// Writes a set_simulation_tier command into `out` for each non-pinned entity of
@@ -1113,11 +1195,14 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
     defer data.deinit();
     const a = try data.createEntity();
     try data.setMovementBody(a, .{ .position = .{ .x = 300, .y = 100 } });
+    try data.setPrimitiveVisual(a, testDrawableVisual());
     const dormant = try data.createEntity();
     try data.setMovementBody(dormant, .{ .position = .{ .x = 500, .y = 200 } });
+    try data.setPrimitiveVisual(dormant, testDrawableVisual());
     try data.setSimulationTier(dormant, .dormant);
     const b = try data.createEntity();
     try data.setMovementBody(b, .{ .position = .{ .x = 700, .y = 260 } });
+    try data.setPrimitiveVisual(b, testDrawableVisual());
 
     const tile_size: f32 = 32;
     const chunk_size: u16 = 8;
@@ -1125,7 +1210,7 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
 
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
-    _ = sys.deriveChunks(&data, &threads, .{
+    _ = try sys.deriveChunks(&data, &threads, .{
         .tile_size = tile_size,
         .chunk_size_tiles = chunk_size,
         .width = dims,
@@ -1142,6 +1227,8 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
         try std.testing.expectEqual(expect.x, meta.chunk.x);
         try std.testing.expectEqual(expect.y, meta.chunk.y);
     }
+    const movement = data.movementBodySliceConst();
+    for (0..movement.entities.len) |index| try expectDrawableAtSettledChunk(&data, index);
 }
 
 test "threaded deriveChunks matches serial across the range block and tail" {
@@ -1161,8 +1248,10 @@ test "threaded deriveChunks matches serial across the range block and tail" {
         const fi: f32 = @floatFromInt(i);
         const te = try threaded_data.createEntity();
         try threaded_data.setMovementBody(te, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+        try threaded_data.setPrimitiveVisual(te, testDrawableVisual());
         const se = try serial_data.createEntity();
         try serial_data.setMovementBody(se, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+        try serial_data.setPrimitiveVisual(se, testDrawableVisual());
     }
 
     var threaded_sys = SimulationScopeSystem.init(allocator);
@@ -1170,21 +1259,123 @@ test "threaded deriveChunks matches serial across the range block and tail" {
     var serial_sys = SimulationScopeSystem.init(allocator);
     defer serial_sys.deinit();
 
-    _ = threaded_sys.deriveChunks(&threaded_data, &threads, grid, .{
+    _ = try threaded_sys.deriveChunks(&threaded_data, &threads, grid, .{
         .items_per_range = scope_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
     var inline_threads = try inlineThreads();
     defer inline_threads.deinit();
-    _ = serial_sys.deriveChunks(&serial_data, &inline_threads, grid, .{});
+    _ = try serial_sys.deriveChunks(&serial_data, &inline_threads, grid, .{});
 
     const ts = threaded_data.scopeColumnsSliceConst();
     const ss = serial_data.scopeColumnsSliceConst();
     for (0..count) |i| {
         try std.testing.expectEqual(ss.chunk_x[i], ts.chunk_x[i]);
         try std.testing.expectEqual(ss.chunk_y[i], ts.chunk_y[i]);
+        try expectDrawableAtSettledChunk(&threaded_data, i);
+        try expectDrawableAtSettledChunk(&serial_data, i);
     }
+}
+
+fn testDrawableVisual() PrimitiveVisual {
+    return .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+}
+
+fn expectDrawableAtSettledChunk(data: *DataSystem, index: usize) !void {
+    const movement = data.movementBodySliceConst();
+    const scope = data.scopeColumnsSliceConst();
+    const run_index = data.movement_bodies.drawableRunIndex(scope.level[index], scope.chunk_x[index], scope.chunk_y[index]);
+    try std.testing.expect(run_index != null);
+    const run = data.movement_bodies.drawableRunSlice(run_index.?);
+    var found = false;
+    for (run.entity, run.movement_index) |entity, movement_index| {
+        if (movement_index != index) continue;
+        try std.testing.expect(entity.eql(movement.entities[index]));
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "deriveChunks restores chunk columns when the second relocate runs out of memory" {
+    const allocator = std.testing.allocator;
+    const grid = SimulationScopeSystem.ChunkGrid{ .tile_size = 32, .chunk_size_tiles = 8, .width = 64, .height = 64 };
+
+    var counted = try visualChunkMovers(allocator);
+    defer counted.data.deinit();
+    var count_threads = try inlineThreads();
+    defer count_threads.deinit();
+    var count_sys = SimulationScopeSystem.init(allocator);
+    defer count_sys.deinit();
+    try count_sys.reserve(2);
+    var counter = std.testing.FailingAllocator.init(allocator, .{});
+    counted.data.allocator = counter.allocator();
+    _ = try count_sys.deriveChunks(&counted.data, &count_threads, grid, .{});
+    counted.data.allocator = allocator;
+    const total = counter.allocations;
+    try std.testing.expect(total >= 2);
+
+    var data = try visualChunkMovers(allocator);
+    defer data.data.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    try sys.reserve(2);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = total - 1 });
+    data.data.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, sys.deriveChunks(&data.data, &threads, grid, .{}));
+    data.data.allocator = allocator;
+
+    const scope = data.data.scopeColumnsSliceConst();
+    try std.testing.expectEqual(@as(i32, 0), scope.chunk_x[0]);
+    try std.testing.expectEqual(@as(i32, 0), scope.chunk_y[0]);
+    try std.testing.expectEqual(@as(i32, 0), scope.chunk_x[1]);
+    try std.testing.expectEqual(@as(i32, 0), scope.chunk_y[1]);
+    try expectRunHolds(&data.data, 0, 0, 0, data.a);
+    try expectRunHolds(&data.data, 0, 0, 0, data.b);
+    try std.testing.expect(data.data.movement_bodies.drawableRunIndex(0, 1, 0) == null);
+    try std.testing.expect(data.data.movement_bodies.drawableRunIndex(0, 2, 0) == null);
+
+    _ = try sys.deriveChunks(&data.data, &threads, grid, .{});
+    try expectDrawableAtSettledChunk(&data.data, 0);
+    try expectDrawableAtSettledChunk(&data.data, 1);
+    try std.testing.expect(data.data.movement_bodies.drawableRunIndex(0, 0, 0) == null);
+}
+
+const VisualChunkMover = struct {
+    data: DataSystem,
+    a: EntityId,
+    b: EntityId,
+};
+
+fn visualChunkMovers(allocator: std.mem.Allocator) !VisualChunkMover {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const a = try data.createEntity();
+    const b = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 8, .y = 8 } });
+    try data.setMovementBody(b, .{ .position = .{ .x = 8, .y = 8 } });
+    try data.setPrimitiveVisual(a, testDrawableVisual());
+    try data.setPrimitiveVisual(b, testDrawableVisual());
+    data.movementBodyPtr(a).?.position_x.* = 300;
+    data.movementBodyPtr(b).?.position_x.* = 600;
+    return .{ .data = data, .a = a, .b = b };
+}
+
+fn expectRunHolds(data: *DataSystem, level: u16, chunk_x: i32, chunk_y: i32, entity: EntityId) !void {
+    const run_index = data.movement_bodies.drawableRunIndex(level, chunk_x, chunk_y);
+    try std.testing.expect(run_index != null);
+    const run = data.movement_bodies.drawableRunSlice(run_index.?);
+    var found = false;
+    for (run.entity) |row_entity| if (row_entity.eql(entity)) {
+        found = true;
+    };
+    try std.testing.expect(found);
 }
 
 test "threaded deriveChunks records one sample into its own tuner" {
@@ -1204,7 +1395,7 @@ test "threaded deriveChunks records one sample into its own tuner" {
 
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
-    const stats = sys.deriveChunks(&data, &threads, .{ .tile_size = 32, .chunk_size_tiles = 8, .width = 256, .height = 256 }, .{});
+    const stats = try sys.deriveChunks(&data, &threads, .{ .tile_size = 32, .chunk_size_tiles = 8, .width = 256, .height = 256 }, .{});
     try std.testing.expectEqual(count, stats.item_count);
     try std.testing.expectEqual(@as(usize, 1), sys.chunk_derive_tuner.sample_count);
     try std.testing.expect(sys.chunk_derive_tuner.last_request != null);

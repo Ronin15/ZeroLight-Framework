@@ -458,6 +458,8 @@ pub const WorldSystem = struct {
     }
 
     pub const setVisibleChunksForWorldRect = world_render.setVisibleChunksForWorldRect;
+    pub const renderWindowLevels = world_render.renderWindowLevels;
+    pub const RenderWindowLevels = world_render.RenderWindowLevels;
 
     pub fn worldWidthPixels(self: *const WorldSystem) f32 {
         return @as(f32, @floatFromInt(self.width)) * self.tile_size;

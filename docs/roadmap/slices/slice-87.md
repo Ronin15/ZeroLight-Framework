@@ -2,10 +2,12 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: not started.** Routed by the 64G combined review (area C). The
-render backend pass closes the core branch and comes after the collect moves,
-so the same files are touched once; 88 follows the collect items, before
-the backend pass (index, merged order).
+**Status: collect walk landed.** The visible-chunk runs, the two capacities,
+and the off-view capacity asserts are in. The flat-time measure is not run.
+Routed by the 64G combined review (area C). The render backend pass closes
+the core branch and comes after the collect moves, so the same files are
+touched once; 88 follows the collect items, before the backend pass (index,
+merged order).
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile sync's
@@ -46,7 +48,8 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
 
 ### Checklist
 
-- [ ] Collect walks the visible chunks' rows. Failure scenario: off-view
+- [ ] Collect walks the visible chunks' rows. The walk and the capacity
+      asserts landed. The flat-time measure has not been run. Failure scenario: off-view
       population raises frame cost and reserved vertex memory with nothing
       more drawn. The visible rows are scattered over the movement store
       (append and swap-remove order, `data_system/movement.zig:67`, `removeAt` `:189`), and

@@ -9,6 +9,7 @@ const pdqSort = @import("../core/sort.zig").pdq;
 const DataSystem = @import("data_system.zig").DataSystem;
 const ConstAssetReferenceSlice = @import("data_system.zig").ConstAssetReferenceSlice;
 const ConstMovementBodySlice = @import("data_system.zig").ConstMovementBodySlice;
+const ConstFacingSlice = @import("data_system.zig").ConstFacingSlice;
 const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const ConstPrimitiveVisualSlice = @import("data_system.zig").ConstPrimitiveVisualSlice;
 const EntityId = @import("data_system.zig").EntityId;
@@ -116,12 +117,11 @@ fn preparePrimitiveVisualRectSoA(
 }
 
 fn preparePrimitiveVisualSoA(
-    movement: ConstMovementBodySlice,
     visuals: ConstPrimitiveVisualSlice,
-    movement_index: usize,
     visual_index: usize,
     render_x: f32,
     render_y: f32,
+    position_z: i32,
     asset_ref: AssetReference,
     runtime_assets: *const RuntimeAssets,
 ) PreparedDraw {
@@ -132,7 +132,7 @@ fn preparePrimitiveVisualSoA(
         .h = visuals.size_y[visual_index],
     };
     const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
-    const order = worldOrder(movement.position_z[movement_index], depth_band);
+    const order = worldOrder(position_z, depth_band);
     const color = Color{
         .r = visuals.color_r[visual_index],
         .g = visuals.color_g[visual_index],
@@ -198,9 +198,10 @@ pub fn worldOrder(base_z: i32, depth: WorldDepth) RenderOrder {
     return RenderOrder.world(render_depth.worldZWithOffset(base_z, depth));
 }
 
-/// Read-only gameplay inputs for one layered world render frame.
+/// Gameplay inputs for one layered world render frame. Collect refreshes
+/// drawable-run poses through `data`.
 pub const GameplayScene = struct {
-    data: *const DataSystem,
+    data: *DataSystem,
     world: *WorldSystem,
     player_entity: EntityId,
     player_level: u16,
@@ -252,6 +253,12 @@ pub const DynamicScenePrep = struct {
         self.records.appendAssumeCapacity(sequenced);
     }
 
+    fn appendWithSequence(self: *DynamicScenePrep, record: DynamicRenderRecord, sequence: usize) void {
+        var sequenced = record;
+        sequenced.sequence = sequence;
+        self.records.appendAssumeCapacity(sequenced);
+    }
+
     fn finalizeDepthBuckets(self: *DynamicScenePrep) void {
         self.depth_spans.clearRetainingCapacity();
         self.sort_indices.clearRetainingCapacity();
@@ -300,19 +307,17 @@ pub const DynamicDepthRange = struct {
 };
 
 pub fn dynamicRecordCapacity(scene: GameplayScene) usize {
-    const visual_count = scene.data.primitiveVisualSliceConst().entities.len;
     const player_marker_count: usize = 1;
-    return visual_count + player_marker_count + scene.particles.activeCount();
+    return visibleDrawableRows(scene) + player_marker_count + scene.particles.activeCount();
 }
 
 /// Peak gameplay sprite commands for the demo state. Stacked UI headroom covers
 /// pause/menu rects submitted after gameplay enqueue; `Engine` adds
 /// `Renderer.k_overlay_command_headroom` for the debug overlay afterward.
 pub fn spriteCommandCapacity(scene: GameplayScene) usize {
-    const visual_count = scene.data.primitiveVisualSliceConst().entities.len;
     const player_marker_count: usize = 1;
     return scene.world.reserveRenderRecords() +
-        visual_count +
+        visibleDrawableRows(scene) +
         player_marker_count +
         scene.particles.activeCount() +
         Renderer.k_stacked_state_ui_headroom;
@@ -359,6 +364,75 @@ pub fn submitGameplayFrame(
     try submitLayeredWorld(scene, prep, renderer, runtime_assets);
 }
 
+fn visibleDrawableRows(scene: GameplayScene) usize {
+    const region = scene.world.visibleChunkRegion() orelse return 0;
+    const levels = scene.world.renderWindowLevels(scene.player_level) orelse return 0;
+    var count: usize = 0;
+    var level = levels.first;
+    while (level <= levels.last) : (level += 1) {
+        var chunk_y = region.min.y;
+        while (chunk_y < region.max_exclusive.y) : (chunk_y += 1) {
+            var chunk_x = region.min.x;
+            while (chunk_x < region.max_exclusive.x) : (chunk_x += 1) {
+                const run = scene.data.movement_bodies.drawableRunIndex(@intCast(level), chunk_x, chunk_y) orelse continue;
+                count += scene.data.movement_bodies.drawableRunLength(run);
+            }
+        }
+    }
+    const player = scene.data.movementBodyDenseIndex(scene.player_entity) orelse return count;
+    const scope = scene.data.scopeColumnsSliceConst();
+    const player_level: u32 = scope.level[player];
+    if (player_level >= levels.first and player_level <= levels.last) return count;
+    if (!region.containsChunk(.{ .x = scope.chunk_x[player], .y = scope.chunk_y[player] })) return count;
+    if (!scene.data.movementBodySliceConst().has_primitive_visual[player]) return count;
+    return count + 1;
+}
+
+fn emitCollectedRow(
+    prep: *DynamicScenePrep,
+    scene: GameplayScene,
+    visible: VisibleWorldRect,
+    runtime_assets: *const RuntimeAssets,
+    interpolation_alpha: f32,
+    movement: ConstMovementBodySlice,
+    visuals: ConstPrimitiveVisualSlice,
+    assets: ConstAssetReferenceSlice,
+    facings: ConstFacingSlice,
+    entity: EntityId,
+    movement_index: usize,
+    previous_x: f32,
+    position_x: f32,
+    previous_y: f32,
+    position_y: f32,
+    position_z: i32,
+) void {
+    const collect_indices = scene.data.renderCollectIndicesForMovement(movement, movement_index, visuals.entities.len) orelse return;
+    const visual_index = collect_indices.visual_index;
+    const render_x = math.lerp(previous_x, position_x, interpolation_alpha);
+    const render_y = math.lerp(previous_y, position_y, interpolation_alpha);
+    const size_x = visuals.size_x[visual_index];
+    const size_y = visuals.size_y[visual_index];
+    if (!visible.overlapsAabb(render_x, render_y, size_x, size_y)) return;
+
+    if (collect_indices.asset_ref_index) |asset_index| {
+        const asset_ref = assetReferenceAt(assets, asset_index);
+        const prepared = preparePrimitiveVisualSoA(visuals, visual_index, render_x, render_y, position_z, asset_ref, runtime_assets);
+        prep.appendWithSequence(.{ .depth = prepared.depth(), .draw = prepared }, movement_index * 2);
+    } else {
+        const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
+        const record_depth = render_depth.worldZWithOffset(position_z, depth_band);
+        prep.appendWithSequence(.{
+            .depth = record_depth,
+            .draw = preparePrimitiveVisualRectSoA(visuals, visual_index, render_x, render_y, record_depth),
+        }, movement_index * 2);
+    }
+    const is_player = entity.index == scene.player_entity.index and entity.generation == scene.player_entity.generation;
+    if (!is_player) return;
+    const facing_index = collect_indices.facing_index orelse return;
+    const marker = preparePlayerMarkerSoA(visuals, visual_index, facings.directions[facing_index], render_x, render_y, position_z) orelse return;
+    prep.appendWithSequence(.{ .depth = marker.depth(), .draw = marker }, movement_index * 2 + 1);
+}
+
 pub fn collectDynamicRecords(
     prep: *DynamicScenePrep,
     scene: GameplayScene,
@@ -375,88 +449,46 @@ pub fn collectDynamicRecords(
     const assets = scene.data.assetReferenceSliceConst();
     const facings = scene.data.facingSliceConst();
     const visible_chunks = scene.world.visibleChunkRegion();
-    const player_entity = scene.player_entity;
-    const player_entity_index = player_entity.index;
-    const player_entity_generation = player_entity.generation;
-    const max_world_level: u16 = scene.world.maxLevelIndex();
-    // Movement-body dense rows are the collect anchor: scope columns (tier/chunk)
-    // align with movement_index; has_primitive_visual skips movement-only rows
-    // before the deferred slot resolve in renderCollectIndicesForMovement.
-    for (movement.entities, 0..) |entity, movement_index| {
-        const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
-        if (!is_player) {
-            const entity_level = scene.data.worldLevelConst(entity) orelse 0;
-            // Window membership (not exact equality) so an entity that fell to a
-            // deeper in-window level (e.g. through a dug hole) still renders, at
-            // its own real depth — matches the dense-layer window this frame
-            // already composites via world/render.zig collectDenseSubmitLayers.
-            if (!scene.world.render_window.levelInWindow(scene.player_level, entity_level, max_world_level)) continue;
-        }
-        if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
-        if (!movement.has_primitive_visual[movement_index]) continue;
-
-        const collect_indices = scene.data.renderCollectIndicesForMovement(movement, movement_index, visuals.entities.len) orelse continue;
-        const visual_index = collect_indices.visual_index;
-
-        const render_x = math.lerp(
-            movement.previous_x[movement_index],
-            movement.position_x[movement_index],
-            interpolation_alpha,
-        );
-        const render_y = math.lerp(
-            movement.previous_y[movement_index],
-            movement.position_y[movement_index],
-            interpolation_alpha,
-        );
-        const size_x = visuals.size_x[visual_index];
-        const size_y = visuals.size_y[visual_index];
-        if (!visible.overlapsAabb(render_x, render_y, size_x, size_y)) continue;
-
-        if (collect_indices.asset_ref_index) |asset_index| {
-            const asset_ref = assetReferenceAt(assets, asset_index);
-            const prepared = preparePrimitiveVisualSoA(
-                movement,
-                visuals,
-                movement_index,
-                visual_index,
-                render_x,
-                render_y,
-                asset_ref,
-                runtime_assets,
-            );
-            prep.appendAssumeCapacity(.{ .depth = prepared.depth(), .draw = prepared });
-        } else {
-            const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
-            const record_depth = render_depth.worldZWithOffset(movement.position_z[movement_index], depth_band);
-            prep.appendAssumeCapacity(.{
-                .depth = record_depth,
-                .draw = preparePrimitiveVisualRectSoA(
-                    visuals,
-                    visual_index,
-                    render_x,
-                    render_y,
-                    record_depth,
-                ),
-            });
-        }
-        if (is_player) {
-            if (collect_indices.facing_index) |facing_index| {
-                if (preparePlayerMarkerSoA(
-                    movement,
-                    visuals,
-                    movement_index,
-                    visual_index,
-                    facings.directions[facing_index],
-                    render_x,
-                    render_y,
-                )) |marker| {
-                    prep.appendAssumeCapacity(.{ .depth = marker.depth(), .draw = marker });
+    const bodies = &scene.data.movement_bodies;
+    if (visible_chunks) |region| {
+        if (scene.world.renderWindowLevels(scene.player_level)) |levels| {
+            var level = levels.first;
+            while (level <= levels.last) : (level += 1) {
+                var chunk_y = region.min.y;
+                while (chunk_y < region.max_exclusive.y) : (chunk_y += 1) {
+                    var chunk_x = region.min.x;
+                    while (chunk_x < region.max_exclusive.x) : (chunk_x += 1) {
+                        const run_index = bodies.drawableRunIndex(@intCast(level), chunk_x, chunk_y) orelse continue;
+                        bodies.refreshRunPose(run_index);
+                        const run = bodies.drawableRunSlice(run_index);
+                        for (run.entity, run.movement_index, run.previous_x, run.position_x, run.previous_y, run.position_y, run.position_z) |entity, movement_row, previous_x, position_x, previous_y, position_y, position_z| {
+                            emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, movement, visuals, assets, facings, entity, movement_row, previous_x, position_x, previous_y, position_y, position_z);
+                        }
+                    }
+                }
+            }
+            if (scene.data.movementBodyDenseIndex(scene.player_entity)) |player_row| {
+                const player_level: u32 = scope.level[player_row];
+                const outside = player_level < levels.first or player_level > levels.last;
+                if (outside and region.containsChunk(.{ .x = scope.chunk_x[player_row], .y = scope.chunk_y[player_row] })) {
+                    if (movement.has_primitive_visual[player_row]) {
+                        if (bodies.drawableRunIndex(@intCast(player_level), scope.chunk_x[player_row], scope.chunk_y[player_row])) |run_index| {
+                            bodies.refreshRunPose(run_index);
+                            const run = bodies.drawableRunSlice(run_index);
+                            for (run.movement_index, 0..) |movement_row, slot| {
+                                if (movement_row != player_row) continue;
+                                emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, movement, visuals, assets, facings, run.entity[slot], movement_row, run.previous_x[slot], run.position_x[slot], run.previous_y[slot], run.position_y[slot], run.position_z[slot]);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     const particles = scene.particles.sliceConst();
+    var particle_sequence = movement.entities.len * 2;
     for (0..particles.len()) |index| {
         if (!particles.renderable(index)) continue;
         const render_x = math.lerp(particles.previous_x[index], particles.position_x[index], interpolation_alpha);
@@ -465,7 +497,8 @@ pub fn collectDynamicRecords(
         const half_size = particle_size * 0.5;
         if (!visible.overlapsAabb(render_x - half_size, render_y - half_size, particle_size, particle_size)) continue;
         const draw = prepareParticleAt(particles, index, render_x, render_y) orelse continue;
-        prep.appendAssumeCapacity(.{ .depth = draw.depth(), .draw = draw });
+        prep.appendWithSequence(.{ .depth = draw.depth(), .draw = draw }, particle_sequence);
+        particle_sequence += 1;
     }
     prep.finalizeDepthBuckets();
 }
@@ -613,16 +646,15 @@ fn nextDynamicDepth(prep: *const DynamicScenePrep, span_index: *usize) ?i32 {
 }
 
 fn preparePlayerMarkerSoA(
-    movement: ConstMovementBodySlice,
     visuals: ConstPrimitiveVisualSlice,
-    movement_index: usize,
     visual_index: usize,
     facing: Facing,
     render_x: f32,
     render_y: f32,
+    position_z: i32,
 ) ?PreparedDraw {
     const marker_depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.marker_depth_values[visual_index]));
-    const marker_order = worldOrder(movement.position_z[movement_index], marker_depth_band);
+    const marker_order = worldOrder(position_z, marker_depth_band);
     return .{ .rect = .{
         .rect = markerRectAt(
             render_x,
@@ -892,7 +924,7 @@ test "dynamic record capacity counts visuals player marker and particles" {
     const player_entity = try EntityId.init(0, 1);
 
     try std.testing.expectEqual(
-        @as(usize, 3),
+        @as(usize, 2),
         dynamicRecordCapacity(.{
             .data = &data,
             .world = &world,
@@ -902,6 +934,114 @@ test "dynamic record capacity counts visuals player marker and particles" {
             .overscan_chunks = 0,
         }),
     );
+}
+
+test "render collect dynamic records follow the visible chunk" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, 0);
+
+    const visual: @import("data_system.zig").PrimitiveVisual = .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+    const player = try data.createEntity();
+    try data.setMovementBody(player, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setFacing(player, .{ .direction = .down });
+    try data.setPrimitiveVisual(player, visual);
+    try data.setSimulationMetadata(player, .{ .chunk = .{ .x = 0, .y = 0 } });
+
+    const near = try data.createEntity();
+    try data.setMovementBody(near, .{ .position = .{ .x = 12, .y = 12 }, .previous_position = .{ .x = 12, .y = 12 } });
+    try data.setPrimitiveVisual(near, visual);
+    try data.setAssetReference(near, .{ .sprite = .demo_tile });
+    try data.setSimulationMetadata(near, .{ .chunk = .{ .x = 0, .y = 0 } });
+
+    const far = try data.createEntity();
+    try data.setMovementBody(far, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setPrimitiveVisual(far, visual);
+    try data.setSimulationMetadata(far, .{ .chunk = .{ .x = 4, .y = 4 } });
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+    try std.testing.expect(particles.emit(.{ .position = .{ .x = 4, .y = 4 }, .start_size = 4, .lifetime = 1 }));
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    try std.testing.expectEqual(@as(usize, 4), dynamicRecordCapacity(scene));
+
+    // The new pose lives only on the movement row until collect refreshes the run.
+    const near_index = data.movementBodyDenseIndex(near).?;
+    const near_body = data.movementBodyPtr(near).?;
+    near_body.position_x.* = 20;
+    near_body.previous_x.* = 20;
+    data.movement_bodies.bumpPoseEpoch();
+    const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0).?;
+    const stale = data.movement_bodies.drawableRunSlice(run_index);
+    var stale_x: f32 = 0;
+    for (stale.movement_index, stale.position_x) |movement_index, position_x| {
+        if (movement_index == near_index) stale_x = position_x;
+    }
+    try std.testing.expectEqual(@as(f32, 12), stale_x);
+    try std.testing.expectEqual(@as(f32, 20), data.movementBodySliceConst().position_x[near_index]);
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const visible = VisibleWorldRect.fromCameraRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, world.chunk_size_tiles, world.tile_size);
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    try std.testing.expectEqual(@as(usize, 4), prep.records.items.len);
+    const player_index = data.movementBodyDenseIndex(player).?;
+    const player_visual = recordWithSequence(&prep, player_index * 2);
+    const player_marker = recordWithSequence(&prep, player_index * 2 + 1);
+    const near_visual = recordWithSequence(&prep, near_index * 2);
+    const particle = recordWithSequence(&prep, data.movementBodySliceConst().entities.len * 2);
+    try std.testing.expect(player_visual != null and player_marker != null and near_visual != null and particle != null);
+    try std.testing.expectEqual(player_visual.?.depth, near_visual.?.depth);
+    try std.testing.expectEqual(@as(f32, 20), dynamicRecordX(near_visual.?));
+    try std.testing.expectEqual(@as(usize, 1), player_marker.?.sequence);
+
+    // Run pose and the movement row disagree. Depth comes from the run, which refresh does not rewrite.
+    data.movementBodyPtr(player).?.position_z.* = 15;
+    data.movementBodyPtr(near).?.position_z.* = 15;
+    const synced = data.movement_bodies.drawableRunSlice(run_index);
+    for (synced.movement_index, synced.position_z) |movement_index, position_z| {
+        if (movement_index == near_index or movement_index == 0) try std.testing.expectEqual(@as(i32, 0), position_z);
+    }
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    const marker_depth = recordWithSequence(&prep, 1).?.depth;
+    const near_depth = recordWithSequence(&prep, near_index * 2).?.depth;
+    try std.testing.expectEqual(render_depth.worldZWithOffset(0, .marker), marker_depth);
+    try std.testing.expectEqual(render_depth.worldZWithOffset(0, .actor), near_depth);
+    try std.testing.expect(marker_depth != render_depth.worldZWithOffset(15, .marker));
+    try std.testing.expect(near_depth != render_depth.worldZWithOffset(15, .actor));
+}
+
+fn recordWithSequence(prep: *const DynamicScenePrep, sequence: usize) ?DynamicRenderRecord {
+    for (prep.records.items) |record| if (record.sequence == sequence) return record;
+    return null;
+}
+
+fn dynamicRecordX(record: DynamicRenderRecord) f32 {
+    return switch (record.draw) {
+        .rect => |rect| rect.rect.x,
+        .sprite => |sprite| sprite.dest.x,
+    };
 }
 
 test "sprite command capacity sums the window's sparse tiles, visuals, player, and ui headroom" {

@@ -231,7 +231,7 @@ fn checkScopeStagesDispatched(allocator: std.mem.Allocator, scope: *SimulationSc
     var commands = RangeOutputStream(StructuralCommand).init(allocator);
     defer commands.deinit();
     const tier_policy = try scope.queueTierChanges(data, visibleRegion(), &commands, thread_system, scopeConfig(case));
-    const chunk_derive = scope.deriveChunks(data, thread_system, .{ .tile_size = tile_size, .chunk_size_tiles = chunk_size_tiles, .width = grid_tiles, .height = grid_tiles }, scopeConfig(case));
+    const chunk_derive = try scope.deriveChunks(data, thread_system, .{ .tile_size = tile_size, .chunk_size_tiles = chunk_size_tiles, .width = grid_tiles, .height = grid_tiles }, scopeConfig(case));
     for ([_]BatchStats{ collision.perf.batch, ai.perf.batch, tier_policy, chunk_derive }) |batch| {
         if (batch.item_count == 0) return error.ScopeStageSkipped;
         try suite.checkStageDispatched(case, thread_system, range, batch);

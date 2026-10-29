@@ -414,11 +414,11 @@ fn buildWindowLayers(self: *const WorldSystem, bucket_start: usize, bucket_end: 
     };
 }
 
-const RenderWindowLevels = struct { first: u32, last: u32, max_level: u16 };
+pub const RenderWindowLevels = struct { first: u32, last: u32, max_level: u16 };
 
 // The level range `render_window` can hold around `active_level`; callers still
 // filter each level with `levelInWindow`. Null for a world with no levels.
-fn renderWindowLevels(self: *const WorldSystem, active_level: u16) ?RenderWindowLevels {
+pub fn renderWindowLevels(self: *const WorldSystem, active_level: u16) ?RenderWindowLevels {
     if (self.levelCount() == 0) return null;
     const max_level = self.maxLevelIndex();
     return .{
