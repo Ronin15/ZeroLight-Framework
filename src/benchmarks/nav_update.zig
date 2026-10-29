@@ -14,7 +14,7 @@
 //! through the production commit seam (`SimulationPipeline.commitStructuralAndReact`, the
 //! pipeline built over the bodies and the world): its `set_movement_body` command, the
 //! budgeted commit, the population seam, the collider sync and its nav record, the trigger
-//! sync, and the nav and steering reactions.
+//! sync, and the nav reaction.
 //! The move is the same in every case, so each passes when flat in its item count:
 //!   - `nav-update-entity-obstacles`: 10, 1,000, or 10,000 other static bodies in chunks away
 //!     from the moved body's 3x3 chunk block.
@@ -645,7 +645,7 @@ const StaticDenseFixture = struct {
 const DenseChangeTiming = struct {
     ns: u64,
     // The rest of the seam: command write, reserves, commit, capture, population seam, nav
-    // record, trigger sync and bound check, and steering reaction.
+    // record, trigger sync and bound check.
     commit_ns: u64,
     // Collider sync (`StaticColliderSystem.sync`, the splice stage included).
     sync_ns: u64,

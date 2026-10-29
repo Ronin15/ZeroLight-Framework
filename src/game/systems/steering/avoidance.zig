@@ -14,7 +14,6 @@ const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
-const ConstSteeringAgentSlice = @import("../../data_system.zig").ConstSteeringAgentSlice;
 const MovementIntent = @import("../../simulation.zig").MovementIntent;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const SimulationIntent = @import("../../simulation.zig").SimulationIntent;
@@ -22,6 +21,11 @@ const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const BoxHits = @import("../static_colliders.zig").BoxHits;
+const capLanes = @import("../spatial_index.zig").capLanes;
+const LaneStop = @import("../spatial_index.zig").LaneStop;
+const NeighborBlock = @import("../spatial_index.zig").NeighborBlock;
+const NeighborLanes = @import("../spatial_index.zig").NeighborLanes;
+const SpatialIndexView = @import("../spatial_index.zig").SpatialIndexView;
 const steering_range_alignment_items = @import("system.zig").steering_range_alignment_items;
 const StageThreads = @import("system.zig").StageThreads;
 const SteeringStats = @import("system.zig").SteeringStats;
@@ -29,14 +33,8 @@ const SteeringSystem = @import("system.zig").SteeringSystem;
 const selectedWorkSlice = @import("system.zig").selectedWorkSlice;
 const selectedWorkSliceConst = @import("system.zig").selectedWorkSliceConst;
 const SelectedWorkSlice = @import("system.zig").SelectedWorkSlice;
-const ConstAgentSnapshotSlice = @import("system.zig").ConstAgentSnapshotSlice;
 const SelectedIntent = @import("system.zig").SelectedIntent;
 const SelectedWindow = @import("directions.zig").SelectedWindow;
-const AgentGridDirectory = @import("agent_grid.zig").AgentGridDirectory;
-const SpatialCellEntry = @import("agent_grid.zig").SpatialCellEntry;
-const SpatialCellRange = @import("agent_grid.zig").SpatialCellRange;
-const findCellRange = @import("agent_grid.zig").findCellRange;
-const spatialCell = @import("agent_grid.zig").spatialCell;
 
 pub const max_agent_candidate_checks: u16 = 64;
 
@@ -54,8 +52,8 @@ pub fn writeMovementIntents(
     self: *SteeringSystem,
     frame: *SimulationFrame,
     threads: StageThreads,
+    index: SpatialIndexView,
     obstacles: ColliderView,
-    steering: ConstSteeringAgentSlice,
     stats: *SteeringStats,
 ) !void {
     const count = stats.selected_intent_count;
@@ -81,13 +79,8 @@ pub fn writeMovementIntents(
         .windows = self.selected_windows.items,
         .selected = self.selected.items,
         .work = selectedWorkSlice(self),
-        .agents = self.agentSnapshotSliceConst(),
-        .agent_radii = steering.agent_radii,
+        .index = index,
         .obstacles = obstacles,
-        .agent_cell_entries = self.agent_cell_entries.items,
-        .agent_cell_ranges = self.agent_cell_ranges.items,
-        .agent_grid = &self.agent_grid,
-        .spatial_cell_size = self.spatial_cell_size,
         .intents = &frame.intents,
         .requests = &frame.path_requests,
         .intent_range_base = intent_base,
@@ -127,15 +120,10 @@ const SteeringJobContext = struct {
     windows: []const SelectedWindow,
     selected: []const SelectedIntent,
     work: SelectedWorkSlice,
-    // By steering row.
-    agents: ConstAgentSnapshotSlice,
-    agent_radii: []const f32,
+    /// The step's shared index, read-only for the whole dispatch.
+    index: SpatialIndexView,
     /// The static colliders' synced rows, read-only for the whole dispatch.
     obstacles: ColliderView,
-    agent_cell_entries: []const SpatialCellEntry,
-    agent_cell_ranges: []const SpatialCellRange,
-    agent_grid: *const AgentGridDirectory,
-    spatial_cell_size: f32,
     intents: *RangeOutputStream(SimulationIntent),
     requests: *RangeOutputStream(PathRequest),
     intent_range_base: usize,
@@ -190,7 +178,8 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
     std.debug.assert(range.end <= job.selected_count);
     var intents = job.intents.rangeWriter(job.intent_range_base + range.index);
     var requests = job.requests.rangeWriter(job.request_range_base + range.index);
-    // One hit scratch per range, reused by every agent of the range.
+    // One neighbor block and one hit scratch per range, reused down the range.
+    var neighbors: NeighborBlock(max_agent_candidate_checks + 1) = .{};
     var obstacle_hits: ObstacleHitScratch = undefined;
     var tally = MovementTally{};
     if (range.start < range.end) {
@@ -200,7 +189,7 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
             while (logical >= job.windows[window].logical_base + job.windows[window].count) window += 1;
             const index = job.windows[window].start + (logical - job.windows[window].logical_base);
             std.debug.assert(index < job.selected.len and index < job.work.len());
-            const result = computeAvoidance(job, index, &obstacle_hits);
+            const result = computeAvoidance(job, index, &obstacle_hits, &neighbors);
             job.work.final_dir_x[index] = result.direction.x;
             job.work.final_dir_y[index] = result.direction.y;
             if (comptime runtime_perf_log.enabled) {
@@ -231,7 +220,12 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
     job.tallies[range.index].value = tally;
 }
 
-fn computeAvoidance(job: *const SteeringJobContext, index: usize, obstacle_hits: *ObstacleHitScratch) AvoidanceResult {
+fn computeAvoidance(
+    job: *const SteeringJobContext,
+    index: usize,
+    obstacle_hits: *ObstacleHitScratch,
+    neighbors: *NeighborBlock(max_agent_candidate_checks + 1),
+) AvoidanceResult {
     // Start with the path/direct base direction, then add bounded local pushes
     // from nearby agents and static obstacle boxes.
     var ax = job.work.base_dir_x[index];
@@ -240,7 +234,26 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize, obstacle_hits:
     var agent_candidate_count: u16 = 0;
     const max_samples = job.work.selected_max_neighbor_samples[index];
     if (max_samples > 0) {
-        accumulateAgentAvoidanceBounded(job, index, &ax, &ay, &sample_count, &agent_candidate_count, max_samples);
+        const avoidance_radius = job.work.selected_avoidance_radii[index];
+        var visitor = AgentAvoidanceVisitor{
+            .radii = job.index.agent_radius,
+            .avoidance = avoidance_radius,
+            .weight = job.work.selected_avoidance_weights[index],
+            .max_samples = max_samples,
+        };
+        const stats = job.index.queryNeighbors(neighbors, .{
+            .x = job.work.start_x[index],
+            .y = job.work.start_y[index],
+            .level = job.work.selected_world_level[index],
+            .radius = avoidance_radius + job.work.selected_agent_radii[index],
+            .max_candidate_checks = max_agent_candidate_checks,
+            .factions = .full,
+            .self = job.selected[index].entity,
+        }, &visitor);
+        ax += simd.sumLanesFloat4(visitor.x);
+        ay += simd.sumLanesFloat4(visitor.y);
+        sample_count = visitor.samples;
+        agent_candidate_count = stats.candidate_checks;
     }
 
     const start_x = job.work.start_x[index];
@@ -383,58 +396,46 @@ inline fn pushObstacleLanes(agent: ObstacleAgentLanes, boxes: ObstacleBoxLanes, 
 // Squared distances at or below this push nothing (no stable direction).
 const obstacle_min_dist2: f32 = 0.0001;
 
-fn accumulateAgentAvoidanceBounded(
-    job: *const SteeringJobContext,
-    index: usize,
-    ax: *f32,
-    ay: *f32,
-    sample_count: *u16,
-    candidate_count: *u16,
-    max_samples: u16,
-) void {
-    // Candidate and sample caps are separate: candidate caps bound dense-cell
-    // cost, while sample caps keep behavior stable for configured agents.
-    const start_x = job.work.start_x[index];
-    const start_y = job.work.start_y[index];
-    const avoidance_radius = job.work.selected_avoidance_radii[index];
-    const query_radius = avoidance_radius + job.work.selected_agent_radii[index];
-    const weight = job.work.selected_avoidance_weights[index];
-    const self_entity = job.selected[index].entity;
-    const min_cell_x = spatialCell(start_x - query_radius, job.spatial_cell_size);
-    const max_cell_x = spatialCell(start_x + query_radius, job.spatial_cell_size);
-    const min_cell_y = spatialCell(start_y - query_radius, job.spatial_cell_size);
-    const max_cell_y = spatialCell(start_y + query_radius, job.spatial_cell_size);
+// A neighbor closer than this has no stable direction, matching `accumulateAgentSample`'s
+// callers: the lengthDirection epsilon stays 0.
+const agent_sample_min_dist2: f32 = 0.0001;
 
-    // The serial grid is one band: its ranges are resolved once, not per probed cell.
-    const one_band: ?[]const SpatialCellRange = if (job.agent_grid.splitter_count == 0)
-        job.agent_cell_ranges[job.agent_grid.bands[0].start..][0..job.agent_grid.bands[0].range_count]
-    else
-        null;
-    var cell_y = min_cell_y;
-    while (cell_y <= max_cell_y and sample_count.* < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_y += 1) {
-        var cell_x = min_cell_x;
-        while (cell_x <= max_cell_x and sample_count.* < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_x += 1) {
-            const band_ranges = one_band orelse job.agent_grid.rangesOfCell(job.agent_cell_ranges, cell_x, cell_y);
-            const range = findCellRange(band_ranges, cell_x, cell_y) orelse continue;
-            for (job.agent_cell_entries[range.start..range.end]) |entry| {
-                if (sample_count.* >= max_samples or candidate_count.* >= max_agent_candidate_checks) break;
-                candidate_count.* += 1;
-                const other_index = entry.index;
-                if (job.agents.entity[other_index].eql(self_entity)) continue;
-                // Match collision's sameWorldLevel gate: pure-XY overlap across
-                // floors must not produce a lateral push.
-                if (job.agents.world_level[other_index] != job.work.selected_world_level[index]) continue;
-                const dx = start_x - job.agents.x[other_index];
-                const dy = start_y - job.agents.y[other_index];
-                const combined_radius = avoidance_radius + job.agent_radii[other_index];
-                const dist2 = dx * dx + dy * dy;
-                if (dist2 > 0.0001 and dist2 < combined_radius * combined_radius) {
-                    accumulateAgentSample(dx, dy, combined_radius, weight, ax, ay, sample_count);
-                }
-            }
-        }
+// One row's agent-avoidance query, summed in lane partials. A lane adds `+0` unless it is
+// inside the query, has a steering radius, and lies strictly inside that neighbor's combined
+// radius and outside `agent_sample_min_dist2`. `capLanes` stops the query when the sample
+// budget fills.
+const AgentAvoidanceVisitor = struct {
+    radii: []const f32,
+    avoidance: f32,
+    weight: f32,
+    max_samples: u16,
+    x: simd.Float4 = simd.splatFloat4(0),
+    y: simd.Float4 = simd.splatFloat4(0),
+    samples: u16 = 0,
+
+    pub fn visitLanes(self: *AgentAvoidanceVisitor, lanes: *const NeighborLanes) LaneStop {
+        const other = simd.gatherFloat4Masked(self.radii, lanes.entry, lanes.inside);
+        const combined = simd.addFloat4(simd.splatFloat4(self.avoidance), other);
+        const combined2 = simd.mulFloat4(combined, combined);
+        const push = lanes.inside &
+            simd.greaterThanFloat4Bits(other, simd.splatFloat4(0)) &
+            simd.greaterThanFloat4Bits(lanes.dist2, simd.splatFloat4(agent_sample_min_dist2)) &
+            simd.lessThanFloat4Bits(lanes.dist2, combined2);
+        if (push == 0) return null;
+        const room = self.max_samples - self.samples;
+        std.debug.assert(room >= 1);
+        const cap = capLanes(push, room);
+        const dir = simd.lengthDirection2Float4(lanes.dx, lanes.dy, 0);
+        const strength = simd.mulFloat4(
+            simd.subFloat4(simd.splatFloat4(1), simd.divFloat4(dir.length, combined)),
+            simd.splatFloat4(self.weight),
+        );
+        self.x = simd.addFloat4(self.x, simd.selectOrZeroFloat4(cap.pass, simd.mulFloat4(dir.direction.x, strength)));
+        self.y = simd.addFloat4(self.y, simd.selectOrZeroFloat4(cap.pass, simd.mulFloat4(dir.direction.y, strength)));
+        self.samples += @popCount(cap.pass);
+        return cap.stop;
     }
-}
+};
 
 fn accumulateAgentSample(
     dx: f32,
@@ -452,6 +453,21 @@ fn accumulateAgentSample(
     sample_count.* += 1;
 }
 
+// `count` identical pushes in scan-lane order: lane `i` sums pushes `i`, `i + 4`, ..., then
+// `(p0 + p1) + (p2 + p3)` is added once to the base and normalized. The cap test's contract.
+fn laneStridedDirection(count: usize, dx: f32, dy: f32, combined: f32, weight: f32, base_x: f32, base_y: f32) math.Vec2 {
+    var lane_x = [_]f32{ 0, 0, 0, 0 };
+    var lane_y = [_]f32{ 0, 0, 0, 0 };
+    var samples: u16 = 0;
+    for (0..count) |push| {
+        const lane = push % simd.lane_count;
+        accumulateAgentSample(dx, dy, combined, weight, &lane_x[lane], &lane_y[lane], &samples);
+    }
+    const ax = base_x + ((lane_x[0] + lane_x[1]) + (lane_x[2] + lane_x[3]));
+    const ay = base_y + ((lane_y[0] + lane_y[1]) + (lane_y[2] + lane_y[3]));
+    return math.normalizeOrZeroFinite(ax, ay, 0.0001);
+}
+
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -459,6 +475,7 @@ const max_steering_neighbor_samples = @import("../../data_system.zig").max_steer
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
+const buildSteeredIndex = @import("test_support.zig").buildSteeredIndex;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const addStaticObstacle = @import("test_support.zig").addStaticObstacle;
 const appendNavigationIntent = @import("test_support.zig").appendNavigationIntent;
@@ -508,8 +525,8 @@ test "steering agent avoidance stops at the candidate cap among dense co-located
     // can stop its walk.
     const agent = try addSteeredEntity(&data, .{ .x = 60, .y = 60 });
     try data.setSteeringAgent(agent, .{ .agent_radius = 8, .waypoint_tolerance = 4, .avoidance_radius = 48, .avoidance_weight = 1.5, .max_neighbor_samples = max_steering_neighbor_samples, .stuck_step_threshold = 3, .replan_cooldown_steps = 4, .unavailable_backoff_steps = 12 });
-    // Twice the cap of neighbors at one point in the grid cell walked before the agent's
-    // own, each in reach.
+    // Twice the cap of neighbors at one point in the agent's index cell, each in reach,
+    // created after the agent so the scan meets them after it.
     const neighbor_count = 2 * max_agent_candidate_checks;
     for (0..neighbor_count) |_| _ = try addSteeredEntity(&data, .{ .x = 50, .y = 52 });
 
@@ -533,22 +550,70 @@ test "steering agent avoidance stops at the candidate cap among dense co-located
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
 
     // The direct direction plus the identical pushes of the first `max_agent_candidate_checks`
-    // candidates, all neighbors; the uncapped walk would add every neighbor's.
-    var capped_ax: f32 = 1;
-    var capped_ay: f32 = 0;
-    var capped_samples: u16 = 0;
-    for (0..max_agent_candidate_checks) |_| accumulateAgentSample(10, 8, 48 + 8, 1.5, &capped_ax, &capped_ay, &capped_samples);
-    var uncapped_ax: f32 = 1;
-    var uncapped_ay: f32 = 0;
-    var uncapped_samples: u16 = 0;
-    for (0..neighbor_count) |_| accumulateAgentSample(10, 8, 48 + 8, 1.5, &uncapped_ax, &uncapped_ay, &uncapped_samples);
-    const expected = math.normalizeOrZeroFinite(capped_ax, capped_ay, 0.0001);
-    const uncapped = math.normalizeOrZeroFinite(uncapped_ax, uncapped_ay, 0.0001);
+    // candidates, one push per scan lane then `(p0+p1)+(p2+p3)` once. The uncapped walk
+    // would add every neighbor the same way.
+    const expected = laneStridedDirection(max_agent_candidate_checks, 10, 8, 48 + 8, 1.5, 1, 0);
+    const uncapped = laneStridedDirection(neighbor_count, 10, 8, 48 + 8, 1.5, 1, 0);
     try std.testing.expect(expected.y != uncapped.y);
     const movement = frame.intents.mergedItems()[0].movement;
     try std.testing.expect(movement.entity.eql(agent));
     try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(movement.direction_x)));
     try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(movement.direction_y)));
+}
+
+test "steering agent avoidance accumulate matches its scalar lanes" {
+    const avoidance: f32 = 48;
+    const weight: f32 = 1.5;
+    const radii = [_]f32{ 8, 0, 4, 12, 6, 8 };
+    // One full batch, then tails of 1, 2, and 3 lanes. A zero radius and a dist2 at the floor
+    // add nothing. An inactive lane's entry index is past the column.
+    const batches = [_]struct {
+        entries: [4]u32,
+        dx: [4]f32,
+        dy: [4]f32,
+        dist2: [4]f32,
+        inside: simd.MaskBits,
+    }{
+        .{ .entries = .{ 0, 1, 2, 3 }, .dx = .{ 10, 4, 1, 3 }, .dy = .{ 0, 0, 0, 4 }, .dist2 = .{ 100, 16, agent_sample_min_dist2, 25 }, .inside = 0b1111 },
+        .{ .entries = .{ 4, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) }, .dx = .{ 6, 99, 99, 99 }, .dy = .{ 8, 99, 99, 99 }, .dist2 = .{ 100, 1, 1, 1 }, .inside = 0b0001 },
+        .{ .entries = .{ 0, 5, std.math.maxInt(u32), std.math.maxInt(u32) }, .dx = .{ 2, 0, 99, 99 }, .dy = .{ 0, 1, 99, 99 }, .dist2 = .{ 4, 0, 1, 1 }, .inside = 0b0011 },
+        .{ .entries = .{ 3, 4, 0, std.math.maxInt(u32) }, .dx = .{ -5, 1, 8, 99 }, .dy = .{ 0, -2, -6, 99 }, .dist2 = .{ 25, 5, 100, 1 }, .inside = 0b0111 },
+    };
+    var visitor = AgentAvoidanceVisitor{ .radii = &radii, .avoidance = avoidance, .weight = weight, .max_samples = 64 };
+    var lane_x = [_]f32{ 0, 0, 0, 0 };
+    var lane_y = [_]f32{ 0, 0, 0, 0 };
+    var samples: u16 = 0;
+    for (batches) |batch| {
+        const stop = visitor.visitLanes(&.{
+            .entry = batch.entries,
+            .x = simd.splatFloat4(0),
+            .y = simd.splatFloat4(0),
+            .dx = batch.dx,
+            .dy = batch.dy,
+            .dist2 = batch.dist2,
+            .inside = batch.inside,
+        });
+        try std.testing.expectEqual(@as(?simd.LaneIndex, null), stop);
+        for (0..simd.lane_count) |lane| {
+            if (batch.inside & (@as(simd.MaskBits, 1) << @intCast(lane)) == 0) continue;
+            const other = radii[batch.entries[lane]];
+            const combined = avoidance + other;
+            const dist2 = batch.dist2[lane];
+            if (!(other > 0 and dist2 > agent_sample_min_dist2 and dist2 < combined * combined)) continue;
+            accumulateAgentSample(batch.dx[lane], batch.dy[lane], combined, weight, &lane_x[lane], &lane_y[lane], &samples);
+        }
+    }
+    const base_x: f32 = 0.25;
+    const base_y: f32 = -0.5;
+    const got_x = base_x + simd.sumLanesFloat4(visitor.x);
+    const got_y = base_y + simd.sumLanesFloat4(visitor.y);
+    const want_x = base_x + ((lane_x[0] + lane_x[1]) + (lane_x[2] + lane_x[3]));
+    const want_y = base_y + ((lane_y[0] + lane_y[1]) + (lane_y[2] + lane_y[3]));
+    try std.testing.expectEqual(@as(u32, @bitCast(want_x)), @as(u32, @bitCast(got_x)));
+    try std.testing.expectEqual(@as(u32, @bitCast(want_y)), @as(u32, @bitCast(got_y)));
+    try std.testing.expectEqual(samples, visitor.samples);
+    // The zero radius and the dist2 floor were inside and added nothing.
+    try std.testing.expect(visitor.samples < 4 + 1 + 2 + 3);
 }
 
 test "steering local agent avoidance ignores XY overlap across different world_levels" {
@@ -583,6 +648,93 @@ test "steering local agent avoidance ignores XY overlap across different world_l
     const movement = frame.intents.mergedItems()[0].movement;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), movement.direction_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), movement.direction_y, 0.001);
+}
+
+test "steering agent avoidance checks stay on the agent's level when other levels share its cell" {
+    // 65 agents on each level before the steerer's, so a level leak fills the check cap
+    // before the same-level neighbor. That neighbor sits inside the combined radius.
+    const other_levels = 2;
+    const per_level = 65;
+    const here = math.Vec2{ .x = 64, .y = 64 };
+    const beside = math.Vec2{ .x = 80, .y = 64 };
+
+    const with_others = try levelAvoidanceDirection(other_levels, per_level, here, beside, true);
+    const same_level_only = try levelAvoidanceDirection(0, 0, here, beside, true);
+    const alone = try levelAvoidanceDirection(0, 0, here, beside, false);
+    try std.testing.expectEqual(@as(u32, @bitCast(same_level_only.x)), @as(u32, @bitCast(with_others.x)));
+    try std.testing.expectEqual(@as(u32, @bitCast(same_level_only.y)), @as(u32, @bitCast(with_others.y)));
+    try std.testing.expect(with_others.x != alone.x or with_others.y != alone.y);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addLevelCrowd(&data, other_levels, per_level, here);
+    const agent = try addSteeredEntity(&data, here);
+    try data.setWorldLevel(agent, @intCast(other_levels));
+    const neighbor = try addSteeredEntity(&data, beside);
+    try data.setWorldLevel(neighbor, @intCast(other_levels));
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+    var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
+    defer colliders.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(other_levels * per_level + 2);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var index = try buildSteeredIndex(&data);
+    defer index.deinit();
+    _ = try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .max_worker_threads = 2, .adaptive = false });
+    const threaded = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(u32, @bitCast(with_others.x)), @as(u32, @bitCast(threaded.direction_x)));
+    try std.testing.expectEqual(@as(u32, @bitCast(with_others.y)), @as(u32, @bitCast(threaded.direction_y)));
+}
+
+fn addLevelCrowd(data: *DataSystem, other_levels: usize, per_level: usize, position: math.Vec2) !void {
+    for (0..other_levels) |level| {
+        for (0..per_level) |_| {
+            const extra = try addSteeredEntity(data, position);
+            try data.setWorldLevel(extra, @intCast(level));
+        }
+    }
+}
+
+fn levelAvoidanceDirection(other_levels: usize, per_level: usize, here: math.Vec2, beside: math.Vec2, with_neighbor: bool) !math.Vec2 {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addLevelCrowd(&data, other_levels, per_level, here);
+    const agent = try addSteeredEntity(&data, here);
+    try data.setWorldLevel(agent, @intCast(other_levels));
+    if (with_neighbor) {
+        const neighbor = try addSteeredEntity(&data, beside);
+        try data.setWorldLevel(neighbor, @intCast(other_levels));
+    }
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+    var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
+    defer colliders.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(other_levels * per_level + 2);
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    const movement = frame.intents.mergedItems()[0].movement;
+    return .{ .x = movement.direction_x, .y = movement.direction_y };
 }
 
 test "steering static obstacle avoidance ignores XY overlap across different world_levels" {
@@ -621,7 +773,6 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
 
     frame.beginStep();
     try commitStaticsForTest(&frame, &data, &colliders, &.{.{ .set_world_level = .{ .entity = obstacle, .level = 1 } }});
-    steering.reactToPostCommitSteeringEvents(&frame);
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const same = frame.intents.mergedItems()[0].movement;
@@ -700,7 +851,9 @@ test "steering multi-level obstacle gate matches between serial and real threade
         var threaded_system = SteeringSystem.init(std.testing.allocator);
         defer threaded_system.deinit();
         try threaded_system.reserve(128);
-        _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
+        var index = try buildSteeredIndex(&data);
+        defer index.deinit();
+        _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, index.view(), .{
             .items_per_range = split.items_per_range,
             .band_items_per_range = 1,
             .max_worker_threads = split.workers,
@@ -751,7 +904,6 @@ test "steering pushes from a static's committed position the step after its move
         .entity = box,
         .body = .{ .position = .{ .x = 8, .y = -32 }, .previous_position = parked, .velocity = .{}, .speed = 0 },
     } }});
-    steering.reactToPostCommitSteeringEvents(&frame);
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     // Pushed away from the box, toward +y.

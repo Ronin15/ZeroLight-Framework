@@ -244,9 +244,9 @@ fn stageContract(stage: StageId) StageContract {
         // reader of a live goal.
         .path_goal_resolve => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{.path_goals}) },
         .steering_update => .{
-            .reads = resources(&.{ .navigation_intents, .path_goals }),
+            .reads = resources(&.{ .navigation_intents, .path_goals, .spatial_index }),
             .writes = resources(&.{ .movement_intents, .path_requests }),
-            .carried = resources(&.{.static_colliders}),
+            .carried = resources(&.{ .static_colliders, .movement_positions, .world_level }),
         },
         .pathfinding_update => .{ .reads = resources(&.{ .path_requests, .path_goals }), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
@@ -666,14 +666,11 @@ pub const SimulationPipelineStats = struct {
             perf.recordBenchBatch(.steering_select_resolve, steering_stats.perf.select_resolve_batch);
             perf.recordBenchBatch(.steering_select_claim, steering_stats.perf.select_claim_batch);
             perf.recordBenchBatch(.steering_directions, steering_stats.perf.directions_batch);
-            perf.recordBenchBatch(.steering_grid_bucket, steering_stats.perf.grid_bucket_batch);
-            perf.recordBenchBatch(.steering_grid_sort, steering_stats.perf.grid_sort_batch);
             perf.recordBenchBatch(.steering, steering_stats.perf.batch);
         }
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
         perf.recordTiming(.steering_directions, steering_stats.directions_ns);
-        perf.recordTiming(.steering_grid, steering_stats.grid_ns);
 
         if (comptime runtime_perf_log.enabled) {
             perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.perf.accepted_requests));
@@ -1346,15 +1343,14 @@ pub const SimulationPipeline = struct {
     /// reserve, the budgeted commit, the collider capture of the step's static changes, the
     /// population growth seam, the collider sync with its nav record and the stored-trigger
     /// contact bound growth (run even when the growth seam failed, so the step's static
-    /// changes land and reach nav), then the post-commit reactions. The nav apply runs only
+    /// changes land and reach nav), then the post-commit nav reaction. The nav apply runs only
     /// after a successful growth seam and collider sync, keeping every recorded mark for the
     /// next step otherwise (a failed trigger bound growth counts as a failed sync and retries
-    /// next seam); the steering reaction (allocation-free flag setting) always runs, and the
-    /// first growth, collider, or nav error is returned only after it. Steering reads the
-    /// synced collider rows, so a growth or nav failure still leaves it on the committed
-    /// statics; a failed collider sync keeps steering on the pre-commit rows and keeps its
-    /// changes for the next step's sync, which converges. Commits `frame`'s structural
-    /// commands in its current step; the step's changes stay in the frame.
+    /// next seam). Steering reads the synced collider rows on its own step, so a growth or
+    /// nav failure still leaves it on the committed statics; a failed collider sync keeps
+    /// steering on the pre-commit rows and keeps its changes for the next step's sync, which
+    /// converges. Commits `frame`'s structural commands in its current step; the step's
+    /// changes stay in the frame.
     pub fn commitStructuralAndReact(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
@@ -1372,8 +1368,8 @@ pub const SimulationPipeline = struct {
         try self.reserveStaticColliders(frame, data);
         const structural = try frame.applyStructuralCommandsBudgeted(data, self.structuralCommitBudget(extra_event_count));
         self.captureStaticColliderChanges(frame);
-        // Population growth seam: the post-commit reactions and the next step see grown
-        // capacities. O(1) when the committed rows fit the tracked capacities.
+        // Population growth seam: the nav reaction and the next step see grown capacities.
+        // O(1) when the committed rows fit the tracked capacities.
         const population_sync = self.syncPopulationCapacity(frame, data);
         const collider_sync = self.syncStaticColliders(frame, data, thread_system);
         const nav_update = if (population_sync) |_|
@@ -1385,7 +1381,6 @@ pub const SimulationPipeline = struct {
             } else |err| err)
         else |err|
             err;
-        self.reactToPostCommitSteeringEvents(frame);
         const population = try population_sync;
         try collider_sync;
         return .{ .structural = structural, .population_sync = population, .nav_update = try nav_update };
@@ -1422,17 +1417,6 @@ pub const SimulationPipeline = struct {
         thread_system: *ThreadSystem,
     ) !NavUpdateStats {
         return self.pathfinding.reactToPostCommitNavEvents(frame, &self.static_colliders, world, thread_system);
-    }
-
-    /// Orchestrates steering's post-commit reaction: its movement-index cache follows the
-    /// step's entity changes. Steering reads the synced collider rows directly, so no
-    /// static change reaches it here. Disjoint state, so it runs even when the nav
-    /// reaction fails.
-    fn reactToPostCommitSteeringEvents(
-        self: *SimulationPipeline,
-        frame: *const SimulationFrame,
-    ) void {
-        self.steering.reactToPostCommitSteeringEvents(frame);
     }
 
     /// Whether the post-commit nav reaction may emit its event this step: a pending
@@ -1819,7 +1803,7 @@ pub const SimulationPipeline = struct {
     fn stageSteeringUpdate(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var steering_timer = StageTimer.start();
-        step.steering = try self.steering.update(context.data, context.frame, context.thread_system, &self.pathfinding, &self.static_colliders, .{});
+        step.steering = try self.steering.update(context.data, context.frame, context.thread_system, &self.pathfinding, &self.static_colliders, self.spatial_index.view(), .{});
         steering_timer.stop(context.perf, .pipeline_steering);
     }
 
@@ -7162,12 +7146,11 @@ test "a population growth seam that runs out of memory still runs the steering r
     const bystander = try addBystanderBody(&fixture.data, 0);
     const scene = try addSteeringAgentAndParkedBox(&fixture.data, 0);
 
-    // Four bodies fit the 4-body reserve. A steering step caches the agent's movement row.
+    // Four bodies fit the 4-body reserve. A steering step before the failing seam.
     frame.beginStep();
     _ = try fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
     try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
     try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
-    try std.testing.expect(fixture.pipeline.steering.steering_movement_index_valid);
 
     // The commit moves the box beside the agent and destroys the bystander, swap-removing
     // the agent into the bystander's row; two creates then push the population past the
@@ -7188,10 +7171,9 @@ test "a population growth seam that runs out of memory still runs the steering r
     try std.testing.expectError(error.OutOfMemory, result);
     try std.testing.expectEqual(@as(usize, 5), fixture.data.movementBodySliceConst().entities.len);
     try std.testing.expect(fixture.data.movementBodyDenseIndex(scene.agent).? != agent_row);
-    try std.testing.expect(!fixture.pipeline.steering.steering_movement_index_valid);
 
-    // The synced collider rows push the agent away from the moved box (+y), and the agent
-    // snapshot reads its own renumbered row, not the create now in its old one.
+    // The synced collider rows push the agent away from the moved box (+y), and the
+    // selected start reads the agent's own renumbered row, not the create now in its old one.
     try std.testing.expect(try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
     try expectSteeringSeesOwnPosition(&fixture.pipeline, &fixture.data, scene.agent);
 }
@@ -7727,7 +7709,6 @@ test "a static committed at the seam pushes steering agents on the next step" {
 
     // After the seam's sync, the stage pushes the agent away from the box (+y).
     try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
-    pipeline.reactToPostCommitSteeringEvents(&frame);
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
 
@@ -8163,6 +8144,9 @@ test "the goal resolve stage writes path_goals, read by steering's status querie
     try std.testing.expect(resolve.reads.contains(.navigation_intents));
     try std.testing.expect(resolve.writes.contains(.path_goals));
     try std.testing.expect(stageContract(.steering_update).reads.contains(.path_goals));
+    try std.testing.expect(stageContract(.steering_update).reads.contains(.spatial_index));
+    try std.testing.expect(stageContract(.steering_update).carried.contains(.movement_positions));
+    try std.testing.expect(stageContract(.steering_update).carried.contains(.world_level));
     try std.testing.expect(stageContract(.pathfinding_update).reads.contains(.path_goals));
     const resolve_at = std.mem.indexOfScalar(StageId, &stage_order, .path_goal_resolve).?;
     try std.testing.expect(std.mem.indexOfScalar(StageId, &stage_order, .ai_decide).? < resolve_at);

@@ -546,6 +546,25 @@ fn gatherUint4MaskedScalar(table: []const u32, indices: [lane_count]u32, lanes: 
     return gathered;
 }
 
+/// `gatherFloat4` in the lanes set in `lanes`, and `+0` in the rest: a column's tail. Reads
+/// only the set lanes' entries, so an inactive lane's index may be anything.
+pub inline fn gatherFloat4Masked(values: []const f32, indices: Uint4, lanes: MaskBits) Float4 {
+    var gathered = splatFloat4(0);
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) gathered[lane] = values[indices[lane]];
+    }
+    return gathered;
+}
+
+/// Scalar form of `gatherFloat4Masked`.
+fn gatherFloat4MaskedScalar(values: []const f32, indices: [lane_count]u32, lanes: MaskBits) [lane_count]f32 {
+    var gathered = [_]f32{ 0, 0, 0, 0 };
+    for (&gathered, indices, 0..) |*lane_value, index, lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) lane_value.* = values[index];
+    }
+    return gathered;
+}
+
 /// Scatters lane values back to `values` at the given indices. Indices must be
 /// distinct; overlapping targets make the result order-dependent.
 pub fn scatterFloat4(values: []f32, indices: [lane_count]usize, vector: Float4) void {
@@ -1082,6 +1101,32 @@ test "u32 gathers, masked gathers, and prefix stores match their scalar forms" {
         for (prefix_simd[count..lane_count]) |untouched| try std.testing.expectEqual(@as(u32, 9), untouched);
         try std.testing.expectEqual(@as(u32, 8), prefix_simd[4]);
         try std.testing.expectEqual(@as(u32, 7), prefix_simd[5]);
+    }
+}
+
+test "float masked gathers match their scalar form and skip inactive lanes" {
+    const values = [_]f32{ 1.25, -0.0, 3.5, -2.5, 0.0, 8 };
+    const index_sets = [_][lane_count]u32{ .{ 5, 0, 3, 1 }, .{ 2, 2, 2, 2 }, .{ 0, 1, 4, 5 } };
+    for (index_sets) |indices| {
+        for (0..1 << lane_count) |bits| {
+            const lanes: MaskBits = @intCast(bits);
+            const masked = toFloatArray(gatherFloat4Masked(&values, indices, lanes));
+            const scalar = gatherFloat4MaskedScalar(&values, indices, lanes);
+            for (0..lane_count) |lane| {
+                try std.testing.expectEqual(@as(u32, @bitCast(scalar[lane])), @as(u32, @bitCast(masked[lane])));
+                const expected: f32 = if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) values[indices[lane]] else 0;
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(masked[lane])));
+            }
+        }
+    }
+    // An inactive lane's index is never read: it may lie past the column, and the lane is +0.
+    const past = [_]u32{ 1, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) };
+    const masked = toFloatArray(gatherFloat4Masked(&values, past, lanesBelow(1)));
+    const scalar = gatherFloat4MaskedScalar(&values, past, lanesBelow(1));
+    try std.testing.expectEqual(@as(u32, @bitCast(values[1])), @as(u32, @bitCast(masked[0])));
+    for (0..lane_count) |lane| {
+        try std.testing.expectEqual(@as(u32, @bitCast(scalar[lane])), @as(u32, @bitCast(masked[lane])));
+        if (lane != 0) try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(masked[lane])));
     }
 }
 

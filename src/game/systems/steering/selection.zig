@@ -254,6 +254,7 @@ const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const direction_epsilon = @import("directions.zig").direction_epsilon;
+const buildSteeredIndex = @import("test_support.zig").buildSteeredIndex;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const selectionIntent = @import("test_support.zig").selectionIntent;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
@@ -334,6 +335,8 @@ test "steering threaded arbitration keeps the first appearance and the best inte
     var outputs: [2][40]MovementIntent = undefined;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
+    var index = try buildSteeredIndex(&data);
+    defer index.deinit();
     for (&outputs, 0..) |*output, run| {
         var frame = SimulationFrame.init(std.testing.allocator);
         defer frame.deinit();
@@ -347,7 +350,7 @@ test "steering threaded arbitration keeps the first appearance and the best inte
         const stats = if (run == 0)
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)
         else
-            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false });
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
         // First appearance order, each agent steering along its best intent.
         for (output, frame.intents.mergedItems(), agents, best) |*slot, merged, agent, best_index| {
@@ -437,6 +440,8 @@ test "steering claims and intents match serial across resolve partitions" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
+    var index = try buildSteeredIndex(&data);
+    defer index.deinit();
     // Serial, then five and two resolve ranges.
     const resolve_ranges = [_]?usize{ null, 16, 48 };
     var outputs: [resolve_ranges.len][40]MovementIntent = undefined;
@@ -452,7 +457,7 @@ test "steering claims and intents match serial across resolve partitions" {
         frame.beginStep();
         try appendNavigationIntents(&frame, &intents);
         const stats = if (items_per_range) |range_items|
-            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = range_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false })
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = range_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false })
         else
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);

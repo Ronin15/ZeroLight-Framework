@@ -88,7 +88,6 @@ comptime {
     _ = @import("game/systems/steering/system.zig");
     _ = @import("game/systems/steering/selection.zig");
     _ = @import("game/systems/steering/directions.zig");
-    _ = @import("game/systems/steering/agent_grid.zig");
     _ = @import("game/systems/steering/avoidance.zig");
     _ = @import("main.zig");
     _ = @import("render/gpu/buffer.zig");

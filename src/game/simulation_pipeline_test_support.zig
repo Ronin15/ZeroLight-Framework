@@ -170,15 +170,20 @@ pub fn writeBoxMove(frame: *SimulationFrame, box: EntityId, position: math.Vec2,
     frame.structural_commands.finishWrite();
 }
 
-/// Steering's last agent snapshot (the positions neighbors avoid) holds `agent` at its own
-/// previous position.
+/// The selected start for `agent` is its own previous position: directions copied it
+/// from that agent's movement row.
 pub fn expectSteeringSeesOwnPosition(pipeline: *const SimulationPipeline, data: *const DataSystem, agent: EntityId) !void {
     const own = data.movementBodyConst(agent).?.previous_position;
-    const agents = pipeline.steering.agentSnapshotSliceConst();
-    for (agents.entity, agents.x, agents.y) |entity, x, y| {
-        if (!entity.eql(agent)) continue;
-        try std.testing.expectEqual(own, math.Vec2{ .x = x, .y = y });
-        return;
+    const selected = pipeline.steering.selected.items;
+    const work = pipeline.steering.selected_work_rows.slice();
+    const start_x = work.items(.start_x);
+    const start_y = work.items(.start_y);
+    for (pipeline.steering.selected_windows.items) |window| {
+        for (window.start..window.start + window.count) |slot| {
+            if (!selected[slot].entity.eql(agent)) continue;
+            try std.testing.expectEqual(own, math.Vec2{ .x = start_x[slot], .y = start_y[slot] });
+            return;
+        }
     }
     return error.TestExpectedEqual;
 }

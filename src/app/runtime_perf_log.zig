@@ -197,12 +197,10 @@ pub const Timing = enum {
     pathfinding_publish,
     pathfinding_resize,
     // Steering prepare stages before the avoidance batch: wall time of selection, of the
-    // agents stage with its rekey, of directions, and of the agent grid, each inline or
-    // dispatched to workers.
+    // agents stage with its rekey, and of directions, each inline or dispatched to workers.
     steering_select,
     steering_snapshot,
     steering_directions,
-    steering_grid,
     state_transitions,
     audio_drain,
     loading_build,
@@ -268,8 +266,6 @@ pub const BenchBatchStage = enum {
     steering_select_resolve,
     steering_select_claim,
     steering_directions,
-    steering_grid_bucket,
-    steering_grid_sort,
     steering,
     // The pathfinding update's registry flush count, a shrink's owner rename, the group-field
     // advance and begin passes, and the publish copy, beside its logged intake and flush.
@@ -726,9 +722,8 @@ const EnabledRuntimePerfLog = struct {
         const steering_select_timing = self.timingValue(.steering_select);
         const steering_snapshot_timing = self.timingValue(.steering_snapshot);
         const steering_directions_timing = self.timingValue(.steering_directions);
-        const steering_grid_timing = self.timingValue(.steering_grid);
         log.debug(
-            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3} grid_avg_ms={d:.3} grid_max_ms={d:.3}",
+            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(steering_select_timing.averageNs()),
@@ -737,8 +732,6 @@ const EnabledRuntimePerfLog = struct {
                 millis(steering_snapshot_timing.max_ns),
                 millis(steering_directions_timing.averageNs()),
                 millis(steering_directions_timing.max_ns),
-                millis(steering_grid_timing.averageNs()),
-                millis(steering_grid_timing.max_ns),
             },
         );
         log.debug(

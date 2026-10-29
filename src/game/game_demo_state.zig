@@ -2108,12 +2108,10 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     const scene = try addSteeringAgentAndParkedBox(&demo.data, 1);
     const parked = demo.data.movementBodyConst(scene.box).?.position;
 
-    // Population seam for the direct adds, then a steering step that caches the agent's
-    // movement row.
+    // Population seam for the direct adds, then a steering step.
     frame.beginStep();
     _ = try demo.pipeline.commitStructuralAndReact(frame, &demo.data, &demo.world, &inline_threads);
     try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal), 0.001);
-    try std.testing.expect(demo.pipeline.steering.steering_movement_index_valid);
 
     frame.beginStep();
     const nav = &demo.pipeline.pathfinding;
@@ -2145,9 +2143,8 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     nav.allocator = nav_allocator;
     nav.graph.allocator = graph_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
-    // The agent's movement row moved, and the steering reaction dropped the cached row.
+    // The agent's movement row moved.
     try std.testing.expect(demo.data.movementBodyDenseIndex(scene.agent).? != agent_row);
-    try std.testing.expect(!demo.pipeline.steering.steering_movement_index_valid);
 
     const lateral = try lateralSteeringOnce(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal);
     try expectSteeringSeesOwnPosition(&demo.pipeline, &demo.data, scene.agent);

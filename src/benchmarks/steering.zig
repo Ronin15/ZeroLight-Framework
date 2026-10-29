@@ -9,8 +9,8 @@
 //! agents and statics, nav over a one-level walkable world, and step its steering system on
 //! its nav and colliders. `steering-static-change` times one static collision body moved and
 //! committed through the production commit seam (`commitStructuralAndReact`: reserves,
-//! budgeted commit, capture, population seam, collider and trigger sync, and the nav and
-//! steering reactions) and one steering step for a fixed agent population, with the static
+//! budgeted commit, capture, population seam, collider and trigger sync, and the nav
+//! reaction) and one steering step for a fixed agent population, with the static
 //! count as its item count; the cost model expects it flat in the static count. `steering-static-dense` times one steering step for a fixed agent
 //! population among chunks holding a count of statics each; its item code names the
 //! statics' layout and that count. The `chunk_ordered` layout creates the statics chunk by
@@ -32,18 +32,24 @@
 //! The agent groups print `avoidance_checks=`, `samples=`, and `intents=`;
 //! `steering-static-change` prints `obstacle_checks=` and `obstacle_samples=`;
 //! `steering-static-dense` prints `obstacle_visits=` (with visits per agent),
-//! `obstacle_samples=`, and `intents=`. `--details` adds each prepare stage's shape
-//! (`agents=`, `resolve=`, `claim=`, `dir=`, `bucket=` the agent grid's bucket pass, `sort=`
-//! its sort; `-` for a stage that did not run), `steer=` (the avoidance pass), each over the
-//! measured steps (`[threaded/non-empty]`), and `main=` with `main_per_item=` (per agent);
-//! the agent groups also print `band_max=`, the entries in the agent grid's largest band.
-//! `steering-static-change` adds the seam's collider sync and trigger patch stages (`seam:`),
-//! and its main share subtracts every seam stage on workers. The tuned case settles every
-//! tuner its measured step runs (`step_tuners:`: the seven steering stages, and the seam's
-//! for `steering-static-change`) and prints each steering tuner's state (`tuners:`). A fixed
-//! threaded case runs every stage of more than one range on workers; the band stages (claim,
-//! grid sort) run at the case's band range (`bandItemsPerRange`), and each fixed threaded case
-//! checks their range counts against it.
+//! `obstacle_samples=`, and `intents=`. `steering-levels` prints checks and samples per
+//! selected intent. `--details` adds each prepare stage's shape (`agents=`, `resolve=`,
+//! `claim=`, `dir=`; `-` for a stage that did not run), `steer=` (the avoidance pass), each
+//! over the measured steps (`[threaded/non-empty]`), and `main=` with `main_per_item=` (per
+//! agent). `steering-static-change` adds the seam's collider sync and trigger patch stages
+//! (`seam:`), and its main share subtracts every seam stage on workers. The tuned case
+//! settles every tuner its measured step runs (`step_tuners:`: the five steering stages, and
+//! the seam's for `steering-static-change`) and prints each steering tuner's state
+//! (`tuners:`). A fixed threaded case runs every stage of more than one range on workers;
+//! the claim runs at the case's band range (`bandItemsPerRange`), and each fixed threaded
+//! case checks its range count against it.
+//!
+//! `steering-levels` times one steering step over 1, 4, and 16 levels with the check cap
+//! of agents at one xy on each level (one under the cap as the others), every agent
+//! selected. Pass: agent candidate checks and neighbor samples per selected intent are the
+//! same at every level count (checks = one under the cap, samples = 0: the same point has
+//! no direction).
+//! The index is built in the untimed prepare; the timed call is `steering.update`.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -59,6 +65,8 @@ const NavigationIntent = @import("../game/simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
+const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const SteeringStats = @import("../game/systems/steering/system.zig").SteeringStats;
 const SteeringSystem = @import("../game/systems/steering/system.zig").SteeringSystem;
@@ -103,6 +111,14 @@ pub const cluster_outlier_group = suite.BenchmarkGroup{
     .write_workload = writeSteeringWorkload,
 };
 
+pub const levels_group = suite.BenchmarkGroup{
+    .name = "steering-levels",
+    .item_label = "levels",
+    .item_counts = &level_counts,
+    .runCase = runLevelsCase,
+    .write_workload = writeLevelsWorkload,
+};
+
 pub const static_change_group = suite.BenchmarkGroup{
     .name = "steering-static-change",
     .item_label = "static bodies",
@@ -122,6 +138,9 @@ pub const static_dense_group = suite.BenchmarkGroup{
 
 const agent_counts = [_]usize{ 128, 512, 1024 };
 const layout_counts = [_]usize{ 1024, 4096, 16384 };
+const level_counts = [_]usize{ 1, 4, 16 };
+// Agents sharing one xy on each level. One under the cap stays inside the check cap.
+const levels_agents_per_cell: usize = @intCast(max_agent_candidate_checks);
 
 // Where the steering agent groups place their agents.
 const Layout = enum {
@@ -151,8 +170,14 @@ const Fixture = struct {
     // Built from the fixture's statics on nav's cell grid; steering reads them.
     colliders: StaticColliderSystem,
     agents: std.ArrayList(EntityId) = .empty,
+    // Rebuilt in the untimed prepare; the timed step only queries its view.
+    index: SpatialIndexSystem,
+    index_threads: ThreadSystem,
+    index_geometry: IndexGeometry,
 
     fn deinit(self: *Fixture, allocator: std.mem.Allocator) void {
+        self.index_threads.deinit();
+        self.index.deinit();
         self.agents.deinit(allocator);
         self.colliders.deinit();
         self.pathfinding.deinit();
@@ -162,7 +187,7 @@ const Fixture = struct {
     }
 };
 
-fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fixture {
+fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, layout: Layout) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
@@ -189,8 +214,13 @@ fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fi
         var prng = std.Random.DefaultPrng.init(layout_shuffle_seed);
         prng.random().shuffle(usize, creation_order);
     }
+    var max_x: f32 = 0;
+    var max_y: f32 = 0;
     for (creation_order) |slot| {
-        agents.appendAssumeCapacity(try addAgent(&data, layoutPosition(layout, slot, count, side, grid_extent)));
+        const position = layoutPosition(layout, slot, count, side, grid_extent);
+        max_x = @max(max_x, position.x);
+        max_y = @max(max_y, position.y);
+        agents.appendAssumeCapacity(try addAgent(&data, position));
     }
 
     const near_static_total = @min(@as(usize, 16), side);
@@ -209,8 +239,36 @@ fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fi
     try pathfinding.rebuildStaticNavGrid(&data, nav_width, nav_height, nav_cell_size);
     var colliders = try buildColliders(allocator, &data, &pathfinding, nav_width, nav_height);
     errdefer colliders.deinit();
+    var index = SpatialIndexSystem.init(allocator);
+    errdefer index.deinit();
+    try index.reserve(count);
+    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    errdefer index_threads.deinit();
+    const geometry = IndexGeometry{
+        .tile_size = nav_cell_size,
+        .chunk_size_tiles = default_chunk_size_tiles,
+        .chunks_x = chunksCovering(max_x),
+        .chunks_y = chunksCovering(max_y),
+        .level_count = 1,
+    };
 
-    return .{ .data = data, .frame = frame, .pathfinding = pathfinding, .colliders = colliders, .agents = agents };
+    return .{
+        .data = data,
+        .frame = frame,
+        .pathfinding = pathfinding,
+        .colliders = colliders,
+        .agents = agents,
+        .index = index,
+        .index_threads = index_threads,
+        .index_geometry = geometry,
+    };
+}
+
+// Chunks whose cell grid holds `extent` without clamping it to the edge.
+fn chunksCovering(extent: f32) u32 {
+    const chunk_world = nav_cell_size * @as(f32, @floatFromInt(default_chunk_size_tiles));
+    const covered = extent + nav_cell_size;
+    return @max(@as(u32, @intFromFloat(@ceil(covered / chunk_world))), 1);
 }
 
 // The static colliders of `data`'s statics on the cell grid of nav's `width` x `height` build.
@@ -237,10 +295,112 @@ fn runClusterOutlierCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     return try runLayoutCase(allocator, io, options, case, item_count, .cluster_outlier);
 }
 
+const LevelsFixture = struct {
+    data: DataSystem,
+    frame: SimulationFrame,
+    pathfinding: PathfindingSystem,
+    colliders: StaticColliderSystem,
+    agents: std.ArrayList(EntityId),
+    index: SpatialIndexSystem,
+    index_threads: ThreadSystem,
+
+    fn deinit(self: *LevelsFixture, allocator: std.mem.Allocator) void {
+        self.index_threads.deinit();
+        self.index.deinit();
+        self.agents.deinit(allocator);
+        self.colliders.deinit();
+        self.pathfinding.deinit();
+        self.frame.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+fn createLevelsFixture(allocator: std.mem.Allocator, io: std.Io, levels: usize) !LevelsFixture {
+    const count = levels * levels_agents_per_cell;
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    var frame = SimulationFrame.init(allocator);
+    errdefer frame.deinit();
+    try frame.reserveStreams(maxRangeCount(count, steering_range_alignment_items), 0, count, 0, 0, 0);
+    try frame.reservePathRequests(maxRangeCount(count, steering_range_alignment_items), count);
+    var pathfinding = PathfindingSystem.init(allocator);
+    errdefer pathfinding.deinit();
+    var colliders = StaticColliderSystem.init(allocator);
+    errdefer colliders.deinit();
+    var agents = std.ArrayList(EntityId).empty;
+    errdefer agents.deinit(allocator);
+    try agents.ensureTotalCapacity(allocator, count);
+    const position = math.Vec2{ .x = 32, .y = 32 };
+    for (0..levels) |level| {
+        for (0..levels_agents_per_cell) |_| {
+            const agent = try addAgent(&data, position);
+            try data.setWorldLevel(agent, @intCast(level));
+            agents.appendAssumeCapacity(agent);
+        }
+    }
+    var index = SpatialIndexSystem.init(allocator);
+    errdefer index.deinit();
+    try index.reserve(count);
+    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    errdefer index_threads.deinit();
+    return .{
+        .data = data,
+        .frame = frame,
+        .pathfinding = pathfinding,
+        .colliders = colliders,
+        .agents = agents,
+        .index = index,
+        .index_threads = index_threads,
+    };
+}
+
+fn prepareLevels(fixture: *LevelsFixture) !void {
+    fixture.frame.beginStep();
+    try appendNavigationIntents(&fixture.frame, fixture.agents.items);
+    const geometry = IndexGeometry{
+        .tile_size = nav_cell_size,
+        .chunk_size_tiles = default_chunk_size_tiles,
+        .chunks_x = 1,
+        .chunks_y = 1,
+        .level_count = level_counts[level_counts.len - 1],
+    };
+    try rebuildAgentIndex(&fixture.index, &fixture.index_threads, &fixture.data, geometry);
+}
+
+fn levelsOnce(system: *SteeringSystem, fixture: *LevelsFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+    const stats = try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, fixture.index.view(), .{
+        .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
+        .band_items_per_range = bandItemsPerRange(case),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
+    });
+    if (stats.movement_intent_count != fixture.agents.items.len) return error.AgentIntentMissing;
+    return stats;
+}
+
+fn runLevelsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try createLevelsFixture(allocator, io, item_count);
+    defer fixture.deinit(allocator);
+    var system = SteeringSystem.init(allocator);
+    defer system.deinit();
+    const measured = try measureCase(allocator, io, options, case, item_count, &system, fixture.agents.items.len, null, &fixture, prepareLevels, levelsOnce);
+    const selected = measured.last.selected_intent_count;
+    if (selected != item_count * levels_agents_per_cell) return error.AgentIntentMissing;
+    if (measured.last.perf.agent_candidate_checks != selected * (levels_agents_per_cell - 1)) return error.LevelChecksNotFlat;
+    if (measured.last.perf.agent_neighbor_samples != 0) return error.LevelSamplesNotFlat;
+    var stats = measured.stats;
+    stats.candidate_pairs = measured.last.perf.agent_candidate_checks;
+    stats.sample_count = measured.last.perf.agent_neighbor_samples;
+    return stats;
+}
+
 fn runLayoutCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, layout: Layout) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var fixture = try createFixture(allocator, item_count, layout);
+    var fixture = try createFixture(allocator, io, item_count, layout);
     defer fixture.deinit(allocator);
     var system = SteeringSystem.init(allocator);
     defer system.deinit();
@@ -261,20 +421,20 @@ const MeasuredCase = struct {
 // Off-main time of one steering step's stages.
 fn stagesOffMainNs(stats: SteeringStats) u64 {
     return offMainNs(stats.perf.agents_batch) + offMainNs(stats.perf.select_resolve_batch) + offMainNs(stats.perf.select_claim_batch) + offMainNs(stats.perf.directions_batch) +
-        offMainNs(stats.perf.grid_bucket_batch) + offMainNs(stats.perf.grid_sort_batch) + offMainNs(stats.perf.batch);
+        offMainNs(stats.perf.batch);
 }
 
-// The steering step's stages, each under its own tuner, in run order: the six prepare
+// The steering step's stages, each under its own tuner, in run order: the four prepare
 // stages, then the avoidance pass (`steer`, the row's batch).
-const stage_names = [_][]const u8{ "agents", "resolve", "claim", "dir", "bucket", "sort", "steer" };
+const stage_names = [_][]const u8{ "agents", "resolve", "claim", "dir", "steer" };
 
 fn stageTuners(system: *const SteeringSystem) [stage_names.len]*const AdaptiveWorkTuner {
-    return .{ &system.agents_tuner, &system.select_resolve_tuner, &system.select_claim_tuner, &system.directions_tuner, &system.grid_bucket_tuner, &system.grid_sort_tuner, &system.adaptive_tuner };
+    return .{ &system.agents_tuner, &system.select_resolve_tuner, &system.select_claim_tuner, &system.directions_tuner, &system.adaptive_tuner };
 }
 
 fn stageBatches(stats: SteeringStats) [stage_names.len]BatchStats {
     const perf = stats.perf;
-    return .{ perf.agents_batch, perf.select_resolve_batch, perf.select_claim_batch, perf.directions_batch, perf.grid_bucket_batch, perf.grid_sort_batch, perf.batch };
+    return .{ perf.agents_batch, perf.select_resolve_batch, perf.select_claim_batch, perf.directions_batch, perf.batch };
 }
 
 // Every tuner a measured step can run: the steering system's, and the commit seam's when the
@@ -284,19 +444,6 @@ fn stepTunerSettle(system: *const SteeringSystem, seam: ?*const SeamFixture) sui
     census.addAll(SteeringSystem, system, "");
     if (seam) |fixture| fixtures.addSeamTuners(&census, &fixture.seam.pipeline);
     return census;
-}
-
-// Entries in the agent grid's largest band after the last step.
-fn largestGridBand(system: *const SteeringSystem) usize {
-    const grid = &system.agent_grid;
-    const band_count: usize = if (grid.splitter_count == 0) 1 else grid.bands.len;
-    var largest: usize = 0;
-    for (grid.bands[0..band_count]) |band| {
-        var entries: usize = 0;
-        for (system.agent_cell_ranges.items[band.start..][0..band.range_count]) |range| entries += range.end - range.start;
-        largest = @max(largest, entries);
-    }
-    return largest;
 }
 
 // Warms up, settles the stage tuners, and times `step(context)` of `system` over
@@ -351,12 +498,10 @@ fn measureCase(
         shapes.add(stageBatches(last_stats));
         if (seam) |fixture| seam_shapes.add(fixtures.seamBatches(&fixture.seam.pipeline));
         try suite.checkStagesDispatched(case, thread_ptr, element_range, &.{
-            last_stats.perf.agents_batch,      last_stats.perf.select_resolve_batch, last_stats.perf.directions_batch,
-            last_stats.perf.grid_bucket_batch, last_stats.perf.batch,
+            last_stats.perf.agents_batch, last_stats.perf.select_resolve_batch, last_stats.perf.directions_batch, last_stats.perf.batch,
         });
-        try suite.checkStagesDispatched(case, thread_ptr, band_range, &.{ last_stats.perf.select_claim_batch, last_stats.perf.grid_sort_batch });
+        try suite.checkStagesDispatched(case, thread_ptr, band_range, &.{last_stats.perf.select_claim_batch});
         try suite.checkFixedRangeCount(case, thread_ptr, band_range, last_stats.perf.select_claim_batch);
-        try suite.checkFixedRangeCount(case, thread_ptr, band_range, last_stats.perf.grid_sort_batch);
     }
 
     var stats = accumulator.finish();
@@ -367,9 +512,6 @@ fn measureCase(
         .select_resolve = suite.batchSummaryFromShapes(&shapes, 1),
         .select_claim = suite.batchSummaryFromShapes(&shapes, 2),
         .directions = suite.batchSummaryFromShapes(&shapes, 3),
-        .grid_bucket = suite.batchSummaryFromShapes(&shapes, 4),
-        .grid_sort = suite.batchSummaryFromShapes(&shapes, 5),
-        .band_max = largestGridBand(system),
     };
     if (seam != null) seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
@@ -384,6 +526,14 @@ fn measureCase(
 fn prepareOnce(fixture: *Fixture) !void {
     fixture.frame.beginStep();
     try appendNavigationIntents(&fixture.frame, fixture.agents.items);
+    try rebuildAgentIndex(&fixture.index, &fixture.index_threads, &fixture.data, fixture.index_geometry);
+}
+
+fn rebuildAgentIndex(index: *SpatialIndexSystem, threads: *ThreadSystem, data: *const DataSystem, geometry: IndexGeometry) !void {
+    _ = try index.build(data, .{ .entities = data.steeringAgentSliceConst().entities }, geometry, threads, .{
+        .cell_size = nav_cell_size,
+        .max_worker_threads = 0,
+    });
 }
 
 // One steering step; fails when an agent writes no movement intent.
@@ -393,7 +543,7 @@ fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSys
     return stats;
 }
 
-// The band stages' (claim, grid sort) fixed partition: one band per range.
+// The claim stage's fixed partition: one band per range.
 const band_partition_items: usize = 1;
 
 // The band stages' range control for `case`: the range modes scale from one band.
@@ -403,7 +553,7 @@ fn bandItemsPerRange(case: suite.BenchmarkCase) ?usize {
 
 // The steering update for `case` over the step's navigation intents.
 fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
-    return try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, .{
+    return try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, fixture.index.view(), .{
         .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
         .band_items_per_range = bandItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
@@ -497,6 +647,8 @@ const SeamFixture = struct {
     world: WorldSystem,
     seam: fixtures.PipelineSeam,
     agents: std.ArrayList(EntityId),
+    // Inline threads for the untimed index build. The timed step only queries.
+    index_threads: ThreadSystem,
     // The last commit seam's collider sync and nav reaction worker time.
     seam_off_main_ns: u64 = 0,
 
@@ -518,15 +670,19 @@ const SeamFixture = struct {
         // One participant, as the pathfinding capacity: the builds run inline.
         var build_threads = try fixtures.initRequiredCaseThreads(allocator, io, suite.serial_cases[0]);
         defer build_threads.deinit();
-        const seam = try fixtures.PipelineSeam.init(allocator, &owned_data, &world, .{
+        var seam = try fixtures.PipelineSeam.init(allocator, &owned_data, &world, .{
             .structural_headroom = structural_headroom,
             .pathfinding = .{ .max_group_fields = 4, .worker_participant_count = 1 },
             .build_thread_system = &build_threads,
         });
-        return .{ .data = owned_data, .world = world, .seam = seam, .agents = owned_agents };
+        errdefer seam.deinit();
+        var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+        errdefer index_threads.deinit();
+        return .{ .data = owned_data, .world = world, .seam = seam, .agents = owned_agents, .index_threads = index_threads };
     }
 
     fn deinit(self: *SeamFixture, allocator: std.mem.Allocator) void {
+        self.index_threads.deinit();
         self.agents.deinit(allocator);
         self.seam.deinit();
         self.world.deinit();
@@ -549,12 +705,13 @@ const SeamFixture = struct {
     fn prepare(self: *SeamFixture) !void {
         self.seam.frame.beginStep();
         try appendNavigationIntents(&self.seam.frame, self.agents.items);
+        try rebuildAgentIndex(&self.seam.pipeline.spatial_index, &self.index_threads, &self.data, IndexGeometry.ofWorld(&self.world));
     }
 
     // The pipeline's steering update for `case` over the step's navigation intents.
     fn step(self: *SeamFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
         const pipeline = &self.seam.pipeline;
-        return try pipeline.steering.update(&self.data, &self.seam.frame, thread_system, &pipeline.pathfinding, &pipeline.static_colliders, .{
+        return try pipeline.steering.update(&self.data, &self.seam.frame, thread_system, &pipeline.pathfinding, &pipeline.static_colliders, pipeline.spatial_index.view(), .{
             .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
             .band_items_per_range = bandItemsPerRange(case),
             .max_worker_threads = case.maxWorkerThreads(),
@@ -894,7 +1051,17 @@ fn writeSteeringWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: su
     if (view == .summary) return;
     try writer.writeByte(' ');
     try suite.writeSteeringStages(writer, stats);
-    try writer.print(" band_max={}", .{(stats.steering_stages orelse suite.SteeringStageSummary{}).band_max});
+    try writeSteerShape(writer, stats);
+}
+
+fn writeLevelsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    const selected = stats.output_count;
+    const checks_per = if (selected == 0) 0 else stats.candidate_pairs / selected;
+    const samples_per = if (selected == 0) 0 else stats.sample_count / selected;
+    try writer.print("avoidance_checks={} samples={} per_intent_checks={} per_intent_samples={}", .{ stats.candidate_pairs, stats.sample_count, checks_per, samples_per });
+    if (view == .summary) return;
+    try writer.writeByte(' ');
+    try suite.writeSteeringStages(writer, stats);
     try writeSteerShape(writer, stats);
 }
 

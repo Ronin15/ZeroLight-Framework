@@ -133,6 +133,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     steering.shuffled_group,
     steering.corridor_group,
     steering.cluster_outlier_group,
+    steering.levels_group,
     steering.static_change_group,
     steering.static_dense_group,
     thread_dispatch.group,

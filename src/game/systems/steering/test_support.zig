@@ -14,16 +14,45 @@ const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const BoxHits = @import("../static_colliders.zig").BoxHits;
+const IndexGeometry = @import("../spatial_index.zig").IndexGeometry;
+const SpatialIndexSystem = @import("../spatial_index.zig").SpatialIndexSystem;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const SteeringStats = @import("system.zig").SteeringStats;
 const SteeringSystem = @import("system.zig").SteeringSystem;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 
-/// `SteeringSystem.update` inline as one range: a thread system with no workers.
-pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, frame: *SimulationFrame, pathfinding: *const PathfindingSystem, colliders: *const StaticColliderSystem) !SteeringStats {
+// Tile 32, chunk 16, 16×16 chunks, 16 levels, cell 32: covers the steering fixtures,
+// including selection rows spaced at 200.
+const steered_index_geometry = IndexGeometry{
+    .tile_size = 32,
+    .chunk_size_tiles = 16,
+    .chunks_x = 16,
+    .chunks_y = 16,
+    .level_count = 16,
+};
+
+/// The inline-built index of every steering agent of `data`, on `std.testing.allocator`.
+/// No halo filter: the fixtures have no AI rows. The caller keeps it alive across `update`.
+pub fn buildSteeredIndex(data: *const DataSystem) !SpatialIndexSystem {
+    var index = SpatialIndexSystem.init(std.testing.allocator);
+    errdefer index.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    return steering.update(data, frame, &threads, pathfinding, colliders, .{});
+    _ = try index.build(data, .{ .entities = data.steeringAgentSliceConst().entities }, steered_index_geometry, &threads, .{
+        .cell_size = 32,
+        .max_worker_threads = 0,
+    });
+    return index;
+}
+
+/// `SteeringSystem.update` inline as one range: a thread system with no workers. Builds
+/// the shared index first; that system outlives the update.
+pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, frame: *SimulationFrame, pathfinding: *const PathfindingSystem, colliders: *const StaticColliderSystem) !SteeringStats {
+    var index = try buildSteeredIndex(data);
+    defer index.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    return steering.update(data, frame, &threads, pathfinding, colliders, index.view(), .{});
 }
 
 // An intent for `agent` (the `agent_index`th) whose direct direction is unique to the

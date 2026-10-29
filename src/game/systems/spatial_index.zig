@@ -222,6 +222,8 @@ pub const SpatialIndexView = struct {
     /// Entry-order columns: a visit's entry index reads them.
     x: []const f32,
     y: []const f32,
+    /// `0` when the indexed body has no steering component.
+    agent_radius: []const f32,
     entity_index: []const u32,
     entity_generation: []const u32,
     /// The population row each entry was indexed from.
@@ -872,6 +874,8 @@ const SlotRow = struct {
     population_row: u32,
     x: f32,
     y: f32,
+    // `0` when the slot's entity has no steering component.
+    agent_radius: f32,
     level: u16,
     faction: Faction,
     cognition_phase: u8,
@@ -880,6 +884,8 @@ const SlotRow = struct {
 const EntryRow = struct {
     x: f32,
     y: f32,
+    // `0` when the indexed body has no steering component.
+    agent_radius: f32,
     entity_index: u32,
     entity_generation: u32,
     population_row: u32,
@@ -897,8 +903,8 @@ fn sortKeyOf(key: SortKey) SortKey {
 }
 
 comptime {
-    // The cognition phase sits in the row's padding.
-    std.debug.assert(@sizeOf(SlotRow) == 24);
+    // The radius keeps the packed row at 28 bytes; 16 of them still fill whole cache lines.
+    std.debug.assert(@sizeOf(SlotRow) == 28);
     std.debug.assert(spatial_index_range_alignment_items * @sizeOf(SlotRow) % thread_shared_record_alignment == 0);
     std.debug.assert(spatial_index_range_alignment_items * @sizeOf(SortKey) % thread_shared_record_alignment == 0);
 }
@@ -1031,6 +1037,7 @@ pub const SpatialIndexSystem = struct {
         return .{
             .x = entries.items(.x),
             .y = entries.items(.y),
+            .agent_radius = entries.items(.agent_radius),
             .entity_index = entries.items(.entity_index),
             .entity_generation = entries.items(.entity_generation),
             .population_row = entries.items(.population_row),
@@ -1227,6 +1234,9 @@ pub const SpatialIndexSystem = struct {
             .population = population,
             .data = data,
             .movement = data.movementBodySliceConst(),
+            .agent_radii = data.steeringAgentSliceConst().agent_radii,
+            .levels = data.worldLevelSliceConst().levels,
+            .factions = data.factions.rows.slice().items(.faction),
             .stagger_phase = scope.stagger_phase,
             .always_active = scope.always_active,
             .grid = self.grid,
@@ -1249,6 +1259,7 @@ pub const SpatialIndexSystem = struct {
             .slot_rows = self.slot_rows.items,
             .entry_x = entries.items(.x),
             .entry_y = entries.items(.y),
+            .entry_agent_radius = entries.items(.agent_radius),
             .entry_entity_index = entries.items(.entity_index),
             .entry_entity_generation = entries.items(.entity_generation),
             .entry_population_row = entries.items(.population_row),
@@ -1291,6 +1302,10 @@ const FillContext = struct {
     population: IndexPopulation,
     data: *const DataSystem,
     movement: ConstMovementBodySlice,
+    // Captured once: the slot resolve reads them by the one resolved slot's indices.
+    agent_radii: []const f32,
+    levels: []const u16,
+    factions: []const Faction,
     // The movement store's scope columns, by body.
     stagger_phase: []const u8,
     always_active: []const bool,
@@ -1298,19 +1313,39 @@ const FillContext = struct {
     // Written at the filled slots only.
     slot_rows: []SlotRow,
 
-    // Scalar: one dense-index point lookup per slot, with a skip.
+    // Scalar: one slot resolve per population slot, with a skip. The radius is the steering
+    // column at that slot's dense index, or `0` when the body has no steering component.
     fn resolveSlot(self: *const FillContext, slot: usize) SlotRow {
         const entity = self.population.entity(slot);
         const population_row = self.population.row(slot);
-        const row: SlotRow = if (self.data.bodyLevelFaction(entity)) |found| .{
+        const absent = SlotRow{
+            .entity = EntityId.invalid,
+            .population_row = population_row,
+            .x = 0,
+            .y = 0,
+            .agent_radius = 0,
+            .level = 0,
+            .faction = .neutral,
+            .cognition_phase = 0,
+        };
+        const found = self.data.resolveSlotConst(entity) orelse {
+            self.slot_rows[slot] = absent;
+            return absent;
+        };
+        const movement_body = found.movement_body_index orelse {
+            self.slot_rows[slot] = absent;
+            return absent;
+        };
+        const row = SlotRow{
             .entity = entity,
             .population_row = population_row,
-            .x = self.movement.previous_x[found.movement_body],
-            .y = self.movement.previous_y[found.movement_body],
-            .level = found.level orelse 0,
-            .faction = found.faction orelse .neutral,
-            .cognition_phase = cognitionPhase(self.always_active[found.movement_body], self.stagger_phase[found.movement_body]),
-        } else .{ .entity = EntityId.invalid, .population_row = population_row, .x = 0, .y = 0, .level = 0, .faction = .neutral, .cognition_phase = 0 };
+            .x = self.movement.previous_x[movement_body],
+            .y = self.movement.previous_y[movement_body],
+            .agent_radius = if (found.steering_agent_index) |index| self.agent_radii[index] else 0,
+            .level = if (found.world_level_index) |index| self.levels[index] else 0,
+            .faction = if (found.faction_index) |index| self.factions[index] else .neutral,
+            .cognition_phase = cognitionPhase(self.always_active[movement_body], self.stagger_phase[movement_body]),
+        };
         self.slot_rows[slot] = row;
         return row;
     }
@@ -1437,6 +1472,7 @@ const BandWriter = struct {
     slot_rows: []const SlotRow,
     entry_x: []f32,
     entry_y: []f32,
+    entry_agent_radius: []f32,
     entry_entity_index: []u32,
     entry_entity_generation: []u32,
     entry_population_row: []u32,
@@ -1475,6 +1511,7 @@ const BandWriter = struct {
             const row = self.slot_rows[keySlot(self.keys[index])];
             self.entry_x[index] = row.x;
             self.entry_y[index] = row.y;
+            self.entry_agent_radius[index] = row.agent_radius;
             self.entry_entity_index[index] = row.entity.index;
             self.entry_entity_generation[index] = row.entity.generation;
             self.entry_population_row[index] = row.population_row;
@@ -1912,6 +1949,7 @@ fn testSplitters(set: TestSplitters, cell_keys: []const SortKey) [band_count - 1
 const TestCapture = struct {
     x: std.ArrayList(f32) = .empty,
     y: std.ArrayList(f32) = .empty,
+    agent_radius: std.ArrayList(f32) = .empty,
     entity_index: std.ArrayList(u32) = .empty,
     entity_generation: std.ArrayList(u32) = .empty,
     population_row: std.ArrayList(u32) = .empty,
@@ -1930,6 +1968,7 @@ const TestCapture = struct {
         const index = system.view();
         try copy.x.appendSlice(testing.allocator, index.x);
         try copy.y.appendSlice(testing.allocator, index.y);
+        try copy.agent_radius.appendSlice(testing.allocator, index.agent_radius);
         try copy.entity_index.appendSlice(testing.allocator, index.entity_index);
         try copy.entity_generation.appendSlice(testing.allocator, index.entity_generation);
         try copy.population_row.appendSlice(testing.allocator, index.population_row);
@@ -1965,6 +2004,7 @@ const TestCapture = struct {
         self.population_row.deinit(testing.allocator);
         self.entity_generation.deinit(testing.allocator);
         self.entity_index.deinit(testing.allocator);
+        self.agent_radius.deinit(testing.allocator);
         self.y.deinit(testing.allocator);
         self.x.deinit(testing.allocator);
     }
@@ -1990,6 +2030,7 @@ fn expectIndexMatches(system: *const SpatialIndexSystem, reference: *const TestC
     defer actual.deinit();
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.x.items), std.mem.sliceAsBytes(index.x));
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.y.items), std.mem.sliceAsBytes(index.y));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.agent_radius.items), std.mem.sliceAsBytes(index.agent_radius));
     try testing.expectEqualSlices(u32, reference.entity_index.items, index.entity_index);
     try testing.expectEqualSlices(u32, reference.entity_generation.items, index.entity_generation);
     try testing.expectEqualSlices(u32, reference.population_row.items, index.population_row);
