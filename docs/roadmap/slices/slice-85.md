@@ -149,7 +149,10 @@ keeps the apply local.
       `src/game/systems/steering/` (selection, directions, avoidance, the
       movement-intent write), `systems/movement.zig`, `systems/particle.zig`,
       and the `data_system/movement.zig` and `data_system/agents.zig` stores.
-      Each finding becomes an item here.
+      Each finding becomes an item here. The two `validateAiAgent` gaps
+      (`last_score`, `commitment_remaining`) are recorded on the AI branch
+      findings in `docs/framework-implementation-slices.md`, not items here.
+      `stuck_step_threshold` stays here.
 - [ ] `buildAgentGridDirect` (`steering/agent_grid.zig:49`) is a separate
       no-worker entry from `buildAgentGrid` (`.grok/rules/tests-benchmarks.md`
       § Test and production code, point 1). If this slice keeps the grid it is

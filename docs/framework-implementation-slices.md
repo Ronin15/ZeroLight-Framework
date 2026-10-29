@@ -338,7 +338,10 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      `world/terrain`, `dig_controller`.
    - AI branch: `ai`, `ai_memory`, `affect`, `perception`, `arbitration`,
      `sensory_bus`, `ai_archetypes`, `ai_debug_overlay`, `world/interest`, and
-     the AI stores.
+     the AI stores. Slice 85's subsystem check (2026-10-29) routed two
+     validator gaps on the AI store here; they are under AI findings below.
+     `stuck_step_threshold` in the same file is a steering tunable and stays
+     on 85.
    - Item 4: states and menus, `audio_controller`, `player`, `src/app` apart
      from `ThreadSystem`, `src/assets`, `src/platform`.
 
@@ -390,6 +393,14 @@ writes the findings into slice checklists or new slice files.
   - **Affect decay:** counted per think, not per elapsed step (73).
 - **Open question:** whether crowds converging on one goal share path work
   through the goal-keyed cache or need the group field (73).
+- **AI store validators** (slice 85's subsystem check, 2026-10-29; derived,
+  not benched). `validateAiAgent` (`src/game/data_system/agents.zig`)
+  finite-checks and caps each gain and caps `commitment_max_steps`, and does
+  not finite-check `last_score` or cap `commitment_remaining`. A non-finite
+  `last_score`, or a `commitment_remaining` above
+  `max_ai_commitment_max_steps`, is stored and read by arbitration
+  (`.grok/rules/zig-style.md` § Errors and resources). Open when this branch
+  starts. `stuck_step_threshold` beside it is steering and stays on slice 85.
 
 ## Deferred By Owner
 
