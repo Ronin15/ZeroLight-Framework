@@ -80,22 +80,12 @@ const StructuralCapacityNeeds = struct {
         };
     }
 
-    fn validateLimits(self: StructuralCapacityNeeds) !void {
-        if (self.slots > std.math.maxInt(u32)) return error.TooManyEntities;
-        if (self.movement_bodies > std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
-        if (self.facings > std.math.maxInt(u32)) return error.TooManyFacingRows;
-        if (self.primitive_visuals > std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
-        if (self.asset_refs > std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
-        if (self.collision_bounds > std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
-        if (self.collision_responses > std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
-        if (self.ai_agents > std.math.maxInt(u32)) return error.TooManyAiAgentRows;
-        if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
-        if (self.world_levels > std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
-        if (self.factions > std.math.maxInt(u32)) return error.TooManyFactionRows;
-        if (self.ai_perceptions > std.math.maxInt(u32)) return error.TooManyAiPerceptionRows;
-        if (self.ai_memories > std.math.maxInt(u32)) return error.TooManyAiMemoryRows;
-        if (self.ai_affects > std.math.maxInt(u32)) return error.TooManyAiAffectRows;
-        if (self.destructibles > std.math.maxInt(u32)) return error.TooManyDestructibleRows;
+    // `u32` row indices: a projection past one fails at the growth seam as `OutOfMemory`,
+    // before any write.
+    fn validateLimits(self: StructuralCapacityNeeds) error{OutOfMemory}!void {
+        inline for (@typeInfo(StructuralCapacityNeeds).@"struct".field_names) |name| {
+            if (@field(self, name) > std.math.maxInt(u32)) return error.OutOfMemory;
+        }
     }
 };
 
@@ -349,7 +339,7 @@ fn commitStructuralCommands(
         switch (command) {
             .create_entity => |template| {
                 const entity = try self.createEntity();
-                errdefer _ = self.destroyEntity(entity);
+                errdefer self.destroyCreatedEntity(entity);
                 stats.components_set += try applyTemplateComponents(self, entity, template);
                 stats.created += 1;
                 change_sink.record(.{ .entity_created = entity });
@@ -360,7 +350,7 @@ fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
                 // Capture plane before destroy: world_level row is removed with the entity.
                 const level = self.worldLevelConst(entity) orelse 0;
-                if (self.destroyEntity(entity)) {
+                if (try self.destroyEntity(entity)) {
                     stats.destroyed += 1;
                     change_sink.record(.{ .entity_destroyed = .{
                         .entity = entity,
@@ -584,6 +574,10 @@ pub fn preflightStructuralCommands(
     }
 
     try projection.required.validateLimits();
+    // Each command records at most two allow ids (a removal and its landed tail,
+    // or a create's errdefer removal). Tier changes record one. Commit then appends
+    // without allocating.
+    try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + commands.len * 2);
     const plan = StructuralCommitPlan{
         .command_count = commands.len,
         .capacity_needs = projection.required,
@@ -772,43 +766,16 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
     return components_set;
 }
 
-test "StructuralCapacityNeeds.validateLimits rejects an ai_perceptions count beyond u32" {
-    // Growing PerceptionStore to u32-max rows is impractical to exercise for
-    // real, so this proves the guard directly against the private capacity
-    // struct rather than via an actual oversized store.
+test "StructuralCapacityNeeds.validateLimits fails every store's count beyond u32 as OutOfMemory" {
+    // Growing a store to u32-max rows is impractical to exercise for real, so this proves
+    // the guard directly against the private capacity struct, one count at a time.
     var needs = std.mem.zeroes(StructuralCapacityNeeds);
     try needs.validateLimits();
-
-    needs.ai_perceptions = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.TooManyAiPerceptionRows, needs.validateLimits());
-}
-
-test "StructuralCapacityNeeds.validateLimits rejects an ai_memories count beyond u32" {
-    // Growing AiMemoryStore to u32-max rows is impractical to exercise for
-    // real, so this proves the guard directly against the private capacity
-    // struct rather than via an actual oversized store.
-    var needs = std.mem.zeroes(StructuralCapacityNeeds);
-    try needs.validateLimits();
-
-    needs.ai_memories = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.TooManyAiMemoryRows, needs.validateLimits());
-}
-
-test "StructuralCapacityNeeds.validateLimits rejects an ai_affects count beyond u32" {
-    // Growing AiAffectStore to u32-max rows is impractical to exercise for
-    // real, so this proves the guard directly against the private capacity
-    // struct rather than via an actual oversized store.
-    var needs = std.mem.zeroes(StructuralCapacityNeeds);
-    try needs.validateLimits();
-
-    needs.ai_affects = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.TooManyAiAffectRows, needs.validateLimits());
-}
-
-test "StructuralCapacityNeeds.validateLimits rejects a destructibles count beyond u32" {
-    var needs = std.mem.zeroes(StructuralCapacityNeeds);
-    try needs.validateLimits();
-
-    needs.destructibles = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.TooManyDestructibleRows, needs.validateLimits());
+    inline for (@typeInfo(StructuralCapacityNeeds).@"struct".field_names) |name| {
+        var over = needs;
+        @field(over, name) = std.math.maxInt(u32);
+        try over.validateLimits();
+        @field(over, name) = @as(usize, std.math.maxInt(u32)) + 1;
+        try std.testing.expectError(error.OutOfMemory, over.validateLimits());
+    }
 }

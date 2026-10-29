@@ -14,13 +14,15 @@ const StateTransitions = @import("state.zig").StateTransitions;
 const UpdateContext = @import("state.zig").UpdateContext;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 const c = @import("../platform/sdl.zig").c;
+const state_policy = @import("state.zig").state_policy;
+const state_test_support = @import("state_test_support.zig");
 
 /// PauseController owns user-initiated (.pause / P) and window-policy (hidden/minimized,
 /// swapchain-blocked) pause entry/exit + source tracking.
 ///
 /// Only enters (user or policy) and notifies via pauseActive when states.isGameplayActive().
 /// This restricts PauseState overlay + onPause (e.g. GameDemoState interp sync for movement/particles)
-/// exclusively to active game states installed via replaceGameplay / state_policy.gameplay.
+/// exclusively to active game states installed under `state_policy.gameplay`.
 /// Non-gameplay states (MainMenu opaque_screen, Settings modal_overlay, any future HUD pass-through)
 /// never receive onPause from the pause flow, and PauseState is never pushed over them.
 ///
@@ -188,7 +190,7 @@ test "pause controller enter and exit are idempotent" {
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns * 2;
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count });
+    _ = try state_test_support.replaceState(&states, TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count }, state_policy.gameplay);
     var pause = PauseController.init(800, 450);
 
     try pause.enterUser(&states, &input, &time_loop, 10);
@@ -260,7 +262,7 @@ test "pause enter clears held dig so dig cannot stick across pause" {
     var time_loop = TimeLoop.init(0);
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(TestingState, .{});
+    _ = try state_test_support.replaceState(&states, TestingState, .{}, state_policy.gameplay);
     var pause = PauseController.init(800, 450);
 
     try pause.enterUser(&states, &input, &time_loop, 10);
@@ -307,7 +309,7 @@ test "pause controller applies forced pause policy once" {
     var time_loop = TimeLoop.init(0);
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(TestingState, .{});
+    _ = try state_test_support.replaceState(&states, TestingState, .{}, state_policy.gameplay);
     var pause = PauseController.init(800, 450);
     const policy = FramePolicy{
         .can_render = false,
@@ -365,7 +367,7 @@ test "pause controller exits only policy-owned pause when window restores" {
     var time_loop = TimeLoop.init(0);
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count });
+    _ = try state_test_support.replaceState(&states, TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count }, state_policy.gameplay);
     var pause = PauseController.init(800, 450);
 
     try pause.applyWindowPolicy(.{
@@ -432,13 +434,13 @@ test "pause controller clears stale handle after stack replacement" {
     var time_loop = TimeLoop.init(0);
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(TestingState, .{});
+    _ = try state_test_support.replaceState(&states, TestingState, .{}, state_policy.gameplay);
     var pause = PauseController.init(800, 450);
 
     try pause.enterUser(&states, &input, &time_loop, 10);
     try std.testing.expect(pause.isPaused());
 
-    _ = try states.replaceGameplay(TestingState, .{});
+    _ = try state_test_support.replaceState(&states, TestingState, .{}, state_policy.gameplay);
     pause.reconcileWithStateStack(&states);
 
     try std.testing.expect(!pause.isPaused());
@@ -487,7 +489,7 @@ test "enterUser from opaque non-gameplay is no-op (no push, no count++, !isPause
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
     // Non-gameplay top (opaque_screen policy, as used for MainMenu bootstrap).
-    _ = try states.pushOpaque(TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count });
+    _ = try state_test_support.pushState(&states, TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count }, state_policy.opaque_screen);
     var pause = PauseController.init(800, 450);
 
     try pause.enterUser(&states, &input, &time_loop, 10);
@@ -540,7 +542,7 @@ test "policy enter (applyWindowPolicy) is also gated by isGameplayActive (no-op 
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
     // Start as menu-like opaque non-gameplay.
-    _ = try states.pushOpaque(TestingState, .{ .pause_count = &pause_count });
+    _ = try state_test_support.pushState(&states, TestingState, .{ .pause_count = &pause_count }, state_policy.opaque_screen);
     var pause = PauseController.init(800, 450);
 
     const policy_pause = FramePolicy{
@@ -557,7 +559,7 @@ test "policy enter (applyWindowPolicy) is also gated by isGameplayActive (no-op 
     try std.testing.expectEqual(@as(u32, 0), pause_count);
 
     // Now launch gameplay (replace), policy pause should take effect.
-    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count });
+    _ = try state_test_support.replaceState(&states, TestingState, .{ .pause_count = &pause_count }, state_policy.gameplay);
     try pause.applyWindowPolicy(policy_pause, &states, &input, &time_loop, 30);
     try std.testing.expect(pause.isPaused());
     try std.testing.expect(pause.isPolicyPaused());
@@ -606,7 +608,7 @@ test "pause enter does not mutate gameplay when modal allocation fails" {
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns;
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count });
+    _ = try state_test_support.replaceState(&states, TestingState, .{ .pause_count = &pause_count }, state_policy.gameplay);
     var pause = PauseController.init(800, 450);
 
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });

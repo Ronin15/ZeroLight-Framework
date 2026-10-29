@@ -146,11 +146,6 @@ pub const WorldTilesetMeta = struct {
         return jsonTileToEntry(self.parsed.value.tiles[index]);
     }
 
-    pub fn sourceRectByName(self: WorldTilesetMeta, tile_name: []const u8) ?manifest.SourceRect {
-        const id = self.name_to_id.get(tile_name) orelse return null;
-        return self.sourceRectForId(id);
-    }
-
     pub fn sourceRectForId(self: WorldTilesetMeta, id: u16) ?manifest.SourceRect {
         const index = self.id_to_index.get(id) orelse return null;
         return sourceRectFromTile(self.parsed.value.tiles[index]);
@@ -162,11 +157,6 @@ pub const WorldTilesetMeta = struct {
         const id = self.name_to_id.get(tile_name) orelse return null;
         const index = self.id_to_index.get(id) orelse return null;
         return jsonTileToEntry(self.parsed.value.tiles[index]);
-    }
-
-    /// Returned animation slices are valid until this meta object is deinitialized.
-    pub fn animationByName(self: WorldTilesetMeta, animation_name: []const u8) ?TileAnimation {
-        return self.animations.get(animation_name);
     }
 };
 
@@ -207,23 +197,6 @@ pub fn load(
 ) !WorldTilesetMeta {
     const loaded = try atlas_meta_common.readJsonAsset(allocator, asset_store, metadata_path, 4 * 1024 * 1024, JsonRoot);
     return finishLoad(allocator, loaded.bytes, loaded.parsed, .world_tileset);
-}
-
-pub fn parse(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-    linked_sprite_id: ?manifest.SpriteAssetId,
-) !WorldTilesetMeta {
-    const owned = try allocator.dupe(u8, bytes);
-
-    const parsed = std.json.parseFromSlice(JsonRoot, allocator, owned, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        allocator.free(owned);
-        return err;
-    };
-
-    return finishLoad(allocator, owned, parsed, linked_sprite_id);
 }
 
 fn finishLoad(
@@ -320,12 +293,12 @@ test "world tileset metadata resolves source rects by filename" {
     try std.testing.expect(meta.rows() > 0);
     try std.testing.expectEqual(meta.tileCount(), meta.parsed.value.tiles.len);
 
-    const grass = meta.sourceRectByName("grass") orelse return error.TestExpectedEqual;
+    const grass = meta.sourceRectForId(meta.name_to_id.get("grass") orelse return error.TestExpectedEqual) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(f32, 0), grass.x);
     try std.testing.expectEqual(@as(f32, 0), grass.y);
     try std.testing.expectEqual(required_tile_size, grass.w);
 
-    const water = meta.sourceRectByName("water_1") orelse return error.TestExpectedEqual;
+    const water = meta.sourceRectForId(meta.name_to_id.get("water_1") orelse return error.TestExpectedEqual) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(required_tile_size, water.w);
     try std.testing.expect(meta.sourceRectForId(9999) == null);
 }
@@ -356,7 +329,7 @@ test "world tileset water animation resolves by name" {
     var meta = try load(std.testing.allocator, asset_store, metadata_path);
     defer meta.deinit();
 
-    const water = meta.animationByName("water") orelse return error.TestExpectedEqual;
+    const water = meta.animations.get("water") orelse return error.TestExpectedEqual;
 
     try std.testing.expect(water.tile_ids.len > 0);
     try std.testing.expect(water.frame_duration_ms > 0);
@@ -366,33 +339,44 @@ test "world tileset water animation resolves by name" {
     }
 }
 
-test "world tileset parse rejects invalid layout without leaking" {
+// Loads `json` through the production `load` from a temporary asset root.
+fn loadJsonForTest(json: []const u8) !WorldTilesetMeta {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "meta.json", .data = json });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const asset_store = @import("assets.zig").AssetStore.init(std.testing.allocator, std.testing.io, root);
+    return load(std.testing.allocator, asset_store, "meta.json");
+}
+
+test "world tileset load rejects invalid layout without leaking" {
     const json =
         \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/world_tileset.png","sprite_asset_id":"world_tileset","width":32,"height":32},"tile_size":16,"columns":1,"rows":1,"tile_count":0,"tiles":[]}
     ;
     try std.testing.expectError(
         atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch,
-        parse(std.testing.allocator, json, .world_tileset),
+        loadJsonForTest(json),
     );
 }
 
-test "world tileset parse rejects source rects that do not match grid position" {
+test "world tileset load rejects source rects that do not match grid position" {
     const json =
         \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/world_tileset.png","sprite_asset_id":"world_tileset","width":32,"height":32},"tile_size":32,"columns":1,"rows":1,"tile_count":1,"tiles":[{"id":0,"name":"x","category":"x","column":0,"row":0,"x":16,"y":0,"width":32,"height":32,"properties":{"layer":"ground","terrain":"x","walkable":true,"blocks_movement":false,"blocks_vision":false}}]}
     ;
     try std.testing.expectError(
         atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch,
-        parse(std.testing.allocator, json, .world_tileset),
+        loadJsonForTest(json),
     );
 }
 
-test "world tileset parse rejects oversized grid products without overflow" {
+test "world tileset load rejects oversized grid products without overflow" {
     const json =
         \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/world_tileset.png","sprite_asset_id":"world_tileset","width":1,"height":1},"tile_size":32,"columns":4294967295,"rows":4294967295,"tile_count":0,"tiles":[]}
     ;
     try std.testing.expectError(
         atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch,
-        parse(std.testing.allocator, json, .world_tileset),
+        loadJsonForTest(json),
     );
 }
 

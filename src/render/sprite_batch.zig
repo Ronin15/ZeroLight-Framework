@@ -8,7 +8,6 @@
 //! stage expands vertices.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 
@@ -18,6 +17,7 @@ const sprite_prep_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .smallest_range_items = 16,
 };
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../app/thread_system.zig").Dispatch;
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
 const logging = @import("../core/logging.zig");
@@ -28,7 +28,6 @@ const perf_diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const simd = @import("../core/simd.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 
 pub const TextureId = resources.TextureId;
 
@@ -134,6 +133,16 @@ pub const Position = [2]f32;
 pub const Uv = [2]f32;
 pub const VertexColor = [4]f32;
 
+/// Vertex emission's range alignment in prepared commands: each range spans whole cache lines
+/// of bytes in every vertex column, so neighbouring ranges share at most their boundary line.
+pub const sprite_prep_range_alignment_items: usize = 4;
+
+comptime {
+    for ([_]usize{ @sizeOf(Position), @sizeOf(Uv), @sizeOf(VertexColor) }) |vertex_bytes| {
+        std.debug.assert(sprite_prep_range_alignment_items * 6 * vertex_bytes % 64 == 0);
+    }
+}
+
 // Mutable column views threaded into vertex emission (workers write disjoint
 // ranges; the world builds 6-corner static spans).
 pub const VertexColumns = struct {
@@ -231,9 +240,9 @@ pub const TextureResolver = struct {
 
 pub const SpritePrepConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
 
 pub const SpritePrepStats = struct {
@@ -245,7 +254,10 @@ pub const SpritePrepStats = struct {
     /// 1 when this reserved frame's submits exceeded its command reservation
     /// (reservation drift), else 0. Always 0 in shipping builds (`ReservationDrift`).
     command_overflow_grows: usize = 0,
-    batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The emit batch, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (perf_diagnostics_enabled) struct { batch: BatchStats = .{} } else struct {};
 };
 
 /// Sprite-command reservation drift: a reserved frame whose submits exceed its command
@@ -283,10 +295,6 @@ const ReservationDrift = if (perf_diagnostics_enabled) struct {
         if (len > reservation) self.exceeded(len, reservation);
     }
 
-    inline fn lifetimeGrows(self: *const @This()) u64 {
-        return self.lifetime_grows;
-    }
-
     inline fn frameGrows(self: *const @This()) usize {
         return self.frame_grows;
     }
@@ -299,7 +307,7 @@ const ReservationDrift = if (perf_diagnostics_enabled) struct {
         if (self.frame_grows != 0) return;
         self.frame_grows = 1;
         self.lifetime_grows += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+        if (comptime logging.enabled(.warn)) {
             if (std.math.isPowerOfTwo(self.lifetime_grows))
                 logging.render.warn("sprite commands exceeded the frame reservation ({d} > {d}; {d} frames so far); reserveSpriteCommands bound is short", .{ count, reservation, self.lifetime_grows });
         }
@@ -308,9 +316,6 @@ const ReservationDrift = if (perf_diagnostics_enabled) struct {
     inline fn beginFrame(_: *@This()) void {}
     inline fn noteSubmit(_: *@This(), _: usize) void {}
     inline fn markReserved(_: *@This(), _: usize, _: usize) void {}
-    inline fn lifetimeGrows(_: *const @This()) u64 {
-        return 0;
-    }
     inline fn frameGrows(_: *const @This()) usize {
         return 0;
     }
@@ -387,15 +392,6 @@ pub const SpriteBatch = struct {
         self.reservation_drift.markReserved(command_reservation, self.commands.items.len);
     }
 
-    /// Lifetime diagnostic count of reserved frames whose submits exceeded the frame's
-    /// command reservation (`ReservationDrift`). Tracked only in Debug/ReleaseSafe
-    /// (`runtime_perf_log.enabled`); always 0 in ReleaseFast/ReleaseSmall. Not the perf
-    /// metric: `sprite_command_overflow_grows` records the per-frame
-    /// `SpritePrepStats.command_overflow_grows` (0 or 1) from `finishPrepStats`.
-    pub fn commandOverflowGrows(self: *const SpriteBatch) u64 {
-        return self.reservation_drift.lifetimeGrows();
-    }
-
     /// Cold geometric growth of the command list for one more submit (the same policy
     /// as a growing `append`), so the outcome never depends on growth history. Whether
     /// the growth is drift is decided against the reservation in `drawSprite`.
@@ -439,29 +435,12 @@ pub const SpriteBatch = struct {
         try self.draw_groups.ensureTotalCapacity(self.allocator, self.commands.items.len);
     }
 
-    pub fn buildSerial(self: *SpriteBatch, texture_resolver: TextureResolver) !void {
-        // `build` allocates via `ensureFrameStorage`; surface OutOfMemory/Overflow to the
-        // caller rather than folding a recoverable failure into ReleaseFast UB. Callers that
-        // have already reserved capacity should call `buildAssumeCapacity` directly.
-        _ = try self.build(texture_resolver, null, .{ .adaptive = false });
-    }
-
-    pub fn build(
-        self: *SpriteBatch,
-        texture_resolver: TextureResolver,
-        thread_system: ?*ThreadSystem,
-        prep_config: SpritePrepConfig,
-    ) !SpritePrepStats {
-        try self.ensureFrameStorage();
-        return self.buildAssumeCapacity(texture_resolver, thread_system, prep_config);
-    }
-
     /// Builds prepared vertices and draw groups without allocating. Callers must
     /// reserve storage for the current command count before entering this path.
     pub fn buildAssumeCapacity(
         self: *SpriteBatch,
         texture_resolver: TextureResolver,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
         prep_config: SpritePrepConfig,
     ) SpritePrepStats {
         _ = self.snapshotCommandsAssumeCapacity(texture_resolver);
@@ -499,7 +478,7 @@ pub const SpriteBatch = struct {
     /// currently thread-schedulable render-prep phase.
     pub fn emitVerticesAssumeCapacity(
         self: *SpriteBatch,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
         prep_config: SpritePrepConfig,
     ) BatchStats {
         const valid_count = self.prepared_commands.items.len;
@@ -515,47 +494,24 @@ pub const SpriteBatch = struct {
                 .uvs = self.uvs.items,
                 .colors = self.colors.items,
             };
-            // Worker jobs write disjoint vertex ranges derived from prepared
-            // command indices. Draw groups remain serial because they depend on
-            // ordered texture/presentation transitions.
-            if (thread_system) |threads| {
-                var system_config = prep_config;
-                if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
-                    system_config.adaptive_tuner = &self.adaptive_tuner;
-                }
-                // Pre-select so the job context can dual-assert range.index against
-                // the dispatched range count (mirror affect.zig / particle.zig).
-                // Mirrors parallelForWithOptions' adaptive_tuner fallback.
-                const selection = threads.selectBatchProfile(system_config.adaptive_tuner orelse &threads.adaptive_tuner, .{
-                    .item_count = valid_count,
-                    .items_per_range = system_config.items_per_range,
-                    .max_worker_threads = system_config.max_worker_threads,
-                    .range_alignment_items = 4,
-                    .adaptive = system_config.adaptive,
-                });
-                var context = SpritePrepJobContext{
-                    .commands = self.prepared_commands.items,
-                    .columns = columns,
-                    .range_count = selection.range_count,
-                };
-                // Align range boundaries to 4 commands (192/192/384 B per column,
-                // all divisible by 64) so no worker range straddles a cache line in
-                // any of the three columns — avoids false sharing on the seams.
-                batch = threads.parallelForWithOptions(valid_count, &context, writePreparedSpritesJob, .{
-                    .items_per_range = system_config.items_per_range,
-                    .max_worker_threads = system_config.max_worker_threads,
-                    .range_alignment_items = 4,
-                    .adaptive = system_config.adaptive,
-                    .adaptive_tuner = selection.active_tuner,
-                    .selected_profile = selection.profile,
-                });
-            } else {
-                fillPreparedRange(self.prepared_commands.items, columns, .{
-                    .start = 0,
-                    .end = valid_count,
-                });
-                batch = inlineBatch(valid_count, 1);
-            }
+            // Disjoint vertex ranges from prepared command indices. Inline runs
+            // this same job. Draw groups stay serial: they depend on ordered
+            // texture and presentation transitions.
+            const prep = Dispatch.init(thread_system, &self.adaptive_tuner, .{
+                .items_per_range = prep_config.items_per_range,
+                .batches_per_participant = prep_config.batches_per_participant,
+                .max_worker_threads = prep_config.max_worker_threads,
+                .adaptive = prep_config.adaptive,
+            });
+            // Pre-select so the job context can dual-assert range.index against
+            // the dispatched range count.
+            const selection = prep.select(valid_count, sprite_prep_range_alignment_items);
+            var context = SpritePrepJobContext{
+                .commands = self.prepared_commands.items,
+                .columns = columns,
+                .range_count = selection.range_count,
+            };
+            batch = prep.run(selection, valid_count, sprite_prep_range_alignment_items, &context, writePreparedSpritesJob);
         }
         return batch;
     }
@@ -572,7 +528,7 @@ pub const SpriteBatch = struct {
             .vertex_count = self.positions.items.len,
             .draw_group_count = self.draw_groups.items.len,
             .command_overflow_grows = self.reservation_drift.frameGrows(),
-            .batch = batch,
+            .perf = if (comptime perf_diagnostics_enabled) .{ .batch = batch } else .{},
         };
         return self.last_prep_stats;
     }
@@ -658,7 +614,7 @@ const SpritePrepJobContext = struct {
 fn writePreparedSpritesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpritePrepJobContext = @ptrCast(@alignCast(context));
     // Dual worker asserts (mirror affect.zig / particle.zig). Write-span bounds
-    // also live in fillPreparedRange (shared with the serial path).
+    // also live in fillPreparedRange.
     std.debug.assert(range.index < job.range_count);
     fillPreparedRange(job.commands, job.columns, range);
 }
@@ -859,6 +815,25 @@ fn initBatchTest(allocator: std.mem.Allocator, table: *const TestTextureTable) !
     return batch;
 }
 
+// The renderer's frame prep: reserve the frame's storage, then build without allocating.
+fn prepare(batch: *SpriteBatch, texture_resolver: TextureResolver, thread_system: *ThreadSystem, prep_config: SpritePrepConfig) !SpritePrepStats {
+    try batch.ensureFrameStorage();
+    return batch.buildAssumeCapacity(texture_resolver, thread_system, prep_config);
+}
+
+// Zero-worker system, so this prep dispatches inline.
+fn prepareInline(batch: *SpriteBatch, texture_resolver: TextureResolver, prep_config: SpritePrepConfig) !SpritePrepStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    return prepare(batch, texture_resolver, &threads, prep_config);
+}
+
+fn buildInline(batch: *SpriteBatch, texture_resolver: TextureResolver, prep_config: SpritePrepConfig) !SpritePrepStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    return batch.buildAssumeCapacity(texture_resolver, &threads, prep_config);
+}
+
 test "batch builder skips invalid stale and destroyed texture ids" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
@@ -887,7 +862,7 @@ test "batch builder skips invalid stale and destroyed texture ids" {
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepareInline(&batch, table.resolver(), .{});
 
     try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
@@ -922,7 +897,7 @@ test "batch builder groups by texture and coordinate presentation" {
         .coordinate_space = .drawable,
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepareInline(&batch, table.resolver(), .{});
 
     try std.testing.expectEqual(@as(usize, 18), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 3), batch.draw_groups.items.len);
@@ -961,7 +936,7 @@ test "world vertices ignore camera now that the transform is baked on the GPU" {
         .coordinate_space = .logical,
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepareInline(&batch, table.resolver(), .{});
 
     // All spaces emit world/identity-space geometry; the camera is applied by
     // the renderer's vertex uniform, never on the CPU.
@@ -1002,7 +977,7 @@ test "batch builder preserves ordered submission stream" {
         .order = RenderOrder.world(@backingInt(OrderedStreamDepth.far)),
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepareInline(&batch, table.resolver(), .{});
 
     try std.testing.expectEqual(@as(f32, 10), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
@@ -1047,7 +1022,7 @@ test "sprite batch build consumes the ordered command stream read-only" {
     defer snapshot.deinit(allocator);
     try snapshot.appendSlice(allocator, batch.commands.items);
 
-    _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
+    _ = try buildInline(&batch, table.resolver(), .{ .adaptive = false });
 
     try std.testing.expect(spriteCommandsEqual(snapshot.items, batch.commands.items));
 }
@@ -1075,7 +1050,7 @@ test "batch builder splits a same-texture run on render order change" {
         .order = RenderOrder.world(1),
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepareInline(&batch, table.resolver(), .{});
 
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
     try std.testing.expectEqual(@as(i32, -2), batch.draw_groups.items[0].order.depth);
@@ -1111,7 +1086,7 @@ test "world and logical vertices stay independent of drawable presentation" {
         .coordinate_space = .drawable,
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepareInline(&batch, table.resolver(), .{});
 
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 30), batch.positions.items[0][1]);
@@ -1134,7 +1109,7 @@ test "safe sprite batch build reserves missing frame storage" {
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
-    const stats = try batch.build(table.resolver(), null, .{ .adaptive = false });
+    const stats = try prepareInline(&batch, table.resolver(), .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), stats.command_count);
     try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
@@ -1160,7 +1135,7 @@ test "warmed sprite batch prep does not allocate" {
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
-    _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
+    _ = try buildInline(&batch, table.resolver(), .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
     try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
@@ -1282,8 +1257,6 @@ test "ui stack order keeps upper state background above lower state text" {
 }
 
 test "parallel sprite prep matches serial vertices and draw groups" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 64, .height = 32 } },
@@ -1301,33 +1274,28 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     try addParallelParityCommands(&serial);
     try addParallelParityCommands(&threaded);
 
-    try serial.buildSerial(table.resolver());
+    var inline_threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    _ = try prepare(&serial, table.resolver(), &inline_threads, .{});
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{
         .max_worker_threads = 2,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    const stats = try threaded.build(table.resolver(), &threads, .{
+    _ = try prepare(&threaded, table.resolver(), &threads, .{
         .items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     });
 
-    try std.testing.expect(stats.batch.active_worker_threads > 0);
-    // The emit path requests 4-command range alignment so worker range seams stay
-    // cache-line-aligned across all three columns; guard the knob so a regression
-    // back to 1 is caught here, not only by a false-sharing slowdown.
-    try std.testing.expectEqual(@as(usize, 4), stats.batch.range_alignment_items);
     try expectEqualVertices(batchColumns(&serial), batchColumns(&threaded));
     try expectEqualDrawGroups(serial.draw_groups.items, threaded.draw_groups.items);
     try std.testing.expectEqual(serial.lastPrepStats().valid_sprite_count, threaded.lastPrepStats().valid_sprite_count);
     try std.testing.expectEqual(@as(usize, 2), threaded.lastPrepStats().skipped_invalid_count);
 }
 
-test "sprite prep uses batch owned adaptive tuner instead of thread system fallback" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
+test "sprite prep records one sample into its own tuner" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
@@ -1353,16 +1321,13 @@ test "sprite prep uses batch owned adaptive tuner instead of thread system fallb
         .items_per_range = 1,
     });
     defer threads.deinit();
-    _ = try batch.build(table.resolver(), &threads, .{});
+    _ = try prepare(&batch, table.resolver(), &threads, .{});
 
-    try std.testing.expect(batch.adaptive_tuner.report().sample_count > 0);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 1), batch.adaptive_tuner.sample_count);
+    try std.testing.expect(batch.adaptive_tuner.last_request != null);
 }
 
 test "sprite prep adaptive gate keeps cheap batches inline" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
@@ -1389,20 +1354,22 @@ test "sprite prep adaptive gate keeps cheap batches inline" {
     });
     defer threads.deinit();
 
-    const warmup_windows = batch.adaptive_tuner.report().sample_window * 4;
-    var last_stats: SpritePrepStats = .{};
+    // Production prep uses the central gate. The run below pins a gate no batch
+    // reaches, so the inline decision holds on any host and build mode.
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, batch.adaptive_tuner.config.threaded_batch_ns);
+    batch.adaptive_tuner.config.threaded_batch_ns = std.math.maxInt(u64);
+
+    const warmup_windows = batch.adaptive_tuner.config.sample_window * 4;
     var window: usize = 0;
     while (window < warmup_windows) : (window += 1) {
-        last_stats = try batch.build(table.resolver(), &threads, .{});
+        _ = try prepare(&batch, table.resolver(), &threads, .{});
     }
 
-    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, batch.adaptive_tuner.config.threaded_batch_ns);
-    try std.testing.expectEqual(@as(usize, 0), last_stats.batch.active_worker_threads);
+    try std.testing.expect(batch.adaptive_tuner.last_request != null);
+    try std.testing.expect(!batch.adaptive_tuner.has_threaded_profile);
 }
 
 test "warmed multi-worker sprite prep does not allocate" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
@@ -1435,22 +1402,29 @@ test "warmed multi-worker sprite prep does not allocate" {
 
     // Reserved-then-build SUCCESS branch under a hard-failing allocator: proves
     // the multi-worker emit path is allocation-free after reserve (not only the
-    // serial inline branch).
+    // serial inline branch). Snapshot, emit, and draw groups are `buildAssumeCapacity`;
+    // the emit batch is the fixed-shape dispatch. An inline emit has no worker ranges.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     batch.allocator = failing.allocator();
     defer batch.allocator = allocator;
 
-    const stats = batch.buildAssumeCapacity(table.resolver(), &threads, .{
+    _ = batch.snapshotCommandsAssumeCapacity(table.resolver());
+    const emit = batch.emitVerticesAssumeCapacity(&threads, .{
         .items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     });
+    batch.buildDrawGroupsAssumeCapacity();
+    const stats = batch.finishPrepStats(emit);
 
-    try std.testing.expect(stats.batch.active_worker_threads > 0);
+    try std.testing.expectEqual(command_capacity, stats.valid_sprite_count);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);
     try std.testing.expectEqual(command_capacity * 6, batch.positions.items.len);
+    try std.testing.expect(!emit.ran_inline);
+    try std.testing.expect(emit.active_worker_threads > 0);
+    try std.testing.expect(emit.worker_thread_ranges > 0);
 }
 
 fn addParallelParityCommands(batch: *SpriteBatch) !void {
@@ -1717,7 +1691,7 @@ fn testOrderedSprite(i: usize) !Sprite {
     };
 }
 
-test "draw sprite past a reserved frame's capacity grows in order and counts the overflow" {
+test "draw sprite past a reserved frame's capacity grows in order" {
     var batch = SpriteBatch.init(std.testing.allocator);
     defer batch.deinit();
     const capacity = try fillReservedCommandsToCapacity(&batch);
@@ -1729,19 +1703,9 @@ test "draw sprite past a reserved frame's capacity grows in order and counts the
     for (batch.commands.items, 0..) |command, i| {
         try std.testing.expectEqual(@as(f32, @floatFromInt(i)), command.sprite.dest.x);
     }
-    // Drift is counted only where perf diagnostics compile in (never in shipping builds).
-    const drift: u64 = @intFromBool(perf_diagnostics_enabled);
-    try std.testing.expectEqual(drift, batch.commandOverflowGrows());
-    try std.testing.expectEqual(@as(usize, @intCast(drift)), batch.finishPrepStats(.{}).command_overflow_grows);
-
-    // The per-frame share resets; the lifetime count stays.
-    batch.beginFrame();
-    try std.testing.expectEqual(@as(usize, 0), batch.finishPrepStats(.{}).command_overflow_grows);
-    try std.testing.expectEqual(drift, batch.commandOverflowGrows());
 }
 
-test "submits past the reservation are drift even inside the physical slack" {
-    if (!perf_diagnostics_enabled) return error.SkipZigTest;
+test "submits past the reservation inside the physical slack never grow the command list" {
     var batch = SpriteBatch.init(std.testing.allocator);
     defer batch.deinit();
     try batch.reserveStorage(16, 16 * 6, 16);
@@ -1749,37 +1713,11 @@ test "submits past the reservation are drift even inside the physical slack" {
     const reservation: usize = 4;
 
     batch.markFrameReserved(reservation);
-    for (0..reservation) |i| try batch.drawSprite(try testOrderedSprite(i));
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
-
-    // Past the reservation, well inside the physical capacity: no growth, still drift.
-    // Counted once for the frame however far it overshoots, and re-marking the frame at
-    // the same reservation (the engine's top-up) does not count it again.
-    for (reservation..reservation + 3) |i| try batch.drawSprite(try testOrderedSprite(i));
+    for (0..reservation + 3) |i| try batch.drawSprite(try testOrderedSprite(i));
+    // Re-marking the frame at the same reservation (the engine's top-up) keeps the list.
     batch.markFrameReserved(reservation);
     try std.testing.expectEqual(capacity, batch.commands.capacity);
-    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
-    try std.testing.expectEqual(@as(usize, 1), batch.finishPrepStats(.{}).command_overflow_grows);
-
-    // Every drifting frame counts.
-    batch.beginFrame();
-    batch.markFrameReserved(reservation);
-    for (0..reservation + 1) |i| try batch.drawSprite(try testOrderedSprite(i));
-    try std.testing.expectEqual(@as(u64, 2), batch.commandOverflowGrows());
-}
-
-test "marking a frame reserved below its submitted count counts the drift" {
-    if (!perf_diagnostics_enabled) return error.SkipZigTest;
-    var batch = SpriteBatch.init(std.testing.allocator);
-    defer batch.deinit();
-    try batch.reserveStorage(16, 16 * 6, 16);
-    for (0..5) |i| try batch.drawSprite(try testOrderedSprite(i));
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
-
-    batch.markFrameReserved(4);
-    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
-    try batch.drawSprite(try testOrderedSprite(5));
-    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+    try std.testing.expectEqual(reservation + 3, batch.commands.items.len);
 }
 
 test "draw sprite growth OOM leaves the reserved stream unchanged" {
@@ -1795,15 +1733,4 @@ test "draw sprite growth OOM leaves the reserved stream unchanged" {
     try std.testing.expectError(error.OutOfMemory, batch.drawSprite(try testOrderedSprite(capacity)));
     try std.testing.expectEqual(capacity, batch.commands.items.len);
     try std.testing.expectEqual(capacity, batch.commands.capacity);
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
-}
-
-test "draw sprite growth outside a reserved frame is not counted" {
-    var batch = SpriteBatch.init(std.testing.allocator);
-    defer batch.deinit();
-
-    try batch.drawSprite(try testOrderedSprite(0));
-
-    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
 }

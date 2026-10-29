@@ -19,7 +19,6 @@ const ChunkForm = world_terrain.ChunkForm;
 const max_chunk_cells = world_terrain.max_chunk_cells;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const types = @import("types.zig");
-const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const default_cell_size = types.default_cell_size;
 const growPool = @import("connectivity.zig").growPool;
 const GridCell = types.GridCell;
@@ -44,7 +43,7 @@ comptime {
 /// non-adjacent orthogonally (a checkerboard), since orthogonal neighbours always join and
 /// the corner rule only splits diagonals.
 pub fn maxChunkLabels(chunk_tiles: u16) usize {
-    return (@as(usize, chunk_tiles) * chunk_tiles + 1) / 2;
+    return @divCeil(@as(usize, chunk_tiles) * chunk_tiles, 2);
 }
 
 const NavCellBlock = struct {
@@ -57,7 +56,7 @@ const NavCellBlock = struct {
 const empty_block = NavCellBlock{ .bits = @splat(0), .labels = @splat(0), .blocked_count = 0, .label_count = 0 };
 
 // One pooled block's columns.
-const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
+pub const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
 
 // Bit of cell (x + dx, y + dy) in a 3x3 `neighborhood` mask.
 fn neighborhoodBit(dx: i32, dy: i32) u4 {
@@ -211,14 +210,6 @@ pub const NavGrid = struct {
         return if (entry == open_entry or entry == blocked_entry) null else entry;
     }
 
-    pub fn chunkForm(self: *const NavGrid, chunk: u32) ChunkForm {
-        return switch (self.dir.items[chunk]) {
-            open_entry => .open,
-            blocked_entry => .blocked,
-            else => .mixed,
-        };
-    }
-
     /// Blocked cells of `chunk`.
     pub fn chunkBlockedCount(self: *const NavGrid, chunk: u32) u32 {
         return switch (self.dir.items[chunk]) {
@@ -266,22 +257,21 @@ pub const NavGrid = struct {
     }
 
     /// Composes `chunk`'s blocked bits: the world's composed bits for this level (null
-    /// world: none) OR the cells of every static collider listed at the chunk, clipped to
-    /// it. Out-of-level bits stay clear. Reads only the world and the colliders, so chunks
-    /// compose in parallel. O(rows listed at the chunk).
-    // SIMD verdict: word-parallel scalar. The world's bits copy as four words and each row
+    /// world: none) OR the cells of every static span listed at the chunk, clipped to it.
+    /// Out-of-level bits stay clear. Reads only the world and the colliders, so chunks
+    /// compose in parallel. O(spans listed at the chunk).
+    // SIMD verdict: word-parallel scalar. The world's bits copy as four words and each span
     // ORs in as one `rectMask`; no per-cell loop is left to vectorize.
     pub fn composeChunk(self: *const NavGrid, chunk: u32, world: ?*const WorldSystem, colliders: ColliderView) ChunkBits {
         const b = self.chunkBounds(chunk);
         var bits = self.worldChunkBits(chunk, world);
-        var rows = colliders.chunkRows(self.level, chunk);
-        while (rows.next()) |row| {
-            const cells = colliders.rowCells(row);
-            // Listed rows overlap the chunk; clip to its in-level cells.
-            const x0 = @max(@as(usize, cells.min_x), b.x0);
-            const y0 = @max(@as(usize, cells.min_y), b.y0);
-            const x1 = @min(@as(usize, cells.max_x) + 1, b.x1);
-            const y1 = @min(@as(usize, cells.max_y) + 1, b.y1);
+        const spans = colliders.chunkRows(self.level, chunk);
+        for (0..spans.entity.len) |index| {
+            // Listed spans overlap the chunk; clip to its in-level cells.
+            const x0 = @max(@as(usize, spans.min_x[index]), b.x0);
+            const y0 = @max(@as(usize, spans.min_y[index]), b.y0);
+            const x1 = @min(@as(usize, spans.max_x[index]) + 1, b.x1);
+            const y1 = @min(@as(usize, spans.max_y[index]) + 1, b.y1);
             if (x0 >= x1 or y0 >= y1) continue;
             const mask = world_terrain.rectMask(self.geometry, @intCast(x0 - b.x0), @intCast(y0 - b.y0), @intCast(x1 - b.x0), @intCast(y1 - b.y0));
             for (&bits, mask) |*word, row_bits| word.* |= row_bits;
@@ -607,16 +597,6 @@ pub const NavGrid = struct {
             self.block_free.capacity * @sizeOf(u32);
     }
 
-    /// An over-estimate of `residentBytes` summed over `levels` levels of `chunks` chunks
-    /// each, whose block needs (mixed chunks, plus the fresh blocks a batch takes before it
-    /// frees the old) sum to `block_need`: the directories, and each level's block pool and
-    /// free list at their worst growth (`growPool`: the pool at most twice its need, the free
-    /// list exactly the pool).
-    pub fn storageBytesBound(levels: usize, chunks: usize, block_need: usize) usize {
-        const blocks = 2 *| block_need;
-        return levels *| listBytesBound(u32, chunks) +| blocks *| (cell_block_bytes +| @sizeOf(u32));
-    }
-
     // Projects a blocked goal cell to the nearest open cell on this level within a
     // bounded radius, scanning rings outward in (dy, dx) order. Only tests openness, not
     // reachability from any start (that is the search's job); returns the open index, or
@@ -692,6 +672,11 @@ pub const NavGrid = struct {
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const test_support = @import("test_support.zig");
+
+/// Mixed chunks of `grid` holding a cell block.
+fn liveBlockCount(grid: *const NavGrid) usize {
+    return grid.blocks.len - grid.block_free.items.len;
+}
 const baselineCapacity = test_support.baselineCapacity;
 const addNavBody = test_support.addNavBody;
 
@@ -735,9 +720,9 @@ test "a block pool grown one claim at a time stays within its storage bound, its
     }
     try std.testing.expect(pool_grows > 1);
     try std.testing.expectEqual(chunks, grid.blocks.capacity);
-    try std.testing.expect(grid.residentBytes() <= NavGrid.storageBytesBound(1, chunks, claims));
+    try std.testing.expect(grid.residentBytes() <= test_support.navGridStorageBytesBound(1, chunks, claims));
     // The pool's doubling past its need is charged: half the blocks' bound is short of it.
-    try std.testing.expect(grid.residentBytes() > NavGrid.storageBytesBound(1, chunks, claims / 2));
+    try std.testing.expect(grid.residentBytes() > test_support.navGridStorageBytesBound(1, chunks, claims / 2));
 }
 
 test "pathfinding nav grid blocked set matches per-level composed mask" {
@@ -790,7 +775,7 @@ test "a cell-aligned static past 32768 world units blocks only its own nav cell"
     _ = try addNavBody(&data, .{ .x = 35_296, .y = 35_296 }, .{ .x = 32, .y = 32 }, true);
     var colliders = static_colliders.StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, .init(32, 2048, 2048, 16));
+    try colliders.rebuild(&data, .init(32, 2048, 2048, 16), null);
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);
@@ -901,7 +886,8 @@ test "a remasked chunk equals world bits OR static coverage, labels and chunkLab
         for (0..world.height) |y| for (0..world.width) |x| {
             var expected = world.levelBlocksMovement(0, @intCast(x), @intCast(y));
             for (data.movementBodySliceConst().entities) |entity| {
-                const rect = data.staticObstacleWorldRect(entity).?;
+                const bounds = data.collisionBoundsConst(entity).?;
+                const rect = math.aabbFromOffsetSize(data.movementBodyConst(entity).?.position, bounds.offset, bounds.size);
                 const span = grid.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
                 if (x >= span.min_x and x <= span.max_x and y >= span.min_y and y <= span.max_y) expected = true;
             }
@@ -945,8 +931,8 @@ test "OPEN and BLOCKED chunks hold no cell block after edits elsewhere on their 
     try system.reserve(test_support.abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
     const grid = system.graph.grid(0).?;
-    try std.testing.expectEqual(ChunkForm.blocked, grid.chunkForm(8));
-    try std.testing.expectEqual(ChunkForm.mixed, grid.chunkForm(4));
+    try std.testing.expectEqual(ChunkForm.blocked, test_support.navChunkForm(grid, 8));
+    try std.testing.expectEqual(ChunkForm.mixed, test_support.navChunkForm(grid, 4));
     try expectBlocksOnlyInMixedChunks(grid, &world);
 
     // Clear the mixed cell and dig into the blocked chunk: chunk (1,1) gives its block back
@@ -954,8 +940,8 @@ test "OPEN and BLOCKED chunks hold no cell block after edits elsewhere on their 
     _ = try world.setDenseTile(obstacle, 5, 5, grass);
     _ = try world.setDenseTile(obstacle, 9, 9, grass);
     _ = try test_support.applyTileEdits(&system, &test_support.no_colliders, &world, &.{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 9, .y = 9 } });
-    try std.testing.expectEqual(ChunkForm.mixed, grid.chunkForm(8));
-    try std.testing.expect(grid.chunkForm(4) != .mixed);
+    try std.testing.expectEqual(ChunkForm.mixed, test_support.navChunkForm(grid, 8));
+    try std.testing.expect(test_support.navChunkForm(grid, 4) != .mixed);
     try expectBlocksOnlyInMixedChunks(grid, &world);
 }
 
@@ -966,11 +952,11 @@ fn expectBlocksOnlyInMixedChunks(grid: *const NavGrid, world: *const WorldSystem
     for (0..grid.dir.items.len) |chunk_index| {
         const chunk: u32 = @intCast(chunk_index);
         const form = world.levelChunkBlockedForm(grid.level, chunk);
-        try std.testing.expectEqual(form, grid.chunkForm(chunk));
+        try std.testing.expectEqual(form, test_support.navChunkForm(grid, chunk));
         try std.testing.expectEqual(form == .mixed, grid.chunkBlock(chunk) != null);
         if (form == .mixed) mixed += 1;
     }
-    try std.testing.expectEqual(mixed, test_support.liveBlockCount(grid));
+    try std.testing.expectEqual(mixed, liveBlockCount(grid));
 }
 
 test "neighborhood equals eight isBlocked reads at chunk corners and level edges" {

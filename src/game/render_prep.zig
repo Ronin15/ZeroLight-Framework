@@ -5,6 +5,7 @@
 const std = @import("std");
 const Color = @import("../config.zig").Color;
 const math = @import("../core/math.zig");
+const pdqSort = @import("../core/sort.zig").pdq;
 const DataSystem = @import("data_system.zig").DataSystem;
 const ConstAssetReferenceSlice = @import("data_system.zig").ConstAssetReferenceSlice;
 const ConstMovementBodySlice = @import("data_system.zig").ConstMovementBodySlice;
@@ -68,11 +69,6 @@ pub const VisibleWorldRect = struct {
             .max_x = camera_rect.x + camera_rect.w + overscan_pixels,
             .max_y = camera_rect.y + camera_rect.h + overscan_pixels,
         };
-    }
-
-    pub fn containsPoint(self: VisibleWorldRect, position: math.Vec2) bool {
-        return position.x >= self.min_x and position.x < self.max_x and
-            position.y >= self.min_y and position.y < self.max_y;
     }
 
     pub fn overlapsAabb(self: VisibleWorldRect, x: f32, y: f32, width: f32, height: f32) bool {
@@ -238,14 +234,6 @@ pub const DynamicScenePrep = struct {
         try self.depth_spans.ensureTotalCapacity(self.allocator, record_capacity);
     }
 
-    pub fn orderedRecords(self: *const DynamicScenePrep) []const DynamicRenderRecord {
-        return self.records.items;
-    }
-
-    pub fn sortedRecordIndices(self: *const DynamicScenePrep) []const usize {
-        return self.sort_indices.items;
-    }
-
     pub fn depthSpans(self: *const DynamicScenePrep) []const DynamicDepthRange {
         return self.depth_spans.items;
     }
@@ -275,7 +263,7 @@ pub const DynamicScenePrep = struct {
         }
 
         const records = self.records.items;
-        std.mem.sort(usize, self.sort_indices.items, records, sortRecordIndexLessThan);
+        pdqSort(usize, self.sort_indices.items, records, sortRecordIndexLessThan);
 
         var span_start: usize = 0;
         var current_depth = records[self.sort_indices.items[0]].depth;
@@ -566,7 +554,7 @@ fn collectDenseInterleaveDepths(scene: GameplayScene, prep: *const DynamicSceneP
     }
 
     const collected = scratch.depths[0..count];
-    std.mem.sort(i32, collected, {}, std.sort.asc(i32));
+    pdqSort(i32, collected, {}, std.sort.asc(i32));
     return collected;
 }
 
@@ -1070,7 +1058,7 @@ test "collect dynamic records after structural growth stays within reserve and a
     // the particle through collectDynamicRecords' appendAssumeCapacity calls.
     try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
     const expected_record_count: usize = created_visual_count + 1 + 1; // visuals + player marker + particle
-    try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
+    try std.testing.expectEqual(expected_record_count, prep.records.items.len);
 
     const original_allocator = prep.allocator;
     // Block resize_fail_index too, not just fail_index: ArrayList.ensureTotalCapacityPrecise
@@ -1084,7 +1072,7 @@ test "collect dynamic records after structural growth stays within reserve and a
     // Re-running at the same grown population must not allocate: ensureScenePrepCapacity's
     // reserve is already sized to match, so every append below is assumeCapacity-only.
     try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
-    try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
+    try std.testing.expectEqual(expected_record_count, prep.records.items.len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
 }
@@ -1142,7 +1130,7 @@ test "collect dynamic records includes an entity that fell to a level within the
     defer prep.deinit();
     try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
 
-    try std.testing.expectEqual(@as(usize, 2), prep.orderedRecords().len);
+    try std.testing.expectEqual(@as(usize, 2), prep.records.items.len);
 }
 
 test "collect dynamic records excludes an entity beyond the render window depth" {
@@ -1210,7 +1198,7 @@ test "collect dynamic records excludes an entity beyond the render window depth"
     try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
 
     // Player + the level-6 entity only; the level-7 entity is dropped.
-    try std.testing.expectEqual(@as(usize, 2), prep.orderedRecords().len);
+    try std.testing.expectEqual(@as(usize, 2), prep.records.items.len);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
@@ -1346,21 +1334,6 @@ test "visible world rect uses half-open aabb overlap" {
     try std.testing.expect(!rect.overlapsAabb(200, 200, 32, 32));
     try std.testing.expect(rect.overlapsAabb(105, 50, 32, 32));
     try std.testing.expect(!rect.overlapsAabb(110, 50, 32, 32));
-}
-
-test "visible world rect uses half-open point containment" {
-    const rect = VisibleWorldRect{
-        .min_x = 10,
-        .min_y = 20,
-        .max_x = 110,
-        .max_y = 120,
-    };
-    try std.testing.expect(rect.containsPoint(.{ .x = 10, .y = 20 }));
-    try std.testing.expect(rect.containsPoint(.{ .x = 109.9, .y = 119.9 }));
-    try std.testing.expect(!rect.containsPoint(.{ .x = 9.9, .y = 20 }));
-    try std.testing.expect(!rect.containsPoint(.{ .x = 10, .y = 19.9 }));
-    try std.testing.expect(!rect.containsPoint(.{ .x = 110, .y = 20 }));
-    try std.testing.expect(!rect.containsPoint(.{ .x = 10, .y = 120 }));
 }
 
 // Registers a store with no GPU buffer in a headless renderer and hands it to

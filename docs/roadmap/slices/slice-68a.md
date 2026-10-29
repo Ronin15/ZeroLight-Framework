@@ -10,8 +10,9 @@ determinism proof.
 1. Perception and AI stop walking the sensed population serially on the main
    thread: main-thread work is proportional to decide rows over the whole
    population 75 indexes. The threaded spatial-index gather produces one
-   per-step entity table and a self-validating map from AI row to table row;
-   perception and AI then walk only their own think or decide rows.
+   per-step entity table and a self-validating map from AI row to table row;   perception and AI then walk only their own think or decide rows. The
+   entity-column part landed with Slice 84 (view columns, `spatial_index.zig:224-230`,
+   `entityAt` `:247`); the checklist's open items are the remaining pieces.
 2. The shared action bus keeps its fixed per-step counts; Slice 56's
    rotating deferral gains a deterministic deferral-age priority, so a
    deferred actor waits a bounded number of its qualifying steps under any
@@ -25,19 +26,22 @@ sensing (Slice 55 rejects it).
 
 ### Current foundation
 
-- `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) already
-  gathers the unstaggered halo on workers into padded per-range slots and
-  merges them in range order; `SpatialIndexRow` is entity, position, cell;
-  `view()` exposes positions, entries, ranges, and the dense lookup;
-  `buildSerial` is the serial twin.
+- `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`, Slice 84)
+  builds the unstaggered halo's index on workers into per-chunk records keyed
+  by level and faction; `view()` carries each entry's position, entity
+  (`entity_index`, `entity_generation`), `population_row` (its AI row), and
+  `cognition_phase`; `build` runs inline on a zero-worker `ThreadSystem` (no separate serial entry). `spatial_index_build`
+  carries `movement_positions` and `world_level`.
 - `PerceptionSystem.gatherPerceptionData`
-  (`src/game/systems/perception.zig`) and `AiSystem.gatherAiData`
-  (`src/game/systems/ai.zig`) each walk the halo serially on the main thread,
-  resolving movement, faction, and level per row into their own candidate
-  tables; both module docs call this a deliberate duplicate gather.
+  (`src/game/systems/perception.zig:362`) and `AiSystem.gatherAiData`
+  (`src/game/systems/ai.zig:502`) keep no candidate tables and walk no halo:
+  each walks only its think rows on workers, in windows main merges in range
+  order, resolving movement, faction, and level per row through the entity
+  slot table. The think set comes from the index on workers
+  (`compactCognition`, `src/game/systems/simulation_scope.zig:338`).
 - `DataSystem.movementVisualDenseIndices` (`src/game/data_system/system.zig`)
   is the single-resolve precedent.
-- From earlier slices: 55's decide set and `ai-idle-*` benches; 75's
+- From earlier slices: 55's decide set (its `ai-idle-stagger` and `ai-idle-coast` benches do not exist yet); 75's
   whole-population spatial index; 56's emitter, per-step budget with
   rotating deferral, and `ai_actions_deferred`.
 - Perf log: 60 s intervals with summed and max metrics, compiled out of
@@ -55,19 +59,19 @@ sensing (Slice 55 rejects it).
   body, asserted in Debug and ReleaseSafe.
 - Main-thread work drops to O(decide rows) over the post-75 population;
   worker work rises by a few column reads per row
-  (`.claude/rules/threading.md`: the main thread holds only ordered merge).
+  (`.grok/rules/threading.md`: the main thread holds only ordered merge).
 - Fairness: the bus counts stay fixed per world; deferral age is a
   persistent per-agent counter written only by the emitter; selection is
   deterministic (age first, then rotation rank) and allocation-free
-  (`.claude/rules/budgets-capacities.md`: a chronically short budget gets
+  (`.grok/rules/budgets-capacities.md`: a chronically short budget gets
   deterministic deferral, never a bigger number).
 - The age counter is hashed and saved (Slice 49 lists, Slice 46 section,
   relative bumps); the table and map are per-step derived and excluded
   (64B).
 - The soak runs realistic to extreme populations from content, never a demo
   count as a target; numbers are machine-specific trend data, never claims
-  or gates (`.claude/rules/tests-benchmarks.md`,
-  `.claude/rules/build-validation.md`).
+  or gates (`.grok/rules/tests-benchmarks.md`,
+  `.grok/rules/build-validation.md`).
 - VoidLight reference: only the idea that one per-frame snapshot serves
   several consumers; not thread-local position-keyed caches,
   completion-order command application, or unbudgeted action dispatch.
@@ -80,11 +84,19 @@ sensing (Slice 55 rejects it).
 - [ ] Single-resolve halo row lookup on `DataSystem` with unit tests.
 - [ ] Spatial index emits the entity table and the AI-row map, reserved with
       the AI population and grown at the seam; view columns and the
-      self-validating lookup; module doc updated.
+      self-validating lookup; module doc updated. The view columns landed
+      with Slice 84 (`08e4799`, `3efa1e4`, `c52a5ff`); the rest is open.
 - [ ] Perception and AI drop their candidate tables and halo walks; config
       fields that described the pairing are deleted; pairing asserts added.
+      Slice 84 removed the tables, the halo walks, and the dual-list config
+      fields; the pairing asserts land with the table and map.
+- [x] The think-set compact leaves main: `compactCognition` runs on workers
+      over the index's columns and main merges the windows (Slice 84,
+      `3efa1e4`); serial == threaded tests; `scope-cognition` measures main's
+      share per row.
 - [ ] Slice 56's arc query maps rows through the table's entity column.
-- [ ] Contract: `spatial_index_build` carries `world_level`.
+- [x] Contract: `spatial_index_build` carries `world_level` (Slice 84,
+      `c52a5ff`).
 - [ ] Tests: view columns equal direct lookups; stale-map and swap-remove
       safety; stage-3 level snapshot; serial == threaded; existing perception,
       AI, and pipeline suites unchanged.
@@ -97,7 +109,7 @@ sensing (Slice 55 rejects it).
 - [ ] Fairness tests: starvation bound, parity with rotation at zero ages,
       serial == threaded, cooldown kept, saturation.
 - [ ] Soak procedure written in this slice with the row schema; pointer
-      added to `.claude/rules/tests-benchmarks.md`.
+      added to `.grok/rules/tests-benchmarks.md`.
 - [ ] Docs: `docs/architecture.md`, `docs/simulation-tiers-and-pipeline.md`,
       `docs/development-workflow.md`.
 

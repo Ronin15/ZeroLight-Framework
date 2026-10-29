@@ -1,6 +1,6 @@
 ## Slice 61: Harvesting And World Resource Nodes
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 73](slice-73.md), [Slice 56](slice-56.md), [Slice 57](slice-57.md), [Slice 49](slice-49.md), [Slice 41](../archive/slice-41.md), [Slice 45](../archive/slice-45.md) · Before: [Slice 58](slice-58.md), [Slice 63](slice-63.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 73](slice-73.md), [Slice 56](slice-56.md), [Slice 57](slice-57.md), [Slice 49](slice-49.md), [Slice 41](../archive/slice-41.md), [Slice 45](../archive/slice-45.md) · Before: [Slice 58](slice-58.md), [Slice 63](slice-63.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
 
 **Status: not started.**
 
@@ -46,10 +46,10 @@ step's commit seam. No sessions, timers, or per-harvester state.
   need relief, visuals); the catalog fingerprint joins Slice 46's.
 - Node storage starts at what the load places and grows at the commit seam;
   the only fixed ceiling is the `u32` index width, failing loudly at load
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - The spatial node lookup is owned per chunk, so a node create, destroy, or
   move costs its chunk, never a rebuild over every node
-  (`.claude/rules/engine-design.md` § Cost model); queries take fixed
+  (`.grok/rules/engine-design.md` § Cost model); queries take fixed
   per-query candidate budgets with a deterministic visit order.
 - Availability is a pure function of charges, regrow step, and the current
   step, so regrowth needs no sweep for correctness and holds in every world
@@ -66,7 +66,7 @@ step's commit seam. No sessions, timers, or per-harvester state.
 - One affect-impulse substrate: domain outcomes move drives through a
   per-producer budgeted queue drained after the same step's structural
   commit, so nothing is pending at a step boundary. 63 and 71A add
-  producers; never a second substrate (`.claude/rules/simulation.md` § AI
+  producers; never a second substrate (`.grok/rules/simulation.md` § AI
   and affect).
 - Yield rolls draw from `seed.derive(.harvest)` (Slice 49).
 - New hashed state is classified in Slice 49's lists and saved by Slice 46;
@@ -98,6 +98,10 @@ step's commit seam. No sessions, timers, or per-harvester state.
       visual refill under a fixed per-step budget.
 - [ ] `action_react` structural share re-derived for the largest claimant;
       capacity-limit test re-pinned.
+- [ ] Harvest commands (depletion, removal) past the structural share defer
+      through [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an
+      over-share harvest burst defers and the step succeeds
+      (`.grok/rules/budgets-capacities.md`).
 - [ ] Affect-impulse substrate with per-producer budgets and the
       commit-seam drain; `FailingAllocator` proof.
 - [ ] `need` drive and `forage` behavior as Slice 73 content; forage

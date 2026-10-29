@@ -23,7 +23,9 @@ symmetrically.
   - `dig_controller.zig`: the hole-vs-tunnel branch (`plan.level == 0`), the
     ramp early-return on level 0, `setEntityLevel`'s `level == 0` return, and
     `digRamp` treating `level - 1` as the plane above;
-  - `systems/world_gate.zig`: both walk gates return on `level == 0`;
+  - `systems/world_gate.zig`: the lane pass marks a row gated only when its
+    level is not 0 (`:265`), and the scalar player gate
+    `gateBodyToWalkableTiles` returns on `level == 0` (`:117`);
   - `game_demo_state.placeDemoInterestMarkers` places markers on level 0.
 - Nav takes static collision bodies on every level from `StaticColliderSystem`
   (64G).
@@ -38,7 +40,7 @@ symmetrically.
 
 - Elevation is a stored per-level fact set when the level is created, never
   derived from index, append order, or `base_z`; levels are added in play at
-  the seam (`.claude/rules/budgets-capacities.md`).
+  the seam (`.grok/rules/budgets-capacities.md`).
 - `addLevel` keeps its signature: the first level is the surface, each later
   `addLevel` sits one below the lowest, so every existing multi-level fixture
   keeps its meaning. Levels above the surface come from an explicit elevated
@@ -49,7 +51,7 @@ symmetrically.
 - "Is there a level above" is an elevation-adjacency lookup, not an index
   comparison.
 - The render window cap bounds levels drawn, never levels that exist; it does
-  not grow with elevation count (`.claude/rules/render.md`).
+  not grow with elevation count (`.grok/rules/render.md`).
 - Needs from 64G: collision bodies reach nav on every level; per-chunk
   render pages so the window is a selection of levels, not a level-sized
   buffer.
@@ -69,7 +71,7 @@ symmetrically.
 - [ ] Render window with levels above and below in elevation terms; the
       default reproduces today's window exactly.
 - [ ] Surface special cases (dig hole vs tunnel, ramp early-return,
-      `setEntityLevel`, both walk gates, nav static bodies, demo interest
+      `setEntityLevel`, the world-gate lane mask and the player gate, nav static bodies, demo interest
       markers) migrated to elevation.
 - [ ] `digRamp`'s "nothing above" check becomes an elevation-adjacency lookup.
 - [ ] Slice 49 / 46 classification and save section for elevation; loader

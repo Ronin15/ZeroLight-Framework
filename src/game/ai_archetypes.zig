@@ -2,33 +2,21 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Data-driven AI archetype catalog: personalities are authored in
-//! `assets/ai/archetypes.json` and loaded once at load-time into a dense
-//! enum-indexed table of prevalidated component bundles. Spawn resolves a slot
-//! to a bundle by `@backingInt` — no strings, no hashmap, no JSON on the hot
-//! path. Lives in the game layer because bundles hold game-layer component
-//! types; it merely borrows `AssetStore`'s path-safe reader (direction stays
-//! game -> assets).
+//! AI archetype catalog: personalities authored in `assets/ai/archetypes.json`, loaded once
+//! into a dense enum-indexed table of component bundles validated with the runtime
+//! validators. Spawn resolves a slot to a bundle by `@backingInt`: no strings, hashing, or
+//! JSON on the hot path. It lives in the game layer because bundles hold game component
+//! types, and reads through `AssetStore`'s path-safe reader.
 //!
-//! Parsing is strict (`ignore_unknown_fields = false`): a misspelled drive,
-//! behavior, faction, or component key becomes `error.UnknownField` at parse
-//! time. Each entry self-declares its `id`; array position is irrelevant.
-//! Duplicate ids and any missing id are rejected. Absent numeric fields fall
-//! back to the component struct defaults exactly, so a loaded bundle is
-//! field-identical to the equivalent hand-written literal.
+//! Parsing is strict: an unknown key is `error.UnknownField`. Each entry names its `id`
+//! (array position is irrelevant); a duplicate or missing id is rejected. An absent numeric
+//! field keeps the component struct default, so a loaded bundle equals the hand-written
+//! literal.
 //!
-//! Schema — `{ "archetypes": [ { entry }, ... ] }`, one entry per id:
-//!   id: string (required)     -> AiArchetypeId
-//!   faction: string (required)-> Faction
-//!   agent: object (optional; absent => no AiAgent):
-//!     active_behavior: string (required) -> AiBehavior
-//!     gain_wander/gain_pursue/gain_flee/gain_investigate/gain_cohere: f32 (opt)
-//!     wander_amplitude, sticky_bonus: f32 (opt); commitment_max_steps: u16 (opt)
-//!   perception: object (optional): vision_range, hearing_range,
-//!     fov_half_angle_radians: f32 (opt)
-//!   memory: object (optional, presence-only) => default AiMemory
-//!   affect: object (optional): baseline_/decay_rate_/threshold_ fear,
-//!     curiosity, aggression, fatigue: f32 (opt)
+//! Schema: `{ "archetypes": [ entry, ... ] }`; an entry's keys are `ArchetypeJson`'s. `id` and
+//! `faction` are required; `agent` (with a required `active_behavior`), `perception`,
+//! `memory` (presence only), and `affect` are optional, and an absent one attaches no
+//! component.
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;

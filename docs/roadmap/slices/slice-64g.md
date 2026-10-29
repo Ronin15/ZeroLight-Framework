@@ -4,15 +4,15 @@
 
 **Status: sealed (2026-10-14, branch `engine_scale`).** Every acceptance check
 passes (verify, ReleaseFast test, gpu-smoke, the acceptance benches, the owner
-demo). Three follow-ups stay open below: partial-path followers (gated on a crowd
-walk), the measured level-build staging peak, and the result cache's
-capacity-history dependence. Kept as one slice by owner decision (2026-10-08).
+demo). Four follow-ups stay open below: partial-path followers (gated on a crowd
+walk), the measured level-build staging peak, the result cache's
+capacity-history dependence, and the per-participant search scratch reserve. Kept as one slice by owner decision (2026-10-08).
 
 Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
 memory follows content rather than level area, and nav processes per chunk so
 threading scales with any number of updates and path requests
-(`.claude/rules/engine-design.md` § Target scale).
+(`.grok/rules/engine-design.md` § Target scale).
 
 ### Current foundation
 
@@ -119,7 +119,7 @@ Failure and limits:
   `WorldBuildConfig` and 8 in `default_chunk_size_tiles`
   (`world_system.zig:48,125`), nav chunks 16 nav cells (`types.zig:130`) with
   the nav cell size set apart from the tile size
-  (`simulation_pipeline.zig:288`), test fixtures 4 and 8.
+  (`simulation_pipeline.zig:407`), test fixtures 4 and 8.
 - No bench varies level size or depth at a fixed change: `nav-update-*` runs
   one 256² world (`nav_update.zig:52`), and `pathfinding*` stays at or below
   256² on one level.
@@ -148,7 +148,7 @@ a design open for this slice):
   plan merge and mark loop B2a-1 then removed (plan 824 → 228 µs, mark 428 → 24 µs,
   `d11f1d9`).
 - **Dense-dig threading.** `pathfinding-evict 640010000 --details` (`83172ce`):
-  the eviction stage costs about 0.7 ms inline, above the 250 µs gate; the tuner
+  the eviction stage costs about 0.7 ms inline, above the gate (250 µs then); the tuner
   probes workers, they do not win on wall time beyond spread (2.62–2.91 ms across
   cases), and it settles inline or threaded run to run: a measured choice with the
   threaded path present.
@@ -195,7 +195,7 @@ a design open for this slice):
 - Owner direction (2026-10-07, 2026-10-08): the chunk is the unit of terrain
   and nav storage, change, work, threading, and save; nav covers the whole
   world; nothing is evicted from the simulation
-  (`.claude/rules/engine-design.md`, `.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/engine-design.md`, `.grok/rules/budgets-capacities.md`).
 - A level holds a directory of its chunks; nothing is sized to level area or
   world extent. Uniform and all-solid chunks stay cheap.
 - A local change touches only its chunks; a dense change processes its dirty
@@ -208,11 +208,11 @@ a design open for this slice):
   fallback rebuild.
 - Path requests fan out against the read-only chunked graph; a request's
   scratch follows its node budget, never level cells
-  (`.claude/rules/pathfinding.md`).
+  (`.grok/rules/pathfinding.md`).
 - Serial equals threaded, and incremental equals a full rebuild
-  (`.claude/rules/threading.md`, `.claude/rules/simulation.md`).
+  (`.grok/rules/threading.md`, `.grok/rules/simulation.md`).
 - Render presentation pools may be sized from the viewport; nothing in render
-  is sized to level area (`.claude/rules/render.md`).
+  is sized to level area (`.grok/rules/render.md`).
 - Provides: 65B copies and swaps only dirty chunks; 46 saves terrain per
   chunk; 64B rebuilds derived nav from chunk storage (perception holds no LOS
   state); 38 gets static collision bodies in nav on every level; 74 creates and
@@ -308,14 +308,14 @@ a design open for this slice):
       load (`4b15d88`); publish copies and registry flushes thread (`870ac61`,
       `8b59c3c`, `9f7de20`); the step's goal projections thread (`2c1a9c1`).
 - [x] Tuner resets learning when an inline batch's item count changes
-      (`thread_system.zig:1134-1137`, `:229-237`: the inline shape's range size
-      is the item count, so `record` sees a new profile): nav intake and group
+      (the inline shape's range size was the item count, so `record` saw a new
+      profile; policy since replaced by the batch tuner, `83ef090`): nav intake and group
       fields stay inline whenever the request or field count varies, e.g. the
       elastic ramp at 4,000 agents runs intake inline every ramp step.
       Landed (TS1): inline batches are one profile; an out-of-band batch is
       not sampled; a sustained same-side shift re-tunes a threaded stage.
-- [x] Tuner window-minimum demotion (`thread_system.zig:241-249`, `:399-410`,
-      `:599-610`): four lockstep group fields finish in one near-empty batch, the
+- [x] Tuner window-minimum demotion (policy since replaced by the batch tuner,
+      `83ef090`): four lockstep group fields finish in one near-empty batch, the
       advance pass demotes to inline and stays there for 360 batches.
       Landed (TS1): windows read the median batch.
 - [x] Tuner judges a demotion and a shift correctly: the first inline window
@@ -325,13 +325,15 @@ a design open for this slice):
       wait-dominated demotion no longer drops a threaded profile (`ff670b4`).
 - [x] The runtime perf log records each change path's cost-driver stage:
       `path_intake`, `path_registry_flush`, `nav_remask`, `nav_evict`,
-      `static_collider_splice` (`69dba4f`), `nav_connect` (`e793590`),
-      `nav_closure` (`a294a7a`). Group-field batches stay bench-only: they drive
+      `static_collider_plan` (`6045eda`), `nav_connect` (`e793590`),
+      `nav_closure` (`a294a7a`); since landed: `spatial_index_build`,
+      `path_resize_copy`, `collision_trigger_rewrite`,
+      `collision_trigger_refresh` (`src/app/runtime_perf_log.zig:217-240`). Group-field batches stay bench-only: they drive
       no change path (`threading.md`).
 - [x] One shared static-collider structure, synced once per entity per step,
       with nav as its first consumer; a static add, move, or destroy costs its
       own rows and chunks (`5db9025`); steering reads it through a size-class
-      query map (`173cc17`). Collision moves onto it in 71B.1.
+      query map (`173cc17`). Collision reads it (86, `b126599`).
 - [x] Steering's prepare phase, its agent grid, AI movement-intent apply, and
       collision response run as threaded stages with main O(1) per item
       (`ede5509`, `df7f1ea`, `cc58f38`, `ff670b4`); plane traversal's per-agent
@@ -411,25 +413,38 @@ a design open for this slice):
       `buildLevel` shrinks its staging before it returns, so `checkNavBytes` never
       sees the peak its bound charges (`639f55d`).
 - [ ] Result-cache size, hit/miss, and eviction follow capacity history (the
-      per-step gates do not since `78f4f90`): the logical size is
-      `4 × effective_agent_capacity` (`system.zig` `deriveLimits`, reserved in
-      `reserve`), the victim is a round-robin over physical probe slots whose
-      layout depends on the last resize's size (`caches.zig:410-419`, cursor
-      reset at `:449`, `:538`), and shrink eviction follows the shrink window
-      (`caches.zig:506`, `system.zig` `adjustCapacityForAgentCount`).
-      Scenario: 40 agents grown to capacity 64 vs freshly sized to 40 (a
-      save/load); after 200 distinct results one has evicted 40, the other
-      none, so later hits and re-solves differ. Admission and deferral are
-      identical and a miss re-solves correctly. Needs a live-count logical
-      limit and a layout-independent victim order (new eviction machinery, about
-      200–300 production lines; `.claude/reports/64g-capacity-gates-design.md`).
+      per-step gates do not since `78f4f90`). Confirmed 2026-10-19 on that
+      commit: `deriveLimits` sets `cached_results` from the held pool,
+      `growForAgentCount` stores at least double, and
+      `adjustCapacityForAgentCount` shrinks only after the low-load window,
+      never below the live queue. `claim` evicts when `len` reaches
+      `logical_capacity`; `evictVictim` walks `next_evict` over the physical
+      probe slots. A crowd that spiked and is still inside the shrink window
+      keeps and evicts different paths than a fresh system with the same live
+      agents. The history tests stop before the cache fills. Admission and
+      deferral are identical and a miss re-solves correctly. Pass: the logical
+      cap follows the live agent count, and the victim order does not depend
+      on the last resize's probe layout. This follow-up stays on 64G. It is
+      not a `core_systems` redo.
+- [ ] Pathfinding search scratch is not reserved per world create at every
+      thread participant. `PathfindingSystem` reserves a `SearchScratch` slot per
+      participant at default caps (`pathfinding/system.zig:540-551`), about 0.95
+      MiB each (derived from `@sizeOf` and the default caps), about 22 MiB on 24
+      participants, on every world create whatever the world's agents
+      (`.claude/reports/slice89-statics-landing.md`). Failure: Debug
+      `world-create-statics` 2,048 (Debug, 750ce0a) tuned 25.82 ms against serial 15.08 ms from
+      the page-faulted, 0xAA-filled reserves (ReleaseFast: 38 us of `rest`, tuned
+      faster than serial); memory is O(participants x caps), not agent count.
+      Pass: the reserve follows the solves that run (lazy at first solve, or
+      shared across worlds), a design the owner approves; world-create memory
+      reported before and after.
 - [x] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage.
 
 ### Acceptance checks
 
 - [x] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
-      levels (`.claude/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
+      levels (`.grok/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
       explosion fill flat across sizes; level create flat across depth and
       linear in its own chunks (level destroy and the world-count axis are
       74's).

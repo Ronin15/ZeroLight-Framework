@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none (F and G re-scoped against [Slice 64G](slice-64g.md) first) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** A1–A4, B1, C1–C7, D3, E2, G1–G3, H2, H3, I1, I2, K6
-landed (D3, E2, G1–G3, H2, H3 with 64G); E3, F1–F3, and J3 superseded; E4 and K3
-moved into 64G; M1, D1, D4, E1, E5–E9, H1, H4, J1, J2, J4, K1, K2, K4, K5, X1
+**Status: in progress.** A1–A4, B1, C1–C7, D3, D4, E2, G1–G3, H2, H3, I1, I2,
+K6 landed (D3, E2, G1–G3, H2, H3 with 64G; D4 with Slice 84); E3, F1–F3, and J3
+superseded; E4 and K3 moved into 64G; M1, D1, E1, E5–E9, H1, H4, J1, J2, J4, K1, K2, K4, K5, X1
 open.
 
 Goal: no live behavior (iteration order, deferral, refusal, drops,
@@ -35,9 +35,7 @@ content across world sizes.
   (`resize_dropped`); the group tally is
   capped at `min(512, n)`; elastic capacity starts at a floor of 8;
   destructible cell resolve scans only the first
-  `destructible_cell_scan_budget` (256) dense rows; the spatial-index dense
-  window is halo-derived on every instance and clamps a wider populated box
-  out silently; AI scan radius uses an unenforced `grid_cell_size` (32);
+  `destructible_cell_scan_budget` (256) dense rows;
   `solved_paths` and the worker path pool stripes share lines across
   workers; GPU static streams are created at the first upload's exact size;
   `StateTransitions.reserve` sets the refusal bound.
@@ -61,14 +59,14 @@ content across world sizes.
 ### Architecture notes
 
 - No `stage_order`, `PipelineResource`, or `stageContract()` change.
-- Growth points (`.claude/rules/memory-performance.md`): population storage
+- Growth points (`.grok/rules/memory-performance.md`): population storage
   in `syncPopulationCapacity`; per-frame render storage on the main thread
   before the threaded emit; gates compare stored logical limits.
-- Storage follows content (`.claude/rules/budgets-capacities.md`): a
+- Storage follows content (`.grok/rules/budgets-capacities.md`): a
   world-extent sizing item is rewritten to size by content, or moved into
   64G, never landed as extent sizing.
 - New growth and drop counters log once and are perf metrics
-  (`.claude/rules/zig-style.md`).
+  (`.grok/rules/zig-style.md`).
 - Each item lands with its tests and bench run; cross-slice text edits land
   in the same change as their item.
 
@@ -91,11 +89,21 @@ content across world sizes.
 - [x] C5 · Per-range outputs never warm in-stage (`78ed7e5`).
 - [x] C6 · Contact streams reserved to the pair bound; overruns counted.
 - [x] C7 · Battle-scale contact density confirmed in the running demo.
-- [ ] D1 · Destructible cell resolve reaches every row (one pass over
-      destructibles per step, today's tie-break), with `destructible-resolve`
-      bench; 61, 63, and 71D resolve text updated.
+- [ ] D1 · Destructible cell resolve reaches every destructible through the
+      shared static-collider query, so its cost follows the cells resolved,
+      never the destructible count, with no per-step pass over destructibles
+      on main (Engine-Core core finding: a pass over every destructible per
+      step fails the cost model). Failure scenario: the resolve scans only the
+      first 256 dense rows (`destructible_controller.zig:36`, `:294`), so a
+      destructible at row 257 or later is never hit (derived; contract test).
+      Each scanned row also resolves the slot, level, body, and bounds
+      (`:297`). That chase goes away with the scan, not as a packed copy of it.
+      Today's tie-break kept; `destructible-resolve` flat in destructible
+      count at three counts; 61, 63, and 71D resolve text updated.
 - [x] D3 · LOS visit limit from the ray's own length.
-- [ ] D4 · AI scan radius from the live spatial cell size.
+- [x] D4 · AI scan radius from the live spatial cell size (`c52a5ff`). Queries take a
+      world radius and the index derives the scan box
+      (`spatial_index.zig:535`); `grid_cell_size` is gone.
 - [ ] E1 · A pathfinding shrink never drops accepted work.
 - [x] E2 · Elastic resizes preserve cache entries and pending work, with a
       `pathfinding-elastic-ramp` bench (solves after ≤ before).
@@ -163,7 +171,7 @@ content across world sizes.
 - [ ] Every capacity-dependent-behavior site is fixed or justified at its
       site.
 - [ ] Every item that can move a hot path is benched before and after on
-      adjacent commits (`.claude/rules/tests-benchmarks.md`) with no
+      adjacent commits (`.grok/rules/tests-benchmarks.md`) with no
       regression beyond run-to-run spread; new groups record baselines.
 - [ ] `footprint-*` at three world sizes shows memory following content, not
       extent, before and after F and G; numbers in the landing commits.

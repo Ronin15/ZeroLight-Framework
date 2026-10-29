@@ -37,7 +37,7 @@ is Slice 44.
 - App/input layer only; no simulation or render surface.
 - One active pad, shared `Action` and routing machinery, per-axis clamping,
   and `releaseHeldGameplay()` on context loss are rules in
-  `.claude/rules/input-state.md`.
+  `.grok/rules/input-state.md`.
 
 ### Checklist
 

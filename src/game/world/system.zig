@@ -5,13 +5,15 @@
 //! State-owned SoA world/tile storage and render preparation.
 //! Persistent world data stores stable tile IDs, level/chunk metadata, and
 //! gameplay tile flags. Dense tiles, composed movement-blocked bits, and link
-//! endpoints are stored per chunk (`terrain.zig`) behind the accessors here. Atlas source rectangles are resolved from `tileset_meta`
-//! once at build time and cached into per-tile `catalog_source_x/y/w/h` columns,
+//! endpoints are stored per chunk (`terrain.zig`) behind the accessors here. Atlas source rectangles are resolved from the tileset
+//! metadata once at build time and cached into per-tile `catalog_source_x/y/w/h` columns,
 //! so hot-path `sourceRect` lookups never re-touch tileset metadata at runtime.
 //! Renderer handles stay outside this owner.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
 const RuntimeAssets = @import("../../assets/runtime_assets.zig").RuntimeAssets;
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const Rect = @import("../../render/renderer.zig").Rect;
@@ -19,6 +21,7 @@ const TilemapParams = @import("../../render/renderer.zig").TilemapParams;
 const TextureDesc = @import("../../render/resources.zig").TextureDesc;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const ActiveRegion = @import("../simulation_scope.zig").ActiveRegion;
 const ChunkCoord = @import("../simulation_scope.zig").ChunkCoord;
@@ -203,16 +206,10 @@ pub const WorldSystem = struct {
     // through `appendLevelBaseZ`, and no chunk storage exists before it.
     chunk_geom: ChunkGeometry = no_level_chunk_geom,
 
-    /// Borrowed atlas metadata used for `sourceRect` lookups. Satisfied by
-    /// `RuntimeAssets.worldTilesetMeta()` for production startup, or by
-    /// `adoptTilesetMeta` for standalone tests/tools that construct a world
-    /// without a long-lived runtime catalog.
-    tileset_meta: ?*const WorldTilesetMeta = null,
-    owned_tileset_meta: ?WorldTilesetMeta = null,
     catalog_valid: std.ArrayList(bool) = .empty,
     catalog_flags: std.ArrayList(TileFlags) = .empty,
     // O(1) source-rect cache, indexed like catalog_valid/catalog_flags. Avoids a
-    // per-tile hash-map lookup into tileset_meta on the per-frame sparse-tile
+    // per-tile hash-map lookup into the tileset metadata on the per-frame sparse-tile
     // render path.
     catalog_source_x: std.ArrayList(f32) = .empty,
     catalog_source_y: std.ArrayList(f32) = .empty,
@@ -249,18 +246,16 @@ pub const WorldSystem = struct {
     edit_level_tails: std.ArrayList(u32) = .empty,
     edit_chunk_heads: []u32 = &.{},
     edit_chunk_tails: []u32 = &.{},
-    // The batched edit's per-stage tuners and last batches (`applyDenseCellWrites`).
+    // The batched edit's per-stage tuners (`applyDenseCellWrites`).
     terrain_edit_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     terrain_edit_write_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    last_terrain_edit_plan_batch: BatchStats = .{},
-    last_terrain_edit_write_batch: BatchStats = .{},
-    // Telemetry: reserves that grew a dense block or composed-bits pool. Pools grow
-    // geometrically at their reserve seams; the first growth logs once.
-    terrain_pool_grows: u64 = 0,
+    // The procedural paint's tuner: fresh per world, so the paint is a one-off.
+    ground_build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(rebuild_tuner_config),
+    // Pools grow geometrically at their reserve seams; the first growth logs once.
     terrain_pool_growth_logged: bool = false,
-    // Telemetry: reserves that grew the batched edit's scratch; the first logs once.
-    dense_edit_scratch_grows: u64 = 0,
+    // The first growth of the batched edit's scratch logs once.
     dense_edit_scratch_growth_logged: bool = false,
+    perf: Perf = .{},
     // Mirror of the renderer-owned GPU tile store holding the render window's dense
     // layers by chunk; `syncDenseTileStore` uploads what changed. Edits hold no GPU
     // memory: a change on a resident layer sets the layer's `render_changed` and
@@ -311,10 +306,7 @@ pub const WorldSystem = struct {
         bounds_height: f32,
     ) !WorldSystem {
         const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
-        var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
-        errdefer world.deinit();
-        try world.addUndergroundLevels(meta);
-        return world;
+        return initDemoFromMetaWithUnderground(allocator, meta, bounds_width, bounds_height);
     }
 
     pub fn initProcedural(
@@ -343,24 +335,8 @@ pub const WorldSystem = struct {
 
     pub const initDemoFromMetaWithChunkSize = world_worldgen.initDemoFromMetaWithChunkSize;
 
-    /// Transfers standalone tileset metadata ownership into this world so
-    /// `sourceRect` lookups remain valid after the caller's local `meta` ends.
-    /// Does not cache a self-pointer: `WorldSystem` is moved by value; read
-    /// via `tilesetMeta()`.
-    pub fn adoptTilesetMeta(self: *WorldSystem, meta: WorldTilesetMeta) void {
-        if (self.owned_tileset_meta) |*owned| owned.deinit();
-        self.owned_tileset_meta = meta;
-    }
-
-    /// Resolves the tileset metadata to read, preferring an owned value (safe
-    /// across moves of `WorldSystem`) over a borrowed pointer set by `buildCatalog`.
-    pub fn tilesetMeta(self: *const WorldSystem) ?*const WorldTilesetMeta {
-        return if (self.owned_tileset_meta) |*m| m else self.tileset_meta;
-    }
-
     /// Prefer `initDemo` with `RuntimeAssets` so tileset metadata is not parsed
-    /// again at world construction. Call `adoptTilesetMeta` when the caller's
-    /// `meta` would not outlive the returned world.
+    /// again at world construction. `meta` is read only during construction.
     pub fn initDemoFromMetaWithUnderground(
         allocator: std.mem.Allocator,
         meta: *const WorldTilesetMeta,
@@ -372,6 +348,16 @@ pub const WorldSystem = struct {
         try world.addUndergroundLevels(meta);
         return world;
     }
+
+    /// Kept only with `runtime_perf_log.enabled`: the batched edit's last plan and write
+    /// batches, the procedural paint's batch, and the reserves that grew a dense block or
+    /// composed-bits pool.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_terrain_edit_plan_batch: BatchStats = .{},
+        last_terrain_edit_write_batch: BatchStats = .{},
+        last_paint_batch: BatchStats = .{},
+        terrain_pool_grows: u64 = 0,
+    } else struct {};
 
     pub fn deinit(self: *WorldSystem) void {
         self.sparse_window.deinit(self.allocator);
@@ -402,9 +388,6 @@ pub const WorldSystem = struct {
         self.catalog_source_x.deinit(self.allocator);
         self.catalog_flags.deinit(self.allocator);
         self.catalog_valid.deinit(self.allocator);
-        if (self.owned_tileset_meta) |*meta| meta.deinit();
-        self.owned_tileset_meta = null;
-        self.tileset_meta = null;
         self.interest_markers.deinit(self.allocator);
         self.* = undefined;
     }
@@ -561,23 +544,9 @@ pub const WorldSystem = struct {
     pub const groupDenseCellWrites = world_edit.groupDenseCellWrites;
     pub const reserveDenseCellWrites = world_edit.reserveDenseCellWrites;
 
-    pub fn denseLayerCount(self: *const WorldSystem) usize {
-        return self.dense_layers.len;
-    }
-
     /// The level a dense layer is a band of.
     pub fn denseLayerLevel(self: *const WorldSystem, layer_index: usize) u16 {
         return self.dense_layers.items(.level_index)[layer_index];
-    }
-
-    /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index. A
-    /// sparse index is valid only until the next sparse tile removal.
-    pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
-        const cell = self.sparse_tiles.items(.cell_index)[index];
-        return .{
-            .x = @intCast(cell % self.width),
-            .y = @intCast(cell / self.width),
-        };
     }
 
     pub fn levelCount(self: *const WorldSystem) usize {
@@ -796,16 +765,6 @@ pub const WorldSystem = struct {
         return self.level_links.items;
     }
 
-    pub fn sparseTileCount(self: *const WorldSystem) usize {
-        return self.sparse_tiles.len;
-    }
-
-    /// A sparse index is valid only until the next sparse tile removal.
-    pub fn sparseTileBlocksMovement(self: *const WorldSystem, index: usize) bool {
-        if (index >= self.sparse_tiles.len) return false;
-        return self.sparse_tiles.items(.flags)[index].blocks_movement;
-    }
-
     pub fn cellRect(self: *const WorldSystem, x: u16, y: u16) ?Rect {
         if (x >= self.width or y >= self.height) return null;
         return .{
@@ -824,6 +783,25 @@ pub const WorldSystem = struct {
         const cell_y = @as(u32, @intFromFloat(world_y / self.tile_size));
         if (cell_x >= self.width or cell_y >= self.height) return null;
         return .{ .x = @intCast(cell_x), .y = @intCast(cell_y) };
+    }
+
+    /// Lane cells of `cellContaining4`: each lane's cell, valid where `inside` is set.
+    pub const LaneCells = struct {
+        x: simd.Int4,
+        y: simd.Int4,
+        inside: simd.Mask4,
+    };
+
+    /// `cellContaining` per lane: a negative coordinate is outside, otherwise the floored
+    /// tile index must lie inside the grid.
+    pub fn cellContaining4(self: *const WorldSystem, world_x: simd.Float4, world_y: simd.Float4) LaneCells {
+        const zero = simd.splatFloat4(0);
+        const tile = simd.splatFloat4(self.tile_size);
+        const x = simd.floorToI4(simd.divFloat4(world_x, tile));
+        const y = simd.floorToI4(simd.divFloat4(world_y, tile));
+        const non_negative = simd.greaterEqualFloat4(world_x, zero) & simd.greaterEqualFloat4(world_y, zero);
+        const below_extent = simd.lessThanInt4(x, simd.splatInt4(self.width)) & simd.lessThanInt4(y, simd.splatInt4(self.height));
+        return .{ .x = x, .y = y, .inside = non_negative & below_extent };
     }
 
     /// The chunk holding cell (x, y). Pure arithmetic on the chunk edge, so it needs no
@@ -958,10 +936,8 @@ pub const WorldSystem = struct {
     pub const clearCellBlocking = world_edit.clearCellBlocking;
 
     /// Builds the tile catalog of a directly constructed world, before its first
-    /// level. Borrows `meta` for `sourceRect` lookups. Production paths keep metadata
-    /// alive via `RuntimeAssets`; standalone callers must call `adoptTilesetMeta`.
+    /// level. Reads `meta` only here: `sourceRect` reads the catalog's cached rects.
     pub fn buildCatalog(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
-        self.tileset_meta = meta;
         const count = catalogCapacity(meta);
         try self.catalog_valid.ensureTotalCapacity(self.allocator, count);
         try self.catalog_flags.ensureTotalCapacity(self.allocator, count);
@@ -1054,17 +1030,6 @@ pub const WorldSystem = struct {
         return @intCast(@max(min, @min(max, value)));
     }
 
-    /// Level-local chunk grid width (every level shares one grid). Requires a level.
-    pub fn chunksX(self: *const WorldSystem) u16 {
-        // At most the u16 width.
-        return @intCast(self.chunkGeometry().chunks_x);
-    }
-
-    /// Level-local chunk grid height. See `chunksX`.
-    pub fn chunksY(self: *const WorldSystem) u16 {
-        return @intCast(self.chunkGeometry().chunks_y);
-    }
-
     /// Chunks per level, the length of every per-level chunk directory. Requires a level.
     pub fn chunkCountPerLevel(self: *const WorldSystem) usize {
         return self.chunkGeometry().chunkCount();
@@ -1116,6 +1081,39 @@ const procedural_test_config = @import("test_support.zig").procedural_test_confi
 const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
 const DenseCellWrite = @import("edit.zig").DenseCellWrite;
 const DenseChunkWrites = @import("edit.zig").DenseChunkWrites;
+
+test "cellContaining4 lanes match cellContaining on edges and outside points" {
+    var world = WorldSystem{ .allocator = std.testing.allocator, .width = 4, .height = 3, .tile_size = 32, .chunk_size_tiles = 4 };
+    defer world.deinit();
+    // The origin, -0.0, just below zero, exact tile multiples, the far edges, and past them.
+    const points = [_][2]f32{
+        .{ 0, 0 },    .{ -0.0, 5 }, .{ 5, -0.0 },      .{ -0.5, 5 },
+        .{ 5, -0.5 }, .{ 32, 64 },  .{ 31.75, 63.75 }, .{ 127.75, 95.75 },
+        .{ 128, 10 }, .{ 10, 96 },  .{ 200, 200 },     .{ -40, -40 },
+    };
+    comptime std.debug.assert(points.len % simd.lane_count == 0);
+    var block: usize = 0;
+    while (block < points.len) : (block += simd.lane_count) {
+        var xs: [simd.lane_count]f32 = undefined;
+        var ys: [simd.lane_count]f32 = undefined;
+        for (points[block..][0..simd.lane_count], 0..) |point, lane| {
+            xs[lane] = point[0];
+            ys[lane] = point[1];
+        }
+        const lanes = world.cellContaining4(simd.loadFloat4(&xs), simd.loadFloat4(&ys));
+        const inside: [simd.lane_count]bool = lanes.inside;
+        const cell_x = simd.toIntArray(lanes.x);
+        const cell_y = simd.toIntArray(lanes.y);
+        for (0..simd.lane_count) |lane| {
+            const want = world.cellContaining(xs[lane], ys[lane]);
+            try std.testing.expectEqual(want != null, inside[lane]);
+            if (want) |cell| {
+                try std.testing.expectEqual(@as(i32, cell.x), cell_x[lane]);
+                try std.testing.expectEqual(@as(i32, cell.y), cell_y[lane]);
+            }
+        }
+    }
+}
 
 test "world dense layer uses row-major indexing" {
     var meta = try testWorldMeta();
@@ -1709,36 +1707,6 @@ test "a rect ending exactly on a tile edge at large pixel coordinates excludes t
     try std.testing.expectEqual(ChunkCoord{ .x = 66, .y = 1 }, tiny.max_exclusive);
 }
 
-fn moveWorldByValue(world: WorldSystem) WorldSystem {
-    return world;
-}
-
-test "tilesetMeta resolves correctly after WorldSystem is moved by value" {
-    const meta = try testWorldMeta();
-    const expected_tile_size = meta.tileSize();
-
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = expected_tile_size,
-        .chunk_size_tiles = 2,
-    };
-    world.adoptTilesetMeta(meta);
-
-    var moved = moveWorldByValue(world);
-    defer moved.deinit();
-
-    const resolved = moved.tilesetMeta() orelse return error.TestExpectedTilesetMeta;
-    try std.testing.expectEqual(expected_tile_size, resolved.tileSize());
-    // `world` (the pre-move original) stays alive for this whole test, so a
-    // value-only comparison would still pass against the pre-fix behavior of
-    // caching `&world.owned_tileset_meta` at adopt time: that stale pointer
-    // still reads correct bytes since `world` was never freed. Assert pointer
-    // identity against `moved`'s own field to actually discriminate the fix.
-    try std.testing.expect(resolved == &moved.owned_tileset_meta.?);
-}
-
 test "levelChunkBlockedBits holds a mixed chunk's cells and nothing for uniform chunks" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2130,7 +2098,7 @@ test "a blocking dense layer add and procedural fills advance the level's conten
         var world = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
         defer world.deinit();
         var blocking_sparse = false;
-        for (0..world.sparseTileCount()) |index| blocking_sparse = blocking_sparse or world.sparseTileBlocksMovement(index);
+        for (0..world.sparse_tiles.len) |index| blocking_sparse = blocking_sparse or world.sparse_tiles.items(.flags)[index].blocks_movement;
         seen_blocking_sparse[@intFromBool(blocking_sparse)] = true;
         try std.testing.expectEqual(@as(u32, 1) + @intFromBool(blocking_sparse), world.level_terrain.items[0].content_revision);
     }

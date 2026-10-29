@@ -6,10 +6,18 @@
 //! Tier/chunk scoping drives cognition-stage gating by camera halo, stagger cadence, and tier commands.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 
 /// Steps between cognition-stage runs for a single entity. AI and steering run
 /// once every cognition_stagger_n fixed steps per entity, rotating by stagger_phase.
 pub const cognition_stagger_n: u8 = 4;
+
+/// `EntitySimulationMetadata.stagger_phase` sentinel: a metadata write keeps the row's phase.
+pub const keep_stagger_phase: u8 = std.math.maxInt(u8);
+
+comptime {
+    std.debug.assert(cognition_stagger_n <= keep_stagger_phase);
+}
 
 /// Simulation LOD bands as chunk distance from the camera-visible border. An
 /// entity's tier is the band its chunk falls into: within cognition_halo it
@@ -129,28 +137,32 @@ pub const ActiveRegion = struct {
     }
 };
 
-/// Per-entity simulation metadata value type for get/set (`simulationMetadata`/
-/// `setSimulationMetadata`). The hot storage is dense SoA columns on the
-/// movement-body store; the hot path reads them directly via `scopeColumnsSlice`.
+/// Per-entity simulation metadata value type (`setSimulationMetadata`). The hot storage is
+/// dense SoA columns on the movement-body store; the hot path reads them directly via
+/// `scopeColumnsSlice`.
 pub const EntitySimulationMetadata = struct {
     tier: SimulationTier = .cognition,
     chunk: ChunkCoord = .{},
-    /// Depth/level this entity occupies. NPCs are all level 0 today, so this
-    /// defaults to the surface; the tier policy weighs it through the cube LOD
-    /// distance so a multi-level world demotes off-level entities correctly.
-    level: u16 = 0,
-    /// Which step within the stagger cycle this entity runs cognition. Assigned at
-    /// movement-body append as dense_index % cognition_stagger_n: stable per entity,
-    /// preserved by setSimulationTier, but not index-correlated after swap-remove
-    /// churn. A full setSimulationMetadata write replaces it with the supplied value.
-    stagger_phase: u8 = 0,
+    /// Depth/level this entity occupies; the tier policy weighs it through the cube LOD
+    /// distance so a multi-level world demotes off-level entities correctly. A
+    /// setSimulationMetadata write takes it from the entity's `world_level` row when it has
+    /// one (a supplied level must match), else keeps the row's level at `null` (the default)
+    /// and writes any other value; a read returns the row's level.
+    level: ?u16 = null,
+    /// Which step within the stagger cycle this entity runs cognition, below
+    /// `cognition_stagger_n`. Assigned at movement-body append as
+    /// dense_index % cognition_stagger_n: stable per entity, preserved by
+    /// setSimulationTier, but not index-correlated after swap-remove churn. A
+    /// setSimulationMetadata write keeps the row's phase at `keep_stagger_phase` (the
+    /// default) and writes any other value; a read returns the row's phase.
+    stagger_phase: u8 = keep_stagger_phase,
     /// When true, the cognition-halo tier policy never demotes this entity
     /// regardless of its distance from the camera. Use for bosses, scripted
     /// enemies, and any NPC that must keep thinking even when far off-screen.
     always_active: bool = false,
 
-    pub fn validate(self: EntitySimulationMetadata) !void {
-        _ = self;
+    pub fn validate(self: EntitySimulationMetadata) error{InvalidStaggerPhase}!void {
+        if (self.stagger_phase != keep_stagger_phase and self.stagger_phase >= cognition_stagger_n) return error.InvalidStaggerPhase;
     }
 };
 
@@ -167,10 +179,14 @@ pub const SimulationScopeStats = struct {
     collision_response_stage_entities: usize = 0,
     ai_stage_entities: usize = 0,
     steering_stage_entities: usize = 0,
-    /// Cognition entities inside the halo that were skipped by stagger this step.
-    stagger_skips: usize = 0,
-    /// Entities excluded from cognition because their chunk is outside the halo.
-    chunk_filtered_entities: usize = 0,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: indexed halo entities the stagger skipped
+    /// this step, and cognition entities excluded because their chunk is outside the halo.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        stagger_skips: usize = 0,
+        chunk_filtered_entities: usize = 0,
+    } else struct {};
 };
 
 /// Transient fixed-step scope. active_region is the cognition halo (camera visible

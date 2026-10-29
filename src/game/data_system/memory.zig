@@ -83,7 +83,8 @@ pub const AiMemoryStore = struct {
     }
 
     pub fn append(self: *AiMemoryStore, allocator: std.mem.Allocator, entity: EntityId, memory: AiMemory) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAiMemoryRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         const ring = splitRing(memory.ring);
@@ -320,4 +321,10 @@ test "AiMemoryStore sliceConst and mutable slice expose aligned columns" {
     try std.testing.expectEqual(@as(f32, 0.7), store.get(1).familiarity);
     try std.testing.expectEqual(@as(u8, 2), store.get(1).ring_next_slot);
     try std.testing.expectEqual(@as(f32, 3.5), store.get(1).ring[0].x);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "AiMemoryStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(AiMemoryStore, AiMemory{});
 }

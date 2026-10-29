@@ -19,13 +19,13 @@ const SimulationEvent = @import("../../game/simulation.zig").SimulationEvent;
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
+const PathfindingConfig = @import("../../game/systems/pathfinding.zig").PathfindingConfig;
 const StaticColliderSystem = @import("../../game/systems/static_colliders.zig").StaticColliderSystem;
 const default_max_solves_per_frame = @import("../../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
-const intake_range_alignment_items = @import("../../game/systems/pathfinding/types.zig").intake_range_alignment_items;
+const flush_pair_count = @import("../../game/systems/pathfinding/publish.zig").flush_pair_count;
 const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
-const goal_scan_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
-const goal_project_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").project_range_alignment_items;
+const default_cache_ttl_steps = @import("../../game/systems/pathfinding/types.zig").default_cache_ttl_steps;
 const WorldSystem = @import("../../game/world/system.zig").WorldSystem;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const TileId = @import("../../game/world/system.zig").TileId;
@@ -33,11 +33,12 @@ const fixtures = @import("../fixtures.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
 
-// A cold step re-solves up to the per-step ceiling, so the cold groups take fewer samples
-// than the suite's defaults; a smaller `--warmup`/`--iterations` still wins.
+// A cold step re-solves up to the per-step ceiling, so the cold groups take fewer warmup and
+// measured samples than the suite's defaults; a smaller `--warmup`/`--iterations` still wins.
+// The tuned case still settles at the suite's limit (`suite.adaptiveSettleIterationLimit`):
+// production's update tuners persist across steps, so a cold step is no fresh one-off.
 const cold_warmup_cap: usize = 1;
 const cold_iteration_cap: usize = 5;
-const cold_settle_cap: usize = 4;
 
 pub fn coldWarmup(options: suite.Options) usize {
     return @min(options.warmup_iterations, cold_warmup_cap);
@@ -45,43 +46,74 @@ pub fn coldWarmup(options: suite.Options) usize {
 pub fn coldIterations(options: suite.Options) usize {
     return @min(options.iterations, cold_iteration_cap);
 }
-pub fn coldSettleLimit(options: suite.Options) usize {
-    return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
+
+/// Every tuner of `system`'s stage set (`fixtures.addNavTuners`): those a pathfinding step,
+/// and its nav reaction, select. A tuner no measured step records in is idle
+/// (`TunerSettle.measured`).
+pub fn stepTunerSettle(system: *const PathfindingSystem) suite.TunerSettle {
+    return fixtures.navTunerSettle("", &system.tuners);
 }
 
-pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(requests, agent_count, .{
-            .max_solved_requests_per_step = solve_budget,
-            .max_solve_admissions_per_step = fallback_budget,
-        });
-    }
-    return try system.update(requests, agent_count, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+/// The update config of a cold step under `case` with the given solve and admission budgets.
+pub fn coldStepConfig(case: suite.BenchmarkCase, solve_budget: usize, fallback_budget: usize) PathfindingConfig {
+    return .{
+        .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .max_solved_requests_per_step = solve_budget,
         .max_solve_admissions_per_step = fallback_budget,
-    });
+    };
 }
 
-// Gives every pathfinding update stage this case's tuner, as the solve batch gets its own.
-pub fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.tuners.solve = tuner;
-    if (suite.adaptiveTunerForCase(case, intake_range_alignment_items)) |tuner| system.tuners.intake = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_begin = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_stall = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.publish_copy = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.registry_flush = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.resize_copy = tuner;
-    if (suite.adaptiveTunerForCase(case, goal_scan_range_alignment_items)) |tuner| system.tuners.goal_scan = tuner;
-    if (suite.adaptiveTunerForCase(case, goal_project_range_alignment_items)) |tuner| system.tuners.goal_project = tuner;
+/// Moves the step clock past the result TTL, as that many idle steps would: each cached
+/// goal's next request finds its result expired, removes it at intake, and solves it cold,
+/// while every chunk that still holds a registration keeps its registry block. This is the
+/// play shape of a cold request; `clearRuntimeState` is a nav rebuild's reset, which releases
+/// every block. Pending work stays, as in play.
+pub fn expireCachedResults(system: *PathfindingSystem) void {
+    system.step_counter +%= default_cache_ttl_steps;
+}
+
+/// Steps `config` over no requests until nothing is pending: play drops pending work only by
+/// solving it or by its second exhausted attempt.
+pub fn drainPending(system: *PathfindingSystem, thread_system: *ThreadSystem, agent_count: usize, config: PathfindingConfig) !void {
+    var empty = RangeOutputStream(PathRequest).init(system.allocator);
+    defer empty.deinit();
+    // Each entry takes at most two attempts, and a step with work pending admits one or more.
+    var steps_left = 2 * system.pending.len + 1;
+    while (system.pending.len != 0) : (steps_left -= 1) {
+        if (steps_left == 0) return error.PendingDrainStalled;
+        _ = try system.update(&empty, agent_count, thread_system, config);
+    }
+}
+
+/// One pathfinding update under `case`; a fixed threaded case runs every update stage of
+/// more than one range on workers, the group field passes' rounds at their step selection
+/// (`RoundDispatch`). A registry flush that added registrations ran at least one unit per
+/// pair and per add, and a fixed threaded case flushes one range per configured range of
+/// units.
+pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
+    const config = coldStepConfig(case, solve_budget, fallback_budget);
+    const stats = try system.update(requests, agent_count, thread_system, config);
+    const perf = stats.perf;
+    try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &.{ perf.intake_batch, perf.solve_batch, perf.publish_copy_batch, perf.registry_flush_batch, perf.resize_copy_batch });
+    // A group field pass's first round expands every field its step sized from, so its step
+    // items are its widest round.
+    try suite.checkRoundsDispatched(case, thread_system, config.items_per_range, perf.group_field_batch, perf.group_field_step_items, perf.group_field_step_items);
+    try suite.checkRoundsDispatched(case, thread_system, config.items_per_range, perf.group_field_begin_batch, perf.group_field_begin_step_items, perf.group_field_begin_step_items);
+    // A shrink's registry rename pass and the flush's bound count.
+    try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &.{ stats.perf.registry_rename_batch, stats.perf.registry_flush_count_batch });
+    const flush = stats.perf.registry_flush_batch;
+    const adds = stats.perf.registrations_added;
+    if (adds != 0 and flush.item_count < flush_pair_count + adds) return error.RegistryFlushMissedUnits;
+    try suite.checkFixedRangeCount(case, thread_system, config.items_per_range, flush);
+    return stats;
 }
 
 // An update's stage batches, in `StageReport` order.
 fn updateBatches(stats: PathfindingStats) [update_stage_count]BatchStats {
-    return .{ stats.intake_batch, stats.group_field_batch, stats.group_field_begin_batch, stats.solve_batch, stats.publish_copy_batch, stats.registry_flush_batch, stats.resize_copy_batch };
+    return .{ stats.perf.intake_batch, stats.perf.group_field_batch, stats.perf.group_field_begin_batch, stats.perf.solve_batch, stats.perf.publish_copy_batch, stats.perf.registry_flush_batch, stats.perf.resize_copy_batch };
 }
 
 const update_stage_count = 7;
@@ -106,8 +138,10 @@ pub const StageReport = struct {
     solve_main_ns: u128 = 0,
     publish_ns: u128 = 0,
     // Intake, group-field advance, group-field begin, solve, publish copy, registry flush,
-    // resize copy.
+    // resize copy. The flush count and a shrink's rename pass are separate: neither is a
+    // perf-log key.
     shapes: suite.StageShapes(update_stage_count) = .{},
+    count: suite.StageShapes(1) = .{},
     // Route groups that count unsolved routes: the last timed step's outcome.
     routes: ?RouteOutcome = null,
     // Path-registry entries the timed updates added and removed.
@@ -121,34 +155,34 @@ pub const StageReport = struct {
     pub fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
         self.samples += 1;
         self.timed_ns += elapsed_ns;
-        self.main_ns += elapsed_ns -| offMainStageNs(stats);
-        self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
-        self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.group_field_batch) + offMainNs(stats.group_field_begin_batch));
-        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.solve_batch);
-        self.publish_ns += stats.publish_ns -| offMainNs(stats.publish_copy_batch);
-        self.registrations_added += stats.registrations_added;
-        self.registrations_removed += stats.registrations_removed;
-        self.unavailable += stats.unavailable_results;
-        self.goal_fallbacks += stats.goal_fallbacks;
+        self.main_ns += elapsed_ns -| offMainStageNs(stats) -| offMainNs(stats.perf.registry_flush_count_batch) -| offMainNs(stats.perf.registry_rename_batch);
+        self.accept_main_ns += stats.accept_ns -| offMainNs(stats.perf.intake_batch);
+        self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.perf.group_field_batch) + offMainNs(stats.perf.group_field_begin_batch));
+        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.perf.solve_batch);
+        self.publish_ns += stats.publish_ns -| offMainNs(stats.perf.publish_copy_batch);
+        self.count.add(.{stats.perf.registry_flush_count_batch});
+        self.registrations_added += stats.perf.registrations_added;
+        self.registrations_removed += stats.perf.registrations_removed;
+        self.unavailable += stats.perf.unavailable_results;
+        self.goal_fallbacks += stats.perf.goal_fallbacks;
         self.shapes.add(updateBatches(stats));
     }
 
-    pub fn print(self: StageReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.timed_ns == 0) return;
+    pub fn write(self: StageReport, details: *suite.DetailLines) void {
+        if (self.timed_ns == 0) return;
         var buffers: [update_stage_count][48]u8 = undefined;
         var labels: [update_stage_count][]const u8 = undefined;
         for (&buffers, &labels, 0..) |*buffer, *label, index| label.* = self.shapes.label(index, buffer);
         const samples: u128 = self.samples * std.time.ns_per_us;
-        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
-            group_name,
-            item_count,
-            case.name,
+        var count_buffer: [48]u8 = undefined;
+        details.print("intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} registry_flush_count={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
             labels[0],
             labels[1],
             labels[2],
             labels[3],
             labels[4],
             labels[5],
+            self.count.label(0, &count_buffer),
             labels[6],
             @as(u64, @intCast(self.main_ns / self.samples / std.time.ns_per_us)),
             @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
@@ -157,23 +191,17 @@ pub const StageReport = struct {
             @as(u64, @intCast(self.solve_main_ns / samples)),
             @as(u64, @intCast(self.publish_ns / samples)),
         });
-        if (self.routes) |routes| std.debug.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
-        std.debug.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
+        if (self.routes) |routes| details.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
+        details.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
         if (self.unavailable + self.goal_fallbacks != 0) {
-            std.debug.print(" unavailable={} goal_fallbacks={} per update", .{
+            details.print(" unavailable={} goal_fallbacks={} per update", .{
                 self.unavailable / self.samples,
                 self.goal_fallbacks / self.samples,
             });
         }
-        std.debug.print("\n", .{});
+        details.print("\n", .{});
     }
 };
-
-pub fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(pathfinding_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, pathfinding_range_alignment_items);
-}
 
 // Walkable levels of `side`² tiles in default chunks, one floor band per level (level
 // `i` owns layer `i`); `blocking` blocks movement.
@@ -195,9 +223,11 @@ pub const OpenWorld = struct {
 };
 
 pub fn buildOpenWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !OpenWorld {
-    var world = try fixtures.buildBandedWorld(allocator, io, side, levels, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const meta = &tileset;
+    var world = try fixtures.buildBandedWorld(allocator, meta, side, levels, "grass", "grass");
     errdefer world.deinit();
-    const meta = world.tilesetMeta().?;
     const walkable = try world.requireTileByName(meta, "grass");
     const blocking = try world.requireTileByName(meta, "dirt");
     return .{ .world = world, .walkable = walkable, .blocking = blocking };
@@ -237,7 +267,7 @@ pub const RouteFixture = struct {
 };
 
 // Takes ownership of `open`; adds one entity per request.
-pub fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !RouteFixture {
+pub fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !RouteFixture {
     var owned_open = open;
     errdefer owned_open.world.deinit();
     var data = DataSystem.init(allocator);
@@ -293,20 +323,27 @@ pub const ReactFixture = struct {
     }
 
     // Requests every result in batches the intake admits and drains each batch, until
-    // every result is cached. Untimed.
-    pub fn fillCache(self: *ReactFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
-        var start: usize = 0;
-        while (start < self.requests.len) : (start += self.agent_count) {
-            const end = @min(start + self.agent_count, self.requests.len);
-            try fixtures.writeRequests(&self.stream, self.requests[start..end]);
-            var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
-            var guard = suite.rangeCount(self.agent_count, default_max_solves_per_frame) + 2;
-            while (step_stats.pending_requests != 0) : (guard -= 1) {
-                if (guard == 0) return error.EvictFillStalled;
-                step_stats = try runColdOnce(&self.system, &self.empty, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+    // every result reads available. A cache hit keeps its solve step, so a pass's own
+    // steps can age a result past the TTL after that pass already served it; the next
+    // pass re-solves those. Passes stop at one per solve step of a full generation,
+    // plus one wave. Untimed.
+    pub fn fillCache(self: *ReactFixture, case: suite.BenchmarkCase, thread_system: *ThreadSystem) !void {
+        const pass_limit = @divCeil(self.requests.len, default_max_solves_per_frame) + 2;
+        for (0..pass_limit) |_| {
+            var start: usize = 0;
+            while (start < self.requests.len) : (start += self.agent_count) {
+                const end = @min(start + self.agent_count, self.requests.len);
+                try fixtures.writeRequests(&self.stream, self.requests[start..end]);
+                var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+                var guard = @divCeil(self.agent_count, default_max_solves_per_frame) + 2;
+                while (step_stats.perf.pending_requests != 0) : (guard -= 1) {
+                    if (guard == 0) return error.EvictFillStalled;
+                    step_stats = try runColdOnce(&self.system, &self.empty, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+                }
             }
+            if (self.cachedCount() == self.requests.len) return;
         }
-        if (self.cachedCount() != self.requests.len) return error.EvictFillIncomplete;
+        return error.EvictFillIncomplete;
     }
 
     // Requests whose path the cache serves. Untimed: one status query per request.
@@ -323,12 +360,12 @@ pub const ReactFixture = struct {
     // record reserve, then the write and its tile events), then times the writer's nav record
     // of the events and the post-commit nav reaction; returns the reaction's time and stats.
     // `changed` holds `cells.len` entries.
-    pub fn changeAndReact(self: *ReactFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
+    pub fn changeAndReact(self: *ReactFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: *ThreadSystem) !Reaction {
         return self.changeLevelAndReact(io, 0, cells, tile, thread_system);
     }
 
     // `changeAndReact` on `level`.
-    pub fn changeLevelAndReact(self: *ReactFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
+    pub fn changeLevelAndReact(self: *ReactFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: *ThreadSystem) !Reaction {
         const layer = OpenWorld.floor(level);
         self.changed.clearRetainingCapacity();
         try self.system.reserveTerrainNavRecord(cells.len);
@@ -347,13 +384,15 @@ pub const ReactFixture = struct {
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (stats.incremental_rebuilds != 1) return error.EvictReactionUnchanged;
         if (self.system.graph.version != version_before) return error.EvictDigRebuiltNav;
-        return .{ .elapsed_ns = elapsed, .stats = stats };
+        return .{ .elapsed_ns = elapsed, .stats = stats, .mark = self.system.perf.last_mark_batch };
     }
 };
 
 pub const Reaction = struct {
     elapsed_ns: u64,
     stats: NavUpdateStats,
+    // The timed terrain record's `nav_mark` dispatch; empty for a reaction that timed no mark.
+    mark: BatchStats = .{},
 };
 
 // Three stages' shapes in the timed nav reactions and the reactions' main-thread share and
@@ -368,7 +407,7 @@ pub const ReactionStages = struct {
     pub fn add(self: *ReactionStages, reaction: Reaction, batches: [3]BatchStats) void {
         self.samples += 1;
         self.timed_ns += reaction.elapsed_ns;
-        const main_ns = reaction.elapsed_ns -| reaction.stats.off_main_stage_ns;
+        const main_ns = reaction.elapsed_ns -| reaction.stats.perf.off_main_stage_ns;
         self.main_ns += main_ns;
         self.nav_main.add(main_ns, reaction.stats);
         self.nav_main.endSample();
@@ -395,27 +434,28 @@ pub const ReactionStages = struct {
 // --details.
 pub const EvictReport = struct {
     stages: ReactionStages = .{},
+    count: suite.StageShapes(1) = .{},
     visited: usize = 0,
     evicted: usize = 0,
 
     pub fn add(self: *EvictReport, reaction: Reaction) void {
-        self.stages.add(reaction, .{ reaction.stats.evict_count_batch, reaction.stats.evict_batch, reaction.stats.evict_flush_batch });
-        self.visited = reaction.stats.evict_entries_visited;
-        self.evicted = reaction.stats.evicted_results;
+        self.stages.add(reaction, .{ reaction.stats.perf.evict_count_batch, reaction.stats.perf.evict_batch, reaction.stats.perf.evict_flush_batch });
+        self.count.add(.{reaction.stats.perf.registry_flush_count_batch});
+        self.visited = reaction.stats.perf.evict_entries_visited;
+        self.evicted = reaction.stats.perf.evicted_results;
     }
 
-    pub fn print(self: EvictReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.stages.timed_ns == 0) return;
+    pub fn write(self: EvictReport, details: *suite.DetailLines) void {
+        if (self.stages.timed_ns == 0) return;
         var shapes: [3][48]u8 = undefined;
         const labels = self.stages.labels(&shapes);
+        var count_buffer: [48]u8 = undefined;
         var main_buffer: [320]u8 = undefined;
-        std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("evict_count={s} evict={s} evict_flush={s} registry_flush_count={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
             labels[0],
             labels[1],
             labels[2],
+            self.count.label(0, &count_buffer),
             self.stages.mainUsPerSample(),
             self.stages.mainPercent(),
             self.visited,
@@ -427,11 +467,11 @@ pub const EvictReport = struct {
 
 // Builds the colliders and the world-backed nav over `open` and `data`, then moves them
 // and `requests` into the fixture. On error they stay with the caller.
-pub fn assembleReactFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+pub fn assembleReactFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&open.world);
-    try colliders.rebuild(data, try extent.colliderGeometry());
+    try colliders.rebuild(data, try extent.colliderGeometry(), null);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(capacity);

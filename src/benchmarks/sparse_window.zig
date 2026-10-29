@@ -2,21 +2,19 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Sparse-tile render prep against the camera window as the world's sparse tile
-//! count grows. A 2048x2048 world of 8 levels holds exactly 256 sparse tiles inside
-//! a fixed 1280x720 camera window on the active level, over four depths; every other
-//! tile sits outside the window's chunks on all levels. The window's work is the
-//! same at every size, so each group is expected flat in the world's sparse count:
-//!   - `render-sparse-window-frame`: one frame's window update (unchanged, so
-//!     O(1)), depth range walk, and sparse submit into a headless `SpriteBatch`.
-//!   - `render-sparse-window-pan`: the window pans one chunk across, a frame, back,
-//!     a frame; each pan rebuilds the window's sparse list.
-//!   - `render-sparse-window-add`: one sparse tile added outside the window, then a
-//!     frame. Tiles are append-only in play, so each iteration's reset (untimed)
-//!     drops the added tile.
-//! The item count is the world's sparse tile count. Fixtures build once per case
-//! outside the timed loop. Sparse prep is main-thread work, so the groups measure
-//! the serial case only.
+//! Sparse-tile render prep against the camera window as the world's sparse tile count (the
+//! item count) grows. A 2048x2048 world of 8 levels holds exactly 256 sparse tiles inside a
+//! fixed 1280x720 camera window on the active level, over four depths; every other tile sits
+//! outside the window's chunks on all levels. The window's work is the same at every size,
+//! so each group passes when flat in the world's sparse count:
+//!   - `render-sparse-window-frame`: one frame's window update (unchanged, so O(1)), depth
+//!     range walk, and sparse submit into a headless `SpriteBatch`.
+//!   - `render-sparse-window-pan`: the window pans one chunk across, a frame, back, a frame;
+//!     each pan rebuilds the window's sparse list.
+//!   - `render-sparse-window-add`: one sparse tile added outside the window, then a frame.
+//!     Tiles are append-only in play, so the untimed reset drops the added tile.
+//! Fixtures build once per case outside the timed loop. Sparse prep is main-thread work, so
+//! the groups run serial only.
 
 const std = @import("std");
 const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
@@ -67,30 +65,29 @@ const sparse_tile_counts = [_]usize{ 1_000, 16_000, 256_000 };
 pub const frame_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-frame",
     .item_label = "sparse tiles in the world",
-    .defaultItemCounts = sparseTileCounts,
+    .item_counts = &sparse_tile_counts,
     .runCase = runFrameCase,
     .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const pan_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-pan",
     .item_label = "sparse tiles in the world",
-    .defaultItemCounts = sparseTileCounts,
+    .item_counts = &sparse_tile_counts,
     .runCase = runPanCase,
     .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const add_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-add",
     .item_label = "sparse tiles in the world",
-    .defaultItemCounts = sparseTileCounts,
+    .item_counts = &sparse_tile_counts,
     .runCase = runAddCase,
     .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
 };
-
-fn sparseTileCounts(_: suite.Profile) []const usize {
-    return &sparse_tile_counts;
-}
 
 const Workload = enum { frame, pan, add };
 
@@ -158,10 +155,10 @@ const Fixture = struct {
     // It invalidates nothing, as the add outside the window invalidated nothing.
     fn dropAddedTile(self: *Fixture) !void {
         const world = &self.world;
-        if (world.sparseTileCount() != self.sparse_count + 1) return error.AddedTileCountMismatch;
+        if (world.sparse_tiles.len != self.sparse_count + 1) return error.AddedTileCountMismatch;
         const added_index: u32 = @intCast(self.sparse_count);
         const chunk = world.chunkCoordForCell(added_tile_x, added_tile_y);
-        const chunk_index: usize = @intCast(chunk.y * @as(i32, world.chunksX()) + chunk.x);
+        const chunk_index: usize = @intCast(chunk.y * @as(i32, @intCast(world.chunkGeometry().chunks_x)) + chunk.x);
         const heads = world.level_terrain.items[added_tile_level].sparse_heads;
         if (heads[chunk_index] != added_index) return error.AddedTileIndexMismatch;
         const rows = world.sparse_tiles.slice();
@@ -173,13 +170,11 @@ const Fixture = struct {
     }
 };
 
-// The world adopts the tileset metadata, so its lookups read the owned copy and
-// never the local `buildCatalog` borrowed.
+// The world reads the tileset metadata only while it builds; `sourceRect` reads its catalog.
 fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, sparse_count: usize) !void {
     std.debug.assert(sparse_count >= window_tile_count);
     var meta = try fixtures.loadTilesetMeta(allocator, io);
-    var meta_owned = true;
-    defer if (meta_owned) meta.deinit();
+    defer meta.deinit();
     fixture.* = .{
         .world = .{
             .allocator = allocator,
@@ -203,8 +198,6 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
     for (0..world_levels) |level_index| {
         _ = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
-    world.adoptTilesetMeta(meta);
-    meta_owned = false;
 
     for (0..window_tile_count) |index| {
         const x = window_block_x + @as(u16, @intCast(index % window_block_edge));
@@ -215,8 +208,8 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
     // The rest spread over every level's outside rows, row-major on a fixed column
     // stride, with the row stride spreading each level's share over the rows.
     const outside_count = sparse_count - window_tile_count;
-    const per_level = (outside_count + world_levels - 1) / world_levels;
-    const outside_rows = @max(1, (per_level + outside_columns - 1) / outside_columns);
+    const per_level = @divCeil(outside_count, world_levels);
+    const outside_rows = @max(1, @divCeil(per_level, outside_columns));
     const row_stride: usize = (world_side - outside_first_row) / outside_rows;
     std.debug.assert(row_stride >= 1);
     for (0..outside_count) |index| {
@@ -227,13 +220,13 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
         std.debug.assert(y < world_side);
         _ = try world.addSparseTile(level, x, y, fixture.window_tile, 0, window_depths[index % window_depths.len]);
     }
-    std.debug.assert(world.sparseTileCount() == sparse_count);
+    std.debug.assert(world.sparse_tiles.len == sparse_count);
 
     try fixture.batch.reserveStorage(window_tile_count, window_tile_count * 6, window_tile_count);
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("sparse window prep runs on the main thread");
+    std.debug.assert(!case.usesThreadSystem());
     var fixture: Fixture = undefined;
     try initFixture(&fixture, allocator, io, item_count);
     defer fixture.deinit();

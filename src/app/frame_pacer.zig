@@ -51,10 +51,6 @@ pub fn targetDelayNs(frame_start_ns: u64, now_ns: u64, target_frame_ns: u64) u64
     return target_frame_ns - elapsed_ns;
 }
 
-pub fn fallbackDelayNs(frame_start_ns: u64, now_ns: u64) u64 {
-    return targetDelayNs(frame_start_ns, now_ns, fallback_frame_ns);
-}
-
 pub fn paceTargetFrame(frame_start_ns: u64, target_frame_ns: u64) void {
     const delay_ns = targetDelayNs(frame_start_ns, c.SDL_GetTicksNS(), target_frame_ns);
     if (delay_ns > 0) {
@@ -67,17 +63,17 @@ pub fn paceFallbackFrame(frame_start_ns: u64) void {
 }
 
 test "fallback delay returns full frame when no time elapsed" {
-    try std.testing.expectEqual(fallback_frame_ns, fallbackDelayNs(100, 100));
+    try std.testing.expectEqual(fallback_frame_ns, targetDelayNs(100, 100, fallback_frame_ns));
 }
 
 test "fallback delay returns remaining frame time" {
     const elapsed_ns = fallback_frame_ns / 4;
-    try std.testing.expectEqual(fallback_frame_ns - elapsed_ns, fallbackDelayNs(100, 100 + elapsed_ns));
+    try std.testing.expectEqual(fallback_frame_ns - elapsed_ns, targetDelayNs(100, 100 + elapsed_ns, fallback_frame_ns));
 }
 
 test "fallback delay returns zero when frame is over budget" {
-    try std.testing.expectEqual(@as(u64, 0), fallbackDelayNs(100, 100 + fallback_frame_ns));
-    try std.testing.expectEqual(@as(u64, 0), fallbackDelayNs(100, 100 + fallback_frame_ns + 1));
+    try std.testing.expectEqual(@as(u64, 0), targetDelayNs(100, 100 + fallback_frame_ns, fallback_frame_ns));
+    try std.testing.expectEqual(@as(u64, 0), targetDelayNs(100, 100 + fallback_frame_ns + 1, fallback_frame_ns));
 }
 
 test "window flags classify renderability separately from background throttling" {

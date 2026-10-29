@@ -12,55 +12,55 @@ pub const lane_count: usize = vector_bytes / @sizeOf(u32);
 // Lanes of a 16-bit element type.
 const u16_lane_count: usize = vector_bytes / @sizeOf(u16);
 const Uint16x8 = @Vector(u16_lane_count, u16);
+// Lanes of an 8-bit element type.
+const u8_lane_count: usize = vector_bytes;
+const Uint8x16 = @Vector(u8_lane_count, u8);
 pub const Float4 = @Vector(lane_count, f32);
 pub const Int4 = @Vector(lane_count, i32);
 pub const Uint4 = @Vector(lane_count, u32);
 pub const Mask4 = @Vector(lane_count, bool);
 
-pub fn float4(x: f32, y: f32, z: f32, w: f32) Float4 {
+// Leaf helpers are inline: measured to cut the AI query's Debug Ir gap 52%, wall gap 68% at 2,048 entities.
+pub inline fn float4(x: f32, y: f32, z: f32, w: f32) Float4 {
     return .{ x, y, z, w };
 }
 
-pub fn int4(x: i32, y: i32, z: i32, w: i32) Int4 {
+pub inline fn int4(x: i32, y: i32, z: i32, w: i32) Int4 {
     return .{ x, y, z, w };
 }
 
-pub fn splatFloat4(value: f32) Float4 {
+pub inline fn splatFloat4(value: f32) Float4 {
     return @splat(value);
 }
 
-pub fn splatInt4(value: i32) Int4 {
+pub inline fn splatInt4(value: i32) Int4 {
     return @splat(value);
 }
 
-pub fn splatUint4(value: u32) Uint4 {
+pub inline fn splatUint4(value: u32) Uint4 {
     return @splat(value);
 }
 
-pub fn loadFloat4(values: []const f32) Float4 {
-    std.debug.assert(values.len >= lane_count);
-    return .{ values[0], values[1], values[2], values[3] };
+/// The first four values; `values.len >= lane_count`.
+pub inline fn loadFloat4(values: []const f32) Float4 {
+    return values[0..lane_count].*;
 }
 
-pub fn loadInt4(values: []const i32) Int4 {
-    std.debug.assert(values.len >= lane_count);
-    return .{ values[0], values[1], values[2], values[3] };
+/// The first four values; `values.len >= lane_count`.
+pub inline fn loadInt4(values: []const i32) Int4 {
+    return values[0..lane_count].*;
 }
 
-/// Loads four contiguous `u32` values into lane order. Used for direct
-/// (non-gathered) loads over row-major dense storage where consecutive
-/// indices are already adjacent in memory (see `spatial_index.zig`'s
-/// `DenseCellLookupView` occupancy scan).
-pub fn loadUint4(values: []const u32) Uint4 {
-    std.debug.assert(values.len >= lane_count);
-    return .{ values[0], values[1], values[2], values[3] };
+/// The first four values; `values.len >= lane_count`.
+pub inline fn loadUint4(values: []const u32) Uint4 {
+    return values[0..lane_count].*;
 }
 
-pub fn storeFloat4(values: *[lane_count]f32, vector: Float4) void {
+pub inline fn storeFloat4(values: *[lane_count]f32, vector: Float4) void {
     values.* = toFloatArray(vector);
 }
 
-pub fn storeFloat4Slice(values: []f32, vector: Float4) void {
+pub inline fn storeFloat4Slice(values: []f32, vector: Float4) void {
     std.debug.assert(values.len >= lane_count);
     const stored = toFloatArray(vector);
     inline for (0..lane_count) |index| {
@@ -68,65 +68,111 @@ pub fn storeFloat4Slice(values: []f32, vector: Float4) void {
     }
 }
 
+/// Writes the first `count` lanes. `count <= lane_count`. Does not write past
+/// `values[0..count]`.
+pub fn storeFloat4Prefix(values: []f32, vector: Float4, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    const stored = toFloatArray(vector);
+    for (0..count) |lane| values[lane] = stored[lane];
+}
+
+/// Scalar form of `storeFloat4Prefix`.
+fn storeFloat4PrefixScalar(values: []f32, lanes: [lane_count]f32, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    for (0..count) |lane| values[lane] = lanes[lane];
+}
+
+/// Writes the first `count` lanes. `count <= lane_count`. Does not write past
+/// `values[0..count]`.
+pub fn storeUint4Prefix(values: []u32, vector: Uint4, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    const stored = toUintArray(vector);
+    for (0..count) |lane| values[lane] = stored[lane];
+}
+
+/// Scalar form of `storeUint4Prefix`.
+fn storeUint4PrefixScalar(values: []u32, lanes: [lane_count]u32, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    for (0..count) |lane| values[lane] = lanes[lane];
+}
+
 /// Stores the four lanes of `vector` into the first four values of `values`, in lane order;
 /// the rest of `values` is left as it was.
-pub fn storeUint4Slice(values: []u32, vector: Uint4) void {
+pub inline fn storeUint4Slice(values: []u32, vector: Uint4) void {
     std.debug.assert(values.len >= lane_count);
     inline for (0..lane_count) |index| {
         values[index] = vector[index];
     }
 }
 
-pub fn storeInt4(values: *[lane_count]i32, vector: Int4) void {
+pub inline fn storeInt4(values: *[lane_count]i32, vector: Int4) void {
     values.* = toIntArray(vector);
 }
 
-pub fn toFloatArray(vector: Float4) [lane_count]f32 {
+pub inline fn toFloatArray(vector: Float4) [lane_count]f32 {
     return .{ vector[0], vector[1], vector[2], vector[3] };
 }
 
-pub fn toIntArray(vector: Int4) [lane_count]i32 {
+pub inline fn toUintArray(vector: Uint4) [lane_count]u32 {
     return .{ vector[0], vector[1], vector[2], vector[3] };
 }
 
-pub fn addFloat4(lhs: Float4, rhs: Float4) Float4 {
+pub inline fn toIntArray(vector: Int4) [lane_count]i32 {
+    return .{ vector[0], vector[1], vector[2], vector[3] };
+}
+
+pub inline fn addFloat4(lhs: Float4, rhs: Float4) Float4 {
     return lhs + rhs;
 }
 
-pub fn addInt4(lhs: Int4, rhs: Int4) Int4 {
+pub inline fn addInt4(lhs: Int4, rhs: Int4) Int4 {
     return lhs + rhs;
 }
 
-pub fn subFloat4(lhs: Float4, rhs: Float4) Float4 {
+pub inline fn subFloat4(lhs: Float4, rhs: Float4) Float4 {
     return lhs - rhs;
 }
 
-pub fn subInt4(lhs: Int4, rhs: Int4) Int4 {
+pub inline fn subInt4(lhs: Int4, rhs: Int4) Int4 {
     return lhs - rhs;
 }
 
-pub fn mulFloat4(lhs: Float4, rhs: Float4) Float4 {
+pub inline fn mulFloat4(lhs: Float4, rhs: Float4) Float4 {
     return lhs * rhs;
 }
 
-pub fn mulInt4(lhs: Int4, rhs: Int4) Int4 {
+pub inline fn mulInt4(lhs: Int4, rhs: Int4) Int4 {
     return lhs * rhs;
 }
 
-pub fn divFloat4(lhs: Float4, rhs: Float4) Float4 {
+pub inline fn divFloat4(lhs: Float4, rhs: Float4) Float4 {
     return lhs / rhs;
+}
+
+/// Every lane shifted left by `amount`.
+pub inline fn shiftLeftUint4(values: Uint4, comptime amount: u5) Uint4 {
+    return values << @splat(amount);
+}
+
+/// Every lane shifted right by `amount`.
+pub inline fn shiftRightUint4(values: Uint4, comptime amount: u5) Uint4 {
+    return values >> @splat(amount);
 }
 
 /// Per-lane linear interpolation between `start` and `end` by `amount`. SIMD
 /// counterpart of `math.lerp`.
-pub fn lerpFloat4(start: Float4, end: Float4, amount: Float4) Float4 {
+pub inline fn lerpFloat4(start: Float4, end: Float4, amount: Float4) Float4 {
     return start + (end - start) * amount;
 }
 
 /// Per-lane truncating integer division. Lowered lane-by-lane because Zig's `/`
 /// operator rejects signed integer operands (it requires @divTrunc/@divFloor/
 /// @divExact), so there is no single signed-vector divide to fold this into.
-pub fn divInt4(lhs: Int4, rhs: Int4) Int4 {
+pub inline fn divInt4(lhs: Int4, rhs: Int4) Int4 {
     return .{
         @divTrunc(lhs[0], rhs[0]),
         @divTrunc(lhs[1], rhs[1]),
@@ -155,15 +201,18 @@ pub fn lastCellOfSpan4(min_pos: Float4, max_pos: Float4, cell_size: f32, max_cel
     return selectInt4(greaterThanFloat4(max_pos, min_pos), maxInt4(first, last), first);
 }
 
+/// Vectorized counterpart of `math.orderedBits`, lane for lane: each lane's bits as a key
+/// whose unsigned order is the float order, `-0` and `+0` one key.
+pub inline fn orderedBitsFloat4(values: Float4) Uint4 {
+    // Adding +0 turns -0 into +0 and leaves every other value as it is.
+    const bits: Uint4 = @bitCast(values + splatFloat4(0));
+    const sign_fill: Uint4 = @bitCast(@as(Int4, @bitCast(bits)) >> @splat(31));
+    return bits ^ (sign_fill | splatUint4(0x8000_0000));
+}
+
 /// Vectorized counterpart of `math.floorToI32`: floors each lane to `i32`,
 /// saturating identically to the scalar form (NaN -> 0; at/below `minInt(i32)`
 /// -> `minInt(i32)`; at/above the f32 rounding of `maxInt(i32)` -> `maxInt(i32)`).
-/// Lanes needing saturation are replaced with a safe dummy value before the
-/// vector cast (Zig requires every lane in range for `@intFromFloat`) and then
-/// patched with the exact saturated constant, mirroring the scalar function's
-/// early-return branches instead of clamping into a castable subrange — the
-/// f32 grid spacing near `maxInt(i32)` (256 apart) makes "clamp to max minus
-/// one" silently round back to the unrepresentable boundary.
 pub fn floorToI4(values: Float4) Int4 {
     const floored = @floor(values);
     const is_nan = floored != floored;
@@ -179,85 +228,164 @@ pub fn floorToI4(values: Float4) Int4 {
     return selectInt4(is_nan, splatInt4(0), with_min);
 }
 
-pub fn minFloat4(lhs: Float4, rhs: Float4) Float4 {
+pub inline fn minFloat4(lhs: Float4, rhs: Float4) Float4 {
     return @min(lhs, rhs);
 }
 
-pub fn minInt4(lhs: Int4, rhs: Int4) Int4 {
+pub inline fn minInt4(lhs: Int4, rhs: Int4) Int4 {
     return @min(lhs, rhs);
 }
 
-pub fn maxFloat4(lhs: Float4, rhs: Float4) Float4 {
+pub inline fn maxFloat4(lhs: Float4, rhs: Float4) Float4 {
     return @max(lhs, rhs);
 }
 
-pub fn maxInt4(lhs: Int4, rhs: Int4) Int4 {
+pub inline fn maxInt4(lhs: Int4, rhs: Int4) Int4 {
     return @max(lhs, rhs);
 }
 
-pub fn lessThanFloat4(lhs: Float4, rhs: Float4) Mask4 {
+pub inline fn lessThanFloat4(lhs: Float4, rhs: Float4) Mask4 {
     return lhs < rhs;
 }
 
-pub fn lessThanInt4(lhs: Int4, rhs: Int4) Mask4 {
+pub inline fn lessThanInt4(lhs: Int4, rhs: Int4) Mask4 {
     return lhs < rhs;
 }
 
-pub fn greaterThanFloat4(lhs: Float4, rhs: Float4) Mask4 {
+pub inline fn greaterThanFloat4(lhs: Float4, rhs: Float4) Mask4 {
     return lhs > rhs;
 }
 
-pub fn greaterThanInt4(lhs: Int4, rhs: Int4) Mask4 {
+pub inline fn lessEqualFloat4(lhs: Float4, rhs: Float4) Mask4 {
+    return lhs <= rhs;
+}
+
+pub inline fn greaterEqualFloat4(lhs: Float4, rhs: Float4) Mask4 {
+    return lhs >= rhs;
+}
+
+pub inline fn greaterThanInt4(lhs: Int4, rhs: Int4) Mask4 {
     return lhs > rhs;
 }
 
-pub fn equalFloat4(lhs: Float4, rhs: Float4) Mask4 {
+pub inline fn equalFloat4(lhs: Float4, rhs: Float4) Mask4 {
     return lhs == rhs;
 }
 
-pub fn equalInt4(lhs: Int4, rhs: Int4) Mask4 {
+pub inline fn equalInt4(lhs: Int4, rhs: Int4) Mask4 {
     return lhs == rhs;
 }
 
-pub fn equalUint4(lhs: Uint4, rhs: Uint4) Mask4 {
+pub inline fn equalUint4(lhs: Uint4, rhs: Uint4) Mask4 {
     return lhs == rhs;
 }
 
-pub fn selectFloat4(mask: Mask4, true_values: Float4, false_values: Float4) Float4 {
+/// `maskBits(lhs < rhs)`.
+pub inline fn lessThanFloat4Bits(lhs: Float4, rhs: Float4) MaskBits {
+    return maskBits(lhs < rhs);
+}
+
+/// `maskBits(lhs > rhs)`.
+pub inline fn greaterThanFloat4Bits(lhs: Float4, rhs: Float4) MaskBits {
+    return maskBits(lhs > rhs);
+}
+
+/// `maskBits(lhs == rhs)`.
+pub inline fn equalUint4Bits(lhs: Uint4, rhs: Uint4) MaskBits {
+    return maskBits(lhs == rhs);
+}
+
+pub inline fn selectFloat4(mask: Mask4, true_values: Float4, false_values: Float4) Float4 {
     return @select(f32, mask, true_values, false_values);
 }
 
-pub fn selectInt4(mask: Mask4, true_values: Int4, false_values: Int4) Int4 {
+pub inline fn selectInt4(mask: Mask4, true_values: Int4, false_values: Int4) Int4 {
     return @select(i32, mask, true_values, false_values);
 }
 
-pub fn clampFloat4(values: Float4, minimum: Float4, maximum: Float4) Float4 {
+pub inline fn clampFloat4(values: Float4, minimum: Float4, maximum: Float4) Float4 {
     return minFloat4(maxFloat4(values, minimum), maximum);
 }
 
-pub fn clampInt4(values: Int4, minimum: Int4, maximum: Int4) Int4 {
+pub inline fn clampInt4(values: Int4, minimum: Int4, maximum: Int4) Int4 {
     return minInt4(maxInt4(values, minimum), maximum);
 }
 
+/// A mask's lanes as bits, lane i at bit i: a lane loop walks the set bits in lane order.
+pub inline fn maskBits(mask: Mask4) MaskBits {
+    return @bitCast(mask);
+}
+
+/// One bit per lane of a `Mask4`.
+pub const MaskBits = @Int(.unsigned, lane_count);
+
+/// A lane's number, its bit's index in `MaskBits`.
+pub const LaneIndex = std.math.Log2Int(MaskBits);
+
+// `lanes_below[n]` holds lanes `[0, n)`.
+const lanes_below = blk: {
+    var table: [lane_count + 1]MaskBits = undefined;
+    for (&table, 0..) |*bits, count| bits.* = @intCast((1 << count) - 1);
+    break :blk table;
+};
+
+/// Lanes `[0, min(count, lane_count))`.
+pub inline fn lanesBelow(count: usize) MaskBits {
+    return lanes_below[@min(count, lane_count)];
+}
+
+/// The lowest `count` set bits of `bits`. Hand-rolled: `std.bit_set` has no lowest-n.
+pub fn keepLowestSetBits(bits: MaskBits, count: usize) MaskBits {
+    var beyond = bits;
+    var kept: usize = 0;
+    while (beyond != 0 and kept < count) : (kept += 1) beyond &= beyond - 1;
+    return bits & ~beyond;
+}
+
+// `lane_words[bits]` is all ones in each lane set in `bits`, zero elsewhere.
+const lane_words = blk: {
+    var table: [1 << lane_count]Uint4 = undefined;
+    for (&table, 0..) |*words, bits| {
+        for (0..lane_count) |lane| words[lane] = if (bits & (1 << lane) != 0) std.math.maxInt(u32) else 0;
+    }
+    break :blk table;
+};
+
+/// The lanes of `values` set in `bits`, bit for bit, and `+0` in the rest.
+pub inline fn selectOrZeroFloat4(bits: MaskBits, values: Float4) Float4 {
+    // AND with a lane-word mask: no bool vector, which Debug lowers lane by lane.
+    return @bitCast(@as(Uint4, @bitCast(values)) & lane_words[bits]);
+}
+
+/// The lanes of `values` set in `bits` and the lanes of `fill` in the rest, bit for bit.
+pub inline fn selectBitsFloat4(bits: MaskBits, values: Float4, fill: Float4) Float4 {
+    // Lane-word AND/OR: no bool vector, which Debug lowers lane by lane.
+    const keep = lane_words[bits];
+    return @bitCast((@as(Uint4, @bitCast(values)) & keep) | (@as(Uint4, @bitCast(fill)) & ~keep));
+}
+
+/// `(lanes[0] + lanes[1]) + (lanes[2] + lanes[3])`: one order in every backend and mode,
+/// which `@reduce` does not pin.
+pub inline fn sumLanesFloat4(lanes: Float4) f32 {
+    return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+}
+
+/// Scalar form of `sumLanesFloat4`.
+pub fn sumLanesScalar(lanes: [lane_count]f32) f32 {
+    return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+}
+
 // Counts the true lanes in a mask via a single vector reduction.
-pub fn countTrue(mask: Mask4) u32 {
+pub inline fn countTrue(mask: Mask4) u32 {
     return @reduce(.Add, @as(@Vector(lane_count, u32), @intFromBool(mask)));
 }
 
-pub fn vectorCount(item_count: usize) usize {
+pub inline fn vectorCount(item_count: usize) usize {
     return item_count / lane_count;
 }
 
-pub fn vectorizedEnd(item_count: usize) usize {
+pub inline fn vectorizedEnd(item_count: usize) usize {
     return vectorCount(item_count) * lane_count;
-}
-
-pub fn tailLen(item_count: usize) usize {
-    return item_count - vectorizedEnd(item_count);
-}
-
-pub fn hasTail(item_count: usize) bool {
-    return tailLen(item_count) != 0;
 }
 
 /// Counts positions `index` where `lhs[index] != rhs[index]`; the slices have equal
@@ -283,6 +411,34 @@ pub fn countUnequalU16Scalar(lhs: []const u16, rhs: []const u16) u32 {
     return count;
 }
 
+/// Bit `index` set where `values[index] & care == want`, for at most 64 values: a byte
+/// compare packed into a bit set. Whole registers, then a scalar tail.
+pub fn bytesMatchingMask(values: []const u8, care: u8, want: u8) u64 {
+    std.debug.assert(values.len <= @bitSizeOf(u64));
+    const vector_end = values.len - values.len % u8_lane_count;
+    const care_lanes: Uint8x16 = @splat(care);
+    const want_lanes: Uint8x16 = @splat(want);
+    var bits: u64 = 0;
+    var index: usize = 0;
+    while (index < vector_end) : (index += u8_lane_count) {
+        const lanes: Uint8x16 = values[index..][0..u8_lane_count].*;
+        const matched: @Int(.unsigned, u8_lane_count) = @bitCast((lanes & care_lanes) == want_lanes);
+        bits |= @as(u64, matched) << @intCast(index);
+    }
+    if (vector_end == values.len) return bits;
+    return bits | bytesMatchingMaskScalar(values[vector_end..], care, want) << @intCast(vector_end);
+}
+
+/// Scalar form of `bytesMatchingMask`.
+pub fn bytesMatchingMaskScalar(values: []const u8, care: u8, want: u8) u64 {
+    std.debug.assert(values.len <= @bitSizeOf(u64));
+    var bits: u64 = 0;
+    for (values, 0..) |value, index| {
+        if (value & care == want) bits |= @as(u64, 1) << @intCast(index);
+    }
+    return bits;
+}
+
 /// Subtracts one from every value, stopping at zero. Whole registers, then a scalar tail.
 pub fn decrementSaturatingU16(values: []u16) void {
     const vector_end = values.len - values.len % u16_lane_count;
@@ -305,6 +461,14 @@ pub fn decrementSaturatingU16Scalar(values: []u16) void {
 /// at or below `epsilon`.
 pub fn normalizeOrZeroFinite2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
     return lengthDirection2Float4(x, y, epsilon).direction;
+}
+
+/// In `lanes`, `(x, y) / sqrt(len2)`; `+0` elsewhere. Bit for bit
+/// `math.normalizeOrZeroFinite(x, y, epsilon)` in each lane of `lanes` whose `x`, `y`, and
+/// `len2 == x * x + y * y` are finite and `len2 > epsilon`, which the caller guarantees.
+pub fn normalizeKnownFinite2Float4(x: Float4, y: Float4, len2: Float4, lanes: MaskBits) Vec2x4 {
+    const inv = splatFloat4(1) / @sqrt(len2);
+    return .{ .x = selectOrZeroFloat4(lanes, x * inv), .y = selectOrZeroFloat4(lanes, y * inv) };
 }
 
 /// Per-axis lanes of `math.normalizeOrDefaultFinite`, equal to it bit for bit in every lane:
@@ -334,45 +498,8 @@ pub const Vec2x4 = struct {
     y: Float4,
 };
 
-/// Per-lane sine and cosine results.
-pub const SinCos4 = struct {
-    sin: Float4,
-    cos: Float4,
-};
-
-/// Gathers four `f32` values from `values` at the given indices into lane order.
-///
-/// This is the entry point of the **packed-SoA-scratch idiom**, the standard
-/// way to vectorize a loop over sparse/filtered SoA indices in this codebase:
-///
-///  1. Scan the sparse/filtered index sequence (e.g. surviving broadphase
-///     candidates, or entities that passed earlier scalar pre-filters) and
-///     buffer up to `lane_count` indices at a time.
-///  2. Once `lane_count` indices are buffered, `gatherFloat4` each needed SoA
-///     column at those indices into contiguous lanes.
-///  3. Vectorize the compare/math step over the gathered lanes, using
-///     `selectFloat4`/`selectInt4` to mask per-lane outcomes instead of
-///     branching.
-///  4. Finish each lane scalarly for anything that does not vectorize (list
-///     append, branchy asset/asset-ref lookups, building non-uniform output
-///     records) — typically an `inline for (0..lane_count)` reading the
-///     masked results lane-by-lane.
-///  5. Handle the final `< lane_count` remainder (the tail) with the plain
-///     scalar version of the same per-item logic; do not pad or mask a
-///     partial group into a fake vector call.
-///
-/// `CollisionSystem` in `src/game/systems/collision.zig` is the canonical
-/// example already in this codebase: `buildBroadphaseCandidatesSimd`
-/// (`while (candidate_sorted_index + simd.lane_count <= sorted_count)`) packs
-/// sorted proxy indices into `candidate_indices`, gathers `min_x`/`min_y`/
-/// `max_x`/`max_y` with `gatherFloat4`, vectorizes the AABB overlap test, then
-/// finishes each lane scalarly by appending surviving pairs — with a scalar
-/// tail loop below it for `candidate_sorted_index < sorted_count`.
-/// `writeNarrowphaseContactsSimd` follows the same shape one level further:
-/// it gathers both proxies of each candidate pair (`a_indices`/`b_indices`)
-/// to compute contacts in lanes, then appends only the lanes whose `valid`
-/// mask is true.
-pub fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Float4 {
+/// Four lanes gathered at `indices`: the gather of the packed-SoA-scratch pattern.
+pub inline fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Float4 {
     return .{
         values[indices[0]],
         values[indices[1]],
@@ -381,14 +508,61 @@ pub fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Float4 {
     };
 }
 
-/// Gathers four `i32` values from `values` at the given indices into lane order.
-pub fn gatherInt4(values: []const i32, indices: [lane_count]usize) Int4 {
+/// The `table` entries at the four lanes of `indices`: the u32 form of `gatherFloat4`, for
+/// a table remap of a u32 id column (each lane's id is its index). Every index is below
+/// `table.len`.
+pub inline fn gatherUint4(table: []const u32, indices: Uint4) Uint4 {
     return .{
-        values[indices[0]],
-        values[indices[1]],
-        values[indices[2]],
-        values[indices[3]],
+        table[indices[0]],
+        table[indices[1]],
+        table[indices[2]],
+        table[indices[3]],
     };
+}
+
+/// Scalar form of `gatherUint4`.
+fn gatherUint4Scalar(table: []const u32, indices: [lane_count]u32) [lane_count]u32 {
+    var lanes: [lane_count]u32 = undefined;
+    for (&lanes, indices) |*lane, index| lane.* = table[index];
+    return lanes;
+}
+
+/// `gatherUint4` in the lanes set in `lanes`, and zero in the rest: a column's tail. Reads
+/// only the set lanes' entries, so an inactive lane's index may be anything.
+pub inline fn gatherUint4Masked(table: []const u32, indices: Uint4, lanes: MaskBits) Uint4 {
+    var gathered = splatUint4(0);
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) gathered[lane] = table[indices[lane]];
+    }
+    return gathered;
+}
+
+/// Scalar form of `gatherUint4Masked`.
+fn gatherUint4MaskedScalar(table: []const u32, indices: [lane_count]u32, lanes: MaskBits) [lane_count]u32 {
+    var gathered = [_]u32{ 0, 0, 0, 0 };
+    for (&gathered, indices, 0..) |*lane_value, index, lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) lane_value.* = table[index];
+    }
+    return gathered;
+}
+
+/// `gatherFloat4` in the lanes set in `lanes`, and `+0` in the rest: a column's tail. Reads
+/// only the set lanes' entries, so an inactive lane's index may be anything.
+pub inline fn gatherFloat4Masked(values: []const f32, indices: Uint4, lanes: MaskBits) Float4 {
+    var gathered = splatFloat4(0);
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) gathered[lane] = values[indices[lane]];
+    }
+    return gathered;
+}
+
+/// Scalar form of `gatherFloat4Masked`.
+fn gatherFloat4MaskedScalar(values: []const f32, indices: [lane_count]u32, lanes: MaskBits) [lane_count]f32 {
+    var gathered = [_]f32{ 0, 0, 0, 0 };
+    for (&gathered, indices, 0..) |*lane_value, index, lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) lane_value.* = values[index];
+    }
+    return gathered;
 }
 
 /// Scatters lane values back to `values` at the given indices. Indices must be
@@ -404,14 +578,199 @@ pub fn scatterFloat4(values: []f32, indices: [lane_count]usize, vector: Float4) 
     }
 }
 
+/// The first `count` values, and `+0` in the other lanes. `count <= lane_count`.
+/// Reads only `values[0..count]`. A vector load would read past that prefix.
+pub fn loadFloat4Prefix(values: []const f32, count: usize) Float4 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// Scalar form of `loadFloat4Prefix`.
+fn loadFloat4PrefixScalar(values: []const f32, count: usize) [lane_count]f32 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// The first `count` values, and zero in the other lanes. `count <= lane_count`.
+/// Reads only `values[0..count]`. A vector load would read past that prefix.
+pub fn loadUint4Prefix(values: []const u32, count: usize) Uint4 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]u32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// Scalar form of `loadUint4Prefix`.
+fn loadUint4PrefixScalar(values: []const u32, count: usize) [lane_count]u32 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]u32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// A lane loop's batch of `count` values from `values`: one vector load of a full batch
+/// (`count >= lane_count`), else the masked tail's live prefix with `+0` in the other lanes
+/// (`loadFloat4Prefix`). Reads only `values[0..min(count, lane_count)]`.
+pub inline fn loadFloat4Lanes(values: []const f32, count: usize) Float4 {
+    if (count >= lane_count) return loadFloat4(values);
+    return loadFloat4Prefix(values, count);
+}
+
+/// Scalar form of `loadFloat4Lanes`.
+fn loadFloat4LanesScalar(values: []const f32, count: usize) [lane_count]f32 {
+    var lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..@min(count, lane_count)) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// `loadFloat4Lanes` over u32 values, zero in the inactive lanes.
+pub inline fn loadUint4Lanes(values: []const u32, count: usize) Uint4 {
+    if (count >= lane_count) return loadUint4(values);
+    return loadUint4Prefix(values, count);
+}
+
+/// Scalar form of `loadUint4Lanes`.
+fn loadUint4LanesScalar(values: []const u32, count: usize) [lane_count]u32 {
+    var lanes = [_]u32{ 0, 0, 0, 0 };
+    for (0..@min(count, lane_count)) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// A lane loop's batch store of `count` values to `values`: one store of a full batch
+/// (`count >= lane_count`), else the masked tail's live lanes only (`storeFloat4Prefix`).
+/// Writes only `values[0..min(count, lane_count)]`.
+pub inline fn storeFloat4Lanes(values: []f32, vector: Float4, count: usize) void {
+    if (count >= lane_count) return storeFloat4Slice(values, vector);
+    storeFloat4Prefix(values, vector, count);
+}
+
+/// Scalar form of `storeFloat4Lanes`.
+fn storeFloat4LanesScalar(values: []f32, lanes: [lane_count]f32, count: usize) void {
+    for (0..@min(count, lane_count)) |lane| values[lane] = lanes[lane];
+}
+
+/// `storeFloat4Lanes` over u32 values.
+pub inline fn storeUint4Lanes(values: []u32, vector: Uint4, count: usize) void {
+    if (count >= lane_count) return storeUint4Slice(values, vector);
+    storeUint4Prefix(values, vector, count);
+}
+
+/// Scalar form of `storeUint4Lanes`.
+fn storeUint4LanesScalar(values: []u32, lanes: [lane_count]u32, count: usize) void {
+    for (0..@min(count, lane_count)) |lane| values[lane] = lanes[lane];
+}
+
+/// `storeUint4Lanes` narrowed to u16 values: one store of a full batch (`count >=
+/// lane_count`), else the masked tail's live lanes only. Every live lane is at most
+/// `maxInt(u16)` (a checked narrowing). Writes only `values[0..min(count, lane_count)]`.
+pub inline fn storeUint4LanesU16(values: []u16, vector: Uint4, count: usize) void {
+    const Narrow = @Vector(lane_count, u16);
+    if (count >= lane_count) {
+        std.debug.assert(values.len >= lane_count);
+        const narrowed: Narrow = @intCast(vector);
+        values[0..lane_count].* = narrowed;
+        return;
+    }
+    std.debug.assert(values.len >= count);
+    const stored = toUintArray(vector);
+    for (0..count) |lane| values[lane] = @intCast(stored[lane]);
+}
+
+/// Scalar form of `storeUint4LanesU16`.
+fn storeUint4LanesU16Scalar(values: []u16, lanes: [lane_count]u32, count: usize) void {
+    for (0..@min(count, lane_count)) |lane| values[lane] = @intCast(lanes[lane]);
+}
+
+/// Writes the lanes set in `lanes`. Distinctness is asserted only for those lanes,
+/// so an inactive index may alias a live one.
+pub fn scatterFloat4Masked(values: []f32, indices: [lane_count]usize, vector: Float4, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
+/// Scalar form of `scatterFloat4Masked`.
+fn scatterFloat4MaskedScalar(values: []f32, indices: [lane_count]usize, vector: [lane_count]f32, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
+/// Writes the lanes set in `lanes`. Distinctness is asserted only for those lanes,
+/// so an inactive index may alias a live one.
+pub fn scatterBool4Masked(values: []bool, indices: [lane_count]usize, vector: Mask4, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
+/// Scalar form of `scatterBool4Masked`.
+fn scatterBool4MaskedScalar(values: []bool, indices: [lane_count]usize, vector: [lane_count]bool, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
 /// Per-lane reciprocal square root, `1 / sqrt(values)`. Lanes that are zero or
 /// negative produce inf/NaN; guard the input when that is possible.
-pub fn reciprocalSqrtFloat4(values: Float4) Float4 {
+pub inline fn reciprocalSqrtFloat4(values: Float4) Float4 {
     return splatFloat4(1) / @sqrt(values);
 }
 
 /// Per-lane squared length of 2D vectors.
-pub fn lengthSquared2Float4(x: Float4, y: Float4) Float4 {
+pub inline fn lengthSquared2Float4(x: Float4, y: Float4) Float4 {
     return x * x + y * y;
 }
 
@@ -458,30 +817,13 @@ pub fn lengthDirection2Float4(x: Float4, y: Float4, epsilon: f32) LengthDirectio
 
 /// Per-lane linear interpolation of 2D vectors between `start` and `end` by
 /// `amount`. SIMD counterpart of `math.lerpVec2`.
-pub fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 {
+pub inline fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 {
     return .{ .x = lerpFloat4(start.x, end.x, amount), .y = lerpFloat4(start.y, end.y, amount) };
 }
 
 /// Per-lane 2D dot product: `ax * bx + ay * by`.
-pub fn dotFloat4(ax: Float4, ay: Float4, bx: Float4, by: Float4) Float4 {
+pub inline fn dotFloat4(ax: Float4, ay: Float4, bx: Float4, by: Float4) Float4 {
     return addFloat4(mulFloat4(ax, bx), mulFloat4(ay, by));
-}
-
-/// Per-lane sine. Uses the compiler builtin element-wise over the vector; the
-/// single call site lets a vectorized polynomial replace this later without
-/// touching callers.
-pub fn sinFloat4(values: Float4) Float4 {
-    return @sin(values);
-}
-
-/// Per-lane cosine. See `sinFloat4` for the implementation note.
-pub fn cosFloat4(values: Float4) Float4 {
-    return @cos(values);
-}
-
-/// Per-lane sine and cosine together, for rotation and field-of-view math.
-pub fn sinCosFloat4(values: Float4) SinCos4 {
-    return .{ .sin = @sin(values), .cos = @cos(values) };
 }
 
 fn expectFloatArrayApprox(actual: [lane_count]f32, expected: [lane_count]f32) !void {
@@ -596,26 +938,30 @@ test "countTrue matches a scalar lane sum" {
     try std.testing.expectEqual(scalar, countTrue(mask));
 }
 
-test "tail helpers cover empty partial exact and multi lane counts" {
+test "maskBits holds each lane at its bit, for every lane pattern" {
+    for (0..1 << lane_count) |pattern| {
+        var lanes: [lane_count]bool = undefined;
+        for (&lanes, 0..) |*lane, index| lane.* = pattern & (@as(usize, 1) << @intCast(index)) != 0;
+        const bits = maskBits(lanes);
+        for (lanes, 0..) |lane, index| {
+            try std.testing.expectEqual(lane, bits & (@as(MaskBits, 1) << @intCast(index)) != 0);
+        }
+        try std.testing.expectEqual(countTrue(lanes), @popCount(bits));
+    }
+}
+
+test "vector count and vectorized end cover empty partial exact and multi lane counts" {
     try std.testing.expectEqual(@as(usize, 0), vectorCount(0));
     try std.testing.expectEqual(@as(usize, 0), vectorizedEnd(0));
-    try std.testing.expectEqual(@as(usize, 0), tailLen(0));
-    try std.testing.expect(!hasTail(0));
 
     try std.testing.expectEqual(@as(usize, 0), vectorCount(3));
     try std.testing.expectEqual(@as(usize, 0), vectorizedEnd(3));
-    try std.testing.expectEqual(@as(usize, 3), tailLen(3));
-    try std.testing.expect(hasTail(3));
 
     try std.testing.expectEqual(@as(usize, 1), vectorCount(4));
     try std.testing.expectEqual(@as(usize, 4), vectorizedEnd(4));
-    try std.testing.expectEqual(@as(usize, 0), tailLen(4));
-    try std.testing.expect(!hasTail(4));
 
     try std.testing.expectEqual(@as(usize, 2), vectorCount(11));
     try std.testing.expectEqual(@as(usize, 8), vectorizedEnd(11));
-    try std.testing.expectEqual(@as(usize, 3), tailLen(11));
-    try std.testing.expect(hasTail(11));
 }
 
 test "countUnequalU16 matches its scalar form over every tail length and random, equal, and different data" {
@@ -641,6 +987,25 @@ test "countUnequalU16 matches its scalar form over every tail length and random,
     // Overlapping views, as a chain of adjacent cells is compared.
     for (&lhs) |*value| value.* = random.uintLessThan(u16, 2);
     try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..32], lhs[1..33]), countUnequalU16(lhs[0..32], lhs[1..33]));
+}
+
+test "bytesMatchingMask matches its scalar form over every length up to 64, for masked and exact matches" {
+    var prng = std.Random.DefaultPrng.init(0x00b1_7e5a);
+    const random = prng.random();
+    var values: [64]u8 = undefined;
+    for (0..values.len + 1) |len| {
+        for (0..8) |_| {
+            // A small value range so matching and unmatched lanes both occur.
+            for (values[0..len]) |*value| value.* = random.uintLessThan(u8, 4);
+            for ([_][2]u8{ .{ 1, 1 }, .{ 0xff, 3 }, .{ 0xff, 0 }, .{ 2, 0 } }) |pair| {
+                try std.testing.expectEqual(bytesMatchingMaskScalar(values[0..len], pair[0], pair[1]), bytesMatchingMask(values[0..len], pair[0], pair[1]));
+            }
+        }
+        @memset(values[0..len], 3);
+        const all: u64 = if (len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(len)) - 1;
+        try std.testing.expectEqual(all, bytesMatchingMask(values[0..len], 0xff, 3));
+        try std.testing.expectEqual(@as(u64, 0), bytesMatchingMask(values[0..len], 0xff, 0));
+    }
 }
 
 test "decrementSaturatingU16 matches its scalar form over every tail length, stopping at zero" {
@@ -737,15 +1102,154 @@ test "gather and scatter move lanes through sparse indices" {
     const gathered = gatherFloat4(&source, .{ 5, 0, 3, 1 });
     try expectFloatArrayApprox(toFloatArray(gathered), .{ 15, 10, 13, 11 });
 
-    const int_source = [_]i32{ 0, -1, -2, -3, -4 };
-    try std.testing.expectEqual(
-        [_]i32{ -4, 0, -2, -1 },
-        toIntArray(gatherInt4(&int_source, .{ 4, 0, 2, 1 })),
-    );
-
     var dest = [_]f32{ 0, 0, 0, 0, 0, 0 };
     scatterFloat4(&dest, .{ 5, 0, 3, 1 }, float4(15, 10, 13, 11));
     try std.testing.expectEqual([_]f32{ 10, 11, 0, 13, 0, 15 }, dest);
+}
+
+test "u32 gathers, masked gathers, and prefix stores match their scalar forms" {
+    const table = [_]u32{ 10, 0, std.math.maxInt(u32), 0x8000_0000, 7, 7 };
+    const index_sets = [_][lane_count]u32{ .{ 5, 0, 3, 1 }, .{ 2, 2, 2, 2 }, .{ 0, 1, 2, 3 }, .{ 4, 5, 4, 5 } };
+    for (index_sets) |indices| {
+        const gathered = toUintArray(gatherUint4(&table, indices));
+        try std.testing.expectEqual(gatherUint4Scalar(&table, indices), gathered);
+        for (0..1 << lane_count) |bits| {
+            const lanes: MaskBits = @intCast(bits);
+            const masked = toUintArray(gatherUint4Masked(&table, indices, lanes));
+            try std.testing.expectEqual(gatherUint4MaskedScalar(&table, indices, lanes), masked);
+            for (0..lane_count) |lane| {
+                const expected = if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) gathered[lane] else 0;
+                try std.testing.expectEqual(expected, masked[lane]);
+            }
+        }
+    }
+    // An inactive lane's index is never read: it may lie past the table.
+    const past = [_]u32{ 1, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) };
+    try std.testing.expectEqual([_]u32{ 0, 0, 0, 0 }, toUintArray(gatherUint4Masked(&table, past, lanesBelow(1))));
+    try std.testing.expectEqual([_]u32{ 0, 0, 0, 0 }, gatherUint4MaskedScalar(&table, past, lanesBelow(1)));
+
+    const prefix_vector: Uint4 = .{ 0, std.math.maxInt(u32), 0x8000_0001, 5 };
+    for (0..lane_count + 1) |count| {
+        var prefix_simd = [_]u32{ 9, 9, 9, 9, 8, 7 };
+        var prefix_scalar = prefix_simd;
+        storeUint4Prefix(prefix_simd[0..], prefix_vector, count);
+        storeUint4PrefixScalar(prefix_scalar[0..], toUintArray(prefix_vector), count);
+        try std.testing.expectEqual(prefix_scalar, prefix_simd);
+        for (prefix_simd[count..lane_count]) |untouched| try std.testing.expectEqual(@as(u32, 9), untouched);
+        try std.testing.expectEqual(@as(u32, 8), prefix_simd[4]);
+        try std.testing.expectEqual(@as(u32, 7), prefix_simd[5]);
+    }
+}
+
+test "float masked gathers match their scalar form and skip inactive lanes" {
+    const values = [_]f32{ 1.25, -0.0, 3.5, -2.5, 0.0, 8 };
+    const index_sets = [_][lane_count]u32{ .{ 5, 0, 3, 1 }, .{ 2, 2, 2, 2 }, .{ 0, 1, 4, 5 } };
+    for (index_sets) |indices| {
+        for (0..1 << lane_count) |bits| {
+            const lanes: MaskBits = @intCast(bits);
+            const masked = toFloatArray(gatherFloat4Masked(&values, indices, lanes));
+            const scalar = gatherFloat4MaskedScalar(&values, indices, lanes);
+            for (0..lane_count) |lane| {
+                try std.testing.expectEqual(@as(u32, @bitCast(scalar[lane])), @as(u32, @bitCast(masked[lane])));
+                const expected: f32 = if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) values[indices[lane]] else 0;
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(masked[lane])));
+            }
+        }
+    }
+    // An inactive lane's index is never read: it may lie past the column, and the lane is +0.
+    const past = [_]u32{ 1, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) };
+    const masked = toFloatArray(gatherFloat4Masked(&values, past, lanesBelow(1)));
+    const scalar = gatherFloat4MaskedScalar(&values, past, lanesBelow(1));
+    try std.testing.expectEqual(@as(u32, @bitCast(values[1])), @as(u32, @bitCast(masked[0])));
+    for (0..lane_count) |lane| {
+        try std.testing.expectEqual(@as(u32, @bitCast(scalar[lane])), @as(u32, @bitCast(masked[lane])));
+        if (lane != 0) try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(masked[lane])));
+    }
+}
+
+test "loadFloat4Prefix and scatterFloat4Masked match their scalar forms bit for bit" {
+    const floats = [_]f32{ 1.25, -2.5, -0.0, 3.5 };
+    const uints = [_]u32{ 0, 1, 0x8000_0000, 0xffff_ffff };
+    for (0..lane_count + 1) |count| {
+        const float_prefix = loadFloat4Prefix(floats[0..count], count);
+        const float_scalar = loadFloat4PrefixScalar(floats[0..count], count);
+        const uint_prefix = loadUint4Prefix(uints[0..count], count);
+        const uint_scalar = loadUint4PrefixScalar(uints[0..count], count);
+        const float_lanes = toFloatArray(float_prefix);
+        const uint_lanes = toUintArray(uint_prefix);
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(@as(u32, @bitCast(float_scalar[lane])), @as(u32, @bitCast(float_lanes[lane])));
+            try std.testing.expectEqual(uint_scalar[lane], uint_lanes[lane]);
+            if (lane >= count) {
+                try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(float_lanes[lane])));
+                try std.testing.expectEqual(@as(u32, 0), uint_lanes[lane]);
+            }
+        }
+    }
+
+    // Inactive indices alias the live one. The mask must not store them back.
+    const alias = [_]usize{ 1, 1, 1, 1 };
+    const alias_vector = float4(-0.0, 9, 9, 9);
+    const alias_bits: MaskBits = 0b0001;
+    var alias_simd = [_]f32{ 1, 2, 3, 4, 5 };
+    var alias_scalar = alias_simd;
+    scatterFloat4Masked(&alias_simd, alias, alias_vector, alias_bits);
+    scatterFloat4MaskedScalar(&alias_scalar, alias, toFloatArray(alias_vector), alias_bits);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&alias_scalar), std.mem.asBytes(&alias_simd));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -0.0))), @as(u32, @bitCast(alias_simd[1])));
+    try std.testing.expectEqual(@as(f32, 1), alias_simd[0]);
+    try std.testing.expectEqual(@as(f32, 3), alias_simd[2]);
+    try std.testing.expectEqual(@as(f32, 4), alias_simd[3]);
+    try std.testing.expectEqual(@as(f32, 5), alias_simd[4]);
+
+    // Inactive indices alias the live one. The mask must not store them back.
+    const bool_alias = [_]usize{ 1, 1, 1, 1 };
+    const bool_alias_vector: Mask4 = .{ true, false, false, false };
+    const bool_alias_bits: MaskBits = 0b0001;
+    var bool_alias_simd = [_]bool{ false, false, true, false, true };
+    var bool_alias_scalar = bool_alias_simd;
+    scatterBool4Masked(&bool_alias_simd, bool_alias, bool_alias_vector, bool_alias_bits);
+    scatterBool4MaskedScalar(&bool_alias_scalar, bool_alias, .{ true, false, false, false }, bool_alias_bits);
+    try std.testing.expectEqualSlices(bool, &bool_alias_scalar, &bool_alias_simd);
+    try std.testing.expect(bool_alias_simd[1]);
+    try std.testing.expect(!bool_alias_simd[0]);
+    try std.testing.expect(bool_alias_simd[2]);
+    try std.testing.expect(!bool_alias_simd[3]);
+    try std.testing.expect(bool_alias_simd[4]);
+
+    const bool_indices = [_]usize{ 4, 0, 2, 1 };
+    const bool_vector: Mask4 = .{ true, false, true, false };
+    const bool_lanes = [_]bool{ true, false, true, false };
+    for (0..1 << lane_count) |bits| {
+        const lanes: MaskBits = @intCast(bits);
+        var bool_simd = [_]bool{ false, true, false, true, false };
+        var bool_scalar = bool_simd;
+        scatterBool4Masked(&bool_simd, bool_indices, bool_vector, lanes);
+        scatterBool4MaskedScalar(&bool_scalar, bool_indices, bool_lanes, lanes);
+        try std.testing.expectEqualSlices(bool, &bool_scalar, &bool_simd);
+    }
+
+    const prefix_vector = float4(-0.0, 1.5, -2.5, 3.5);
+    for (0..lane_count + 1) |count| {
+        var prefix_simd = [_]f32{ 7, 7, 7, 7, 8, 9 };
+        var prefix_scalar = prefix_simd;
+        storeFloat4Prefix(prefix_simd[0..], prefix_vector, count);
+        storeFloat4PrefixScalar(prefix_scalar[0..], toFloatArray(prefix_vector), count);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&prefix_scalar), std.mem.asBytes(&prefix_simd));
+        try std.testing.expectEqual(@as(f32, 8), prefix_simd[4]);
+        try std.testing.expectEqual(@as(f32, 9), prefix_simd[5]);
+    }
+
+    const full_indices = [_]usize{ 5, 0, 3, 1 };
+    const full_vector = float4(-0.0, 10, 13, 11);
+    var full_masked = [_]f32{ 0, 0, 0, 0, 0, 0 };
+    var full_scatter = full_masked;
+    var full_scalar = full_masked;
+    scatterFloat4Masked(&full_masked, full_indices, full_vector, lanesBelow(lane_count));
+    scatterFloat4(&full_scatter, full_indices, full_vector);
+    scatterFloat4MaskedScalar(&full_scalar, full_indices, toFloatArray(full_vector), lanesBelow(lane_count));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_scatter), std.mem.asBytes(&full_masked));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_scatter), std.mem.asBytes(&full_scalar));
 }
 
 test "reciprocal sqrt matches scalar reference" {
@@ -952,16 +1456,218 @@ test "lastCellOfSpan4 matches math.lastCellOfSpan lane-for-lane" {
     );
 }
 
-test "sin and cos match scalar builtins per lane" {
-    const angles = float4(0, std.math.pi / 6.0, std.math.pi / 2.0, std.math.pi);
-    const sines = toFloatArray(sinFloat4(angles));
-    const cosines = toFloatArray(cosFloat4(angles));
-    const both = sinCosFloat4(angles);
+test "orderedBitsFloat4 matches math.orderedBits lane-for-lane" {
+    const inf = std.math.inf(f32);
+    const subnormal = std.math.floatTrueMin(f32);
+    const cases = [_]f32{
+        0,                      -0.0,                    subnormal,  -subnormal,
+        std.math.floatMin(f32), -std.math.floatMin(f32), inf,        -inf,
+        std.math.floatMax(f32), -std.math.floatMax(f32), 1.5,        -1.5,
+        std.math.nan(f32),      -std.math.nan(f32),      123_456.75, -0.001,
+    };
+    comptime std.debug.assert(cases.len % lane_count == 0);
+    var start: usize = 0;
+    while (start < cases.len) : (start += lane_count) {
+        const lanes: [lane_count]u32 = orderedBitsFloat4(loadFloat4(cases[start..]));
+        for (0..lane_count) |lane| try std.testing.expectEqual(math.orderedBits(cases[start + lane]), lanes[lane]);
+    }
+}
 
-    inline for (0..lane_count) |lane| {
-        try std.testing.expectApproxEqAbs(@sin(angles[lane]), sines[lane], 0.0001);
-        try std.testing.expectApproxEqAbs(@cos(angles[lane]), cosines[lane], 0.0001);
-        try std.testing.expectApproxEqAbs(sines[lane], both.sin[lane], 0.0001);
-        try std.testing.expectApproxEqAbs(cosines[lane], both.cos[lane], 0.0001);
+// Lane values for the compare and select tests: ordinary, equal, signed zeros, infinities,
+// and NaN.
+const compare_lane_values = [_]f32{ -2, 0, -0.0, 1.5, 3, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) };
+
+test "compare-to-bits matches each lane's scalar compare for every lane pattern, NaN, signed zeros, infinities, and equal lanes" {
+    var prng = std.Random.DefaultPrng.init(0xb175_c0de);
+    const random = prng.random();
+    for (0..512) |_| {
+        var lhs: [lane_count]f32 = undefined;
+        var rhs: [lane_count]f32 = undefined;
+        var lhs_words: [lane_count]u32 = undefined;
+        var rhs_words: [lane_count]u32 = undefined;
+        for (0..lane_count) |lane| {
+            lhs[lane] = compare_lane_values[random.uintLessThan(usize, compare_lane_values.len)];
+            rhs[lane] = compare_lane_values[random.uintLessThan(usize, compare_lane_values.len)];
+            lhs_words[lane] = random.uintLessThan(u32, 3);
+            rhs_words[lane] = if (random.boolean()) lhs_words[lane] else std.math.maxInt(u32) - random.uintLessThan(u32, 2);
+        }
+        const less = lessThanFloat4Bits(loadFloat4(&lhs), loadFloat4(&rhs));
+        const greater = greaterThanFloat4Bits(loadFloat4(&lhs), loadFloat4(&rhs));
+        const equal = equalUint4Bits(loadUint4(&lhs_words), loadUint4(&rhs_words));
+        for (0..lane_count) |lane| {
+            const bit = @as(MaskBits, 1) << @intCast(lane);
+            try std.testing.expectEqual(lhs[lane] < rhs[lane], less & bit != 0);
+            try std.testing.expectEqual(lhs[lane] > rhs[lane], greater & bit != 0);
+            try std.testing.expectEqual(lhs[lane] <= rhs[lane], maskBits(lessEqualFloat4(loadFloat4(&lhs), loadFloat4(&rhs))) & bit != 0);
+            try std.testing.expectEqual(lhs[lane] >= rhs[lane], maskBits(greaterEqualFloat4(loadFloat4(&lhs), loadFloat4(&rhs))) & bit != 0);
+            try std.testing.expectEqual(lhs_words[lane] == rhs_words[lane], equal & bit != 0);
+        }
+    }
+}
+
+test "lanesBelow and keepLowestSetBits match a reference loop for every mask and count 0..5" {
+    for (0..lane_count + 2) |count| {
+        var below: MaskBits = 0;
+        for (0..@min(count, lane_count)) |lane| below |= @as(MaskBits, 1) << @intCast(lane);
+        try std.testing.expectEqual(below, lanesBelow(count));
+        for (0..1 << lane_count) |pattern| {
+            const bits: MaskBits = @intCast(pattern);
+            var kept: MaskBits = 0;
+            var taken: usize = 0;
+            for (0..lane_count) |lane| {
+                const bit = @as(MaskBits, 1) << @intCast(lane);
+                if (bits & bit != 0 and taken < count) {
+                    kept |= bit;
+                    taken += 1;
+                }
+            }
+            try std.testing.expectEqual(kept, keepLowestSetBits(bits, count));
+        }
+    }
+}
+
+test "selectBitsFloat4 takes masked lanes from values and the rest from fill bit for bit" {
+    const values = float4(std.math.nan(f32), -0.0, std.math.inf(f32), -3.25);
+    const fill = float4(1.5, 0.0, -0.0, -std.math.inf(f32));
+    const value_lanes = toFloatArray(values);
+    const fill_lanes = toFloatArray(fill);
+    for (0..1 << lane_count) |pattern| {
+        const bits: MaskBits = @intCast(pattern);
+        const selected = toFloatArray(selectBitsFloat4(bits, values, fill));
+        for (0..lane_count) |lane| {
+            const want = if (bits & (@as(MaskBits, 1) << @intCast(lane)) != 0) value_lanes[lane] else fill_lanes[lane];
+            try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(selected[lane])));
+        }
+    }
+}
+
+test "selectOrZeroFloat4 keeps masked lanes bit for bit and zeroes the rest for every mask" {
+    const values = float4(std.math.nan(f32), -0.0, std.math.inf(f32), -3.25);
+    const value_lanes = toFloatArray(values);
+    for (0..1 << lane_count) |pattern| {
+        const bits: MaskBits = @intCast(pattern);
+        const selected = toFloatArray(selectOrZeroFloat4(bits, values));
+        for (0..lane_count) |lane| {
+            const want: f32 = if (bits & (@as(MaskBits, 1) << @intCast(lane)) != 0) value_lanes[lane] else 0;
+            try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(selected[lane])));
+        }
+    }
+}
+
+test "normalizeKnownFinite2Float4 matches math.normalizeOrZeroFinite bit for bit on finite lanes with len2 above epsilon, and zeroes the masked lanes" {
+    for ([_]f32{ 0, 0.0001, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < finite_normalize_cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            var lanes: MaskBits = 0;
+            for (finite_normalize_cases[index..][0..lane_count], &xs, &ys, 0..) |case, *x, *y, lane| {
+                x.* = case[0];
+                y.* = case[1];
+                const len2 = case[0] * case[0] + case[1] * case[1];
+                const meets = std.math.isFinite(case[0]) and std.math.isFinite(case[1]) and std.math.isFinite(len2) and len2 > epsilon;
+                if (meets) lanes |= @as(MaskBits, 1) << @intCast(lane);
+            }
+            const x_lanes = loadFloat4(&xs);
+            const y_lanes = loadFloat4(&ys);
+            const out = normalizeKnownFinite2Float4(x_lanes, y_lanes, lengthSquared2Float4(x_lanes, y_lanes), lanes);
+            const out_x = toFloatArray(out.x);
+            const out_y = toFloatArray(out.y);
+            for (0..lane_count) |lane| {
+                const expected = math.normalizeOrZeroFinite(xs[lane], ys[lane], epsilon);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(out_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(out_y[lane])));
+            }
+        }
+    }
+}
+
+test "sumLanesFloat4 equals its scalar form bit for bit, in its pinned pairwise order" {
+    // Sequential `((a + b) + c) + d` gives 1 here; the pinned pairwise order gives 0.
+    const order_case = [lane_count]f32{ 1e8, 1, -1e8, 1 };
+    try std.testing.expectEqual(@as(f32, 1), ((order_case[0] + order_case[1]) + order_case[2]) + order_case[3]);
+    try std.testing.expectEqual(@as(f32, 0), sumLanesFloat4(order_case));
+    var prng = std.Random.DefaultPrng.init(0x5e3_1a4e);
+    const random = prng.random();
+    for (0..256) |_| {
+        var lanes: [lane_count]f32 = undefined;
+        for (&lanes) |*lane| lane.* = (random.float(f32) - 0.5) * std.math.pow(f32, 10, @floatFromInt(random.uintLessThan(u8, 12)));
+        try std.testing.expectEqual(@as(u32, @bitCast(sumLanesScalar(lanes))), @as(u32, @bitCast(sumLanesFloat4(loadFloat4(&lanes)))));
+    }
+}
+
+test "shiftLeftUint4 and shiftRightUint4 match a per-lane shift" {
+    const words = [lane_count]u32{ 1, 0x8000_0001, std.math.maxInt(u32), 0x1234_5678 };
+    const lanes = loadUint4(&words);
+    inline for ([_]u5{ 0, 1, 14, 31 }) |amount| {
+        const left: [lane_count]u32 = shiftLeftUint4(lanes, amount);
+        const right: [lane_count]u32 = shiftRightUint4(lanes, amount);
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(words[lane] << amount, left[lane]);
+            try std.testing.expectEqual(words[lane] >> amount, right[lane]);
+        }
+    }
+}
+
+test "lane batch loads and stores match their scalar forms and touch only the live lanes, full batches and every tail" {
+    const floats = [_]f32{ -0.0, 1.5, std.math.inf(f32), -3.25, 7, 8 };
+    const words = [_]u32{ 0, std.math.maxInt(u32), 0x8000_0001, 5, 6, 7 };
+    const float_lanes = [lane_count]f32{ 9.5, -0.0, std.math.floatMax(f32), 2 };
+    const word_lanes = [lane_count]u32{ 11, 0, std.math.maxInt(u32), 0x7fff_ffff };
+    const float_vector = loadFloat4(&float_lanes);
+    const word_vector = loadUint4(&word_lanes);
+    for (0..lane_count + 3) |count| {
+        const live = @min(count, lane_count);
+        // A load reads only a slice of `count` values, zero past the live lanes.
+        const loaded_floats = toFloatArray(loadFloat4Lanes(floats[0..count], count));
+        const scalar_floats = loadFloat4LanesScalar(floats[0..count], count);
+        for (loaded_floats, scalar_floats, 0..) |lane, scalar, index| {
+            try std.testing.expectEqual(@as(u32, @bitCast(scalar)), @as(u32, @bitCast(lane)));
+            const expected: f32 = if (index < live) floats[index] else 0;
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(lane)));
+        }
+        const loaded_words = toUintArray(loadUint4Lanes(words[0..count], count));
+        try std.testing.expectEqual(loadUint4LanesScalar(words[0..count], count), loaded_words);
+        for (loaded_words, 0..) |lane, index| try std.testing.expectEqual(if (index < live) words[index] else 0, lane);
+
+        var stored_floats = [_]f32{ 4, 4, 4, 4, 4, 4 };
+        var scalar_stored_floats = stored_floats;
+        storeFloat4Lanes(stored_floats[0..], float_vector, count);
+        storeFloat4LanesScalar(scalar_stored_floats[0..], toFloatArray(float_vector), count);
+        for (stored_floats, scalar_stored_floats, 0..) |stored, scalar, index| {
+            try std.testing.expectEqual(@as(u32, @bitCast(scalar)), @as(u32, @bitCast(stored)));
+            const expected: f32 = if (index < live) float_lanes[index] else 4;
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(stored)));
+        }
+        var stored_words = [_]u32{ 3, 3, 3, 3, 3, 3 };
+        var scalar_stored_words = stored_words;
+        storeUint4Lanes(stored_words[0..], word_vector, count);
+        storeUint4LanesScalar(scalar_stored_words[0..], toUintArray(word_vector), count);
+        try std.testing.expectEqual(scalar_stored_words, stored_words);
+        for (stored_words, 0..) |stored, index| try std.testing.expectEqual(if (index < live) word_lanes[index] else 3, stored);
+    }
+}
+
+test "narrowing u16 lane store matches its scalar form, keeps the max value, and touches only the live lanes" {
+    const max = std.math.maxInt(u16);
+    const lane_sets = [_][lane_count]u32{
+        .{ 0, max, 1, 0x8000 },
+        .{ max, max, max, max },
+        .{ 32, 0, 0x7fff, 7 },
+    };
+    for (lane_sets) |lanes| {
+        const vector = loadUint4(&lanes);
+        for (0..lane_count + 3) |count| {
+            const live = @min(count, lane_count);
+            var stored = [_]u16{ 0xabcd, 0xabcd, 0xabcd, 0xabcd, 0xabcd, 0xabcd };
+            var scalar = stored;
+            storeUint4LanesU16(stored[0..], vector, count);
+            storeUint4LanesU16Scalar(scalar[0..], lanes, count);
+            try std.testing.expectEqual(scalar, stored);
+            for (stored, 0..) |value, index| {
+                const expected: u16 = if (index < live) @intCast(lanes[index]) else 0xabcd;
+                try std.testing.expectEqual(expected, value);
+            }
+        }
     }
 }

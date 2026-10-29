@@ -4,7 +4,6 @@
 
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
-const builtin = @import("builtin");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
@@ -56,7 +55,6 @@ const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline
 const PopulationSyncStats = @import("simulation_pipeline.zig").PopulationSyncStats;
 const sim_view_overscan_chunks = @import("simulation_pipeline.zig").sim_view_overscan_chunks;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
-const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -97,7 +95,6 @@ const DemoPopulationCapacity = struct {
     underground_movers: usize,
     contact_capacity: usize,
     intent_capacity: usize,
-    collision_trigger_capacity: usize,
 };
 
 fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
@@ -115,10 +112,6 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // path REQUESTS, which are sparse/event-driven) — this must cover the full
     // population, not an independent guess.
     const intent_capacity = mover_count + obstacle_count + 1;
-    // Owned by collision_response (a trigger event requires an underlying contact, so
-    // trigger count is bounded by contact count — collision_response's own domain
-    // knowledge, not a second independent ratio for this demo to guess).
-    const collision_trigger_capacity = estimateTriggerCapacity(contact_capacity);
     // The per-step `frame.events` bound is not derived here: it is the exhaustive
     // `EventProducerId` table (`simulation.zig`), summed by
     // `SimulationPipeline.eventCapacitySum()`. The perception/affect shares derive from
@@ -131,7 +124,6 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
         .underground_movers = underground_movers,
         .contact_capacity = contact_capacity,
         .intent_capacity = intent_capacity,
-        .collision_trigger_capacity = collision_trigger_capacity,
     };
 }
 
@@ -339,9 +331,10 @@ pub const GameDemoState = struct {
         return state;
     }
 
-    /// Resolves the dig controller's tile config (the walkable ramp and tunnel
-    /// tiles) from the runtime tileset metadata.
-    fn initWithWorld(
+    /// Builds the state on `world_value`, which it owns from the call on: it is freed on
+    /// failure too, so the caller keeps no cleanup for it. `dig_config` is the dig
+    /// controller's tile config, resolved by the caller; `mover_count` demo movers spawn.
+    pub fn initWithWorld(
         allocator: std.mem.Allocator,
         viewport_width: f32,
         viewport_height: f32,
@@ -351,7 +344,7 @@ pub const GameDemoState = struct {
         dig_config: DigConfig,
         worker_participant_count: usize,
         pathfinding_override: ?PathfindingCapacity,
-        nav_build_thread_system: ?*ThreadSystem,
+        build_thread_system: ?*ThreadSystem,
         mover_count: usize,
         asset_store: AssetStore,
     ) !GameDemoState {
@@ -427,21 +420,16 @@ pub const GameDemoState = struct {
                 .worker_participant_count = worker_participant_count,
             },
             .navigation_world = &world,
-            .nav_build_thread_system = nav_build_thread_system,
+            .build_thread_system = build_thread_system,
             .dig = dig_config,
             .structural_headroom = demo_structural_headroom,
         });
         errdefer pipeline.deinit();
-        // The shared `range_count` equals the event bound: one range per required append
-        // is the worst case. The last arg sizes the structural-command stream: one
-        // `set_simulation_tier` per movement body plus the whole structural share (the
-        // demo's create burst and the pipeline's destructible commands), so the commit
-        // seam stays allocation-free on churn frames. The event value capacity and
-        // limit are set by `pipeline.reserve` below.
-        try simulation_frame.reserveStreams(pipeline.eventCapacitySum(), 0, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.intent_capacity + pipeline.structuralCommandHeadroom());
-        try simulation_frame.reservePathRequests(pipeline.steeringStreamRangeCount(), pop_cap.mover_count);
-        // Raises `frame.events.capacity_limit` to the exhaustive producer sum.
-        try pipeline.reserve(&simulation_frame, pop_cap.intent_capacity);
+        // The frame's pipeline streams at the tracked population, the structural-command
+        // stream with the whole structural share (the demo's create burst and the
+        // pipeline's destructible commands), so the commit seam stays allocation-free on
+        // churn frames; raises `frame.events.capacity_limit` to the exhaustive producer sum.
+        try pipeline.reserveFrame(&simulation_frame);
 
         var state = GameDemoState{
             .allocator = allocator,
@@ -642,8 +630,8 @@ pub const GameDemoState = struct {
         };
     }
 
-    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, thread_system: ?*ThreadSystem) !StructuralCommitStats {
-        const result = try commitStructuralAndReact(&self.pipeline, &self.simulation_frame, &self.data, &self.world, thread_system);
+    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, thread_system: *ThreadSystem) !StructuralCommitStats {
+        const result = try self.pipeline.commitStructuralAndReact(&self.simulation_frame, &self.data, &self.world, thread_system);
         self.last_population_sync = result.population_sync;
         self.last_nav_update_stats = result.nav_update;
         try render_prep.ensureScenePrepCapacity(&self.scene_prep, self.gameplayScene());
@@ -654,52 +642,6 @@ pub const GameDemoState = struct {
         try render_prep.validateAtlasReferences(&self.data, runtime_assets);
     }
 };
-
-const DemoCommitResult = struct {
-    structural: StructuralCommitStats,
-    population_sync: PopulationSyncStats,
-    nav_update: NavUpdateStats,
-};
-
-/// The demo's structural-commit seam, in order: the static-collider and static nav-mark
-/// reserve, the budgeted commit, the collider capture of the step's static changes, the
-/// population growth seam, the collider sync and its nav record (run even when the growth
-/// seam failed, so the step's static changes land and reach nav), then the post-commit
-/// reactions. The nav apply runs only after a successful growth seam and collider sync,
-/// keeping every recorded mark for the next step otherwise; the steering reaction
-/// (allocation-free flag setting) always runs, and the first growth, collider, or nav error
-/// is returned only after it. Steering reads the synced collider rows, so a growth or nav
-/// failure still leaves it on the committed statics; a failed collider sync keeps steering
-/// on the pre-commit rows and keeps its changes for the next step's sync, which converges.
-fn commitStructuralAndReact(
-    pipeline: *SimulationPipeline,
-    frame: *SimulationFrame,
-    data: *DataSystem,
-    world: *WorldSystem,
-    thread_system: ?*ThreadSystem,
-) !DemoCommitResult {
-    // The post-commit nav reaction appends at most one nav_region_invalidated event,
-    // driven by structural commands applied this frame, marks a terrain writer recorded (a
-    // dig's world_tile_changed), or nav work the world left pending (a level, link, or
-    // content revision). Reserve the slot for every source so the append never trips a
-    // tight capacity_limit.
-    const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
-    try pipeline.reserveStaticColliders(frame, data);
-    const structural = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
-    pipeline.captureStaticColliderChanges(frame);
-    // Population growth seam: the post-commit reactions and the next step see grown
-    // capacities. O(1) when the committed rows fit the tracked capacities.
-    const population_sync = pipeline.syncPopulationCapacity(frame, data);
-    const collider_sync = pipeline.syncStaticColliders(data, thread_system);
-    const nav_update = if (population_sync) |_|
-        (if (collider_sync) |_| pipeline.reactToPostCommitNavEvents(frame, world, thread_system) else |err| err)
-    else |err|
-        err;
-    pipeline.reactToPostCommitSteeringEvents(frame);
-    const population = try population_sync;
-    try collider_sync;
-    return .{ .structural = structural, .population_sync = population, .nav_update = try nav_update };
-}
 
 const SpawnCellCoord = struct { x: u16, y: u16 };
 
@@ -911,9 +853,7 @@ fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.Ti
     _ = try world.setDenseTile(floor_layer, cell.x, cell.y, tunnel_tile);
 }
 
-/// Places durable investigate POIs on the surface level (index 0 today).
-/// If elevation stacks above the surface are added, rebind this to the
-/// level whose `levelElevation` is 0 rather than hardcoding storage index 0.
+/// Places durable investigate POIs on the surface level (storage index 0).
 fn placeDemoInterestMarkers(world: *WorldSystem) !void {
     const w = world.worldWidthPixels();
     const h = world.worldHeightPixels();
@@ -972,7 +912,7 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk post.entities[post.entities.len - 1];
     } else blk: {
         const e = try data.createEntity();
-        errdefer _ = data.destroyEntity(e);
+        errdefer data.destroyCreatedEntity(e);
         try data.setMovementBody(e, .{
             .position = spec.position,
             .previous_position = spec.position,
@@ -1004,14 +944,23 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk e;
     };
 
-    const body = data.movementBodyPtr(entity).?;
-    body.snapZ(world.levelBaseZ(spec.world_level));
+    try placeSpawnedMover(data, world, entity);
+    return entity;
+}
+
+/// Places a just-created movement row on its `world_level` (the surface without one): its
+/// render z at that level's base and its scope metadata (cognition tier, the chunk under its
+/// position, that level, not `always_active`). Returns `error.InvalidEntity` for a row with
+/// no movement body.
+pub fn placeSpawnedMover(data: *DataSystem, world: *const WorldSystem, entity: EntityId) !void {
+    const body = data.movementBodyPtr(entity) orelse return error.InvalidEntity;
+    const level = data.worldLevelConst(entity) orelse 0;
+    body.snapZ(world.levelBaseZ(level));
     try data.setSimulationMetadata(entity, .{
         .tier = .cognition,
-        .chunk = world.chunkCoordForWorldPos(spec.position.x, spec.position.y),
-        .level = spec.world_level,
+        .chunk = world.chunkCoordForWorldPos(body.position_x.*, body.position_y.*),
+        .level = level,
     });
-    return entity;
 }
 
 fn demoVelocityForIndex(index: usize) math.Vec2 {
@@ -1089,7 +1038,7 @@ fn spawnObstacles(data: *DataSystem, world: *const WorldSystem) ![obstacle_count
     var entities: [obstacle_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
         const entity = try data.createEntity();
-        errdefer _ = data.destroyEntity(entity);
+        errdefer data.destroyCreatedEntity(entity);
         try data.setMovementBody(entity, .{
             .position = spec.position,
             .previous_position = spec.position,
@@ -1127,7 +1076,7 @@ fn spawnObstaclesCompact(data: *DataSystem) ![obstacle_count]EntityId {
     var entities: [obstacle_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
         const entity = try data.createEntity();
-        errdefer _ = data.destroyEntity(entity);
+        errdefer data.destroyCreatedEntity(entity);
         try data.setMovementBody(entity, .{
             .position = spec.position,
             .previous_position = spec.position,
@@ -1214,10 +1163,10 @@ fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: SpriteAssetId, 
 
 fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
-    world.adoptTilesetMeta(meta);
-    const dig_config = try DigConfig.fromMeta(world.tilesetMeta().?);
+    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
+    const dig_config = try DigConfig.fromMeta(&meta);
     return try GameDemoState.initWithWorld(
         allocator,
         demo_test_viewport_width,
@@ -1241,25 +1190,23 @@ fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     try demo.pipeline.commitDigWorldEdit(&demo.world, edit, &demo.simulation_frame);
 }
 
-const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
-
-// The level of entity `index`'s static-collider row, or null when it has none (a row id of
-// maxInt(u32)).
-fn colliderRowLevelForTest(colliders: *const StaticColliderSystem, index: u32) ?u16 {
-    if (index >= colliders.row_of_index.items.len) return null;
-    const row = colliders.row_of_index.items[index];
-    if (row == std.math.maxInt(u32)) return null;
-    return colliders.row_level[row];
-}
-
 const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlocksMovement;
+const pipeline_test_support = @import("simulation_pipeline_test_support.zig");
+const lateralSteeringOnce = pipeline_test_support.lateralSteeringOnce;
+const addSteeringAgentAndParkedBox = pipeline_test_support.addSteeringAgentAndParkedBox;
+const writeBoxMove = pipeline_test_support.writeBoxMove;
+const expectSteeringSeesOwnPosition = pipeline_test_support.expectSteeringSeesOwnPosition;
+const addBystanderBody = pipeline_test_support.addBystanderBody;
+const OneAgentPipelineFixture = pipeline_test_support.OneAgentPipelineFixture;
 
 // The player's cell-entry plane traversal through the plane stage with no NPC entries;
 // its landing carve publishes into the demo's frame.
 fn traversePlaneForTest(demo: *GameDemoState) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const dig = &demo.pipeline.dig;
-    const reservation = try dig.reservePlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, &.{}, null);
-    try dig.commitPlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, &.{}, &serial_threads);
+    try dig.commitPlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, reservation, &serial_threads);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1280,7 +1227,7 @@ fn ambientAudioCommandCount(audio: *const AudioCommandBuffer) usize {
     return count;
 }
 
-fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
+fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId, threads: *ThreadSystem) !void {
     const isolate_x: f32 = demo.bounds_width + 64;
     const isolate_y: f32 = demo.bounds_height + 64;
     for (demo.test_squares) |entity| {
@@ -1293,15 +1240,9 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
         body.velocity_x.* = 0;
         body.velocity_y.* = 0;
     }
-    for (demo.obstacles) |entity| {
-        const body = demo.data.movementBodyPtr(entity).?;
-        body.position_x.* = isolate_x;
-        body.position_y.* = isolate_y;
-        body.previous_x.* = isolate_x;
-        body.previous_y.* = isolate_y;
-        body.velocity_x.* = 0;
-        body.velocity_y.* = 0;
-    }
+    var obstacle_positions: [obstacle_count]math.Vec2 = undefined;
+    for (&obstacle_positions) |*position| position.* = .{ .x = isolate_x, .y = isolate_y };
+    try commitStaticPositionsForTest(demo, threads, &demo.obstacles, &obstacle_positions);
     const player_body = demo.data.movementBodyPtr(demo.player.entity).?;
     player_body.position_x.* = isolate_x;
     player_body.position_y.* = isolate_y;
@@ -1310,6 +1251,27 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
     player_body.velocity_x.* = 0;
     player_body.velocity_y.* = 0;
 }
+
+// Places static obstacles through the commit seam so the collider rows match the bodies.
+fn commitStaticPositionsForTest(demo: *GameDemoState, threads: *ThreadSystem, entities: []const EntityId, positions: []const math.Vec2) !void {
+    std.debug.assert(entities.len == positions.len);
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, entities.len);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    for (entities, positions) |entity, position| {
+        writer.write(.{ .set_movement_body = .{
+            .entity = entity,
+            .body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 },
+        } });
+    }
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+    _ = try demo.pipeline.commitStructuralAndReact(&demo.simulation_frame, &demo.data, &demo.world, threads);
+}
+
+const data_test_support = @import("data_system/test_support.zig");
 
 test "GameDemoState owns test_squares via its own allocator field, not DataSystem's" {
     var demo = try initDemoForTest(std.testing.allocator);
@@ -1361,20 +1323,20 @@ test "demo spawns atlas-backed moving actors" {
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
-    const player_asset = demo.data.assetReferenceConst(demo.player.entity).?;
+    const player_asset = data_test_support.assetReference(&demo.data, demo.player.entity).?;
     try std.testing.expectEqual(SpriteAssetId.grim_characters, player_asset.sprite);
     try std.testing.expect(player_asset.hasAtlasEntry());
     try std.testing.expectEqual(@as(usize, 0), demo.particles.activeCount());
     for (demo.test_squares) |entity| {
         try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
-        const asset_ref = demo.data.assetReferenceConst(entity).?;
+        const asset_ref = data_test_support.assetReference(&demo.data, entity).?;
         try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
         try std.testing.expect(asset_ref.hasAtlasEntry());
         const body = demo.data.movementBodyConst(entity).?;
         const has_ai = demo.data.hasComponents(entity, component_masks.ai_agent);
         try std.testing.expect(has_ai or body.velocity.x != 0 or body.velocity.y != 0);
         if (has_ai) {
-            try std.testing.expect(demo.data.aiAgentConst(entity) != null);
+            try std.testing.expect(data_test_support.aiAgent(&demo.data, entity) != null);
         }
         const visual = demo.data.primitiveVisualConst(entity).?;
         try std.testing.expect(visual.color.a > 0);
@@ -1382,7 +1344,7 @@ test "demo spawns atlas-backed moving actors" {
     }
     for (demo.obstacles) |entity| {
         try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
-        try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(entity).?.sprite);
+        try std.testing.expectEqual(SpriteAssetId.demo_tile, data_test_support.assetReference(&demo.data, entity).?.sprite);
         const body = demo.data.movementBodyConst(entity).?;
         try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
         try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
@@ -1395,10 +1357,10 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
     // <=16 threshold, exercising the non-compact spawn branch.
     const world_dimension_px: f32 = 544;
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, world_dimension_px, world_dimension_px);
-    world.adoptTilesetMeta(meta);
-    const dig_config = try DigConfig.fromMeta(world.tilesetMeta().?);
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, world_dimension_px, world_dimension_px);
+    const dig_config = try DigConfig.fromMeta(&meta);
     var demo = try GameDemoState.initWithWorld(
         std.testing.allocator,
         world_dimension_px,
@@ -1427,20 +1389,20 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
-    const player_asset = demo.data.assetReferenceConst(demo.player.entity).?;
+    const player_asset = data_test_support.assetReference(&demo.data, demo.player.entity).?;
     try std.testing.expectEqual(SpriteAssetId.grim_characters, player_asset.sprite);
     try std.testing.expect(player_asset.hasAtlasEntry());
     try std.testing.expectEqual(@as(usize, 0), demo.particles.activeCount());
     for (demo.test_squares) |entity| {
         try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
-        const asset_ref = demo.data.assetReferenceConst(entity).?;
+        const asset_ref = data_test_support.assetReference(&demo.data, entity).?;
         try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
         try std.testing.expect(asset_ref.hasAtlasEntry());
         const body = demo.data.movementBodyConst(entity).?;
         const has_ai = demo.data.hasComponents(entity, component_masks.ai_agent);
         try std.testing.expect(has_ai or body.velocity.x != 0 or body.velocity.y != 0);
         if (has_ai) {
-            try std.testing.expect(demo.data.aiAgentConst(entity) != null);
+            try std.testing.expect(data_test_support.aiAgent(&demo.data, entity) != null);
         }
         const visual = demo.data.primitiveVisualConst(entity).?;
         try std.testing.expect(visual.color.a > 0);
@@ -1448,7 +1410,7 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
     }
     for (demo.obstacles) |entity| {
         try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
-        try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(entity).?.sprite);
+        try std.testing.expectEqual(SpriteAssetId.demo_tile, data_test_support.assetReference(&demo.data, entity).?.sprite);
         const body = demo.data.movementBodyConst(entity).?;
         try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
         try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
@@ -1493,10 +1455,10 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
     const large_bounds_height: f32 = 4096;
 
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
-    world.adoptTilesetMeta(meta);
-    const dig_config = try DigConfig.fromMeta(world.tilesetMeta().?);
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
+    const dig_config = try DigConfig.fromMeta(&meta);
     var demo = try GameDemoState.initWithWorld(
         std.testing.allocator,
         demo_test_viewport_width,
@@ -1563,6 +1525,8 @@ test "demo init rejects missing character atlas metadata" {
 }
 
 test "demo world tile event invalidates navigation after commit reaction" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -1578,8 +1542,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
     // The writer's nav record of its event.
     try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(&demo.pipeline.pathfinding, demo.simulation_frame.events.mergedItems(), &demo.world);
 
-    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.world, null);
-    demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
+    demo.last_nav_update_stats = (try demo.pipeline.commitStructuralAndReact(&demo.simulation_frame, &demo.data, &demo.world, &inline_threads)).nav_update;
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1630,6 +1593,8 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 }
 
 test "a demo ramp dig is routable from both levels the next step" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -1645,9 +1610,8 @@ test "a demo ramp dig is routable from both levels the next step" {
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
-    // The step's post-commit nav reaction.
-    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.world, null);
-    demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
+    // The step's commit seam (no commands): its post-commit reactions.
+    demo.last_nav_update_stats = (try demo.pipeline.commitStructuralAndReact(&demo.simulation_frame, &demo.data, &demo.world, &inline_threads)).nav_update;
 
     // Next step: a request up the ramp from the dirt plane and one down it from the surface
     // both route across the link.
@@ -1663,9 +1627,9 @@ test "a demo ramp dig is routable from both levels the next step" {
     }.of;
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 1, .goal_level = 0, .start = center(4, 2), .goal = center(0, 4) });
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 0, .goal_level = 1, .start = center(0, 4), .goal = center(4, 2) });
-    const stats = try demo.pipeline.pathfinding.updateSerial(&stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 2), stats.available_results);
-    try std.testing.expectEqual(@as(usize, 2), stats.cross_level_solves);
+    _ = try @import("systems/pathfinding/test_support.zig").updatePathfindingInline(&demo.pipeline.pathfinding, &stream, 8, .{});
+    try std.testing.expect(demo.pipeline.pathfinding.statusForWorld(1, center(4, 2), 0, center(0, 4), .default, null).status == .available);
+    try std.testing.expect(demo.pipeline.pathfinding.statusForWorld(0, center(0, 4), 1, center(4, 2), .default, null).status == .available);
 
     // The link still climbs planes via the world tier.
     placePlayerInCell(&demo, 5, 2);
@@ -1701,7 +1665,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
     // Regression: the player's scope metadata level (read by the LOD tier demotion
     // in queueTierChanges) must track current_level, or descending far enough
     // stages the player out of the movement tier via a phantom level_delta.
-    try std.testing.expectEqual(@as(u16, 2), demo.data.simulationMetadata(demo.player.entity).?.level);
+    try std.testing.expectEqual(@as(u16, 2), data_test_support.simulationMetadata(&demo.data, demo.player.entity).?.level);
 
     // The void-plane landing cell is carved walkable so the player is not buried.
     const floor2 = demo.world.denseFloorLayerForLevel(2).?;
@@ -1709,6 +1673,8 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -1748,8 +1714,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
     try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(&demo.pipeline.pathfinding, demo.simulation_frame.events.mergedItems(), &demo.world);
 
     const version_before = demo.pipeline.pathfinding.graph.version;
-    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.world, null);
-    demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
+    demo.last_nav_update_stats = (try demo.pipeline.commitStructuralAndReact(&demo.simulation_frame, &demo.data, &demo.world, &inline_threads)).nav_update;
 
     // The incremental update ran and kept nav_version (caches are scope-evicted).
     try std.testing.expectEqual(@as(usize, 1), demo.last_nav_update_stats.incremental_rebuilds);
@@ -1775,8 +1740,6 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
 }
 
 test "demo owns and completes a simulation frame during update" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1828,8 +1791,6 @@ test "demo owns and completes a simulation frame during update" {
 }
 
 test "demo queues jet loop audio only on movement edges" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1888,8 +1849,6 @@ test "demo queues jet loop audio only on movement edges" {
 }
 
 test "demo collision response blocks player against obstacles" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1930,8 +1889,6 @@ test "demo collision response blocks player against obstacles" {
 }
 
 test "demo ai processor drives non-player squares via intents (seek_target deterministic, 0-worker serial path)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1988,8 +1945,6 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
 }
 
 test "demo collision response handles player contacts with moving entities" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2011,13 +1966,11 @@ test "demo collision response handles player contacts with moving entities" {
         body.previous_x.* = body.position_x.*;
         body.previous_y.* = body.position_y.*;
     }
-    for (demo.obstacles, 0..) |obstacle, index| {
-        const body = demo.data.movementBodyPtr(obstacle).?;
-        body.position_x.* = 620 + @as(f32, @floatFromInt(index)) * 80;
-        body.position_y.* = 330;
-        body.previous_x.* = body.position_x.*;
-        body.previous_y.* = body.position_y.*;
+    var obstacle_positions: [obstacle_count]math.Vec2 = undefined;
+    for (&obstacle_positions, 0..) |*position, index| {
+        position.* = .{ .x = 620 + @as(f32, @floatFromInt(index)) * 80, .y = 330 };
     }
+    try commitStaticPositionsForTest(&demo, &threads, &demo.obstacles, &obstacle_positions);
     const player_body = demo.data.movementBodyPtr(demo.player.entity).?;
     const square_body = demo.data.movementBodyPtr(square).?;
     player_body.position_x.* = 200;
@@ -2049,7 +2002,7 @@ test "demo collision response handles player contacts with moving entities" {
     try std.testing.expect(square_after.velocity.x > 0);
 }
 
-test "ai squares use consistent math.clamp and zero velocity on bounds (main thread only)" {
+test "ai squares clamp their collision box to the bounds and zero velocity on clamped axes" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2066,8 +2019,8 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     // Pick an ai square (index 0 is wander ai), park in the top-left corner, then
     // push out of bounds so clamp runs without post-clamp collision shoving it back out.
     const ai_ent = demo.test_squares[0];
-    isolateDemoBodiesAwayFrom(&demo, ai_ent);
-    const visual = demo.data.primitiveVisualConst(ai_ent).?;
+    try isolateDemoBodiesAwayFrom(&demo, ai_ent, &threads);
+    const box = demo.data.collisionBoundsConst(ai_ent).?;
     const body = demo.data.movementBodyPtr(ai_ent).?;
     body.position_x.* = -10;
     body.position_y.* = -10;
@@ -2087,17 +2040,20 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     });
 
     const after = demo.data.movementBodyConst(ai_ent).?;
-    // Clamped via math.clamp (pos >=0, <= bound-size), and vels zeroed for the clamped axes (AI policy).
-    try std.testing.expect(after.position.x >= 0);
-    try std.testing.expect(after.position.y >= 0);
-    try std.testing.expect(after.position.x <= demo.bounds_width - visual.size.x);
-    try std.testing.expect(after.position.y <= demo.bounds_height - visual.size.y);
+    // The box (`position + offset`, `size`) is clamped into the bounds, and velocity is
+    // zeroed on the clamped axes.
+    try std.testing.expect(after.position.x + box.offset.x >= 0);
+    try std.testing.expect(after.position.y + box.offset.y >= 0);
+    try std.testing.expect(after.position.x + box.offset.x + box.size.x <= demo.bounds_width);
+    try std.testing.expect(after.position.y + box.offset.y + box.size.y <= demo.bounds_height);
     // vels zeroed on the violated axes (was pushed out)
     try std.testing.expectEqual(@as(f32, 0), after.velocity.x);
     try std.testing.expectEqual(@as(f32, 0), after.velocity.y);
 }
 
 test "demo structural static obstacle change emits one navigation invalidation event" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -2119,7 +2075,7 @@ test "demo structural static obstacle change emits one navigation invalidation e
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&inline_threads);
 
     var nav_invalidations: usize = 0;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -2135,118 +2091,27 @@ test "demo structural static obstacle change emits one navigation invalidation e
     try std.testing.expectEqual(@as(usize, 1), demo.simulation_frame.events.stats.nav_region_invalidated);
 }
 
-// One steering step for `agent` heading +x; returns its lateral (y) direction.
-fn lateralSteeringOnceForTest(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, agent: EntityId, goal: math.Vec2) !f32 {
-    frame.beginStep();
-    try frame.navigation_intents.prepareRangeCounts(1);
-    frame.navigation_intents.addCount(0, 1);
-    try frame.navigation_intents.prefix();
-    var writer = frame.navigation_intents.rangeWriter(0);
-    writer.write(.{ .entity = agent, .goal = goal, .direct_direction_x = 1 });
-    writer.finish();
-    frame.navigation_intents.finishWrite();
-    _ = try pipeline.steering.updateSerial(data, frame, &pipeline.pathfinding, &pipeline.static_colliders);
-    for (frame.intents.mergedItems()) |intent| {
-        if (intent.movement.entity.eql(agent)) return intent.movement.direction_y;
-    }
-    return error.TestExpectedEqual;
-}
-
-const SteeringBoxForTest = struct {
-    agent: EntityId,
-    box: EntityId,
-    goal: math.Vec2,
-    // Ahead of and above (-y) the agent: steering pushes it toward +y.
-    beside: math.Vec2,
-};
-
-// A steering agent heading +x and a static box parked far from it, on `level`. The agent
-// is created last, so it is the last movement row: destroying any earlier movement body
-// swap-removes the agent into that body's row.
-fn addSteeringAgentAndParkedBoxForTest(data: *DataSystem, level: u16) !SteeringBoxForTest {
-    const parked = math.Vec2{ .x = 96, .y = 960 };
-    const box = try data.createEntity();
-    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
-    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
-    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
-    try data.setWorldLevel(box, level);
-    const agent_position = math.Vec2{ .x = 96, .y = 96 };
-    const agent = try data.createEntity();
-    try data.setMovementBody(agent, .{ .position = agent_position, .previous_position = agent_position, .velocity = .{}, .speed = 32 });
-    try data.setSteeringAgent(agent, .{
-        .agent_radius = 8,
-        .waypoint_tolerance = 4,
-        .avoidance_radius = 48,
-        .avoidance_weight = 1.5,
-        .max_neighbor_samples = 8,
-        .stuck_step_threshold = 3,
-        .replan_cooldown_steps = 4,
-        .unavailable_backoff_steps = 12,
-    });
-    try data.setWorldLevel(agent, level);
-    return .{
-        .agent = agent,
-        .box = box,
-        .goal = .{ .x = 192, .y = 96 },
-        .beside = .{ .x = agent_position.x + 8, .y = agent_position.y - 32 },
-    };
-}
-
-// Writes this step's structural commands: one `set_movement_body` moving `box` to `position`.
-fn writeBoxMoveForTest(frame: *SimulationFrame, box: EntityId, position: math.Vec2, extra: []const StructuralCommand) !void {
-    try frame.structural_commands.prepareRangeCounts(1);
-    frame.structural_commands.addCount(0, 1 + extra.len);
-    try frame.structural_commands.prefix();
-    var writer = frame.structural_commands.rangeWriter(0);
-    writer.write(.{ .set_movement_body = .{ .entity = box, .body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 } } });
-    for (extra) |command| writer.write(command);
-    writer.finish();
-    frame.structural_commands.finishWrite();
-}
-
-// Steering's last agent snapshot (the positions neighbors avoid) holds `agent` at its own
-// previous position.
-fn expectSteeringSeesOwnPositionForTest(pipeline: *const SimulationPipeline, data: *const DataSystem, agent: EntityId) !void {
-    const own = data.movementBodyConst(agent).?.previous_position;
-    const agents = pipeline.steering.agentSnapshotSliceConst();
-    for (agents.entity, agents.x, agents.y) |entity, x, y| {
-        if (!entity.eql(agent)) continue;
-        try std.testing.expectEqual(own, math.Vec2{ .x = x, .y = y });
-        return;
-    }
-    return error.TestExpectedEqual;
-}
-
-// A movement body with no steering or collider component, far from the scene on `level`.
-fn addBystanderBodyForTest(data: *DataSystem, level: u16) !EntityId {
-    const far = math.Vec2{ .x = 900, .y = 900 };
-    const bystander = try data.createEntity();
-    try data.setMovementBody(bystander, .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 });
-    try data.setWorldLevel(bystander, level);
-    return bystander;
-}
-
 // Commits one step whose nav reaction runs out of memory: more recorded tile marks than
 // the nav batch storage holds, applied under a failing nav allocator. The same commit
 // destroys a bystander body, swap-removing the steering agent into the bystander's movement
 // row, and places the static box: beside the agent with `move_static`, else where it is
 // parked. Returns the agent's lateral steering component on the next step.
 fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     const frame = &demo.simulation_frame;
 
     // Agent, box, and bystander on level 1, apart from the demo population on level 0.
-    const bystander = try addBystanderBodyForTest(&demo.data, 1);
-    const scene = try addSteeringAgentAndParkedBoxForTest(&demo.data, 1);
+    const bystander = try addBystanderBody(&demo.data, 1);
+    const scene = try addSteeringAgentAndParkedBox(&demo.data, 1);
     const parked = demo.data.movementBodyConst(scene.box).?.position;
 
-    // Population seam for the direct adds, then a steering step that caches the agent's
-    // movement row.
+    // Population seam for the direct adds, then a steering step.
     frame.beginStep();
-    _ = try commitStructuralAndReact(&demo.pipeline, frame, &demo.data, &demo.world, null);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal), 0.001);
-    try std.testing.expect(demo.pipeline.steering.steering_movement_index_valid);
+    _ = try demo.pipeline.commitStructuralAndReact(frame, &demo.data, &demo.world, &inline_threads);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal), 0.001);
 
     frame.beginStep();
     const nav = &demo.pipeline.pathfinding;
@@ -2266,7 +2131,7 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     }
     // The writer's nav record, before the nav allocator fails.
     try @import("systems/pathfinding/test_support.zig").recordTerrainEvents(nav, frame.events.mergedItems(), &demo.world);
-    try writeBoxMoveForTest(frame, scene.box, if (move_static) scene.beside else parked, &.{.{ .destroy_entity = bystander }});
+    try writeBoxMove(frame, scene.box, if (move_static) scene.beside else parked, &.{.{ .destroy_entity = bystander }});
     const agent_row = demo.data.movementBodyDenseIndex(scene.agent).?;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -2274,16 +2139,15 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     const graph_allocator = nav.graph.allocator;
     nav.allocator = failing.allocator();
     nav.graph.allocator = failing.allocator();
-    const result = commitStructuralAndReact(&demo.pipeline, frame, &demo.data, &demo.world, null);
+    const result = demo.pipeline.commitStructuralAndReact(frame, &demo.data, &demo.world, &inline_threads);
     nav.allocator = nav_allocator;
     nav.graph.allocator = graph_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
-    // The agent's movement row moved, and the steering reaction dropped the cached row.
+    // The agent's movement row moved.
     try std.testing.expect(demo.data.movementBodyDenseIndex(scene.agent).? != agent_row);
-    try std.testing.expect(!demo.pipeline.steering.steering_movement_index_valid);
 
-    const lateral = try lateralSteeringOnceForTest(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal);
-    try expectSteeringSeesOwnPositionForTest(&demo.pipeline, &demo.data, scene.agent);
+    const lateral = try lateralSteeringOnce(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal);
+    try expectSteeringSeesOwnPosition(&demo.pipeline, &demo.data, scene.agent);
     return lateral;
 }
 
@@ -2293,146 +2157,6 @@ test "a nav reaction that runs out of memory still runs the steering reaction an
     try std.testing.expectApproxEqAbs(@as(f32, 0), control, 0.001);
     // The synced collider rows push the agent away from the moved box (+y).
     try std.testing.expect(moved > 0.05);
-}
-
-test "a population growth seam that runs out of memory still runs the steering reaction and returns the error" {
-    var fixture: DemoConfigPipelineFixture = undefined;
-    try fixture.init(std.testing.allocator);
-    defer fixture.deinit();
-    const frame = &fixture.frame;
-    const bystander = try addBystanderBodyForTest(&fixture.data, 0);
-    const scene = try addSteeringAgentAndParkedBoxForTest(&fixture.data, 0);
-
-    // Four bodies fit the 4-body reserve. A steering step caches the agent's movement row.
-    frame.beginStep();
-    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
-    try std.testing.expect(fixture.pipeline.steering.steering_movement_index_valid);
-
-    // The commit moves the box beside the agent and destroys the bystander, swap-removing
-    // the agent into the bystander's row; two creates then push the population past the
-    // reserve, the first refilling the agent's old row. The growth seam's first reserve
-    // fails.
-    const far = math.Vec2{ .x = 640, .y = 640 };
-    const create: StructuralCommand = .{ .create_entity = .{
-        .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
-    } };
-    frame.beginStep();
-    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{ .{ .destroy_entity = bystander }, create, create });
-    const agent_row = fixture.data.movementBodyDenseIndex(scene.agent).?;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const scope_allocator = fixture.pipeline.scope.allocator;
-    fixture.pipeline.scope.allocator = failing.allocator();
-    const result = commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    fixture.pipeline.scope.allocator = scope_allocator;
-    try std.testing.expectError(error.OutOfMemory, result);
-    try std.testing.expectEqual(@as(usize, 5), fixture.data.movementBodySliceConst().entities.len);
-    try std.testing.expect(fixture.data.movementBodyDenseIndex(scene.agent).? != agent_row);
-    try std.testing.expect(!fixture.pipeline.steering.steering_movement_index_valid);
-
-    // The synced collider rows push the agent away from the moved box (+y), and the agent
-    // snapshot reads its own renumbered row, not the create now in its old one.
-    try std.testing.expect(try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
-    try expectSteeringSeesOwnPositionForTest(&fixture.pipeline, &fixture.data, scene.agent);
-}
-
-test "a population-seam OOM still records the step's static changes" {
-    var fixture: DemoConfigPipelineFixture = undefined;
-    try fixture.init(std.testing.allocator);
-    defer fixture.deinit();
-    const frame = &fixture.frame;
-    const scene = try addSteeringAgentAndParkedBoxForTest(&fixture.data, 0);
-    frame.beginStep();
-    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    // The box was added outside a commit, so the colliders have not seen it yet.
-    try std.testing.expect(colliderRowLevelForTest(&fixture.pipeline.static_colliders, scene.box.index) == null);
-
-    // The commit moves the box while two creates push the population past its reserve;
-    // the growth seam's first reserve fails.
-    const far = math.Vec2{ .x = 640, .y = 640 };
-    const create: StructuralCommand = .{ .create_entity = .{
-        .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
-    } };
-    frame.beginStep();
-    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{ create, create });
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const scope_allocator = fixture.pipeline.scope.allocator;
-    fixture.pipeline.scope.allocator = failing.allocator();
-    const result = commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    fixture.pipeline.scope.allocator = scope_allocator;
-    try std.testing.expectError(error.OutOfMemory, result);
-
-    // The collider sync ran anyway: the moved box has its row.
-    const row_level = colliderRowLevelForTest(&fixture.pipeline.static_colliders, scene.box.index) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u16, 0), row_level);
-    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.static_colliders.changesThisStep().len);
-
-    // The next step, with no command, applies the recorded change: nav equals a fresh
-    // build of the statics, the box's cells blocked.
-    frame.beginStep();
-    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    const live = fixture.pipeline.pathfinding.graph.grid(0).?;
-    var rebuilt = PathfindingSystem.init(std.testing.allocator);
-    defer rebuilt.deinit();
-    try rebuilt.reserve(fixture.pipeline.pathfinding.capacity);
-    try rebuilt.rebuildStaticNavGrid(&fixture.data, 64, 64, fixture.pipeline.pathfinding.graph.cell_size);
-    const fresh = rebuilt.graph.grid(0).?;
-    var blocked: usize = 0;
-    for (0..live.geometry.height) |y| for (0..live.geometry.width) |x| {
-        const cell: @import("systems/pathfinding/types.zig").GridCell = .{ .x = @intCast(x), .y = @intCast(y) };
-        try std.testing.expectEqual(fresh.isBlockedCell(cell), live.isBlockedCell(cell));
-        if (live.isBlockedCell(cell)) blocked += 1;
-    };
-    try std.testing.expect(blocked != 0);
-}
-
-test "a collider sync that runs out of memory leaves steering on the pre-commit rows and the next seam converges" {
-    var fixture: DemoConfigPipelineFixture = undefined;
-    try fixture.init(std.testing.allocator);
-    defer fixture.deinit();
-    const frame = &fixture.frame;
-    const scene = try addSteeringAgentAndParkedBoxForTest(&fixture.data, 0);
-    const colliders = &fixture.pipeline.static_colliders;
-
-    // The box was added outside a commit: a commit re-placing it where it is gives it its
-    // row, parked far from the agent.
-    const parked = fixture.data.movementBodyConst(scene.box).?.position;
-    frame.beginStep();
-    try writeBoxMoveForTest(frame, scene.box, parked, &.{});
-    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    try std.testing.expect(colliderRowLevelForTest(colliders, scene.box.index) != null);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
-
-    // The commit moves the box beside the agent. The sync's plan scratch is released
-    // first, so the sync must grow it, and every collider allocation fails: the sync after
-    // the commit fails.
-    colliders.sync_plan.clearAndFree(colliders.allocator);
-    frame.beginStep();
-    try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{});
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const allocators = .{ colliders.allocator, colliders.chunk_lists.allocator, colliders.query_lists.allocator };
-    colliders.allocator = failing.allocator();
-    colliders.chunk_lists.allocator = failing.allocator();
-    colliders.query_lists.allocator = failing.allocator();
-    const result = commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    colliders.allocator = allocators[0];
-    colliders.chunk_lists.allocator = allocators[1];
-    colliders.query_lists.allocator = allocators[2];
-    try std.testing.expectError(error.OutOfMemory, result);
-    // The commit applied; the sync kept the change for the next seam.
-    try std.testing.expectEqual(scene.beside, fixture.data.movementBodyConst(scene.box).?.position);
-    try std.testing.expect(colliders.hasPendingChanges());
-
-    // Steering reads the pre-commit rows: the box is still parked.
-    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
-
-    // The next seam, with no command, syncs the kept change: steering pushes away from the
-    // box (+y).
-    frame.beginStep();
-    _ = try commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, null);
-    try std.testing.expect(!colliders.hasPendingChanges());
-    try std.testing.expect(try lateralSteeringOnceForTest(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
 }
 
 test "demo event bound is the pinned exhaustive producer sum" {
@@ -2448,50 +2172,9 @@ test "demo event bound is the pinned exhaustive producer sum" {
     try std.testing.expectEqual(pinned_event_bound, demo.pipeline.eventCapacitySum());
 }
 
-/// Minimal pipeline under the demo's config (`demo_structural_headroom`) over a 1x1
-/// one-level world, with one cognition agent carrying the demo's `AiPerception` +
-/// `AiAffect` pair. Test-only local fixture.
-const DemoConfigPipelineFixture = struct {
-    world: WorldSystem,
-    data: DataSystem,
-    frame: SimulationFrame,
-    pipeline: SimulationPipeline,
-
-    fn init(self: *DemoConfigPipelineFixture, allocator: std.mem.Allocator) !void {
-        self.world = .{ .allocator = allocator, .width = 1, .height = 1, .tile_size = 32, .chunk_size_tiles = 1 };
-        errdefer self.world.deinit();
-        _ = try self.world.addLevel(0);
-        self.data = DataSystem.init(allocator);
-        errdefer self.data.deinit();
-        const agent = try self.data.createEntity();
-        try self.data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 } });
-        try self.data.setAiPerception(agent, .{});
-        try self.data.setAiAffect(agent, .{});
-        self.frame = SimulationFrame.init(allocator);
-        errdefer self.frame.deinit();
-        self.pipeline = try SimulationPipeline.init(allocator, &self.data, 64, 64, .{
-            .movement_body_capacity = 4,
-            .structural_headroom = demo_structural_headroom,
-            .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
-        });
-        errdefer self.pipeline.deinit();
-        // The demo's init order: streams sized from the producer sum, then `reserve`
-        // raises the event limit to it.
-        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + self.pipeline.structuralCommandHeadroom());
-        try self.pipeline.reserve(&self.frame, 4);
-    }
-
-    fn deinit(self: *DemoConfigPipelineFixture) void {
-        self.pipeline.deinit();
-        self.frame.deinit();
-        self.data.deinit();
-        self.world.deinit();
-    }
-};
-
 test "every event producer has a nonzero budget under the demo config" {
-    var fixture: DemoConfigPipelineFixture = undefined;
-    try fixture.init(std.testing.allocator);
+    var fixture: OneAgentPipelineFixture = undefined;
+    try fixture.init(demo_structural_headroom);
     defer fixture.deinit();
 
     const budgets = fixture.pipeline.eventBudgets();
@@ -2534,6 +2217,8 @@ test "every producer budget fits the demo event bound allocation-free in one ste
 }
 
 test "demo preflights navigation invalidation event before structural mutation" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -2558,13 +2243,15 @@ test "demo preflights navigation invalidation event before structural mutation" 
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(null));
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&inline_threads));
     try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
 }
 
 test "demo preflights same-batch static obstacle promotion before mutation" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -2593,7 +2280,7 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(null));
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&inline_threads));
     try std.testing.expect(demo.data.collisionBoundsConst(entity) == null);
     try std.testing.expect(demo.data.collisionResponseConst(entity) == null);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
@@ -2601,6 +2288,8 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
 }
 
 test "demo unrelated structural component change does not invalidate navigation" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -2616,7 +2305,7 @@ test "demo unrelated structural component change does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&inline_threads);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
@@ -2628,6 +2317,8 @@ test "demo unrelated structural component change does not invalidate navigation"
 }
 
 test "demo dynamic entity structural destruction does not invalidate navigation" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
@@ -2650,7 +2341,7 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&inline_threads);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
@@ -2659,45 +2350,4 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
         }
     }
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
-}
-
-test "demo commit seam grows pipeline capacity" {
-    var fixture: DemoConfigPipelineFixture = undefined;
-    try fixture.init(std.testing.allocator);
-    defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
-
-    // Five creates (movement, bounds, response: 4 commit events each, 20 <= 79) push
-    // the population to 6, past the 4-body initial reserve.
-    var commands: [5]StructuralCommand = undefined;
-    for (&commands, 0..) |*command, index| {
-        const x: f32 = @as(f32, @floatFromInt(index)) * 64;
-        command.* = .{ .create_entity = .{
-            .movement_body = .{ .position = .{ .x = x, .y = 180 }, .previous_position = .{ .x = x, .y = 180 }, .velocity = .{}, .speed = 0 },
-            .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
-            .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
-        } };
-    }
-    fixture.frame.beginStep();
-    try fixture.frame.structural_commands.prepareRangeCounts(1);
-    fixture.frame.structural_commands.addCount(0, commands.len);
-    try fixture.frame.structural_commands.prefix();
-    var writer = fixture.frame.structural_commands.rangeWriter(0);
-    for (commands) |command| writer.write(command);
-    writer.finish();
-    fixture.frame.structural_commands.finishWrite();
-    const grown = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 5), grown.structural.created);
-
-    // 6 bodies -> 6 + 3 + 16 = 25, hot-store aligned to 32. The bound follows:
-    // dig 2 + perception 2 + affect 4 + plane (32 + 1) + action_react 64 +
-    // structural 79 (fixed) + nav 1 = 185.
-    try std.testing.expect(grown.population_sync.grew);
-    try std.testing.expectEqual(@as(usize, 32), fixture.pipeline.movement_body_capacity);
-    try std.testing.expectEqual(@as(usize, 185), fixture.pipeline.eventCapacitySum());
-    try std.testing.expectEqual(@as(?usize, 185), fixture.frame.events.capacity_limit);
-
-    fixture.frame.beginStep();
-    const unchanged = try commitStructuralAndReact(&fixture.pipeline, &fixture.frame, &fixture.data, &fixture.world, null);
-    try std.testing.expect(!unchanged.population_sync.grew);
 }

@@ -14,15 +14,19 @@
 //! AI row order.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const builtin = @import("builtin");
 const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const compactSliceWindows = @import("../../app/thread_system.zig").compactSliceWindows;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
@@ -98,21 +102,16 @@ comptime {
 /// system's tuner; an explicit `items_per_range` pins the range size.
 pub const PlaneEntryConfig = struct {
     items_per_range: ?usize = null,
+    batches_per_participant: ?f64 = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
 
-// One range's entry count, written once by its job. Padded to a cache line.
-const PlaneEntryTally = struct {
-    count: usize align(thread_shared_record_alignment) = 0,
-};
-
-comptime {
-    std.debug.assert(@sizeOf(PlaneEntryTally) % thread_shared_record_alignment == 0);
-}
+// One range's entry count, written once by its job into its padded slot.
+const PlaneEntryTally = struct { kept: usize = 0 };
 
 const EntryList = std.array_list.Aligned(PlaneEntry, .fromByteUnits(thread_shared_record_alignment));
-const TallyList = std.array_list.Aligned(PlaneEntryTally, .fromByteUnits(thread_shared_record_alignment));
+const TallyList = SlotList(PlaneEntryTally);
 
 pub const PlaneEntrySystem = struct {
     allocator: std.mem.Allocator,
@@ -123,11 +122,18 @@ pub const PlaneEntrySystem = struct {
     reserved_items: usize = 0,
     config: PlaneEntryConfig = .{},
     tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    last_batch: BatchStats = .{},
-    /// Telemetry: gathers whose AI rows exceeded the reservation and grew the windows
-    /// on the main thread before dispatch. Nonzero means the population seam's reserve
-    /// is short of the live AI rows; the first warns once.
-    windows_grown: u64 = 0,
+    /// Set by the first gather whose AI rows exceeded the reservation and grew the windows
+    /// on the main thread before dispatch, which warns once: the population seam's reserve
+    /// is short of the live AI rows.
+    windows_growth_logged: bool = false,
+    // The gather's last batch and the gathers that grew the windows, kept only with
+    // `runtime_perf_log.enabled`.
+    perf: Perf = .{},
+
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_batch: BatchStats = .{},
+        window_grows: u64 = 0,
+    } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) PlaneEntrySystem {
         return .{ .allocator = allocator };
@@ -163,7 +169,7 @@ pub const PlaneEntrySystem = struct {
         tunnel_tile: TileId,
         thread_system: ?*ThreadSystem,
     ) error{OutOfMemory}![]const PlaneEntry {
-        self.last_batch = .{};
+        if (comptime runtime_perf_log.enabled) self.perf.last_batch = .{};
         self.entries.clearRetainingCapacity();
         const ai = data.aiAgentSliceConst();
         const item_count = ai.entities.len;
@@ -188,7 +194,6 @@ pub const PlaneEntrySystem = struct {
                 .size_y = visuals.size_y,
                 .tier = scope.tier,
                 .scope_level = scope.level,
-                .grid = CellGrid.of(world),
                 .tunnel_tile = tunnel_tile,
             },
             .entries = undefined,
@@ -199,7 +204,7 @@ pub const PlaneEntrySystem = struct {
         const ts = thread_system orelse {
             self.entries.items.len = item_count;
             self.entries.items.len = gatherRange(&job.input, 0, item_count, self.entries.items);
-            self.last_batch = inlineBatch(item_count, plane_entry_range_alignment_items);
+            if (comptime runtime_perf_log.enabled) self.perf.last_batch = inlineBatch(item_count, plane_entry_range_alignment_items);
             return self.entries.items;
         };
         const stage = (StageThreads(PlaneEntryConfig){ .thread_system = ts, .config = self.config }).stage(&self.tuner);
@@ -211,8 +216,9 @@ pub const PlaneEntrySystem = struct {
         job.entries = self.entries.items;
         job.tallies = self.tallies.items;
         job.items_per_range = selection.items_per_range;
-        self.last_batch = stage.run(selection, item_count, plane_entry_range_alignment_items, &job, planeEntryJob);
-        compactWindows(&self.entries, self.tallies.items, selection.items_per_range);
+        const batch = stage.run(selection, item_count, plane_entry_range_alignment_items, &job, planeEntryJob);
+        if (comptime runtime_perf_log.enabled) self.perf.last_batch = batch;
+        self.entries.items.len = compactSliceWindows(PlaneEntry, PlaneEntryTally, self.entries.items, self.tallies.items, selection.items_per_range);
         return self.entries.items;
     }
 
@@ -227,39 +233,13 @@ pub const PlaneEntrySystem = struct {
         self.reserved_items = target;
         std.debug.assert(self.entries.capacity >= self.reserved_items);
         std.debug.assert(self.tallies.capacity >= maxRangeCount(self.reserved_items, plane_entry_range_alignment_items));
-        self.windows_grown += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
-            if (self.windows_grown == 1) logging.game.warn(
-                "plane entry gather: {d} AI rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
-                .{ needed, target },
-            );
-        }
-    }
-};
-
-// Compacts range r's `count` entries at `r * items_per_range` into one prefix in range
-// order. Each window starts at or after the running total, so a forward copy is safe.
-fn compactWindows(entries: *EntryList, tallies: []const PlaneEntryTally, items_per_range: usize) void {
-    var dst: usize = 0;
-    for (tallies, 0..) |tally, range_index| {
-        const src = range_index * items_per_range;
-        std.debug.assert(dst <= src);
-        if (dst != src and tally.count != 0) {
-            @memmove(entries.items[dst..][0..tally.count], entries.items[src..][0..tally.count]);
-        }
-        dst += tally.count;
-    }
-    entries.items.len = dst;
-}
-
-// The world's cell grid as the lane cell test reads it.
-const CellGrid = struct {
-    tile_size: f32,
-    width: i32,
-    height: i32,
-
-    fn of(world: *const WorldSystem) CellGrid {
-        return .{ .tile_size = world.tile_size, .width = world.width, .height = world.height };
+        if (comptime runtime_perf_log.enabled) self.perf.window_grows += 1;
+        if (self.windows_growth_logged) return;
+        self.windows_growth_logged = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "plane entry gather: {d} AI rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
+            .{ needed, target },
+        );
     }
 };
 
@@ -277,14 +257,13 @@ const GatherInput = struct {
     size_y: []const f32,
     tier: []const SimulationTier,
     scope_level: []const u16,
-    grid: CellGrid,
     tunnel_tile: TileId,
 };
 
 const PlaneEntryJob = struct {
     input: GatherInput,
     entries: []PlaneEntry,
-    tallies: []PlaneEntryTally,
+    tallies: []PaddedSlot(PlaneEntryTally),
     items_per_range: usize,
 };
 
@@ -295,7 +274,7 @@ fn planeEntryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.entries.len);
     std.debug.assert(range.end <= job.input.entities.len);
-    job.tallies[range.index].count = gatherRange(&job.input, range.start, range.end, job.entries[range.start..range.end]);
+    job.tallies[range.index].value.kept = gatherRange(&job.input, range.start, range.end, job.entries[range.start..range.end]);
 }
 
 // Lane cells of one block: each lane's current body-center cell, and whether its
@@ -306,24 +285,6 @@ const LaneCellEntries = struct {
     cell_y: simd.Int4,
 };
 
-const LaneCells = struct {
-    x: simd.Int4,
-    y: simd.Int4,
-    inside: simd.Mask4,
-};
-
-// `WorldSystem.cellContaining` per lane: a negative center is outside, otherwise the
-// floored tile index must be inside the grid.
-fn laneCells(center_x: simd.Float4, center_y: simd.Float4, grid: CellGrid) LaneCells {
-    const zero = simd.splatFloat4(0);
-    const tile = simd.splatFloat4(grid.tile_size);
-    const x = simd.floorToI4(simd.divFloat4(center_x, tile));
-    const y = simd.floorToI4(simd.divFloat4(center_y, tile));
-    const non_negative = (center_x >= zero) & (center_y >= zero);
-    const below_extent = simd.lessThanInt4(x, simd.splatInt4(grid.width)) & simd.lessThanInt4(y, simd.splatInt4(grid.height));
-    return .{ .x = x, .y = y, .inside = non_negative & below_extent };
-}
-
 // SIMD twin of `cellEntryScalar`, same operation order.
 fn laneCellEntries(
     previous_x: simd.Float4,
@@ -332,13 +293,13 @@ fn laneCellEntries(
     position_y: simd.Float4,
     size_x: simd.Float4,
     size_y: simd.Float4,
-    grid: CellGrid,
+    world: *const WorldSystem,
 ) LaneCellEntries {
     const half = simd.splatFloat4(0.5);
     const half_x = simd.mulFloat4(size_x, half);
     const half_y = simd.mulFloat4(size_y, half);
-    const previous = laneCells(simd.addFloat4(previous_x, half_x), simd.addFloat4(previous_y, half_y), grid);
-    const current = laneCells(simd.addFloat4(position_x, half_x), simd.addFloat4(position_y, half_y), grid);
+    const previous = world.cellContaining4(simd.addFloat4(previous_x, half_x), simd.addFloat4(previous_y, half_y));
+    const current = world.cellContaining4(simd.addFloat4(position_x, half_x), simd.addFloat4(position_y, half_y));
     const moved = (current.x != previous.x) | (current.y != previous.y);
     return .{ .entered = previous.inside & current.inside & moved, .cell_x = current.x, .cell_y = current.y };
 }
@@ -395,7 +356,7 @@ fn gatherRange(input: *const GatherInput, start: usize, end: usize, window: []Pl
             simd.gatherFloat4(input.position_y, movement_rows),
             simd.gatherFloat4(input.size_x, visual_rows),
             simd.gatherFloat4(input.size_y, visual_rows),
-            input.grid,
+            input.world,
         );
         inline for (0..simd.lane_count) |lane| {
             if (active[lane] and lanes.entered[lane]) {
@@ -462,9 +423,9 @@ const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 
 const test_tile: f32 = 32;
 
-// The walkable floor a fall carves, from the world's own tileset meta.
-fn testTunnelTile(world: *const WorldSystem) !TileId {
-    return (try DigConfig.fromMeta(world.tilesetMeta().?)).tunnel_tile;
+// The walkable floor a fall carves, from the fixture's tileset meta.
+fn testTunnelTile(meta: *const world_tileset_meta.WorldTilesetMeta) !TileId {
+    return (try DigConfig.fromMeta(meta)).tunnel_tile;
 }
 const test_side: u16 = 8;
 const test_levels: usize = 3;
@@ -636,7 +597,7 @@ const StageOutcome = struct {
 // Gathers with `thread_system` and `config`, checks the entries against `want` when
 // given, then runs the plane stage's reserve and commit (its carve batch on
 // `thread_system` too) on them.
-fn runParityStage(population: usize, thread_system: ?*ThreadSystem, config: PlaneEntryConfig, want: ?[]const PlaneEntry) !StageOutcome {
+fn runParityStage(population: usize, thread_system: *ThreadSystem, config: PlaneEntryConfig, want: ?[]const PlaneEntry) !StageOutcome {
     var fixture: TestFixture = undefined;
     try fixture.init(population);
     defer fixture.deinit();
@@ -644,7 +605,7 @@ fn runParityStage(population: usize, thread_system: ?*ThreadSystem, config: Plan
     defer system.deinit();
     system.config = config;
     try system.reserve(population);
-    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), thread_system);
+    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), thread_system);
     if (want) |expected| try std.testing.expectEqualSlices(PlaneEntry, expected, entries);
 
     var dig = try fixture.digController();
@@ -669,7 +630,7 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     defer serial_fixture.deinit();
     var serial_system = PlaneEntrySystem.init(allocator);
     defer serial_system.deinit();
-    const serial_entries = try serial_system.gather(&serial_fixture.data, &serial_fixture.world, serial_fixture.player.entity, try testTunnelTile(&serial_fixture.world), null);
+    const serial_entries = try serial_system.gather(&serial_fixture.data, &serial_fixture.world, serial_fixture.player.entity, try testTunnelTile(&serial_fixture.meta), null);
     try std.testing.expectEqual(entries_per_kind_set * (population / agent_kind_count), serial_entries.len);
     for (serial_entries, 0..) |entry, index| {
         // AI row order: kinds 2, 4, 7, 8 of each set.
@@ -685,13 +646,13 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     const want = try allocator.dupe(PlaneEntry, serial_entries);
     defer allocator.free(want);
 
-    var serial_outcome = try runParityStage(population, null, .{}, want);
+    var inline_threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    var serial_outcome = try runParityStage(population, &inline_threads, .{}, want);
     defer serial_outcome.deinit();
     // Falls: kind 2 and 8 per set carve one landing between them; kind 4 climbs.
     try std.testing.expectEqual(population / agent_kind_count, serial_outcome.published);
 
-    var inline_threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer inline_threads.deinit();
     inline for (.{ PlaneEntryConfig{}, PlaneEntryConfig{ .items_per_range = 16, .adaptive = false } }) |config| {
         var outcome = try runParityStage(population, &inline_threads, config, want);
         defer outcome.deinit();
@@ -701,7 +662,6 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     if (builtin.single_threaded) return;
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return;
     for ([_]usize{ 16, 32, 64 }) |items_per_range| {
         var outcome = try runParityStage(population, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false }, want);
         defer outcome.deinit();
@@ -737,7 +697,6 @@ test "plane entry SIMD blocks match the scalar entry test" {
         .{ .previous = .{ -16, 0 }, .current = .{ 16, 0 }, .size = 32 },
     };
     comptime std.debug.assert(cases.len % simd.lane_count == 0);
-    const grid = CellGrid.of(&world);
     var block: usize = 0;
     while (block < cases.len) : (block += simd.lane_count) {
         var columns: [6][simd.lane_count]f32 = undefined;
@@ -756,7 +715,7 @@ test "plane entry SIMD blocks match the scalar entry test" {
             simd.loadFloat4(&columns[3]),
             simd.loadFloat4(&columns[4]),
             simd.loadFloat4(&columns[5]),
-            grid,
+            &world,
         );
         const entered: [simd.lane_count]bool = lanes.entered;
         const cell_x = simd.toIntArray(lanes.cell_x);
@@ -792,8 +751,7 @@ test "plane entry SIMD blocks match the scalar entry test" {
         .size_y = visuals.size_y,
         .tier = scope.tier,
         .scope_level = scope.level,
-        .grid = CellGrid.of(&fixture.world),
-        .tunnel_tile = try testTunnelTile(&fixture.world),
+        .tunnel_tile = try testTunnelTile(&fixture.meta),
     };
     var simd_window: [population]PlaneEntry = undefined;
     var scalar_window: [population]PlaneEntry = undefined;
@@ -803,14 +761,9 @@ test "plane entry SIMD blocks match the scalar entry test" {
     try std.testing.expectEqualSlices(PlaneEntry, scalar_window[0..scalar_count], simd_window[0..simd_count]);
 }
 
-test "plane entry test fixture's world reads the fixture's own tileset meta" {
-    var fixture: TestFixture = undefined;
-    try fixture.init(0);
-    defer fixture.deinit();
-    try std.testing.expect(fixture.world.tilesetMeta().? == &fixture.meta);
-}
-
 test "plane entry gather never yields the player, even as an AI agent; the stage traverses it once on its own path" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var fixture: TestFixture = undefined;
     try fixture.init(0);
     defer fixture.deinit();
@@ -835,7 +788,7 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
 
     var system = PlaneEntrySystem.init(std.testing.allocator);
     defer system.deinit();
-    const entries = try system.gather(data, &fixture.world, player, try testTunnelTile(&fixture.world), null);
+    const entries = try system.gather(data, &fixture.world, player, try testTunnelTile(&fixture.meta), null);
     try std.testing.expectEqual(fixture.agents.items.len, entries.len);
     for (entries, fixture.agents.items) |entry, npc| try std.testing.expect(entry.entity.eql(npc));
 
@@ -845,8 +798,8 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
     defer frame.deinit();
     try frame.reserveStreams(4, entries.len + 1, 0, 0, 0, 0);
     frame.beginStep();
-    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, entries, null);
-    try dig.commitPlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, reservation, &serial_threads);
     // One fall each: the player's landing at (4,1) and the NPCs' shared one at (4,0).
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(player));
     try std.testing.expectEqual(@as(u16, 1), fixture.player.current_level);
@@ -855,7 +808,6 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
 }
 
 test "warmed plane entry gather allocates nothing on real workers (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     // Not a range multiple, so the last range is a short tail.
     const population = plane_entry_range_alignment_items * 8 + 3;
@@ -865,13 +817,12 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
 
     var serial = PlaneEntrySystem.init(allocator);
     defer serial.deinit();
-    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), null));
+    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), null));
     defer allocator.free(want);
     try std.testing.expect(want.len > 0);
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = PlaneEntrySystem.init(allocator);
     defer system.deinit();
     try system.reserve(population);
@@ -886,13 +837,11 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
     }
     for ([_]usize{ 32, 16 }) |items_per_range| {
         system.config = .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
-        const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
-        try std.testing.expect(!system.last_batch.ran_inline);
-        try std.testing.expectEqual((population + items_per_range - 1) / items_per_range, system.last_batch.range_count);
+        const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads);
         try std.testing.expectEqualSlices(PlaneEntry, want, entries);
     }
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), system.windows_grown);
+    try std.testing.expect(!system.windows_growth_logged);
 }
 
 test "plane entry gather past its reservation grows once before dispatch; OOM returns before any write" {
@@ -903,7 +852,7 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
     defer fixture.deinit();
     var serial = PlaneEntrySystem.init(allocator);
     defer serial.deinit();
-    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), null));
+    const want = try allocator.dupe(PlaneEntry, try serial.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), null));
     defer allocator.free(want);
     try std.testing.expect(want.len > 0);
 
@@ -919,20 +868,24 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
     const landing_before = fixture.world.denseTile(floor1, 4, 0);
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();
-    try std.testing.expectError(error.OutOfMemory, system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads));
+    try std.testing.expectError(error.OutOfMemory, system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads));
     system.allocator = allocator;
-    try std.testing.expectEqual(@as(u64, 0), system.windows_grown);
+    try std.testing.expect(!system.windows_growth_logged);
+    try std.testing.expect(population > system.reserved_items);
     try std.testing.expectEqual(@as(usize, 0), system.entries.items.len);
     try std.testing.expectEqual(landing_before, fixture.world.denseTile(floor1, 4, 0));
     for (fixture.agents.items, 0..) |npc, index| {
         try std.testing.expectEqual(parityAgent(index).world_level, fixture.data.worldLevelConst(npc));
     }
 
-    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
-    try std.testing.expectEqual(@as(u64, 1), system.windows_grown);
+    const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads);
+    try std.testing.expect(system.windows_growth_logged);
     try std.testing.expect(system.reserved_items >= population);
     try std.testing.expectEqualSlices(PlaneEntry, want, entries);
-    // A second gather of the same rows fits the grown windows.
-    _ = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.world), &threads);
-    try std.testing.expectEqual(@as(u64, 1), system.windows_grown);
+    // A second gather of the same rows fits the grown windows: it allocates nothing.
+    var refit = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = refit.allocator();
+    defer system.allocator = allocator;
+    _ = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads);
+    try std.testing.expectEqual(@as(usize, 0), refit.allocations);
 }

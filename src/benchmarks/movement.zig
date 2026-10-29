@@ -5,30 +5,31 @@
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const SimulationIntent = @import("../game/simulation.zig").SimulationIntent;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
 
+// `movement`: one `MovementSystem` update over N movement bodies with varied velocities,
+// with no reset between iterations. `--details` prints `main=`, the time outside an
+// integrate that ran on workers, and `main_per_item=`. Pass shape: time linear in bodies
+// and main per body flat; asserts check each step covers every body, and a fixed threaded
+// case dispatches the integrate to workers.
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
     .item_label = "movement bodies",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
-    .write_workload = suite.writeNoWorkload,
+    .write_workload = writeMovementWorkload,
 };
 
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -55,43 +56,40 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     return data;
 }
 
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var data = try createFixture(allocator, item_count);
     defer data.deinit();
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     var system = MovementSystem.init();
-    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
-        system.adaptive_tuner = tuner;
-    }
 
-    for (0..options.warmup_iterations) |_| {
-        _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(suite.tunerSettled(&system.adaptive_tuner))) {
+        _ = runOnce(&system, &data, &threads, case);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) system.adaptive_tuner.isSettled() else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
+        const batch = runOnce(&system, &data, &threads, case);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        std.debug.assert(batch.item_count == item_count);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(movement_range_alignment_items), batch);
+        accumulator.record(elapsed_ns, batch);
+        // Main is everything but an integrate that ran on workers.
+        main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
     }
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.adaptive_tuner, adaptive_tuner_start);
     }
     return stats;
 }
@@ -99,67 +97,53 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 fn runOnce(
     system: *MovementSystem,
     data: *DataSystem,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
     var slice = data.movementBodySlice();
-    if (!case.usesThreadSystem()) {
-        movement.updateSerial(&slice, delta_seconds);
-        return inlineBatch(data.movementBodySliceConst().entities.len, movement_range_alignment_items);
-    }
 
-    const stats = system.update(&slice, thread_system.?, delta_seconds, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+    const stats = system.update(&slice, thread_system, delta_seconds, .{
+        .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
-    return stats.batch;
+    return stats.perf.batch;
 }
 
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(movement_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, movement_range_alignment_items);
+fn writeMovementWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }
 
-// `movement-apply-intents`: one AI movement intent per moving agent, written once in a
-// scattered row order. Timed: one apply of the merged intents into velocity; apply is
-// idempotent, so no reset runs between iterations. `--details` reports the applied
-// intents, the apply shape, and the main-thread time (everything but a dispatched
-// apply) and share. `movement-apply-intents-sorted` is the same stream in row order, so
-// each range writes one contiguous row window: the scattered group's control for worker
-// ranges writing rows scattered across the velocity columns.
+// `movement-apply-intents` and `movement-apply-intents-sorted`: one movement intent per
+// moving agent, in movement-row order with `movement_row` set. The sorted group is the
+// production shape's control; both fixtures are that order. Timed: one apply of the merged
+// intents into velocity; apply is idempotent, so no reset runs between iterations.
+// `--details` reports the applied intents, the apply shape, and the main-thread time
+// (everything but a dispatched apply), share, and time per intent; a fixed threaded case
+// with more than one range of intents dispatches the apply at one range per fixed range.
 pub const apply_intents_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents",
     .item_label = "moving agents",
-    .defaultItemCounts = applyIntentsItemCounts,
-    .runCase = runApplyIntentsScatteredCase,
+    .item_counts = &apply_intents_item_counts,
+    .runCase = runApplyIntentsCase,
     .write_workload = writeApplyWorkload,
 };
 
 pub const apply_intents_sorted_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents-sorted",
     .item_label = "moving agents",
-    .defaultItemCounts = applyIntentsItemCounts,
-    .runCase = runApplyIntentsSortedCase,
+    .item_counts = &apply_intents_item_counts,
+    .runCase = runApplyIntentsCase,
     .write_workload = writeApplyWorkload,
 };
-
-// The intent stream's row order.
-const IntentOrder = enum { scattered, sorted };
 
 const apply_intents_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
 // Every this-many agents has speed 0, so the apply takes its default-speed path.
 const zero_speed_every: usize = 5;
-// First stride tried for the scattered intent order; stepped by 2 until coprime with
-// the agent count so the order visits every row once.
-const scatter_stride_seed: usize = 7_919;
 // The apply's speed for a row whose speed is not positive.
 const default_intent_speed: f32 = 40.0;
-
-fn applyIntentsItemCounts(_: suite.Profile) []const usize {
-    return &apply_intents_item_counts;
-}
 
 const ApplyIntentsFixture = struct {
     data: DataSystem,
@@ -183,16 +167,9 @@ fn agentDirection(index: usize) [2]f32 {
     };
 }
 
-fn scatterStride(count: usize) usize {
-    var stride = scatter_stride_seed;
-    while (std.math.gcd(stride, count) != 1) stride += 2;
-    return stride;
-}
-
 // `count` agents with a movement body (zero velocity) and an AI agent, entity `index`
-// on movement row `index`; one movement intent each, in `index * stride mod count` order
-// when scattered, else in row order.
-fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize, order_kind: IntentOrder) !ApplyIntentsFixture {
+// on movement row `index`; one movement intent each, in row order, `movement_row` set.
+fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize) !ApplyIntentsFixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     for (0..count) |index| {
@@ -205,18 +182,15 @@ fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize, order_ki
 
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.intents.prepareRangeCounts(1);
-    frame.intents.addCount(0, count);
-    try frame.intents.prefix();
-    var writer = frame.intents.rangeWriter(0);
-    const stride: usize = switch (order_kind) {
-        .scattered => scatterStride(count),
-        .sorted => 1,
-    };
-    for (0..count) |order| {
-        const row = order * stride % count;
+    var writer = try fixtures.beginOneRange(SimulationIntent, &frame.intents, count);
+    for (0..count) |row| {
         const direction = agentDirection(row);
-        writer.write(.{ .movement = .{ .entity = entities[row], .direction_x = direction[0], .direction_y = direction[1] } });
+        writer.write(.{ .movement = .{
+            .entity = entities[row],
+            .direction_x = direction[0],
+            .direction_y = direction[1],
+            .movement_row = @intCast(row),
+        } });
     }
     writer.finish();
     frame.intents.finishWrite();
@@ -240,60 +214,34 @@ fn countAppliedRows(data: *const DataSystem) usize {
 fn applyIntentsOnce(
     system: *MovementSystem,
     fixture: *ApplyIntentsFixture,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    if (!case.usesThreadSystem()) {
-        movement.applyIntentsSerial(&fixture.data, &fixture.frame);
-        return inlineBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
-    }
-    const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+    const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system, .{
+        .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
-    return stats.batch;
+    return stats.perf.batch;
 }
 
-fn runApplyIntentsScatteredCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runApplyIntentsCase(allocator, io, options, case, item_count, .scattered);
-}
-
-fn runApplyIntentsSortedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runApplyIntentsCase(allocator, io, options, case, item_count, .sorted);
-}
-
-fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, order_kind: IntentOrder) !suite.RunStats {
+fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
-    var fixture = try buildApplyIntentsFixture(allocator, item_count, order_kind);
+    var fixture = try buildApplyIntentsFixture(allocator, item_count);
     defer fixture.deinit();
     var system = MovementSystem.init();
-    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
-        system.apply_intents_tuner = tuner;
-    }
 
-    // A fixed threaded case with more than one range of intents dispatches the apply.
-    const expect_dispatch = if (thread_ptr) |thread_system|
-        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > benchmarkItemsPerRange(case).?
-    else
-        false;
-
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(suite.tunerSettled(&system.apply_intents_tuner))) {
         _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.apply_intents_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) system.apply_intents_tuner.isSettled() else false;
+    const apply_intents_tuner_start = suite.TunerStart.of(&system.apply_intents_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -302,7 +250,10 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         const batch = applyIntentsOnce(&system, &fixture, thread_ptr, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         std.debug.assert(batch.item_count == item_count);
-        std.debug.assert(!expect_dispatch or (batch.range_count > 1 and !batch.ran_inline));
+        // A fixed threaded case with more than one range of intents dispatches the apply, one
+        // range per fixed range of intents.
+        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), batch);
+        try suite.checkFixedRangeCount(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), batch);
         accumulator.record(elapsed_ns, batch);
         // Main is everything but an apply that ran on workers.
         main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
@@ -311,11 +262,9 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     std.debug.assert(applied == item_count);
     var stats = accumulator.finish();
     stats.output_count = applied;
-    if (stats.iterations > 0) {
-        stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
-    }
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.apply_intents_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.apply_intents_tuner, apply_intents_tuner_start);
     }
     return stats;
 }
@@ -325,5 +274,5 @@ fn writeApplyWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite
     if (view == .summary) return;
     try writer.writeAll(" apply=");
     try suite.writeStageShape(writer, stats.batch);
-    try suite.writeShare(writer, "main", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
+    try suite.writeMainShare(writer, stats, stats.output_count);
 }

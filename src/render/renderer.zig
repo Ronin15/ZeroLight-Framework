@@ -74,7 +74,7 @@ const tile_data_cells_per_element: usize = 2;
 pub const tile_data_pad_cell: u16 = std.math.maxInt(u16);
 
 fn tileDataElementCount(cell_count: usize) usize {
-    return (cell_count + tile_data_cells_per_element - 1) / tile_data_cells_per_element;
+    return @divCeil(cell_count, tile_data_cells_per_element);
 }
 
 fn packTileDataElement(low_cell: u16, high_cell: u16) u32 {
@@ -442,17 +442,13 @@ pub const Renderer = struct {
     // Pooled transfer buffer holding every store's pending values for one copy pass.
     tile_upload_transfer: ?*c.SDL_GPUTransferBuffer = null,
     tile_upload_transfer_byte_size: u32 = 0,
-    // Times a larger transfer replaced the pooled one; the first replacement logs once.
-    tile_upload_transfer_grows: u64 = 0,
+    // The first time a larger transfer replaced the pooled one is logged once.
     tile_upload_transfer_growth_logged: bool = false,
-    // Times a tile store grew into a larger buffer; the first growth logs once.
-    tile_store_grows: u64 = 0,
+    // The first time a tile store grew into a larger buffer is logged once.
     tile_store_growth_logged: bool = false,
-    // Times the retained static streams grew; the first growth logs once.
-    static_stream_grows: u64 = 0,
+    // The first growth of the retained static streams is logged once.
     static_stream_growth_logged: bool = false,
-    // Times the dynamic batch streams grew past their reservation; the first warns once.
-    batch_stream_grows: u64 = 0,
+    // The first growth of the dynamic batch streams past their reservation warns once.
     batch_stream_growth_logged: bool = false,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
@@ -608,7 +604,7 @@ pub const Renderer = struct {
     /// allocation-free render frames. Marks the frame reserved at `command_high_water`,
     /// the same bound `ensureFrameBatchCapacity` grows past, so in perf-diagnostic builds a
     /// frame whose submits exceed it is counted as reservation drift
-    /// (`SpriteBatch.commandOverflowGrows`) even when the command list's rounded-up
+    /// (`ReservationDrift` in sprite_batch.zig) even when the command list's rounded-up
     /// capacity absorbed them; it still grows in every build.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
         if (command_capacity > self.command_high_water) {
@@ -841,7 +837,7 @@ pub const Renderer = struct {
 
     /// Retires every tile store no owner claimed since the previous `endFrame`
     /// (`claimTileStore`), then prepares, uploads, and draws the frame.
-    pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
+    pub fn endFrame(self: *Renderer, thread_system: *ThreadSystem) !FrameResult {
         self.sweepUnclaimedTileStores();
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
@@ -1361,7 +1357,6 @@ pub const Renderer = struct {
 
     fn countTileStoreGrowth(self: *Renderer, capacity: u32) void {
         @branchHint(.cold);
-        self.tile_store_grows += 1;
         if (self.tile_store_growth_logged) return;
         self.tile_store_growth_logged = true;
         if (comptime logging.enabled(.info)) log.info("tile store grew to {d} elements", .{capacity});
@@ -1421,7 +1416,6 @@ pub const Renderer = struct {
 
     fn countTileUploadTransferGrowth(self: *Renderer, byte_size: u32) void {
         @branchHint(.cold);
-        self.tile_upload_transfer_grows += 1;
         if (self.tile_upload_transfer_growth_logged) return;
         self.tile_upload_transfer_growth_logged = true;
         if (comptime logging.enabled(.info)) log.info("tile upload transfer grew to {d} bytes", .{byte_size});
@@ -1456,29 +1450,6 @@ pub const Renderer = struct {
         const texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, texture.texture);
         return try self.registerTexture(texture, internal);
-    }
-
-    /// Replaces a non-internal texture's GPU image. Creates the new upload first,
-    /// then waits for GPU idle before releasing the old handle so in-flight frames
-    /// (up to `frames_in_flight`) never sample a freed texture.
-    pub fn replaceTextureFromPixels(
-        self: *Renderer,
-        id: TextureId,
-        pixels: []const u8,
-        width: u32,
-        height: u32,
-        pitch: usize,
-    ) !void {
-        const slot = self.resolveTextureSlot(id) orelse return error.InvalidTexture;
-        if (slot.internal) return error.InvalidTexture;
-
-        const next_texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
-        errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
-
-        self.waitForIdle();
-        c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
-        slot.texture = next_texture.texture;
-        slot.desc = next_texture.desc;
     }
 
     fn registerTexture(self: *Renderer, texture: UploadedTexture, internal: bool) !TextureId {
@@ -1560,7 +1531,7 @@ pub const Renderer = struct {
         // Over-submission beyond the reserved `command_high_water` is handled the same
         // way in Debug and ReleaseFast. `drawSprite` already grew the command list if
         // needed and, in a reserved frame of a perf-diagnostic build, counted crossing this
-        // same bound as drift (`SpriteBatch.commandOverflowGrows`); this fallback grows prepared/vertex/group
+        // same bound as drift (`ReservationDrift` in sprite_batch.zig); this fallback grows prepared/vertex/group
         // storage and the GPU streams before the threaded emit. There is no hard submit
         // bound. A Debug-only assert against `command_high_water` would panic where
         // ReleaseFast regrows.
@@ -1738,7 +1709,6 @@ pub const Renderer = struct {
     // so the first warns.
     fn countBatchStreamGrowth(self: *Renderer, capacity: usize) void {
         @branchHint(.cold);
-        self.batch_stream_grows += 1;
         if (self.batch_stream_growth_logged) return;
         self.batch_stream_growth_logged = true;
         if (comptime logging.enabled(.warn)) log.warn("vertex batch streams grew to {d} vertices; reserve capacity to avoid this", .{capacity});
@@ -1746,7 +1716,6 @@ pub const Renderer = struct {
 
     fn countStaticStreamGrowth(self: *Renderer, capacity: usize) void {
         @branchHint(.cold);
-        self.static_stream_grows += 1;
         if (self.static_stream_growth_logged) return;
         self.static_stream_growth_logged = true;
         if (comptime logging.enabled(.info)) log.info("static vertex streams grew to {d} vertices", .{capacity});
@@ -1764,7 +1733,7 @@ pub const Renderer = struct {
         return self.batch.lastPrepStats();
     }
 
-    fn prepareFrameCommands(self: *Renderer, thread_system: ?*ThreadSystem) !void {
+    fn prepareFrameCommands(self: *Renderer, thread_system: *ThreadSystem) !void {
         _ = self.batch.buildAssumeCapacity(self.textureResolver(), thread_system, .{});
     }
 };
@@ -2068,7 +2037,6 @@ test "internal texture slots cannot be destroyed or replaced through public APIs
 
     renderer.destroyTexture(texture);
     try std.testing.expect(renderer.resolveTextureSlot(texture) != null);
-    try std.testing.expectError(error.InvalidTexture, renderer.replaceTextureFromPixels(texture, &.{ 255, 255, 255, 255 }, 1, 1, 4));
 }
 
 test "drawable presentation uses full drawable scissor and overscan scissor clamps to drawable bounds" {
@@ -2230,7 +2198,10 @@ test "same-texture dynamic run straddling a static span interleaves by order" {
             }
         }.resolve,
     };
-    try batch.buildSerial(resolver);
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    try batch.ensureFrameStorage();
+    _ = batch.buildAssumeCapacity(resolver, &threads, .{});
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
 
     var list: std.ArrayList(DrawGroup) = .empty;
@@ -3085,12 +3056,9 @@ test "reserved sprite frame submits allocation-free with no overflow growth (Fai
     }
     try std.testing.expectEqual(reserved, renderer.spriteCommandCount());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), renderer.batch.commandOverflowGrows());
 }
 
-test "submits past the reservation inside the command list's slack count as drift" {
-    // Drift diagnostics compile out of shipping builds (`SpriteBatch.ReservationDrift`).
-    if (!@import("../app/runtime_perf_log.zig").enabled) return error.SkipZigTest;
+test "submits past the reservation inside the command list's slack pass the high water without growing the list" {
     const allocator = std.testing.allocator;
     var renderer = Renderer{
         .allocator = allocator,
@@ -3122,12 +3090,9 @@ test "submits past the reservation inside the command list's slack count as drif
         });
     }
     // The command list never grew, but the frame is past `command_high_water`, which is
-    // what makes `ensureFrameBatchCapacity` grow (and can GPU-idle stall): drift, counted
-    // once for the frame.
+    // what makes `ensureFrameBatchCapacity` grow (and can GPU-idle stall).
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
     try std.testing.expect(renderer.spriteCommandCount() > renderer.command_high_water);
-    try std.testing.expectEqual(@as(u64, 1), renderer.batch.commandOverflowGrows());
-    try std.testing.expectEqual(@as(usize, 1), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 
 test "linear merge matches stable sort for pre-sorted static and dynamic groups" {

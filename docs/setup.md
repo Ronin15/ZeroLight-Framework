@@ -17,8 +17,7 @@ native target and do not require an external MinGW or Visual Studio toolchain.
 - Python 3 for `zig build verify` (`idiom-lint` and `assets-lint` are Python
   scripts); Pillow as well for atlas packing, source-art export, and
   placeholder generation
-- `jq` for the Claude Code `zig fmt` hook (`.claude/hooks/zig-fmt.sh` does
-  nothing without it)
+- `jq` for the `zig fmt` hook (`.grok/hooks/zig-fmt.sh` does nothing without it)
 
 The app uses core SDL3 PNG loading through `SDL_LoadPNG`; it does not require
 `SDL3_image`.
@@ -64,10 +63,8 @@ package paths automatically. If you already have SDL installed globally, pass
 `SDL3-3.4.10`, `SDL3_ttf-3.2.2`, and `SDL3_mixer-3.2.4` directories.
 
 On a Windows host, `zig build run`, `test`, `bench`, and `gpu-smoke` prepend the
-SDL DLL directories to `PATH` for the launched process. Because that reads the
-host environment at configure time, `build.zig` poisons Zig 0.17's configure
-cache on Windows hosts, so `build.zig` re-runs on every `zig build` there. Linux
-and macOS hosts (including Windows cross-builds) keep the configure cache.
+SDL DLL directories to `PATH` for the launched process; the configure-cache
+consequence is in `docs/development-workflow.md` § Windows SDL Packages.
 
 Windows shader builds require `glslc`, `spirv-cross`, and `dxc` on `PATH` or
 passed with `-Dshader-compiler`, `-Dshader-cross-compiler`, and

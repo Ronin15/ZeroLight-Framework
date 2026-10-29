@@ -20,11 +20,11 @@ tags pass it before Steam `staging` is promoted to `default`.
   `RunStats` (mean/min/max/iterations), human-readable tables only
   (`printGroupReport`); filtering a non-baseline case auto-adds
   `serial-direct`.
-- `tools/bench_run.py` saves header-stamped runs to `benchmark_outputs/`
-  (gitignored); 52C adds optimize and CPU-baseline options.
-- Size profiles: `eventScaleCounts` quick is `{1024, 4096, 10000}`;
+- `tools/bench_ab.py` runs targeted before/after comparisons; 52C adds
+  optimize and CPU-baseline options.
+- Size lists: `suite.event_scale_counts` is `{1024, 4096, 10000}`;
   `steering` and the pathfinding fallback group use their own smaller
-  ladders; 52C's `frame-battle` runs one fixed size.
+  ladders; 52C's extended `production-step` runs one fixed size.
 - Reference machine: AMD Ryzen 9 7900X3D, 12 cores / 24 threads, two CCDs
   (CCD0 `0-5,12-17` with the 96 MiB V-Cache L3; CCD1 `6-11,18-23` with
   32 MiB); `amd-pstate-epp`, dev default `powersave` with boost on.
@@ -35,13 +35,13 @@ tags pass it before Steam `staging` is promoted to `default`.
 - Every number comes from `zig build bench`; sizes are sample points on a
   curve, never targets, capacities, or acceptance thresholds; a regression
   is a change beyond the run-to-run spread measured by 3 interleaved reps
-  and medians (`.claude/rules/tests-benchmarks.md`).
+  and medians (`.grok/rules/tests-benchmarks.md`).
 - Each gated group runs at least three sizes far enough apart to show its
   shape, so a cost that starts growing with world size, depth, or world
   count fails even when one size looks fine. The gate set covers the
   scaling groups that exist at landing, including 64G's `chunk-scale` and
   the world-instance and far-simulation groups (74, 75) when present, plus
-  the multi-worker cases (`.claude/rules/threading.md`).
+  the multi-worker cases (`.grok/rules/threading.md`).
 - Tolerances come from the recorded spread and are never widened to absorb
   a regression; a row too noisy to gate after the bounded repetition
   ladder is removed from the gate with its noise recorded and stays as
@@ -80,7 +80,7 @@ tags pass it before Steam `staging` is promoted to `default`.
       promotion), the "trend data vs authoritative" distinction, the
       Release Checklist line.
 - [ ] Add the perf-gate spread/shape and baseline-promotion rule to
-      `.claude/rules/build-validation.md` when this lands.
+      `.grok/rules/build-validation.md` when this lands.
 
 ### Acceptance checks
 

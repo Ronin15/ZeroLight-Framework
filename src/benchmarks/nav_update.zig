@@ -2,42 +2,44 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Incremental nav update over a 3-level 256² world: each timed sample toggles a dirty
-//! footprint of `item_count` cells on level 1 open, then blocked, each half one buffered nav
-//! update (the terrain record of its writes untimed), so only the chunks the footprint touches
-//! and their neighbours are patched. The reported mean is the two halves' average.
-//!   - `nav-update-scattered`: digs spread over the world's 256 chunks, one per chunk up to
-//!     256 and several per chunk past that. Passes when linear in digs up to 256 (one dirty
-//!     chunk each) and linear in dirty cells past it.
-//!   - `nav-update-multichunk`: one compact block of the item count's cells centered on a
-//!     chunk corner. Passes when linear in the chunks the block touches.
+//! `nav-update-scattered`: incremental nav update over a 3-level 256² world. Each timed
+//! sample toggles `item_count` digs on level 1 open, then blocked, each half one buffered nav
+//! update (its terrain record untimed), so only the touched chunks and their neighbours patch.
+//! The mean is the two halves' average. Digs go one per chunk over the world's 256 chunks,
+//! several per chunk past that. Passes when linear in digs up to 256 and in dirty cells past it.
+//! Each update's remask batch covers exactly its dirty chunks, and an untimed update with no
+//! marks after the measured toggles remasks nothing.
 //!
-//! Two static-obstacle groups time one static collision body moved one step: its
-//! `set_movement_body` command committed through a `SimulationFrame` and the post-commit nav
-//! reaction (`reactToPostCommitNavEvents`), on a 256² world, timed through the commit seam
-//! (collider and static mark reserve, commit, capture, collider sync and its nav record,
-//! reaction). The move is the same in every case, so each passes when flat in its item count:
-//!   - `nav-update-entity-obstacles`: 10, 1,000, or 10,000 other static bodies (the item count)
-//!     spread over chunks away from the moved body's 3x3 chunk block.
-//!   - `nav-update-static-population`: 1,000, 10,000, or 50,000 dynamic collision bodies (the
-//!     item count) spread over the level, and no other static body.
-//! Each case builds its own world, bodies, and nav outside the timed loop; the moved body
-//! alternates between two cells of one chunk. `outputs` is the chunks the reaction patched and
-//! `candidates` the collision bodies present.
+//! The static-obstacle groups time one static collision body moved one step on a 256² world
+//! through the production commit seam (`SimulationPipeline.commitStructuralAndReact`, the
+//! pipeline built over the bodies and the world): its `set_movement_body` command, the
+//! budgeted commit, the population seam, the collider sync and its nav record, the trigger
+//! sync, and the nav reaction.
+//! The move is the same in every case, so each passes when flat in its item count:
+//!   - `nav-update-entity-obstacles`: 10, 1,000, or 10,000 other static bodies in chunks away
+//!     from the moved body's 3x3 chunk block.
+//!   - `nav-update-static-population`: 1,000, 10,000, or 50,000 dynamic bodies and no other
+//!     static body.
+//! Each case builds its world, bodies, and nav untimed; the moved body alternates between two
+//! cells of one chunk. `outputs` is the chunks patched and `candidates` the bodies present.
 //!
-//! `nav-update-static-dense` times many statics changed in one commit through the same seam:
-//! 64, 1,024, or 16,384 changes (the item count), half moving one chunk over and half
-//! destroyed and recreated one chunk over at reused entity indices, among 64 statics per
-//! chunk, so every chunk list they enter is about 64 long. Passes when linear in the change
-//! count, with the sorted list placement threaded.
-//! `nav-update-static-dense-tail` is its sibling where every insert lands past its list's
-//! tail: 32 changed statics per chunk, created after every one of the 64 residents per
-//! chunk, all move one chunk over and back each step, commands in (chunk, slot) order, so
-//! each list's inserts arrive in ascending entity order. Passes when linear in the change
-//! count.
+//! `nav-update-static-dense`: 64, 1,024, or 16,384 statics changed in one commit through the
+//! same seam, half moved one chunk over and half destroyed and recreated there at reused
+//! entity indices, among 64 statics per chunk. Passes when linear in the change count, with
+//! the chunk rewrite threaded. `nav-update-static-dense-tail`: every insert lands past
+//! its run's tail (32 statics per chunk, created after the 64 residents, moved one chunk over
+//! and back each step in (chunk, slot) order). Passes when linear in the change count.
 //!
-//! Every group runs serial and threaded; `--details` prints the reaction's mark (when it
-//! marks events), plan, remask, and patch shapes.
+//! Every group runs serial and threaded; `--details` prints the main thread's share (the
+//! time outside the seam's or update's stages on workers) and the reaction's stage shapes over
+//! the measured steps (`[threaded/non-empty]`): `nav-update-scattered` the opening updates' and,
+//! under the row, the re-blocking ones' (`block_update:`); the seam groups the seam's collider
+//! sync and trigger patch stages too (`seam:`). The static-dense groups' headline batch and
+//! tuner are the sync's chunk rewrite. Every measured update runs each nav stage of more than
+//! one range on workers in a fixed threaded case (`suite.checkNavReactionDispatched`), as does
+//! every collider sync stage of the static-dense groups. The tuned case settles every tuner
+//! the measured step runs (`step_tuners:`): both toggle halves' nav stage sets, or every seam
+//! stage set (`fixtures.addSeamTuners`).
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -48,15 +50,13 @@ const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const CollisionResponseMobility = @import("../game/data_system.zig").CollisionResponseMobility;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
-const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const SimulationEvent = @import("../game/simulation.zig").SimulationEvent;
 const TileEdit = @import("../game/systems/pathfinding/test_support.zig").TileEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
-const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const SyncStage = @import("../game/systems/static_colliders.zig").SyncStage;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const TileId = @import("../game/world/system.zig").TileId;
 const fixtures = @import("fixtures.zig");
@@ -66,33 +66,14 @@ const suite = @import("suite.zig");
 // with a few chunks of margin.
 const world_tiles: u16 = 256;
 const tile_size: f32 = 32.0;
-const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 
-// Abstract chunk side in tiles. Nav takes the world's chunk, and `initDemoFromMeta` builds at
-// the default, so the scattered footprint stays one dirty cell per distinct chunk (its
-// item_count equals the dirty-chunk count) even if the default changes.
+// Abstract chunk side in tiles. Nav takes the world's chunk, and the world builds at the
+// default, so the scattered footprint stays one dirty cell per distinct chunk (its item_count
+// equals the dirty-chunk count) even if the default changes.
 const nav_chunk_tiles: u16 = @import("../game/world/system.zig").default_chunk_size_tiles;
+const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
 const chunks_per_side: usize = @as(usize, world_tiles) / nav_chunk_tiles;
 const total_chunks: usize = chunks_per_side * chunks_per_side;
-
-// Dirty cells of the multichunk block: footprints spanning about 4, 9, 20, 36, and 72 chunks.
-const update_counts = [_]usize{ 256, 1024, 4096, 8192, 16384 };
-
-// Gives the static colliders' chunk-list and query-list splice stages fresh tuners for `case`.
-fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) void {
-    colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-}
-
-// The splice stage's fixed range size for a non-adaptive control case; adaptive cases return
-// null.
-fn spliceItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(splice_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, splice_range_alignment_items);
-}
-
-const Variant = enum { scattered, multichunk };
 
 // Scattered dig counts over the world's 256 chunks: one dig per distinct chunk up to 256,
 // then several per chunk (up to `max_digs_per_chunk`).
@@ -102,38 +83,16 @@ const max_digs_per_chunk: usize = 16;
 pub const group = suite.BenchmarkGroup{
     .name = "nav-update-scattered",
     .item_label = "digs in one step",
-    .defaultItemCounts = scatteredItemCounts,
-    .runCase = runScatteredCase,
+    .item_counts = &scattered_counts,
+    .runCase = runCase,
     .write_workload = writeNavStagesWorkload,
 };
 
-pub const multichunk_group = suite.BenchmarkGroup{
-    .name = "nav-update-multichunk",
-    .item_label = "cells dug in one block",
-    .defaultItemCounts = multichunkItemCounts,
-    .runCase = runMultichunkCase,
-    .write_workload = writeNavStagesWorkload,
-};
-
-fn multichunkItemCounts(_: suite.Profile) []const usize {
-    return &update_counts;
-}
-
-fn scatteredItemCounts(_: suite.Profile) []const usize {
-    return &scattered_counts;
-}
-
-fn runScatteredCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .scattered);
-}
-
-fn runMultichunkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .multichunk);
-}
-
-// A dig footprint's nav stages, under `--details`.
+// A dig footprint's main-thread share (per edited cell) and nav stages, under `--details`.
 fn writeNavStagesWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
-    if (view == .details) try suite.writeNavStages(writer, stats);
+    if (view == .summary) return;
+    try suite.writeNavStages(writer, stats);
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }
 
 // The world, nav, and footprint one dig case toggles, built per case.
@@ -151,10 +110,15 @@ const Fixture = struct {
     // writes' events the terrain record takes, as a writer's.
     edits: std.ArrayList(TileEdit) = .empty,
     events: std.ArrayList(SimulationEvent) = .empty,
-    // Chunks each update must remask, when the footprint fixes it.
-    expected_dirty_chunks: ?usize = null,
-    // The stats of the most recent timed update.
+    // Chunks each update must remask.
+    expected_dirty_chunks: usize = 0,
+    // The stats of the most recent timed update, and of the most recent opening and
+    // re-blocking halves.
     last_stats: NavUpdateStats = .{},
+    open_stats: NavUpdateStats = .{},
+    block_stats: NavUpdateStats = .{},
+    // The re-blocking half's stage tuners (`fixtures.NavTuners`), set with the opening set.
+    revert_tuners: fixtures.NavTuners = .{},
 
     fn deinit(self: *Fixture) void {
         self.events.deinit(self.allocator);
@@ -171,23 +135,19 @@ const Fixture = struct {
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_bounds, world_bounds);
+    // Three walkable levels; the dig happens on level 1's obstacle band.
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles, 3, "grass", "grass");
     errdefer world.deinit();
-    const grass = try world.requireTileByName(&meta, "grass");
-    const tree = try world.requireTileByName(&meta, "tree_0");
-    // Three levels (surface plus two underground floors); the dig happens on level 1.
-    _ = try world.addLevel(0);
-    _ = try world.addLevel(0);
-    _ = try world.addDenseLayer(1, 0, .floor, grass);
-    _ = try world.addDenseLayer(2, 0, .floor, grass);
+    const grass = try world.requireTileByName(&tileset, "grass");
+    const tree = try world.requireTileByName(&tileset, "tree_0");
     const obstacle_layer = try world.addDenseLayer(1, 0, .obstacle, grass);
 
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
+    try colliders.rebuild(&data, try extent.colliderGeometry(), null);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(.{ .worker_participant_count = participant_count });
@@ -205,68 +165,49 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usi
     };
 }
 
-// The count's dirty footprint on level 1. Cost is per chunk (the remask is whole-chunk), so
-// shape matters more than position:
-//   - scattered: digs over distinct chunks, row-major: the k-th round of 256 digs places one more
-//     dig in every chunk (chunk centers first, then cells stepping (3, 5) from them), so up to
-//     256 digs dirty that many chunks and more digs dirty all 256, several per chunk. Capped at
-//     `max_digs_per_chunk` per chunk.
-//   - multichunk: a compact square block centered on a chunk corner at the world midpoint, so
-//     it straddles chunk boundaries (the worst neighbour fan-out).
-// The world is not written here: the toggle sets the open and blocked state.
-fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Variant, cells: usize) !void {
+// The count's digs on level 1, over distinct chunks, row-major: the k-th round of 256 digs
+// places one more dig in every chunk (chunk centers first, then cells stepping (3, 5) from
+// them), so up to 256 digs dirty that many chunks and more digs dirty all 256, several per
+// chunk. Capped at `max_digs_per_chunk` per chunk. Cost is per chunk (the remask is
+// whole-chunk). The world is not written here: the toggle sets the open and blocked state.
+fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, cells: usize) !void {
     fixture.edits.clearRetainingCapacity();
-    fixture.expected_dirty_chunks = null;
-    switch (variant) {
-        .scattered => {
-            const n = @min(cells, total_chunks * max_digs_per_chunk);
-            fixture.expected_dirty_chunks = @min(n, total_chunks);
-            var placed = try std.DynamicBitSetUnmanaged.initEmpty(allocator, @as(usize, world_tiles) * world_tiles);
-            defer placed.deinit(allocator);
-            for (0..n) |dig| {
-                const chunk = dig % total_chunks;
-                const round = dig / total_chunks;
-                const cx = chunk % chunks_per_side;
-                const cy = chunk / chunks_per_side;
-                // 3 and 5 are odd, so rounds below the chunk edge hit distinct cells.
-                const local_x = (nav_chunk_tiles / 2 + 3 * round) % nav_chunk_tiles;
-                const local_y = (nav_chunk_tiles / 2 + 5 * round) % nav_chunk_tiles;
-                // In range: inside the `world_tiles`² level.
-                const x: u16 = @intCast(cx * nav_chunk_tiles + local_x);
-                const y: u16 = @intCast(cy * nav_chunk_tiles + local_y);
-                // Every dig is a distinct cell, so the step makes `n` real changes.
-                const cell = @as(usize, y) * world_tiles + x;
-                if (placed.isSet(cell)) return error.ScatteredCellRepeated;
-                placed.set(cell);
-                try fixture.edits.append(allocator, .{ .level = 1, .x = x, .y = y });
-            }
-        },
-        .multichunk => {
-            // A block centered at the world midpoint stays in bounds up to the level's area.
-            const n = @min(cells, @as(usize, world_tiles) * world_tiles);
-            // The smallest square side holding `n` cells, filled row-major up to `n`.
-            var side: usize = std.math.sqrt(n);
-            if (side * side < n) side += 1;
-            // world_tiles/2 is a chunk boundary, so the block straddles one at every size.
-            const center: usize = world_tiles / 2;
-            const origin = center -| side / 2;
-            for (0..n) |index| {
-                // In range: the block lies inside the level.
-                try fixture.edits.append(allocator, .{ .level = 1, .x = @intCast(origin + index % side), .y = @intCast(origin + index / side) });
-            }
-        },
+    const n = @min(cells, total_chunks * max_digs_per_chunk);
+    fixture.expected_dirty_chunks = @min(n, total_chunks);
+    var placed = try std.DynamicBitSetUnmanaged.initEmpty(allocator, @as(usize, world_tiles) * world_tiles);
+    defer placed.deinit(allocator);
+    for (0..n) |dig| {
+        const chunk = dig % total_chunks;
+        const round = dig / total_chunks;
+        const cx = chunk % chunks_per_side;
+        const cy = chunk / chunks_per_side;
+        // 3 and 5 are odd, so rounds below the chunk edge hit distinct cells.
+        const local_x = (nav_chunk_tiles / 2 + 3 * round) % nav_chunk_tiles;
+        const local_y = (nav_chunk_tiles / 2 + 5 * round) % nav_chunk_tiles;
+        // In range: inside the `world_tiles`² level.
+        const x: u16 = @intCast(cx * nav_chunk_tiles + local_x);
+        const y: u16 = @intCast(cy * nav_chunk_tiles + local_y);
+        // Every dig is a distinct cell, so the step makes `n` real changes.
+        const cell = @as(usize, y) * world_tiles + x;
+        if (placed.isSet(cell)) return error.ScatteredCellRepeated;
+        placed.set(cell);
+        try fixture.edits.append(allocator, .{ .level = 1, .x = x, .y = y });
     }
 }
 
 // One open-then-blocked toggle of the footprint: the first half opens it (grass), the second
-// re-blocks it (tree), each one nav update; only the updates are timed. Returns both halves'
-// sum.
-fn runToggle(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
+// re-blocks it (tree) on the revert stage tuners (swapped untimed), each one nav update; only
+// the updates are timed. Returns both halves' sum.
+fn runToggle(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u64 {
     var elapsed: u64 = 0;
     try writeFootprint(fixture, fixture.grass);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
+    fixture.open_stats = fixture.last_stats;
+    fixtures.swapNavTuners(&fixture.system, &fixture.revert_tuners);
+    defer fixtures.swapNavTuners(&fixture.system, &fixture.revert_tuners);
     try writeFootprint(fixture, fixture.tree);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
+    fixture.block_stats = fixture.last_stats;
     return elapsed;
 }
 
@@ -282,65 +223,87 @@ fn writeFootprint(fixture: *Fixture, tile: TileId) !void {
 
 // Times one incremental nav update over the fixture's footprint. The terrain record of the
 // footprint's writes (serial, so it trains no tuner) is untimed setup, as production records
-// edits before the patch. Fails unless the update applied and remasked the footprint's chunks.
-fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
+// edits before the patch. Fails unless the update applied and remasked the footprint's chunks,
+// its remask batch over exactly those chunks.
+fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u64 {
     try fixture.system.reserveTerrainNavRecord(fixture.events.items.len);
     fixture.system.recordTerrainNavEvents(fixture.events.items, &fixture.world, null);
     const t0 = suite.nowNs(io);
     const stats = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_system);
     const elapsed = suite.elapsedNs(t0, suite.nowNs(io));
     if (stats.incremental_rebuilds != 1) return error.NavUpdateNotApplied;
-    if (fixture.expected_dirty_chunks) |expected| if (stats.dirty_chunks != expected) return error.NavUpdateNotApplied;
+    if (stats.dirty_chunks != fixture.expected_dirty_chunks) return error.NavUpdateNotApplied;
+    if (stats.perf.remask_batch.item_count != stats.dirty_chunks) return error.NavUpdateRemaskMissedChunks;
     fixture.last_stats = stats;
     return elapsed;
 }
 
-fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, variant: Variant) !suite.RunStats {
+// Both toggle halves' stage tuner sets, every tuner of each.
+fn toggleTunerSettle(fixture: *const Fixture) suite.TunerSettle {
+    var census = fixtures.navTunerSettle("", &fixture.system.tuners);
+    fixtures.addNavTuners(&census, "revert.", &fixture.revert_tuners);
+    return census;
+}
+
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var fixture = try buildFixture(allocator, io, fixtures.participantCount(thread_ptr));
     defer fixture.deinit();
-    try setFootprint(&fixture, allocator, variant, item_count);
+    try setFootprint(&fixture, allocator, item_count);
     // Untimed: block the whole footprint, so every toggle half writes a real flip per cell
     // (a write that changes nothing emits no event and no mark).
     try writeFootprint(&fixture, fixture.tree);
     try fixture.system.reserveTerrainNavRecord(fixture.events.items.len);
     fixture.system.recordTerrainNavEvents(fixture.events.items, &fixture.world, null);
-    _ = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, null);
+    _ = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_ptr);
     fixtures.setNavTuners(&fixture.system, case);
+    fixture.revert_tuners = fixture.system.tuners;
 
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuners have trained an inline baseline before timing.
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runToggle(&fixture, io, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.tuners.nav.getPtrConst(.plan).isSettled() or !fixture.system.tuners.nav.getPtrConst(.remask).isSettled() or !fixture.system.tuners.nav.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runToggle(&fixture, io, thread_ptr);
-        }
-    }
-    const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.nextSettled(toggleTunerSettle(&fixture))) _ = try runToggle(&fixture, io, thread_ptr);
+    const settle = toggleTunerSettle(&fixture);
+    const remask_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.remask), case);
+    const patch_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.patch), case);
 
-    // Throughput is over the cells edited: both variants cap their footprint, so a count
-    // above the cap edits fewer cells.
+    // Throughput is over the cells edited: the footprint is capped, so a count above the cap
+    // edits fewer cells.
     const edited_cells = fixture.edits.items.len;
     var accumulator = suite.StatsAccumulator.init(edited_cells);
+    var open_reactions = suite.NavReactionShapes{};
+    var block_reactions = suite.NavReactionShapes{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const elapsed = try runToggle(&fixture, io, thread_ptr);
-        accumulator.record(elapsed / 2, inlineBatch(edited_cells, 1));
+        // The opening update's remask: the reported tuners' set (the revert half runs on
+        // the revert set).
+        accumulator.record(elapsed / 2, fixture.open_stats.perf.remask_batch);
+        try suite.checkNavReactionDispatched(case, thread_ptr, .{}, fixture.open_stats);
+        try suite.checkNavReactionDispatched(case, thread_ptr, .{}, fixture.block_stats);
+        // Main is the halves' time outside their stages on workers, per half as the mean is.
+        main_total += (elapsed -| (fixture.open_stats.perf.off_main_stage_ns + fixture.block_stats.perf.off_main_stage_ns)) / 2;
+        open_reactions.add(.{}, fixture.open_stats);
+        block_reactions.add(.{}, fixture.block_stats);
     }
+    // Untimed: an update with no marks applies and remasks nothing, so it reports no stale
+    // remask from the toggles.
+    const idle = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_ptr);
+    if (idle.incremental_rebuilds != 0 or idle.perf.remask_batch.item_count != 0) return error.NavIdleUpdateRemasked;
     var stats = accumulator.finish();
-    // The stages each update ran, so a threaded row the tuner kept inline reads inline.
-    stats.batch = suite.batchSummaryFromBatch(fixture.last_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.last_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.last_stats.patch_batch);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    // The opening updates' stages (the reported tuners' set) in the workload column; the
+    // re-blocking updates' under the row.
+    open_reactions.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
+    block_reactions.print(&stats.details, "block_update");
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }
@@ -355,7 +318,7 @@ const dynamic_body_counts = [_]usize{ 1_000, 10_000, 50_000 };
 pub const entity_obstacle_group = suite.BenchmarkGroup{
     .name = "nav-update-entity-obstacles",
     .item_label = "other static bodies",
-    .defaultItemCounts = otherStaticItemCounts,
+    .item_counts = &other_static_counts,
     .runCase = runEntityObstacleCase,
     .write_workload = writeStaticMoveWorkload,
 };
@@ -363,18 +326,10 @@ pub const entity_obstacle_group = suite.BenchmarkGroup{
 pub const static_population_group = suite.BenchmarkGroup{
     .name = "nav-update-static-population",
     .item_label = "dynamic bodies",
-    .defaultItemCounts = dynamicBodyItemCounts,
+    .item_counts = &dynamic_body_counts,
     .runCase = runStaticPopulationCase,
     .write_workload = writeStaticMoveWorkload,
 };
-
-fn otherStaticItemCounts(_: suite.Profile) []const usize {
-    return &other_static_counts;
-}
-
-fn dynamicBodyItemCounts(_: suite.Profile) []const usize {
-    return &dynamic_body_counts;
-}
 
 fn runEntityObstacleCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runStaticMoveCase(allocator, io, options, case, item_count, 0);
@@ -437,82 +392,61 @@ fn addDynamicBodies(data: *DataSystem, count: usize) !void {
 const StaticMoveFixture = struct {
     data: DataSystem,
     world: WorldSystem,
-    colliders: StaticColliderSystem,
-    system: PathfindingSystem,
-    frame: SimulationFrame,
-    moved: EntityId,
+    // The production commit seam; its pipeline owns the colliders and nav.
+    seam: fixtures.PipelineSeam,
+    // Between two cells of one chunk.
+    moved: fixtures.StaticMove,
     // Collision bodies present, the moved one included.
     body_count: usize,
-    // Which of the two cells the moved body sits on.
-    at_cell_b: bool = false,
 
     fn deinit(self: *StaticMoveFixture) void {
-        self.frame.deinit();
-        self.system.deinit();
-        self.colliders.deinit();
+        self.seam.deinit();
         self.world.deinit();
         self.data.deinit();
         self.* = undefined;
     }
 
-    // One move to the other cell through the commit seam: its command written, the collider
-    // and static mark reserve, the commit, the collider capture, sync, and nav record, then
-    // the nav reaction. Returns the time from the command write through the reaction.
-    fn moveAndReact(self: *StaticMoveFixture, io: std.Io, thread_system: ?*ThreadSystem) !struct { ns: u64, stats: NavUpdateStats } {
-        const target = if (self.at_cell_b) moved_cell_a else moved_cell_b;
-        const position = cellCorner(target, moved_cell_a);
-        self.frame.beginStep();
+    fn nav(self: *StaticMoveFixture) *PathfindingSystem {
+        return &self.seam.pipeline.pathfinding;
+    }
+
+    // One move to the other cell through the production commit seam
+    // (`SimulationPipeline.commitStructuralAndReact`). Returns the time from the command
+    // write through the seam.
+    fn moveAndReact(self: *StaticMoveFixture, io: std.Io, thread_system: *ThreadSystem) !struct { ns: u64, stats: NavUpdateStats } {
+        self.seam.frame.beginStep();
         const start_ns = suite.nowNs(io);
-        try self.frame.structural_commands.prepareRangeCounts(1);
-        self.frame.structural_commands.addCount(0, 1);
-        try self.frame.structural_commands.prefix();
-        var writer = self.frame.structural_commands.rangeWriter(0);
-        writer.write(.{ .set_movement_body = .{
-            .entity = self.moved,
-            .body = .{ .position = position, .previous_position = position },
-        } });
-        writer.finish();
-        self.frame.structural_commands.finishWrite();
-        try self.colliders.reserveForCommit(&self.data, 1);
-        try self.system.reserveStaticColliderMarks(self.colliders.pendingChangeCount() + 1);
-        _ = try self.frame.applyStructuralCommands(&self.data);
-        self.colliders.capture(&self.frame);
-        try self.colliders.sync(&self.data, thread_system);
-        self.system.recordStaticColliderChanges(self.colliders.changesThisStep());
-        const stats = try self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.world, thread_system);
+        const stats = (try self.seam.commit(&self.data, &self.world, &.{self.moved.command()}, thread_system)).nav_update;
         const ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (stats.incremental_rebuilds != 1) return error.StaticMoveNotApplied;
-        self.at_cell_b = !self.at_cell_b;
+        self.moved.advance();
         return .{ .ns = ns, .stats = stats };
     }
 };
 
-fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics: usize, dynamic_bodies: usize, participant_count: usize) !StaticMoveFixture {
+fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics: usize, dynamic_bodies: usize, threads: *ThreadSystem) !StaticMoveFixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
-    const moved = try createBody(&data, cellCorner(moved_cell_a, moved_cell_a), .static);
+    const moved = fixtures.StaticMove{
+        .entity = try createBody(&data, cellCorner(moved_cell_a, moved_cell_a), .static),
+        .positions = .{ cellCorner(moved_cell_a, moved_cell_a), cellCorner(moved_cell_b, moved_cell_a) },
+    };
     try addOtherStatics(allocator, &data, other_statics);
     try addDynamicBodies(&data, dynamic_bodies);
 
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_bounds, world_bounds);
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles, 1, "grass", "grass");
     errdefer world.deinit();
-
-    var colliders = StaticColliderSystem.init(allocator);
-    errdefer colliders.deinit();
-    const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
-    var system = PathfindingSystem.init(allocator);
-    errdefer system.deinit();
-    try system.reserve(.{ .worker_participant_count = participant_count });
-    try system.rebuildNavFromColliders(&colliders, extent, null);
+    const seam = try fixtures.PipelineSeam.init(allocator, &data, &world, .{
+        .structural_headroom = fixtures.StaticMove.structural_headroom,
+        .pathfinding = .{ .worker_participant_count = threads.participantSlotCount() },
+        .build_thread_system = threads,
+    });
     return .{
         .data = data,
         .world = world,
-        .colliders = colliders,
-        .system = system,
-        .frame = SimulationFrame.init(allocator),
+        .seam = seam,
         .moved = moved,
         .body_count = 1 + other_statics + dynamic_bodies,
     };
@@ -521,49 +455,47 @@ fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics
 fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, other_statics: usize, dynamic_bodies: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count = fixtures.participantCount(thread_ptr);
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
-    var fixture = try initStaticMoveFixture(allocator, io, other_statics, dynamic_bodies, participant_count);
+    var fixture = try initStaticMoveFixture(allocator, io, other_statics, dynamic_bodies, thread_ptr);
     defer fixture.deinit();
-    fixtures.setNavTuners(&fixture.system, case);
-    setSpliceTuners(&fixture.colliders, case);
-    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = spliceItemsPerRange(case) };
+    fixture.seam.setCaseTuners(case);
+    const nav = fixture.nav();
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.moveAndReact(io, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.tuners.nav_mark.isSettled() or !fixture.system.tuners.nav.getPtrConst(.plan).isSettled() or !fixture.system.tuners.nav.getPtrConst(.remask).isSettled() or !fixture.system.tuners.nav.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try fixture.moveAndReact(io, thread_ptr);
-        }
-    }
-    const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.nextSettled(fixtures.seamTunerSettle(&fixture.seam.pipeline))) _ = try fixture.moveAndReact(io, thread_ptr);
+    const settle = fixtures.seamTunerSettle(&fixture.seam.pipeline);
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), case);
+    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), case);
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
-    var last_stats: NavUpdateStats = .{};
+    var reactions = suite.NavReactionShapes{};
+    var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const result = try fixture.moveAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
-        last_stats = result.stats;
-        accumulator.record(result.ns, result.stats.remask_batch);
+        accumulator.record(result.ns, result.stats.perf.remask_batch);
+        try suite.checkNavReactionDispatched(case, thread_ptr, nav.perf.last_mark_batch, result.stats);
+        reactions.add(nav.perf.last_mark_batch, result.stats);
+        seam_shapes.add(fixtures.seamBatches(&fixture.seam.pipeline));
+        main_total += result.ns -| fixtures.seamOffMainNs(&fixture.seam.pipeline, result.stats);
     }
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = fixture.body_count;
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.nav_mark_batch = suite.batchSummaryFromBatch(fixture.system.last_mark_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    reactions.summarize(&stats, fixtures.floodTunerWorkers(nav, case));
+    seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }
@@ -583,7 +515,7 @@ const dense_changes_per_chunk: usize = dense_statics_per_chunk / 2;
 pub const static_dense_group = suite.BenchmarkGroup{
     .name = "nav-update-static-dense",
     .item_label = "statics changed in one commit",
-    .defaultItemCounts = denseChangeItemCounts,
+    .item_counts = &dense_change_counts,
     .runCase = runStaticDenseCase,
     .write_workload = writeStaticDenseWorkload,
 };
@@ -591,22 +523,17 @@ pub const static_dense_group = suite.BenchmarkGroup{
 pub const static_dense_tail_group = suite.BenchmarkGroup{
     .name = "nav-update-static-dense-tail",
     .item_label = "statics changed in one commit",
-    .defaultItemCounts = denseChangeItemCounts,
+    .item_counts = &dense_change_counts,
     .runCase = runStaticDenseTailCase,
     .write_workload = writeStaticDenseWorkload,
 };
-
-fn denseChangeItemCounts(_: suite.Profile) []const usize {
-    return &dense_change_counts;
-}
 
 const StaticDenseFixture = struct {
     allocator: std.mem.Allocator,
     data: DataSystem,
     world: WorldSystem,
-    colliders: StaticColliderSystem,
-    system: PathfindingSystem,
-    frame: SimulationFrame,
+    // The production commit seam; its pipeline owns the colliders and nav.
+    seam: fixtures.PipelineSeam,
     commands: std.ArrayList(StructuralCommand) = .empty,
     // Moved statics by (chunk, slot) order, and the current ids of the recreated ones.
     moved: std.ArrayList(EntityId) = .empty,
@@ -622,9 +549,7 @@ const StaticDenseFixture = struct {
         self.recreated.deinit(self.allocator);
         self.moved.deinit(self.allocator);
         self.commands.deinit(self.allocator);
-        self.frame.deinit();
-        self.system.deinit();
-        self.colliders.deinit();
+        self.seam.deinit();
         self.world.deinit();
         self.data.deinit();
         self.* = undefined;
@@ -647,13 +572,21 @@ const StaticDenseFixture = struct {
         };
     }
 
-    // One dense change through the commit seam: every move and every destroy + create
-    // written as one commit, the collider and static mark reserve, the commit, the collider
-    // capture, sync, and nav record, then the nav reaction. Returns the time from the
-    // command write through the reaction, its commit, sync, and reaction phases, and the
-    // splice and reaction off-main stage time.
-    fn changeAndReact(self: *StaticDenseFixture, io: std.Io, thread_system: ?*ThreadSystem) !DenseChangeTiming {
-        self.frame.beginStep();
+    fn nav(self: *StaticDenseFixture) *PathfindingSystem {
+        return &self.seam.pipeline.pathfinding;
+    }
+
+    fn colliders(self: *StaticDenseFixture) *StaticColliderSystem {
+        return &self.seam.pipeline.static_colliders;
+    }
+
+    // One dense change through the production commit seam
+    // (`SimulationPipeline.commitStructuralAndReact`): every move and every destroy + create
+    // as one commit. Returns the time from the command build through the seam, its collider
+    // sync and nav reaction phases (`SimulationPipeline.Perf`) and the rest, and the splice and
+    // reaction off-main stage time.
+    fn changeAndReact(self: *StaticDenseFixture, io: std.Io, thread_system: *ThreadSystem) !DenseChangeTiming {
+        self.seam.frame.beginStep();
         const start_ns = suite.nowNs(io);
         self.commands.clearRetainingCapacity();
         // Changed slots: every slot ≡ 0 (mod 4) moves, every slot ≡ 2 (mod 4) is recreated.
@@ -681,28 +614,14 @@ const StaticDenseFixture = struct {
                 try self.commands.append(self.allocator, .{ .create_entity = denseStaticTemplate(self.targetCorner(chunk, slot)) });
             }
         };
-        try self.frame.structural_commands.prepareRangeCounts(1);
-        self.frame.structural_commands.addCount(0, self.commands.items.len);
-        try self.frame.structural_commands.prefix();
-        var writer = self.frame.structural_commands.rangeWriter(0);
-        for (self.commands.items) |command| writer.write(command);
-        writer.finish();
-        self.frame.structural_commands.finishWrite();
-        try self.colliders.reserveForCommit(&self.data, self.commands.items.len);
-        try self.system.reserveStaticColliderMarks(self.colliders.pendingChangeCount() + self.commands.items.len);
-        _ = try self.frame.applyStructuralCommands(&self.data);
-        self.colliders.capture(&self.frame);
-        const sync_start_ns = suite.nowNs(io);
-        try self.colliders.sync(&self.data, thread_system);
-        self.system.recordStaticColliderChanges(self.colliders.changesThisStep());
-        const nav_start_ns = suite.nowNs(io);
-        const stats = try self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.world, thread_system);
+        const stats = (try self.seam.commit(&self.data, &self.world, self.commands.items, thread_system)).nav_update;
         const end_ns = suite.nowNs(io);
+        const perf = self.seam.pipeline.perf;
         if (stats.incremental_rebuilds != 1) return error.StaticChangeNotApplied;
-        if (self.colliders.changesThisStep().len != self.layout.chunk_count * dense_changes_per_chunk) return error.StaticChangesMissing;
+        if (self.colliders().changesThisStep().len != self.layout.chunk_count * dense_changes_per_chunk) return error.StaticChangesMissing;
         // The recreated statics' new ids, in create order.
         recreated_at = 0;
-        for (self.frame.structural_changes_scratch.items) |change| switch (change) {
+        for (self.seam.frame.structural_changes_scratch.items) |change| switch (change) {
             .entity_created => |entity| {
                 self.recreated.items[recreated_at] = entity;
                 recreated_at += 1;
@@ -711,15 +630,13 @@ const StaticDenseFixture = struct {
         };
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
-        const splice = self.colliders.last_splice_batch;
-        const query_splice = self.colliders.last_query_splice_batch;
-        const splice_off_main_ns = offMainNs(splice) + offMainNs(query_splice);
+        const ns = suite.elapsedNs(start_ns, end_ns);
         return .{
-            .ns = suite.elapsedNs(start_ns, end_ns),
-            .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
-            .sync_ns = suite.elapsedNs(sync_start_ns, nav_start_ns),
-            .nav_ns = suite.elapsedNs(nav_start_ns, end_ns),
-            .off_main_ns = stats.off_main_stage_ns + splice_off_main_ns,
+            .ns = ns,
+            .commit_ns = ns -| (perf.seam_collider_sync_ns + perf.seam_nav_reaction_ns),
+            .sync_ns = perf.seam_collider_sync_ns,
+            .nav_ns = perf.seam_nav_reaction_ns,
+            .off_main_ns = fixtures.seamOffMainNs(&self.seam.pipeline, stats),
             .stats = stats,
         };
     }
@@ -727,10 +644,12 @@ const StaticDenseFixture = struct {
 
 const DenseChangeTiming = struct {
     ns: u64,
-    // Command write, reserves, commit, and capture.
+    // The rest of the seam: command write, reserves, commit, capture, population seam, nav
+    // record, trigger sync and bound check.
     commit_ns: u64,
-    // Collider sync (the splice stage included) and its nav record.
+    // Collider sync (`StaticColliderSystem.sync`, the splice stage included).
     sync_ns: u64,
+    // The post-commit nav reaction.
     nav_ns: u64,
     off_main_ns: u64,
     stats: NavUpdateStats,
@@ -772,9 +691,8 @@ const DenseLayout = struct {
     }
 };
 
-fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count: usize, participant_count: usize, tail: bool) !StaticDenseFixture {
+fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count: usize, threads: *ThreadSystem, tail: bool) !StaticDenseFixture {
     const layout = DenseLayout.init(change_count);
-    const world_side: f32 = @as(f32, @floatFromInt(layout.chunks_x * nav_chunk_tiles)) * tile_size;
 
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -802,26 +720,22 @@ fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count
         }
     }
 
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_side, world_side);
+    // Layout widths are a few chunks: within a level side.
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, @intCast(layout.chunks_x * nav_chunk_tiles), 1, "grass", "grass");
     errdefer world.deinit();
-
-    var colliders = StaticColliderSystem.init(allocator);
-    errdefer colliders.deinit();
-    const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
-    var system = PathfindingSystem.init(allocator);
-    errdefer system.deinit();
-    try system.reserve(.{ .worker_participant_count = participant_count });
-    try system.rebuildNavFromColliders(&colliders, extent, null);
+    const seam = try fixtures.PipelineSeam.init(allocator, &data, &world, .{
+        // Per chunk: the moves and destroys, and a create per destroy unless the tail only moves.
+        .structural_headroom = structuralEventHeadroom(if (tail) 0 else layout.chunk_count * dense_changes_per_chunk / 2, layout.chunk_count * dense_changes_per_chunk),
+        .pathfinding = .{ .worker_participant_count = threads.participantSlotCount() },
+        .build_thread_system = threads,
+    });
     return .{
         .allocator = allocator,
         .data = data,
         .world = world,
-        .colliders = colliders,
-        .system = system,
-        .frame = SimulationFrame.init(allocator),
+        .seam = seam,
         .moved = moved,
         .recreated = recreated,
         .layout = layout,
@@ -840,27 +754,21 @@ fn runStaticDenseTailCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, tail: bool) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    const participant_count = fixtures.participantCount(thread_ptr);
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
-    var fixture = try initStaticDenseFixture(allocator, io, item_count, participant_count, tail);
+    var fixture = try initStaticDenseFixture(allocator, io, item_count, thread_ptr, tail);
     defer fixture.deinit();
-    fixtures.setNavTuners(&fixture.system, case);
-    setSpliceTuners(&fixture.colliders, case);
-    fixture.colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = spliceItemsPerRange(case) };
+    fixture.seam.setCaseTuners(case);
+    const nav = fixture.nav();
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.changeAndReact(io, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.colliders.splice_tuner.isSettled() or !fixture.colliders.query_splice_tuner.isSettled() or !fixture.system.tuners.nav.getPtrConst(.plan).isSettled() or !fixture.system.tuners.nav.getPtrConst(.remask).isSettled() or !fixture.system.tuners.nav.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try fixture.changeAndReact(io, thread_ptr);
-        }
-    }
-    const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.nextSettled(fixtures.seamTunerSettle(&fixture.seam.pipeline))) _ = try fixture.changeAndReact(io, thread_ptr);
+    const settle = fixtures.seamTunerSettle(&fixture.seam.pipeline);
+    const rewrite_tuner = fixture.colliders().tuners.getPtrConst(.rewrite);
+    const rewrite_tuner_start = suite.TunerStart.of(rewrite_tuner, case);
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), case);
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -869,26 +777,29 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var nav_total: u128 = 0;
     var main_total: u128 = 0;
     var chunks_patched: usize = 0;
-    var last_stats: NavUpdateStats = .{};
+    var reactions = suite.NavReactionShapes{};
+    var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
     for (0..options.iterations) |_| {
         const result = try fixture.changeAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
-        last_stats = result.stats;
         commit_total += result.commit_ns;
         sync_total += result.sync_ns;
         nav_total += result.nav_ns;
         main_total += result.ns -| result.off_main_ns;
-        accumulator.record(result.ns, result.stats.remask_batch);
+        const seam_batches = fixtures.seamBatches(&fixture.seam.pipeline);
+        // The headline is the collider sync's chunk rewrite, the stage the pass shape names.
+        accumulator.record(result.ns, seam_batches[@backingInt(SyncStage.rewrite)]);
+        try suite.checkNavReactionDispatched(case, thread_ptr, nav.perf.last_mark_batch, result.stats);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(splice_range_alignment_items), seam_batches[0..fixtures.seam_sync_stage_count]);
+        reactions.add(nav.perf.last_mark_batch, result.stats);
+        seam_shapes.add(seam_batches);
     }
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
-    stats.candidate_pairs = fixture.colliders.rowCount();
+    stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders().*);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
-    stats.query_splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_query_splice_batch);
+    reactions.summarize(&stats, fixtures.floodTunerWorkers(nav, case));
+    seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.
@@ -900,28 +811,28 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(rewrite_tuner, rewrite_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
     }
     return stats;
 }
 
+// The bodies and chunks patched; under --details the seam's main-thread share (per move) and
+// the reaction's stages.
 fn writeStaticMoveWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("bodies={} chunks_patched={}", .{ stats.candidate_pairs, stats.output_count });
     if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, 1);
     try writer.writeByte(' ');
     try suite.writeNavStages(writer, stats);
 }
 
 fn writeStaticDenseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
-    const splice = stats.splice_batch orelse suite.BatchSummary{};
-    const query_splice = stats.query_splice_batch orelse suite.BatchSummary{};
-    try writer.print("statics={} keys={} qkeys={} patched={}", .{ stats.candidate_pairs, splice.item_count, query_splice.item_count, stats.output_count });
+    try writer.print("statics={} units={} patched={}", .{ stats.candidate_pairs, stats.batch.item_count, stats.output_count });
     if (view == .summary) return;
-    try writer.writeAll(" splice=");
-    try suite.writeStageShape(writer, splice);
-    try writer.writeAll(" qsplice=");
-    try suite.writeStageShape(writer, query_splice);
+    try writer.writeAll(" rewrite=");
+    try suite.writeStageShape(writer, stats.batch);
     try writer.writeByte(' ');
     try suite.writeNavStages(writer, stats);
     const phases = stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{};

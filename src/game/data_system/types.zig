@@ -14,7 +14,6 @@ const faction = @import("../faction.zig");
 const render_depth = @import("../render_depth.zig");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const WorldDepth = render_depth.WorldDepth;
 pub const Faction = faction.Faction;
 
@@ -27,7 +26,7 @@ pub const HotI32Slice = []i32;
 pub const ConstHotI32Slice = []const i32;
 
 pub fn hotStoreCapacity(min_len: usize) usize {
-    return alignItemCount(min_len, movement_range_alignment_items);
+    return std.mem.alignForwardAnyAlign(usize, min_len, movement_range_alignment_items);
 }
 
 /// Committed row counts of the component stores whose pipeline scratch, event
@@ -111,7 +110,6 @@ pub const component_masks = struct {
     pub const ai_memory = componentMask(.ai_memory);
     pub const ai_affect = componentMask(.ai_affect);
     pub const destructible = componentMask(.destructible);
-    pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
 pub fn componentMask(component: Component) ComponentMask {
@@ -165,6 +163,15 @@ pub const MovementBodySlice = struct {
     speed: HotF32Slice,
     /// Dense drawable flag for render collect; movement-only rows stay false.
     has_primitive_visual: []bool,
+    /// The entity's `CollisionBounds` offset and size (zero without one), mirrored by
+    /// `DataSystem` at the commit seam; read-only here.
+    bounds_offset_x: ConstHotF32Slice,
+    bounds_offset_y: ConstHotF32Slice,
+    bounds_size_x: ConstHotF32Slice,
+    bounds_size_y: ConstHotF32Slice,
+    has_collision_bounds: []const bool,
+    /// Whether the entity carries an `AiAgent`; read-only here.
+    has_ai_agent: []const bool,
 };
 
 pub const ConstMovementBodySlice = struct {
@@ -179,6 +186,15 @@ pub const ConstMovementBodySlice = struct {
     speed: ConstHotF32Slice,
     /// Dense drawable flag for render collect; movement-only rows stay false.
     has_primitive_visual: []const bool,
+    /// The entity's `CollisionBounds` offset and size (zero without one), mirrored by
+    /// `DataSystem` at the commit seam; read-only here.
+    bounds_offset_x: ConstHotF32Slice,
+    bounds_offset_y: ConstHotF32Slice,
+    bounds_size_x: ConstHotF32Slice,
+    bounds_size_y: ConstHotF32Slice,
+    has_collision_bounds: []const bool,
+    /// Whether the entity carries an `AiAgent`; read-only here.
+    has_ai_agent: []const bool,
 };
 
 /// Dense simulation-scope columns in lockstep with the movement store rows
@@ -217,11 +233,6 @@ pub const FacingData = struct {
 pub const ConstFacingSlice = struct {
     entities: []const EntityId,
     directions: []const Facing,
-};
-
-pub const ConstFactionSlice = struct {
-    entities: []const EntityId,
-    factions: []const Faction,
 };
 
 /// Data-only primitive visual component. Render order and colors live here, but
@@ -273,11 +284,11 @@ pub const ConstAssetReferenceSlice = struct {
     atlas_entry_ids: []const u16,
 };
 
-/// Dense component indices resolved in one entity-slot lookup for render-hot paths.
-pub const RenderEntityComponentIndices = struct {
+/// A movement body's row, world level, and faction resolved in one entity-slot lookup.
+pub const BodyLevelFaction = struct {
     movement_body: usize,
-    asset_ref: ?usize = null,
-    facing: ?usize = null,
+    level: ?u16 = null,
+    faction: ?Faction = null,
 };
 
 /// Primitive-visual and optional facing/asset indices for one movement-body row.
@@ -288,9 +299,9 @@ pub const RenderCollectIndices = struct {
     facing_index: ?usize = null,
 };
 
-/// Dense movement + primitive-visual row indices from a single entity slot resolve.
-/// Used by bounds clamp / tile gate so the hot path does one hash lookup, then pure
-/// SoA column writes (not `movementBodyPtr` + `primitiveVisualDenseIndex` per entity).
+/// Dense movement + primitive-visual row indices from a single entity slot resolve, so
+/// the plane-entry gather does one lookup, not a separate movement and visual lookup per
+/// entity.
 pub const MovementVisualDenseIndices = struct {
     movement: usize,
     visual: usize,
@@ -462,13 +473,10 @@ const default_ai_perception_cos_half_fov: f32 = 0.5;
 /// and held across steps otherwise.
 pub const AiPerception = struct {
     // Balanced against `ai.zig`'s separation_radius (48) / cohere_radius (96)
-    // as a consistent 2x step per tier (48 -> 96 -> 192), not an arbitrary
-    // larger number: spatial-index cell-scan cost is quadratic in radius
-    // (queryNeighbors walks every cell in the radius-derived scan square,
-    // populated or not, before max_candidate_checks ever bounds per-candidate
-    // work), so the previous 240 (2.5x cohere_radius by raw distance) was a
-    // ~6x scan-area jump, not 2.5x. 192 keeps vision meaningfully longer-range
-    // than cohere/separation while keeping that per-tier ratio consistent.
+    // as a consistent 2x step per tier (48 -> 96 -> 192). A neighbor query
+    // costs O(r) probes over its scan square's 2r + 1 cell rows plus the
+    // entries it visits, capped by max_candidate_checks. 192 keeps vision
+    // longer-range than cohere and separation at that per-tier ratio.
     vision_range: f32 = 192.0,
     fov_half_angle_radians: f32 = default_ai_perception_fov_half_angle_radians,
     cos_half_fov: f32 = default_ai_perception_cos_half_fov,
@@ -836,9 +844,32 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-/// World-space AABB of a static navigation obstacle's collision body, resolved from its
-/// movement body position plus collision bounds offset/size (`math.aabbFromOffsetSize`).
-pub const ObstacleWorldRect = math.Aabb;
+/// The store columns `DataSystem.staticObstacleAt` reads, sliced once per pass by
+/// `DataSystem.staticObstacleColumns`. Valid until the stores change.
+pub const StaticObstacleColumns = struct {
+    position_x: ConstHotF32Slice,
+    position_y: ConstHotF32Slice,
+    offset_x: ConstHotF32Slice,
+    offset_y: ConstHotF32Slice,
+    size_x: ConstHotF32Slice,
+    size_y: ConstHotF32Slice,
+    mobilities: []const CollisionResponseMobility,
+    levels: []const u16,
+};
+
+/// A static navigation obstacle: its id, its world level (`world_level`, else 0), and the
+/// inputs of its world rect, `math.aabbFromOffsetSize` of position, bounds offset and
+/// bounds size.
+pub const StaticObstacle = struct {
+    entity: EntityId,
+    level: u16,
+    x: f32,
+    y: f32,
+    offset_x: f32,
+    offset_y: f32,
+    size_x: f32,
+    size_y: f32,
+};
 
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,

@@ -74,12 +74,11 @@ identifiers used to find IDs during world or entity construction; they should
 not become hot runtime lookup keys. Resolve source rectangles through prepared
 metadata loaders:
 
-- `world_tileset_meta.zig` — `tileByName`, `sourceRectByName`, `sourceRectForId`,
-  `animationByName` (JSON-driven animation table built at load)
-- `sprite_atlas_meta.zig` — `spriteByName`, `sourceRectByName`, `sourceRectForId`
+- `world_tileset_meta.zig` — `tileByName`, `sourceRectForId`, `tileAtIndex`
+- `sprite_atlas_meta.zig` — `sourceRectForId`
 
-Metadata paths resolve through `manifest.spriteSpec(id).metadata_path`. Name
-lookup uses load-time hash indexes; hot render prep should use stable numeric
+Metadata paths resolve through `manifest.spriteSpec(id).metadata_path`. Tile
+name lookup uses a load-time hash index; hot render prep should use stable numeric
 IDs and direct metadata tables. Missing IDs or names return null instead of
 guessing grid positions.
 

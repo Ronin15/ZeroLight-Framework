@@ -3,31 +3,20 @@
 
 Runs only the named bench groups (never the full suite), a base git ref
 against the working tree, one run per side by default, and prints per-(group,
-item, case) times and a verdict (`.claude/rules/tests-benchmarks.md`). One run
-per side: a change beyond NOISE_PCT counts, and a `slower` case is confirmed by
-rerunning only that group, size, and case with `--reps 3`. With reps, it prints
-medians and min-max spread, and a change counts only when the two sides' ranges
-do not overlap.
+item, case) times and a verdict (`.grok/rules/tests-benchmarks.md`). Base
+export, reps and spread, the run cache, cases, the CPU floor, and output
+locations: `tools/README.md` § `bench_ab.py`. A run must name its config with
+`-- --items N` (or pass `--grid` for every config).
 
-The base ref is exported once with `git archive` under
-`benchmark_outputs/ab-base/<sha>/` and reused while it exists (its build cache
-stays warm; both sides share the repo's `.zig-cache`, so a new base rebuilds
-only what differs). Raw outputs and the summary go to
-`benchmark_outputs/ab-<stamp>/`. Cases default to `serial-direct` and
-`thread-adaptive-tuned-range`; the forced-thread cases are scheduler controls
-(`--all-cases` runs every case). A run must name its config with
-`-- --items N` (or pass `--grid` for every config): one config answers a
-regression question; a full grid is rarely the right signal. Runs use `--warmup 2 --iterations 10`
-unless the forwarded bench args set them.
-
-Each side's raw outputs are cached under `benchmark_outputs/ab-cache/`, keyed
-by the side's build inputs (`src/`, `build.zig*`, `assets/` as git trees, the
-working tree's content included, so a landing's measured tree is the next
-landing's cached base), the build mode, the case, and the
-forwarded args. A side with enough cached reps younger than
-`CACHE_MAX_AGE_S` is not rerun; that side is then not interleaved with the
-other, so `--fresh` reruns both when a verdict sits at the edge of spread. `--optimize ReleaseFast` is only for a
-question Debug cannot answer (`.claude/rules/build-validation.md`).
+Forwarded to the bench binary after `--` (`tools/bench_ab.py -- --help` prints
+this help and runs nothing):
+    --warmup N
+    --iterations N
+    --case name
+    --items N
+    --fallback-budget N
+    --details
+This script owns `--group`, `--group-prefix`, `--case`, and `--list`.
 
 Usage:
     tools/bench_ab.py --group chunk-scale-dig -- --items 1024032
@@ -36,6 +25,9 @@ Usage:
     tools/bench_ab.py --base none --grid --group chunk-scale-dig   # shape: tree only, every config
     tools/bench_ab.py --group pathfinding -- --items 2000         # forward bench args
     tools/bench_ab.py --optimize ReleaseFast --group movement-apply-intents -- --items 16384
+    tools/bench_ab.py --cpu native --group ai -- --items 1024         # both sides at the host CPU
+    tools/bench_ab.py --list                                         # each group's items and cases
+    tools/bench_ab.py --list --group world-gate
 """
 
 from __future__ import annotations
@@ -45,6 +37,7 @@ import datetime
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import statistics
@@ -63,13 +56,40 @@ CACHE_DIRNAME = "ab-cache"
 CACHE_MAX_AGE_S = 6 * 3600
 
 GROUP_HEADER = re.compile(r"^(\S+)\s+(\d+)\s+\S")
-CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s")
+CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s+\S+\s+\S+\s+(\S+)")
 UNIT_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
 DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
 # Single-run verdict band; a regression past it is confirmed with --reps 3.
 NOISE_PCT = 10.0
 # A regression check needs medians and spread over reps, not long runs per config.
-DEFAULT_TIMING = ("--warmup", "2", "--iterations", "10")
+DEFAULT_TIMING = ("--warmup", "1", "--iterations", "3")
+TUNED_CASE = "thread-adaptive-tuned-range"
+# A rep's tuned case matches its controls when within this much of that rep's fastest one.
+CONTROL_MATCH_PCT = 5.0
+ATTENTION = re.compile(r"^summary: .*?(attention: .*)$", re.M)
+
+
+def host_target() -> tuple[str, str]:
+    """(arch, os) of the host as Zig resolves it (`zig env` `.target`), so an emulated
+    Python interpreter (Rosetta) never picks the wrong floor."""
+    try:
+        out = subprocess.run(["zig", "env"], capture_output=True, text=True, check=True).stdout
+        match = re.search(r'\.target = "([^-"]+)-([^-."]+)', out)
+        if match:
+            return match.group(1), match.group(2)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return platform.machine().lower(), sys.platform
+
+
+def shipped_cpu_floor() -> str:
+    """The host's shipped CPU floor, matching `shippedCpuFloor` in build.zig."""
+    arch, os_name = host_target()
+    if arch in ("x86_64", "amd64"):
+        return "x86_64_v2"
+    if arch in ("arm64", "aarch64") and os_name in ("macos", "darwin"):
+        return "apple_m1"
+    return "baseline"
 
 
 def repo_root() -> Path:
@@ -90,7 +110,21 @@ def export_base(root: Path, ref: str) -> Path:
             shutil.rmtree(target)
         target.mkdir(parents=True)
         archive = subprocess.Popen(["git", "archive", sha], cwd=root, stdout=subprocess.PIPE)
-        subprocess.run(["tar", "-x", "-C", str(target)], stdin=archive.stdout, check=True)
+        # Instruction files stay out: a nested AGENTS.md, CLAUDE.md, or rules tree (.claude, or .grok in older bases) loads when an agent reads the export.
+        subprocess.run(
+            [
+                "tar",
+                "-x",
+                "-C",
+                str(target),
+                "--exclude=AGENTS.md",
+                "--exclude=CLAUDE.md",
+                "--exclude=.grok",
+                "--exclude=.claude",
+            ],
+            stdin=archive.stdout,
+            check=True,
+        )
         if archive.wait() != 0:
             raise SystemExit(f"git archive {ref} failed")
         (target / READY_MARKER).write_text(sha + "\n")
@@ -119,8 +153,8 @@ def tree_of(root: Path, ref: str | None) -> str:
     return hashlib.sha256(" ".join(parts).encode()).hexdigest()
 
 
-def cache_path(root: Path, tree: str, optimize: str, bench_args: list[str]) -> Path:
-    digest = hashlib.sha256(json.dumps([optimize, bench_args]).encode()).hexdigest()[:16]
+def cache_path(root: Path, tree: str, optimize: str, cpu: str, bench_args: list[str]) -> Path:
+    digest = hashlib.sha256(json.dumps([optimize, cpu, bench_args]).encode()).hexdigest()[:16]
     return root / OUTPUT_DIRNAME / CACHE_DIRNAME / tree[:16] / f"{digest}.json"
 
 
@@ -134,16 +168,33 @@ def cached_texts(path: Path, reps: int) -> list[str] | None:
     return entry["texts"][:reps]
 
 
-def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str) -> tuple[int, str]:
+def list_groups(args: argparse.Namespace) -> int:
+    """Print the bench binary's groups. Items and cases come from the groups, not this script."""
+    forwarded = ["--list"]
+    for name in args.group:
+        forwarded += ["--group", name]
+    for prefix in args.group_prefix:
+        forwarded += ["--group-prefix", prefix]
+    root = repo_root()
+    code, text = run_bench(root, forwarded, root / ".zig-cache", "Debug", shipped_cpu_floor())
+    kept = [line for line in text.splitlines() if line.startswith(("group=", "label=", "items=", "cases="))]
+    if code != 0 or not kept:
+        sys.stderr.write(text)
+        return code or 1
+    print("\n".join(kept))
+    return 0
+
+
+def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str, cpu: str) -> tuple[int, str]:
     # Both sides share the repo's local cache: it is content-addressed, so a base
     # export of a new parent commit rebuilds only what differs instead of cold.
-    cmd = ["zig", "build", "bench", f"-Doptimize={optimize}", "--cache-dir", str(cache_dir), "--", *bench_args]
+    cmd = ["zig", "build", "bench", f"-Doptimize={optimize}", f"-Dcpu={cpu}", "--cache-dir", str(cache_dir), "--", *bench_args]
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def parse(text: str, case_filter: str | None) -> dict[tuple[str, str, str], float]:
-    """(group, item code, case) -> mean in microseconds."""
+def parse(text: str, case_filter: str | None, workers: dict | None = None) -> dict[tuple[str, str, str], float]:
+    """(group, item code, case) -> mean in microseconds; fills `workers` with each row's worker_threads cell."""
     out: dict[tuple[str, str, str], float] = {}
     group = item = None
     for line in text.splitlines():
@@ -153,6 +204,8 @@ def parse(text: str, case_filter: str | None) -> dict[tuple[str, str, str], floa
             # First row per case is the compact table's mean; --details rows follow.
             if (case_filter is None or case == case_filter) and (group, item, case) not in out:
                 out[(group, item, case)] = float(row.group(2)) * UNIT_US[row.group(3)]
+                if workers is not None:
+                    workers[(group, item, case)] = row.group(4)
             continue
         header = GROUP_HEADER.match(line)
         if header and not line.startswith(("case ", "summary", "details", "benchmark", "purpose", "worker")):
@@ -164,6 +217,33 @@ def fmt_us(v: float) -> str:
     if v >= 1e3:
         return f"{v / 1e3:.2f} ms"
     return f"{v:.1f} us"
+
+
+def tuned_vs_controls(by_rep: dict[tuple[str, str, str], dict[int, dict[str, tuple[float, str]]]], names: list[str]) -> list[str]:
+    """Per (group, item, side): in how many reps the tuned case matched that rep's fastest
+    other case (`tests-benchmarks.md`: every other case is a control), and its worst rep."""
+    out: list[str] = []
+    for group, item, side in sorted(by_rep, key=lambda k: (k[0], k[1], names.index(k[2]))):
+        reps = by_rep[(group, item, side)]
+        judged = []
+        for rep in sorted(reps):
+            cases_us = reps[rep]
+            if TUNED_CASE not in cases_us or len(cases_us) < 2:
+                continue
+            tuned_us, tuned_cell = cases_us[TUNED_CASE]
+            best_case, (best_us, best_cell) = min(((k, v) for k, v in cases_us.items() if k != TUNED_CASE), key=lambda kv: kv[1][0])
+            judged.append((tuned_us / best_us if best_us else 1.0, tuned_us, tuned_cell, best_case, best_us, best_cell))
+        if not judged:
+            continue
+        if not out:
+            out += ["", f"# tuned vs fastest control per rep (match: within {CONTROL_MATCH_PCT:.0f}%)"]
+        matched = sum(1 for j in judged if j[0] <= 1 + CONTROL_MATCH_PCT / 100)
+        ratio, tuned_us, tuned_cell, best_case, best_us, best_cell = max(judged)
+        out.append(
+            f"{group:30} {item:>12} {side:<18} matched {matched}/{len(judged)}"
+            f"  worst: tuned {fmt_us(tuned_us)} @{tuned_cell} vs {best_case} {fmt_us(best_us)} @{best_cell} ({(ratio - 1) * 100:+.0f}%)"
+        )
+    return out
 
 
 def main() -> int:
@@ -194,12 +274,29 @@ def main() -> int:
         default="Debug",
         help="build mode for both sides (default: Debug; ReleaseFast only for what Debug cannot show)",
     )
+    parser.add_argument(
+        "--cpu",
+        default=shipped_cpu_floor(),
+        help="-Dcpu for both sides (default: the host's shipped CPU floor, %(default)s; e.g. native)",
+    )
     parser.add_argument("--fresh", action="store_true", help="ignore cached reps and rerun both sides")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print each group's items and cases from the bench binary, then exit",
+    )
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
     args = parser.parse_args()
 
+    if args.bench_args in (["--help"], ["-h"]):
+        parser.print_help()
+        return 0
+
+    if args.list:
+        return list_groups(args)
+
     if not args.group and not args.group_prefix:
-        parser.error("name at least one --group or --group-prefix; full-suite sweeps use tools/bench_run.py")
+        parser.error("name at least one --group or --group-prefix (flags: --help); full-suite sweeps run zig build bench")
     names_items = any(a.startswith("--items") for a in args.bench_args)
     if not names_items and not args.grid:
         parser.error("name the config that answers the question (-- --items N), or pass --grid for every config")
@@ -232,7 +329,7 @@ def main() -> int:
         for c, case in enumerate(cases):
             for s, (name, _, tree) in enumerate(sides):
                 bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
-                hit = None if args.fresh else cached_texts(cache_path(root, tree, args.optimize, bench_args), args.reps)
+                hit = None if args.fresh else cached_texts(cache_path(root, tree, args.optimize, args.cpu, bench_args), args.reps)
                 if hit is not None:
                     texts[(t, c, s)] = hit
                     cached_sides.add(name)
@@ -247,11 +344,11 @@ def main() -> int:
                     if (t, c, s) in texts:
                         continue
                     bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
-                    code, text = run_bench(cwd, bench_args, root / ".zig-cache", args.optimize)
+                    code, text = run_bench(cwd, bench_args, root / ".zig-cache", args.optimize, args.cpu)
                     tag = "_".join([name.replace(":", "-").replace("/", "-"), target[1], case or "all", str(rep)])
                     (out_dir / f"{tag}.txt").write_text(text)
                     done += 1
-                    print(f"[{done}/{total}] {name} {' '.join(bench_args)}", file=sys.stderr)
+                    print(f"[{done}/{total}] {name} -Dcpu={args.cpu} {' '.join(bench_args)}", file=sys.stderr)
                     if code != 0:
                         print(text[-4000:], file=sys.stderr)
                         print(f"bench failed on {name} (exit {code}); raw output in {out_dir}", file=sys.stderr)
@@ -260,19 +357,30 @@ def main() -> int:
 
     for (t, c, s), runs in fresh.items():
         bench_args = targets[t] + (["--case", cases[c]] if cases[c] else []) + timing + args.bench_args
-        path = cache_path(root, sides[s][2], args.optimize, bench_args)
+        path = cache_path(root, sides[s][2], args.optimize, args.cpu, bench_args)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"created": time.time(), "args": bench_args, "texts": runs}))
+        path.write_text(json.dumps({"created": time.time(), "cpu": args.cpu, "args": bench_args, "texts": runs}))
+    workers: dict[tuple[str, str, str, str], str] = {}
+    # (group, item, side) -> rep index -> case -> (us, worker_threads cell): the tuned
+    # case is judged per rep against the controls of the same rep.
+    by_rep: dict[tuple[str, str, str], dict[int, dict[str, tuple[float, str]]]] = {}
+    attention: dict[str, list[str]] = {}
     for (t, c, s), runs in {**texts, **fresh}.items():
-        for text in runs:
-            for (group, item, case_name), us in parse(text, cases[c]).items():
+        for rep_index, text in enumerate(runs):
+            side_workers: dict[tuple[str, str, str], str] = {}
+            for (group, item, case_name), us in parse(text, cases[c], side_workers).items():
                 samples.setdefault((group, item, case_name, sides[s][0]), []).append(us)
+                cell = side_workers.get((group, item, case_name), "-")
+                by_rep.setdefault((group, item, sides[s][0]), {}).setdefault(rep_index, {})[case_name] = (us, cell)
+            for key, cell in side_workers.items():
+                workers[key + (sides[s][0],)] = cell
+            attention.setdefault(sides[s][0], []).extend(ATTENTION.findall(text))
 
     keys = sorted({k[:3] for k in samples})
     names = [n for n, _, _ in sides]
     lines = [
         f"# bench_ab  {stamp}  head={git(root, 'rev-parse', '--short', 'HEAD')}"
-        f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  {args.optimize}",
+        f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  {args.optimize}  cpu={args.cpu}",
         f"# args  {' '.join(sum(targets, []))}  cases={'all' if args.all_cases else ','.join(c for c in cases)}  extra={' '.join(args.bench_args) or '-'}",
         f"# cached (not interleaved): {', '.join(sorted(cached_sides)) or 'none'}",
         "",
@@ -304,7 +412,14 @@ def main() -> int:
             else:
                 verdict = "slower" if tlo > bhi else "faster" if thi < blo else "within spread"
             row += f" {delta:+7.1f}%  {verdict}"
+        if key[2] == "thread-adaptive-tuned-range":
+            # Workers used/available: 0/N means the tuner kept the stage inline (serial is production).
+            row += "  workers " + " ".join(f"{n}={workers.get(key + (n,), '-')}" for n in names)
         lines.append(row)
+    lines += tuned_vs_controls(by_rep, names)
+    for n in names:
+        if attention.get(n):
+            lines.append(f"# {n}: {len(attention[n])} harness attention line(s); first: {attention[n][0]}")
     summary = "\n".join(lines) + "\n"
     (out_dir / "summary.txt").write_text(summary)
     print(summary)

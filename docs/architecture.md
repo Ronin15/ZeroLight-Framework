@@ -3,14 +3,14 @@
 The project is organized for SDL_GPU-first 2D game work: thin executable
 timing, app coordination under `src/app/`, GPU work under `src/render/`, and
 game-specific behavior under `src/game/`. This doc describes how the engine is
-built; the rules it follows live in `.claude/rules/`.
+built; the rules it follows live in `.grok/rules/`.
 
 ## Target Model
 
 The engine core serves a fully simulated game of many worlds that keeps
 growing; the demo state is a harness that exercises this model, not the model.
 Designs start here, then read the live structure below (rules:
-`.claude/rules/engine-design.md` § Target scale and § Cost model).
+`.grok/rules/engine-design.md` § Target scale and § Cost model).
 
 - **Fully simulated:** everything that exists keeps advancing, in every
   world; distance from the observer (the camera focus, or a player when a
@@ -31,6 +31,13 @@ Designs start here, then read the live structure below (rules:
 - **Populations, items, links:** grow in play at the structural-commit seam.
 - **Scale:** 2048² levels, deep stacks, and several worlds are a floor; work
   and memory follow what changed and what exists, never extent × world count.
+- **Content shape (owner design calls):** long links (teleports) are one-off
+  world gates and dungeon entrances, a handful per world. A very long path
+  completes by moving toward the goal and retrying later. An agent knows a
+  location only if it has been there or heard of it from one that has, so far
+  goals come from what agents know. Large full-fidelity bench crowds are
+  signal; in play, far agents run at lower fidelity, so they overstate the
+  per-step load.
 
 ## Source Layout
 
@@ -74,7 +81,7 @@ Designs start here, then read the live structure below (rules:
   each public method defined in a sibling file is a declaration alias on the
   type (`pub const setDenseTile = world_edit.setDenseTile;`) with its `///` doc
   on the definition, so method syntax resolves straight to it with no forwarder
-  frame in any mode (`.claude/rules/zig-style.md`). `world/`, `data_system/`,
+  frame in any mode (`.grok/rules/zig-style.md`). `world/`, `data_system/`,
   and `pathfinding/` use it; in `pathfinding/`, `Connectivity`'s home file is
   `connectivity.zig`.
 - `src/game/world/` holds `WorldSystem`'s state-local world/tile data, with no
@@ -91,7 +98,8 @@ Designs start here, then read the live structure below (rules:
     reserve seams, batched dense writes as threaded plan and write jobs, sparse
     add/remove, and blocking clears.
   - `worldgen.zig`: the procedural and demo world builds (procedural ground
-    painted per chunk on the thread system) and the underground level stack.
+    painted per chunk on the thread system as a fresh one-off stage at 32-chunk range
+    alignment, `ground_build_tuner`) and the underground level stack.
   - `terrain.zig`: chunk-owned terrain storage: per dense layer a chunk
     directory over a pool of tile blocks, and per level a `LevelTerrain`
     (growable band list and cached floor layer, a composed movement-blocked
@@ -128,7 +136,8 @@ Designs start here, then read the live structure below (rules:
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
-  orchestration, reusable gameplay systems, and full-active scope stats.
+  orchestration, reusable gameplay systems, and full-active scope stats;
+  its test-only scenario fixtures are private in that file.
 - `src/game/simulation_scope.zig` defines simulation tiers, active-region
   scaffolding, per-entity scope metadata types, stagger/halo constants, and scope
   counters.
@@ -143,18 +152,23 @@ Designs start here, then read the live structure below (rules:
   is `position_z` / `world_level`, not continuous z motion) and applies the
   step's AI movement intents as a threaded stage.
 - `src/game/systems/world_gate.zig` clamps settled bodies to world bounds and
-  gates them off solid tiles (serial, main thread).
+  gates them off solid tiles as threaded lane batches over the movement rows,
+  then the player row on the main thread. The body box is the collision bounds,
+  mirrored into movement-row columns (offset, size, `has_collision_bounds`,
+  `has_ai_agent`) that only `DataSystem` writes at the commit seam; a player
+  without bounds is neither clamped nor gated.
 - `src/game/systems/plane_entry.zig` owns `PlaneEntrySystem`, plane traversal's
   threaded per-agent cell-entry gather and classification.
 - `src/game/systems/static_colliders.zig` owns `StaticColliderSystem`, the shared
-  static-collider rows nav and steering read through `ColliderView`.
-- `src/game/systems/chunk_list_map.zig` holds `ChunkListMap` (per-key owner lists
-  backing the static-collider chunk lists and the path registry) and
-  `OrderedIndexSet` (the ordered chunk/level set nav's plan merge and the world's
-  write grouping drain).
+  static-collider rows nav, steering, and collision read through `ColliderView`.
+- `src/game/systems/chunk_list_map.zig` holds `ChunkDirectory` (per-level chunk
+  slots and a payload pool), chunk-key helpers, and `OrderedIndexSet` (nav's
+  plan sets and the world's edit-level set).
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
-  pipeline-shared per-step uniform grid built once from the cognition-scoped
-  population and read by AI separation and perception.
+  pipeline-shared neighbor index, built each step on workers from a handed
+  population into per-chunk records keyed by level and faction, and read by
+  AI separation and cohere, perception, and steering;
+  `spatial_index_test_support.zig` holds its test-only fixtures.
 - `src/game/systems/perception.zig` owns `PerceptionSystem`: vision
   (range/FOV/LOS/faction-stance gating) and hearing (transient world
   stimuli), emitting `entity_perceived`/`entity_lost` events on acquire/lose
@@ -175,9 +189,17 @@ Designs start here, then read the live structure below (rules:
 - `src/game/ai_debug_overlay.zig` draws read-only AI introspection (vision,
   drives, memory, active behavior) under the existing debug toggle; never
   mutates simulation.
-- `src/game/systems/steering.zig` consumes navigation intents and path status,
-  then emits final NPC movement intents with local avoidance (same-level agent
-  neighbor gating mirrors collision).
+- `src/game/systems/steering/` consumes navigation intents and path status,
+  then emits final NPC movement intents with local avoidance. One file per
+  stage, with no facade; each stage file holds free functions over
+  `*SteeringSystem`:
+  - `system.zig`: `SteeringSystem`, its lifecycle and reserve, the step, and the
+    `agents` stage;
+  - `selection.zig`: `select_resolve` and `select_claim`;
+  - `directions.zig`: `directions` (path status and base direction);
+  - `avoidance.zig`: the avoidance pass, the movement-intent write, and the
+    movement-row place and sort;
+  - `test_support.zig`: test-only fixtures shared across the files.
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
   response-policy movement corrections;
@@ -227,14 +249,17 @@ Designs start here, then read the live structure below (rules:
 - `src/game/render_depth.zig` defines world depth bands and z-order intent;
   `src/game/render_prep.zig` resolves entities to ordered render-draw records.
 - `src/gpu_smoke.zig` is the GPU smoke executable entry point, while
-  `src/platform/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
+  `src/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
 - `src/platform/sdl.zig` contains shared SDL, SDL_ttf, and SDL_mixer C imports
   plus small SDL wrappers.
 - Sprite and audio startup assets are declared in `src/assets/manifest.zig` and
   live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
+- `src/core/sort.zig` holds `pdq` and `insertion`, std's sorts with
+  whole-element swaps; production sorts use them (`.grok/rules/zig-style.md`
+  § Style).
 - `src/core/rng.zig` provides a deterministic, stateless, seeded per-entity RNG
-  facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
+  facility (`mix64`/`uniformF32`/`unitVec2`) for reproducible
   gameplay randomness (AI wander, etc.).
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
 - `src/root.zig` stays minimal for math aliases and compile coverage; feature
@@ -274,7 +299,7 @@ pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
 Frame pacing policy is explicit and situational
-(`.claude/rules/memory-performance.md`).
+(`.grok/rules/memory-performance.md`).
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
@@ -282,7 +307,7 @@ transformed through that presentation into drawable pixels, then clipped to the
 logical viewport; drawable overlays use raw swapchain pixels. Swapchain
 presentation state lives in the SDL_GPU renderer path, world render state in
 `WorldSystem`'s render path, and debug UI state in the debug overlay and
-render-service path (`.claude/rules/render.md`).
+render-service path (`.grok/rules/render.md`).
 
 ## Coordination Boundaries
 
@@ -293,7 +318,7 @@ state-owned dynamic render prep, then both streams are merged by world z before
 commands reach `SpriteBatch`. Window, GPU device, swapchain, shader, texture,
 text, and frame submission code lives under `src/render/` and `src/app/`;
 ownership wrappers may centralize cleanup at the owning site
-(`.claude/rules/engine-design.md`, `.claude/rules/zig-style.md`).
+(`.grok/rules/engine-design.md`, `.grok/rules/zig-style.md`).
 
 `Renderer` preserves strict ordered submission while delegating sprite-specific
 CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition, swapchain
@@ -365,7 +390,7 @@ comes only from the fixed-step camera (`GameDemoState.simViewRect()` passed as
 render visibility window, which follows the interpolated render camera and so
 depends on frame pacing. Scope pin metadata
 may keep an entity in a higher sim band off-camera without bypassing render
-visibility (`.claude/rules/simulation.md`). Open scaling gaps (collect scan cost, dense-floor layer quads,
+visibility (`.grok/rules/simulation.md`). Open scaling gaps (collect scan cost, dense-floor layer quads,
 movement contiguous-path vs dormant rows, per-entity depth alignment, component
 mask headroom) are consolidated under **Scaling Gaps And Hardening Frontier** in
 [`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
@@ -440,7 +465,7 @@ renderer, asset, audio, text, state, pause, input, and thread-system services.
 Logging uses the scoped categories in `src/core/logging.zig`, with the default
 log level chosen from build options; diagnostics cover startup, configuration,
 fallback, lifecycle, and failure context, and hot paths stay quiet
-(`.claude/rules/zig-style.md`).
+(`.grok/rules/zig-style.md`).
 
 ## Thread System
 
@@ -449,67 +474,300 @@ fallback, lifecycle, and failure context, and hot paths stay quiet
 work that must finish before the next system or render phase.
 
 Worker threads are pre-spawned at startup. The default worker thread count is based
-on CPU count, with the main/render thread participating as an additional worker
+on CPU count (`defaultWorkerThreadCount`: cores - 1, 0 when the count is
+unknown or 1; the benches read it too), with the main/render thread participating as an additional worker
 while it waits. Batch submission does not allocate after initialization.
 Production worker participation is timing-adaptive: batches start inline and
 move to worker participation only when measured completion time shows the
 threaded profile is worthwhile. Structural limits still force inline execution
-when there is no work, no available worker, only one splittable range, an
-explicit serial override, or a processor range-alignment constraint leaves no
-safe split.
+when no worker is available, only one splittable range exists, an explicit
+serial override is set, or a processor range-alignment constraint leaves no
+safe split. An empty batch (`item_count == 0`) is not that path: `shapeBatch`
+gives it zero ranges and keeps the caller's alignment as the width, so a
+later range count does not divide by zero.
 
-Adaptive work tuning chooses a complete batch profile: inline or threaded,
-worker threads, and items per claimed range. Worker count and range size remain
-distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
-owns the decision. The tuner starts inline, records that inline baseline for the
-owning batch, probes a threaded profile when the measured work is expensive
-enough, and only reports a best threaded profile after a threaded candidate wins.
-Each decision reads the median of a short sample window, so one spike or one
-near-free batch never decides alone. A batch outside the learned item-count band
-runs with the current profile without being sampled; a full window of them in a
-row on the same side is a sustained shift, which re-tunes a threaded stage at the
-new count and relearns an inline one; that retune re-bases on the incumbent profile
-at the new count and commits a climb only at the threaded commit margin (5%), while
-the periodic retune keeps the measured best and the 1% margin. A settled
-threaded-to-inline demotion remembers its threaded profile, and the first inline
-window judges it: at or above the gate, with the profile still dispatching threaded
-at that count, the profile is restored at once and the bound rule is suppressed
-until the next retune probe or sustained shift; otherwise the demotion stands. Main
-waiting on workers never demotes a stage. There are no static item-count floors
-(`.claude/rules/threading.md`);
-slower hardware or expensive small-N processors train their own threaded
-profile. The tuner counts closed probe windows and demotions for `--details`
-(`probes=`, `demotes=`); the counters compile to nothing in ReleaseFast and
+The thread that calls `init` owns the system and must outlive it:
+`deinit` runs on the owner, outside any batch, with nothing pending. Every
+`selectBatchProfile` and `parallelForWithOptions` call first classifies its
+caller (O(1) for the owner, O(workers) for any other thread):
+
+- the owner outside a batch takes the normal path;
+- a participant (the owner inside one of its own batches, or a worker of this
+  system) runs the nested batch forced inline on its own `WorkerId`, in every
+  build mode: the selected profile's ranges, or the untuned fixed shape when
+  none is given, never consulting or recording a tuner (`Dispatch.select` and
+  `RoundDispatch` included). The range set and indices are kept, so output
+  stays deterministic. Forced inline sets `BatchStats.forced_inline`, which
+  benches assert is false on the stages they measure. On a worker its ranges
+  count as worker ranges with `ran_inline` set, so a proof that a batch ran on
+  workers checks `!ran_inline`;
+- any other thread (a participant of a different `ThreadSystem` included)
+  panics in every build mode before touching shared or tuner state. Slice
+  51's lane thread is foreign, so lane jobs run serial code paths
+  (`.grok/rules/threading.md`).
+
+Workers name themselves `zl-worker-<index>` after their startup permit
+(Darwin can name only the calling thread); the main thread is never renamed,
+since on Linux that renames the process.
+
+Shared batch state is three blocks, each one `std.atomic.cache_line` (128 B on
+x86_64 and aarch64; comptime asserts pin the layout, 384 B per system;
+`.grok/rules/threading.md`): the descriptor (written only by main: `io`,
+`accepting_work`, the published batch), the claim (`next_range` alone), and
+the completion state (`pending`, `worker_ranges`, the `done` event). Wake
+words (`WakeWord`) are one cache line each, written only by main and built at
+init beside the shared state (freed at `deinit`): each worker owns one bit of
+one word. On Linux a word serves 32 workers (`wake_block_width`); elsewhere
+each worker has a word of its own. Each participant copies the batch into a private `BatchView` once and counts its ranges
+locally; a worker adds its count to `worker_ranges` once, main keeps its own.
+The claim is the claim loop's only atomic RMW.
+
+Dispatch is lock-free:
+
+- publish: main writes the descriptor and resets `next_range`,
+  `worker_ranges`, `pending` (active workers + 1, main included), and `done`;
+  then, per wake word holding a counted worker, it XORs the counted workers'
+  bits into the word in one store (release) and issues one wake for those bits
+  (`WakeWordOps.post`): `FUTEX_WAKE_BITSET` with that mask on Linux, a plain
+  `std.Io` futex wake of the word's one worker elsewhere;
+- worker: it loads its word (acquire) and runs only when its bit differs from
+  the value it last ran (`WakeWordOps.awaitFlip`); otherwise it waits on the
+  word with the loaded value (and its bit, on Linux). A spurious wake, or a
+  wake whose flip was another worker's, reads nothing shared and waits again.
+  After a flip it checks `accepting_work`, then runs its first range (worker
+  *i* runs range *i* − 1), claims the rest, adds its range count, and
+  decrements `pending` (acq_rel); the last finisher sets `done`. A worker's
+  bit flips again only after it has decremented the batch that flipped it, so
+  at most one flip is outstanding and no counter wraps;
+- join: main claims ranges too, then decrements; it waits on `done` only when
+  it was not last;
+- shutdown: `accepting_work` stored false (release), then every worker's bit
+  flipped and woken before the join. The one startup permit per worker
+  (`WorkerRecord.start`, a semaphore) is the only semaphore left.
+
+Workers park on their wake word after every batch. Spin-within-step-then-park
+was measured and rejected (`13a2a67`): at the release shape it saved 0.04–0.07
+ms per step (within spread) while roughly doubling worker CPU and slowing
+main's serial work 9–41% from a waiting SMT sibling. Measured dispatch floor
+(`thread-dispatch` `thread-fixed-auto`, ReleaseFast `-Dcpu=x86_64_v2`, 23
+workers, 3 interleaved reps, warmup 5 / iterations 30): 16,384 items (23 active
+workers) 26.0 µs with a semaphore post per worker, 16.3 µs with wake words
+(`07b9c9a`); 1,024 items (15 active) 19.0 to 14.3 µs. The startup calibration
+below measures the floor of the machine it runs on.
+
+Adaptive work tuning is a batch tuner: `AdaptiveWorkTuner` decides inline or
+threaded, and for a threaded stage tunes one value, the batch count; workers
+follow the batches (at most one per batch beyond main, up to the stage's worker
+cap) and are never tuned on their own. A stage hands its tuner its items and
+sets neither (`.grok/rules/threading.md`).
+
+- Learning: a fresh tuner runs inline and records the baseline. A window median
+  below the gate settles inline; at or above it the tuner probes a threaded
+  shape, which commits only when it beats the inline baseline by the 5%
+  threaded commit margin. A lost probe stays inline for
+  `inline_probe_cooldown_windows` settled inline windows (default 120; 0 is
+  none) and halves the batch multiplier for the next probe (floor 0.25). A
+  window holds inline or threaded batches only, and each decision reads the
+  window median (a median-of-3 network at the default window of 3), so one spike
+  or near-free batch never decides alone.
+- Shape: batch count = (pool participants + 1 main) x `batch_multiplier` (start
+  1.0, the full pool), rounded and clamped to at least 2 ranges and at most
+  `maxRangeCount`, each range at least one alignment unit; workers =
+  min(batches - 1, pool). The shape is stored (`current_profile`) and rewritten
+  only when the nudge steps, a probe commits, a restore lands, or an item-count
+  shift reshapes it.
+- Nudge: each threaded batch feeds a throughput EMA (items per ns, alpha 0.15),
+  seeded from the median of the first 3 threaded batches after a (re)start
+  (`nudge_samples` floors at 3); later samples are clipped to ema x [0.9, 1.1] so
+  one outlier never decides. After 7 samples the first comparison is a clamp
+  trial: one jump to the clamp top (4x the pool's participants) when it dispatches
+  a different shape than the measured one, with the EMA and the reference
+  restarted at the median of the last 3 raw throughputs at the measured shape
+  (the settled EMA still carries the warm-up). After 7 trial samples a gain beyond
+  the stepped band below keeps the top and steps down from it, its EMA restarted
+  at the median of the trial's own last 3 throughputs; a tie or loss returns to
+  the measured shape at its median level and takes the first step to fewer
+  batches (the multiplier divides by 1.1). When the top is the measured shape or
+  nothing threaded is dispatched, the first step is local at once. A demotion,
+  retune, or lost probe during a trial abandons it. 7 samples after each step the EMA is compared with the pre-step reference. A
+  gain beyond the stepped band, 5% x (1 - 0.85^7) = 3.4% (the EMA still carries
+  the old shape), keeps the direction and steps again; a loss flips the
+  direction and steps from the reference shape; inside the band the tuner holds.
+  A held tuner resumes stepping after 7 samples in a row whose EMA departs the
+  hold reference by more than 5%. Steps are multiplicative (x1.1), clamped to
+  0.25-4.0; a step that leaves the dispatched batch count unchanged keeps
+  stepping, and at a clamp the direction flips and the tuner holds. After a step
+  the multiplier is restated as dispatched ranges / participants. Demotion, a
+  lost probe, a restore's re-decision, and an item-count shift restart the
+  measurement (the EMA reseeds); the multiplier is kept except on a relearn,
+  which resets it to 1.
+- Item-count shift: a batch outside the 25% band of the learned count runs with
+  the current profile without being sampled; a full window in a row on the same
+  side is a sustained shift. A threaded stage keeps its profile, reshapes it
+  from the multiplier at the new count, and re-decides inline or threaded on the
+  next settled window; an inline stage relearns. An unsustained jump up on a
+  tuner without a threaded profile runs the shape the per-item model predicts,
+  judged by its own skipped records (`judgeJump`): the gate, the bound rule, one
+  inline backprobe when a threaded record is under the gate but its bound is
+  not, and the commit margin between the two measurements; a repeated kind holds
+  the shape it measured. The judgment covers every requested count inside the 25%
+  band of the jump's own count (`jumpCovers`, anchored, never chained) under the
+  same learned count. It is final within two records and never trains the window,
+  the nudge, or the model, and reopens after `sample_window` consecutive records
+  of the held shape that move against the verdict past the commit margin of its
+  stored measurement, or across the gate where the bound rule held it inline
+  (`contradictsJudgment`); a single, equal, or alternating record never reopens
+  it. The judgment clears on a relearn and when a threaded profile is adopted.
+- Demotion: a settled threaded window demotes to inline only when its median of
+  (batch duration x that batch's participants), an upper bound on the inline
+  cost, is below the gate. The demoted threaded profile is remembered and the
+  first inline window judges it: at or above the gate, with the profile still
+  dispatching threaded at that count, it is restored at once and the bound rule
+  is suppressed until a sustained item-count shift or a relearn; otherwise the
+  demotion stands and the cooldown applies. A demotion holds the inline side. A
+  threaded commit whose inline baseline is at or above the gate and whose bound
+  is not under the gate, and a restore, hold the threaded side. While a side is
+  held, one winner-changing settled window increments a count and returns. The
+  window that fills `sample_window` consecutive winner-changing records demotes,
+  or takes the inline decision: a probe when the model still predicts threading,
+  otherwise the same side. An agreeing window zeros the count. The first inline
+  window after a demotion still restores at once. A sustained item-count shift
+  clears the hold. The gate, commit margin, reset band, and cooldown are
+  unchanged. Main waiting on workers never demotes a stage.
+- No timer re-probe: a settled stage re-tunes only on evidence (a sustained
+  item-count shift, a sustained 5% throughput departure while holding), never on
+  elapsed windows (`.grok/rules/threading.md`).
+- One-off first selection: a tuner built with `first_selection = .full_pool`
+  (`rebuild_tuner_config`: a world-create or static-collider rebuild whose first
+  batch is too large for main) keeps that full-pool shape for the whole opening
+  window, at 2 batches per participant (measured against 1 and 4 on the rebuild
+  and world-create benches), until the window adopts. A later relearn selects
+  normally. No nudge follows a one-off. The `rebuild_tuner_config`
+  users: the world's procedural paint (`ground_build_tuner`, at 32-chunk range
+  alignment), the static-collider rebuild, pathfinding's level build set
+  (`nav_build`, fresh at every nav build: it samples each stage once per level,
+  too rarely to settle), the shrink's resize copy and registry rename, and the
+  one-off flush set (a shrink's flush, a level rebuild's evictions).
+
+There are no static item-count floors (`.grok/rules/threading.md`); slower
+hardware or expensive small-N processors train their own shape. The tuner counts
+closed probe windows and demotions for `--details` (`probes=`, `demotes=`) and
+also restores, skipped out-of-band batches (`restore_count`,
+`shift_skip_count`), and batches recorded with items (`record_count`, which the
+bench settle census reads); benches report them as deltas over the measured
+window. The counters compile to nothing in ReleaseFast and
 ReleaseSmall and no policy reads them.
+
+The gate is a probe floor: an inline window median below it settles inline
+without probing, and it bounds demotion and restore. It never decides that
+threading wins; that is measured on the host, where a first threaded profile
+commits only at the 5% commit margin. The gate is calibrated at startup
+(`ThreadSystem.calibration`, null with no workers): `init` spawns the workers,
+then `calibrate` times a no-op job through `runThreadedBatch`, the runner
+stages use, at one active worker (2 ranges) and at the full pool (W + 1 ranges),
+8 warm-up and 31 timed dispatches each, taking the median (W = 1 measures
+once). `ThreadCalibration.fromFloors` models the floor as linear in active
+workers, F(A) = F1 + b (A − 1) with b = (F_W − F1) / (W − 1), and derives the
+gate by `58ff9e1`'s rule: break-even is T ≥ F / (0.95 − 1/P) for dispatch floor
+F at P participants, and the gate is 2 × F_W, raised only where that check
+fails at some active count. The participant-overhead prior is max(b, 1 ns) and
+the floor on each learned overhead sample is 0.1 × the prior. Every tuner
+reads them through `AdaptiveWorkRequest.calibration` (`gateNsFor`); a
+`threaded_batch_ns` set in `AdaptiveWorkTunerConfig` overrides the gate (tests
+and benches). Calibration reads only timing and picks dispatch shapes, never
+simulation state, and runs once. The medians are this process's, so the gate
+and a tuner's inline or threaded choice can differ from one start to the next
+(`gateNsFor`, `predictsThreaded`); that choice is a dispatch shape only. The init
+debug line reports `dispatch_floor_ns`, `one_worker_floor_ns`, `worker_wake_ns`,
+`gate_ns`, `participant_overhead_ns`, and `calibration_ns`. Measured on the
+23-worker dev
+host (init line, `thread-dispatch`): calibration 1.21 ms in Debug and
+ReleaseFast (one run each); ReleaseFast floors F_W 16.5–18.7 µs and F1
+4.8–6.0 µs, gate 32.9–37.4 µs (4 runs); Debug gate 37.6–49.1 µs (3 runs).
+
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.
-Production processors own their own tuner state so movement, particles,
-collision, and future systems never train each other with unrelated batch
-timings; `ThreadSystem` keeps shared fallback state for generic callers. Batches
+Every production stage dispatches through a `Dispatch` built on a tuner its
+system owns (`Dispatch.init` or `StageThreads.stage`), scope's `chunk_derive`
+included, so no stage trains on another's batch timings
+(`.grok/rules/threading.md`). No config field carries a tuner, and no stage
+falls back to `ThreadSystem.adaptive_tuner`: that shared tuner serves only
+generic callers, a `parallelForWithOptions` call that passes none. Batches
 can still force explicit fixed profiles through `items_per_range`,
-`max_worker_threads`, and `adaptive = false`. Worker threads are reused across
+`batches_per_participant`, `max_worker_threads`, and `adaptive = false`: the one
+sanctioned test and bench seam (`.grok/rules/tests-benchmarks.md`).
+`batches_per_participant` shapes each dispatch from its real item count through
+the tuner's own pool sizing (`poolItemsPerRange`; `fixedBatchesItemsPerRange` is
+the one resolver the bench reads); an explicit `items_per_range` wins, and either
+bypasses the tuner. Production only forwards a stage
+config's own fields into it (`ai.zig`'s `separation_items_per_range` and
+`intent_items_per_range`, `CollisionSystem.trigger_controls` for the commit-seam
+trigger sync, all null or default in production), and idiom-lint rule 13 fails the
+build otherwise: 13.1 a range, batch-count, or worker field set to anything but
+a forward of a stage config or typed `*_controls` field or a selection's value,
+13.2 `adaptive` set to anything but the config's, 13.3 a dispatch no tuner
+records, 13.4 a forward of `items_per_range` that drops the same owner's
+`batches_per_participant`. It scans production files
+outside `thread_system.zig`, tests, and test-only helpers. Worker threads are reused across
 frame batches, parked when idle, and joined during `ThreadSystem` shutdown.
 Processor-specific batches can align range starts to hot-column boundaries
 through `parallelForWithOptions`.
 
 Systems with multiple independently timed threaded stages own one tuner per
-stage (broadphase and narrowphase, AI gather and decision emission). A stage
+pass (broadphase and narrowphase; AI gather, separation, and decision
+emission; the index's bucket, sort, and link). Rounds of one pass are one
+sample, a round that runs only in another pass's rare phase folds into that
+pass's sample (the group field's stall rounds), and rare one-off passes of one
+job share one tuner set. A stage
 that preselects a profile passes it with its own tuner, so inline samples still
 train that stage, and diagnostics report inline stages as `inline`
-(`.claude/rules/threading.md`).
+(`.grok/rules/threading.md`).
 
 `thread_system.zig` holds the one copy of the stage pattern: `StageControls`
-(`items_per_range`, `max_worker_threads`, `adaptive`; every stage takes a per-stage
+(`items_per_range`, `batches_per_participant`, `max_worker_threads`, `adaptive`; every stage takes a per-stage
 worker cap, which production leaves unset), `Dispatch` (select a profile under the
 stage's tuner, then run it), `StageThreads(Config)` (a system's thread system plus
 config), `stageShape`/`runShaped`/`runStage` (pre-size range windows for the shape
 the dispatch will use, then run), and `RoundDispatch` (a multi-round stage selects
 once and records one tuner sample per step). Beside them: the 64-byte
 `thread_shared_record_alignment`, `paddingForCacheLine`, `PaddedSlot`/`SlotList`,
-`BandPartition`, `inlineBatch`, `accumulateBatch`, and `offMainNs`.
+`RangeSlots`, `BandPartition`, `inlineBatch`, `accumulateBatch`, `offMainNs`, and
+`compactRowWindows`/`compactSliceWindows` (main's range-order merge of a
+windowed gather's MAL rows or slice items).
+
+`selectBatchProfile` and `parallelForWithOptions` are the raw calls beneath
+`Dispatch`/`StageThreads`; a stage calls them directly only where the wrappers
+do not fit (scope's gather stages). A pass with at most one output per
+item tallies into a range tally sized by `maxRangeCount(item_count,
+range_alignment_items)`, the bound on ranges any partition can produce, so a
+retune never allocates in-stage; data-dependent per-range output slots are
+sized from the selection the dispatch uses (`threading.md` § Writes, capacity,
+and determinism): `RangeSlots(Slot)` sizes each range of the dispatch's own
+selection at the per-item bound times the items it covers (`prepare`, main,
+geometric, counted), `run` dispatches with no tuner record, grows each
+overflowing range to its counted need and replays the same ranges, and the
+caller records the final pass once (`prepare_grows`, `replays`). Rows stay dense: each stage's `range_alignment_items` makes
+every range span at least one full cache line in the columns it writes. Per-range and
+per-worker records pad to the 64-byte `thread_shared_record_alignment`:
+`PaddedSlot(T)` is aligned to at least that and padded to whole lines by its
+type, so any array, `SlotList`, or embedded field of slots starts each slot on
+its own line and a tally needs no field alignment; a contended singleton
+shared record aligns to `std.atomic.cache_line` (`shared_line`). A batched
+`RangeOutputStream` or `SimulationEvents` calls `finishWrite` once per commit
+after every range has written; it walks all range offsets, so a per-record call
+is O(N x ranges).
+
+`runtime_perf_log.BatchStage` names the stages whose batch timing the runtime
+perf log records (`recordBatch`); the change paths log their cost-driver stage
+(`nav_connect`, `nav_closure`, `path_resize_copy`, ...). Other timings are
+bench output (`--details`).
 
 ## Gameplay Data
+
+Hot-column order follows `.grok/rules/memory-performance.md` § Data-oriented design.
+
+### Component stores
 
 Gameplay states own their own `DataSystem`; it is not an app singleton. The
 system stores persistent world entities, per-entity component masks for system
@@ -518,17 +776,54 @@ primitive visual intent, and stable sprite asset references.
 Collision bounds are stored as dedicated persistent gameplay data rather than
 being inferred from render visuals.
 
-Hot gameplay data is stored as scalar columns. The movement-body store exposes
-64-byte-aligned `position_x`, `position_y`, `previous_x`, `previous_y`,
-`velocity_x`, `velocity_y`, and `speed` slices so update processors can load
-lanes directly with `src/core/simd.zig`. Movement processor ranges align
+Hot gameplay data is stored as scalar columns. The movement-body store is one
+`MultiArrayList` row (`MovementBodyStore.rows`, `data_system/movement.zig`); it
+exposes `position_x`, `position_y`, `previous_x`, `previous_y`, `velocity_x`,
+`velocity_y`, and `speed` as `[]f32` columns (`HotF32Slice`) that update
+processors stream in `src/core/simd.zig` lanes with unaligned loads, since the
+list does not guarantee aligned column bases. Movement processor ranges align
 to `data_system.movement_range_alignment_items`, which maps one cache line to
-sixteen `f32` elements. The same store carries the dense simulation-scope columns
-(`tier`, `chunk_x/y`, `stagger_phase`, `always_active`) as separate aligned arrays
-in lockstep with the movement rows; the movement processor's slice omits them, so
-movement integration never touches their cache lines. Component masks decide
-whether an entity belongs to a system; hot processors iterate already aligned SoA
-slices.
+sixteen `f32` elements. The simulation-scope columns (`tier`, `chunk_x/y`,
+`stagger_phase`, `always_active`) are fields of the same row; the movement
+processor's slice omits them, so movement integration never reads their
+columns. Component masks decide whether an entity belongs to a system; hot
+processors iterate the SoA columns.
+
+A new per-entity concept follows the component-store pattern
+(`.grok/rules/simulation.md`); `PerceptionStore` in
+`data_system/perception.zig` is the compact example. Each piece lives in
+`data_system/`:
+
+- a `Component` tag appended in `types.zig`, and its `component_masks` entry;
+- an optional field on `EntityTemplate` and a `set_*` variant on
+  `StructuralCommand` (`types.zig`), handled in `structural.zig`: validation,
+  the preflight projection, the commit, and the component-change record;
+- a capacity need: a count in `StructuralCapacityNeeds` (`structural.zig`)
+  with its `u32` row-count limit, reserved before the commit applies;
+- the SoA store, a `std.MultiArrayList(Row)` with `append`, `set`, `get`,
+  `removeAt` (swap-remove; returns the entity moved into the hole), `slice`,
+  and `sliceConst`; the mutable slice exposes only the hot columns a system
+  writes, and the cold tunables stay const;
+- a dense-index field on the entity slot (`ai_perception_index`) that
+  `DataSystem` rekeys when `removeAt` moves a row;
+- `DataSystem` helpers: a validated `setX` (upsert; a retune keeps hot state),
+  `xConst`, `xSliceConst`, `xDenseIndex`, and `xSlice`.
+
+A store appends one row at a time through a private `ensureCapacityForOne`
+(reserve one, then `appendAssumeCapacity`), never reserving `n` and then
+`append`. A store whose ranges thread or run SIMD reserves
+`data_system.hotStoreCapacity(n)` (`n` rounded up to
+`movement_range_alignment_items`); `systems/affect.zig`, `particle.zig`,
+`collision.zig`, `perception.zig`, `ai_memory.zig`, and
+`collision_response.zig` hold file-local copies for their scratch rows. A hot
+gather loop captures `var row_slice = rows.slice()` once and appends with
+`addOneAssumeCapacity`, then `row_slice.len = rows.len` and
+`row_slice.set(rows.len - 1, row)`, so the slice stays valid without
+re-slicing per row. There is no shared helper: each row type carries its own
+copy (`appendAffectGatherRow` in `systems/affect.zig`, `appendParticleRow` in
+`systems/particle.zig`, `appendProxyRow` in `systems/collision.zig`).
+
+### Fixed-step pipeline
 
 Gameplay states own their `DataSystem`, a transient `SimulationFrame`, and a
 state-owned `SimulationPipeline` for each fixed step. The state clears the
@@ -536,6 +831,8 @@ frame, runs main-thread input writes, delegates fixed-step processor dispatch to
 the pipeline, and applies deferred structural commands at explicit main-thread
 commit points. `DataSystem` remains persistent storage, not the simulation
 scheduler.
+
+### World surfaces
 
 Large world surfaces belong to state-owned world storage rather than
 `DataSystem` entities or the simulation pipeline. `GameDemoState` owns its
@@ -568,7 +865,7 @@ arrive grouped by chunk (`groupDenseCellWrites` groups a batch given in any orde
 in O(1) per write through each level's ordered chunk set, with no sort), storage
 is reserved on the main thread first (`reserveDenseCellWrites`), chunks are written in parallel on the
 `ThreadSystem`, and results merge in a fixed order, so threaded equals serial
-(`.claude/rules/threading.md`). A write marks its block changed and, on a layer
+(`.grok/rules/threading.md`). A write marks its block changed and, on a layer
 resident in the GPU tile store, flags the layer for the next
 `syncDenseTileStore`, which uploads each changed window chunk once; edits hold
 no render memory. Dense layers can be added in play. Visibility is the
@@ -582,18 +879,21 @@ camera-visible chunks to render prep. Simulation scope uses the fixed-step
 `sim_view` region, never the render window; `SimulationPipeline` owns no tile
 storage, runtime atlas metadata, or camera policy.
 
+### Stage order and commit seam
+
 The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
 3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
-   `.claude/rules/simulation.md` and
+   `.grok/rules/simulation.md` and
    `docs/simulation-tiers-and-pipeline.md` for the full contract):
    at step open: promote prior-step deferred impacts onto the live bus, then
    `dig_world_edit` (author world-tile edits from player digging), then at most
    one player footstep when velocity is non-trivial — all before
    `perception_update` reads `frame.stimuli` → `scope_advance_and_ai_gather` →
-   `spatial_index_build` (shared `SpatialIndexSystem`, Slice 28) →
+   `spatial_index_build` (shared `SpatialIndexSystem`) →
+   `ai_cognition_order` (the think set in the index's cell-major order) →
    `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
    `ai_decide` → `path_goal_resolve` (the step's goal table) →
@@ -612,11 +912,12 @@ The current gameplay fixed-step pipeline is:
    budgeted all-or-fail commit, capture the step's static changes into the
    collider's dirty list, run `SimulationPipeline.syncPopulationCapacity` (the
    population growth seam), sync the static colliders (recording their nav marks;
-   it runs even when the growth seam failed), then the post-commit reactions:
+   it runs even when the growth seam failed), then the post-commit nav reaction
    `reactToPostCommitNavEvents` (only after a successful growth seam and collider
-   sync, else every mark stays for the next step) and
-   `reactToPostCommitSteeringEvents` (always). The first growth, collider, or nav
-   error is returned only after the steering reaction has run. The demo state holds
+   sync, else every mark stays for the next step). Steering has no post-commit
+   reaction: it reads the synced collider rows on its own step, so a growth or
+   nav failure still leaves it on the committed statics, and a failed collider
+   sync keeps it on the pre-commit rows. The demo state holds
    this order (`commitStructuralAndReact`).
 7. Render current `WorldSystem`, `DataSystem`, and particle state with
    interpolation.
@@ -626,13 +927,15 @@ stage order, scope stats, budgets, and processor handoff for one gameplay state
 instance, while `StateStack` remains the dispatch/lifetime owner. Domain
 features are concrete pipeline-owned controllers; the pipeline is a thin
 composer and each controller and system owns its own internals
-(`.claude/rules/simulation.md`).
+(`.grok/rules/simulation.md`).
+
+### Tiers and scope
 
 Simulation tiers and active scope belong in the same pipeline boundary. Tier and
 chunk metadata are dense SoA columns on the movement-body store
 (`tier`, `chunk_x/y`, `stagger_phase`, `always_active`), in lockstep with the
 movement rows so they exist exactly for simulated entities and the O(N) scope
-passes read/write aligned columns rather than scattered slots. The pipeline-owned
+passes read/write dense columns rather than scattered slots. The pipeline-owned
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
 that derives the camera cognition halo from `WorldSystem` and selects which entities
 enter each stage; entity chunk columns are derived by the dedicated late `chunk_derive`
@@ -644,13 +947,14 @@ collision gate on tier only (no chunk filter, so off-screen entities keep moving
 and colliding) and short-circuit to full-active in O(1) via incremental
 `tier_counts` when nothing is dormant/kinematic; **cognition thinking** (perception
 observers, memory, affect, AI decide) gates on tier + camera halo + a per-entity
-stagger cadence, while the shared spatial index and perception **candidates** are
-built from the unstaggered cognition halo so off-phase agents remain visible;
-steering inherits think-set scope transitively through the navigation-intent
+stagger cadence, while the shared spatial index (and so every neighbor query's
+candidates) is built from the unstaggered cognition halo so off-phase agents
+remain visible; the think set is the indexed rows on this step's phase
+(`ai_cognition_order`); steering inherits think-set scope transitively through the navigation-intent
 stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
 ranges. Scope bounds active work per step; benches at large counts show how
-each stage scales (`.claude/rules/tests-benchmarks.md`).
+each stage scales (`.grok/rules/tests-benchmarks.md`).
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope (today every
@@ -661,6 +965,8 @@ detection/response, and `cognition` entities add AI, steering, and path
 requests. Scope then decides which worlds, chunks, chunk halos, or
 staggered/reduced-cadence groups enter those tiered stages for the current
 fixed step.
+
+### Affect
 
 Emergent NPC behavior layers on the cognition tier. Perception, memory, and
 **affect (feelings / emotion drives)** are durable per-entity concepts that live
@@ -674,7 +980,7 @@ similar). Cross-entity classification (faction/stance), a deterministic
 per-entity RNG facility in `src/core`, and a shared per-frame spatial index are
 shared substrate these stages consume. Because they *think* only for in-halo, on-phase cognition entities, their
 think cost scales with the stagger-filtered set (~N/4), not total entity
-count; the shared index and candidate table scale with the unstaggered halo.
+count; the shared index scales with the unstaggered halo.
 
 **Emotion model (Slice 31 substrate):** `AiAffect` stores independent scalar
 drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
@@ -682,22 +988,25 @@ per-entity baseline, decay rate, and threshold. `AffectSystem` appraises them
 from perception/memory (optional per row) and emits rising/falling threshold
 edges only. Behavior arbitration (`src/game/systems/arbitration.zig`, Slice
 32) consumes these drive columns directly: `scoreBehaviors` sums each drive
-against a fixed `[drive_count][behavior_count]f32` weight table (fear→flee,
+against a fixed `[drive_count][behavior_count]f32` weight table whose rows follow
+the append-only `AiAffectDrive` declaration order (fear→flee,
 aggression→pursue, curiosity→investigate, fatigue→wander), scaled by the
 agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
 threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
 `stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
 by `affect_update`, per `stage_order`). Adding a feeling:
-`.claude/rules/simulation.md` § AI and affect (roadmap
+`.grok/rules/simulation.md` § AI and affect (roadmap
 [Slice 42](roadmap/slices/slice-42.md)). See the
 [Emergent AI Track Overview](roadmap/tracks/emergent-ai.md).
+
+### Controllers
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
 domains. Controllers own feature orchestration: small queues, budgets,
 cooldowns, priority/conflict policy, and handoff between processors. They
 emit `SimulationFrame` outputs or deferred structural commands and call
-processors with typed `DataSystem` views (`.claude/rules/simulation.md`).
+processors with typed `DataSystem` views (`.grok/rules/simulation.md`).
 
 Landed pipeline-owned domain controllers (beside processors):
 
@@ -725,6 +1034,8 @@ Non-locomotion player/AI requests flow through `SimulationFrame.action_intents`
 pathfinder. Locomotion stays on `navigation_intents` → steering → `intents`
 (movement).
 
+### Processor handoff
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are
@@ -740,57 +1051,200 @@ SDL_mixer handles, live renderer texture IDs, prepared sprite records, asset
 leases, audio command buffers, input frame state, thread-system state,
 transient events, tile maps, or scratch buffers.
 
+### Movement
+
 `MovementSystem` updates movement-body slices as an ordered gameplay data
 processor, using SIMD lanes inside each assigned range and
 `ThreadSystem.parallelForWithOptions` when completion-time feedback shows the
 batch is large enough. Worker ranges are aligned to movement cache-line
 boundaries and only write their assigned movement rows.
 `MovementSystem.applyIntents` (`apply_ai_movement_intents`) runs over the step's
-merged movement intents as a threaded stage with its own tuner and an inline path:
-one dense-index resolve per intent (`DataSystem.aiMovementDenseIndex`), a 4-lane
-SIMD velocity block (default speed where speed is not positive) with a
-bit-identical scalar finish, and velocity written in place at each intent's
-movement row. Rows are disjoint because `SimulationFrame.intents` carries at most
-one movement intent per entity per step (steering's first claim), asserted at the
-stage; main keeps O(ranges) dispatch. The rows are scattered across the velocity
-columns, which `threading.md` allows: `movement-apply-intents-sorted` is its
-row-order control.
+merged movement intents as a threaded stage with its own tuner, inline when the
+tuner or a zero-worker pool stays on the caller. Each intent already carries its
+movement row (stored at steering resolve; [Steering](#steering)); the apply does
+not look one up. A full group is a 4-lane velocity write (`direction * speed`,
+speed 40 where speed is not positive), and a short group is that kernel with a
+mask. Ranges write in parallel. The stream carries at most one movement intent
+per row (steering's first claim), so the written rows are disjoint; main keeps
+O(ranges) dispatch. Steering has already sorted the merged intents by
+`movement_row`, so the walk is in row order.
 
-`CollisionSystem` is a high-throughput contact generator over entities that have
-both movement bodies and collision bounds. It owns warmed, 64-byte-aligned AABB
-proxy scratch, preserves a sorted sweep-and-prune order across fixed steps, and
-threads broadphase anchor ranges through `ThreadSystem` to emit candidate pairs
-once with SIMD Y-overlap filtering. Narrowphase then uses its own threaded batch
-over candidate pairs, computes AABB contact math with SIMD lanes inside each
-worker range, and merges range-owned contact buffers deterministically for
-same-step response. Thread-written range scratch is cache-line padded;
-persistent collision component data is not padded by default. Broadphase and
-narrowphase keep separate adaptive tuners and batch stats so each stage is
-measured against its own workload; benchmark detail rows report narrowphase
-separately so an inline narrowphase cannot be mistaken for a broadphase tuning
-result.
-Contacts are transient `SimulationFrame` data; `CollisionResponseSystem`
-consumes the completed same-step contact stream through explicit response-policy
-components in two threaded stages, each with its own tuner and an inline path.
-`gather` (over contacts) classifies each contact, resolves each response intent's
-movement row, writes its range's windows of intents, triggers, and observer
-contacts, and runs the intent math with `src/core/simd.zig`; with workers it also
-places its intents by 16-row movement band, and `apply` (over bands) applies, for
-the rows each band owns, every gather range's segment in range order (a 4-lane
-SIMD block, flushed when a row repeats). An inline gather applies its own window
-inside its timed range, so its tuner measures everything the inline choice keeps
-on main. Either way each movement row takes its intents in contact order, so the
-result is bit-identical for any worker count, range size, or tuner decision. Main
-does O(ranges) tallies, merges the trigger stream and observer contacts in range
-order (O(1) per record), and reserves everything before dispatch.
-`observerContacts` (the contacts naming the observer) serves player impacts and
-collision audio, replacing two scans of every contact.
+### Collision
+
+`CollisionSystem` generates contacts for entities that have both a movement
+body and collision bounds. `update` runs the banded fill, sort, sweep, and
+narrowphase, each under its own tuner, and the same functions inline when the
+tuner or a zero-worker pool stays on the caller. The sweep key is level, strip,
+ordered min, and entity. Statics are not sweep entries. Dynamic×static pairs
+come from `ColliderView`. Solid static×static pairs are dropped. A static
+trigger over a static is stored across steps and updated when the collider
+revision changes; `syncStaticColliders` patches or rebuilds the store at that
+sync.
+
+The stored pairs live in `TriggerStore` (`collision_triggers.zig`): per level a
+B+-tree of sorted 64-pair pages (the leaves, pooled `PayloadSlabs` slots) under
+inner nodes of up to 62 entries (3,072 B slot class). A page's header holds the
+valid and allowed slot masks (`simd.bytesMatchingMask`); a node keeps prefix
+columns of its children's pairs for each `PairCount` (`start`, `valid_start`,
+`allowed_start`), and `LevelRank` folds the levels' three counts. Emission is
+one dispatch over the emitted contacts through `emittedCursorAt`, with no count
+pass, and never reads a filtered pair. A patch buckets its edits on main, plans
+every tree height from counts, writes the fresh pages in one leaf dispatch
+(each range finds its run once), and writes the nodes on main as an
+O(1)-per-output merge with advancing run and segment cursors (not a stage).
+`collision_allow_epoch` moves when a tier crosses `allowsCollision`
+(`noteCollisionAllow` records that entity) and when a movement row is removed
+(`removeMovementBodyAt` records the removed id and any swapped tail).
+`TriggerStore.refresh` re-resolves the stored pairs that name those entities:
+it gathers their pair refs, the refresh place and sort stages order them with
+the banded sort, and the refresh dispatch writes each dirty page's rows and
+emit bits. The range that holds a page's first affected item writes that page's
+affected slots, including ones past the range's end. Untouched slots are
+not read. Main point-adds each dirty page's valid and allowed deltas into
+the later prefix entries of those counts, the node, level, and store totals,
+and `LevelRank`. Pair-start prefixes are not rewritten, and pair totals do
+not move. The fold is those dirty pages, flat in stored pairs for one
+recorded entity. `planHeights` reserves the refresh scratch to the published
+pairs before install, so a later refresh allocates nothing. A failure before the epoch stamp leaves the record list and the
+epoch; a rebuild stamps the epoch after writing current rows, and records
+from before that stamp are dropped without a dispatch. A list a drop emptied,
+still empty after the patch's inserts, leaves the pair index
+(`retireEmptyRefs`); a list that still has capacity is spared. Perf carries
+the node merge's work proof (`last_node_merge`, `last_rebuild_node_merge`
+{outputs, ns}), `last_refresh_sort`, and `last_refresh_fold` {entries, ns}.
+
+Range slots follow each dispatch's selection (`RangeSlots`, § Thread System):
+the spill, broadphase, and static-query sets, the trigger patch and rebuild
+query sets (`SlotSet`), with the rebuild set released after the store rebuild.
+The capacity seam warms only the inline slot, so a serial or single-range step
+allocates nothing from the first step. `pair_bound_overflows` and
+`entry_bound_overflows` count total-bound overflow only; range-local growth
+counts in its set's `prepare_grows` and `replays`, logged once per set
+(`slot_growth_logged`).
+
+`packFillRange` writes each slot's position, offset, size, level, and entity
+index once. `fillSlots` loads those columns in lanes; a short tail is that
+kernel with a prefix load. `chooseSplitters` still resolves its fixed sample
+on the main thread. Each band sorts its first, second, and spill runs and
+merges them. `writeSorted` then copies bounds from the proxy at `entry.slot`
+into the entry columns. `SortEntry` stays the 32-byte key, slot, and
+first-copy flag. The sweep reads those columns unit-stride and emits candidate
+pairs. Narrowphase gathers each pair's bounds and velocity and keeps overlap,
+normal, penetration, and the speed squares in lanes until the compact stores
+them. A group shorter than a lane repeats the last in-range pair and the store
+mask drops it. Compaction walks the emit mask. Range scratch is cache-line
+padded; persistent collision component data is not. With no static pairs,
+narrowphase windows merge in range order. With static pairs, dynamic and
+static contacts merge in key order. Broadphase and narrowphase keep separate
+tuners and batch stats.
+
+After the static query, one pass writes movement index, generation, an allow
+word (0 or 1), and velocity onto the hit row. Hit rows are per static-query
+slot, floored at that slot's reserve window (the pairs reserved for its
+range, capped at `reserved_query_hits`). A query whose live count fits in
+the window releases the slot to it. A wider count keeps one geometric step
+above the live count, and a one-row shrink keeps the block until capacity
+is a step above that bound. A slot the partition drops frees its hit
+storage. The contact loop streams those columns with the same overlap
+lanes. A shared edge stays a query hit and is not a contact. In Debug the
+query records the static ids it walked; after the ranges join, one compare
+checks each distinct static's stored bounds against the live rect and
+returns `StaticMovedOutsideCommit` on a mismatch. ReleaseFast does not
+record, stamp, or compare.
+
+Contacts are transient `SimulationFrame` data. `CollisionResponseSystem`
+consumes that stream through explicit response-policy components. `gather`
+(over contacts) classifies each contact, resolves each intent's movement row,
+and writes its range's windows of intents, triggers, and observer contacts.
+`computeIntentMath` streams correction and velocity scale: a full group is a
+vector load and store, and the remainder is that multiply on a prefix
+(`loadFloat4Prefix` / `storeFloat4Prefix`) so it does not read or write past
+the window. With workers, each range groups intents on a direct table keyed
+by `movement_row >> 4` and scatters correction, normal, velocity scale, kind,
+and movement row into `packed_intents` in apply order. `placeRuns` runs on
+main after the gather join, an O(1)-per-run ordered merge (not a stage; perf
+`place_ns`) so earlier ranges stay first. `apply` (over
+occupied 16-row blocks, its own tuner) streams each run as a unit-stride
+prefix. A repeated row flushes before the next intent joins it, a short group
+is the same kernel with a mask, and the open group ends at the run. Movement
+position and velocity are gathered at that flush, not packed with the intents.
+Zero workers, and a tuner that stays inline, apply inside the gather: the same
+kernel over a four-lane copy of the window, so there is no second walk of the
+contacts. Either way each movement row takes its intents in contact order, so
+the result is bit-identical for any worker count, range size, or tuner
+decision. Main does O(ranges) tallies, merges the trigger stream and observer
+contacts in range order (O(1) per record), and reserves everything before
+dispatch. `observerContacts` (the contacts naming the observer) serves player
+impacts and collision audio, replacing two scans of every contact.
+
+### Spatial index
+
+`SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) is the pipeline's one
+neighbor index. `spatial_index_build` builds it each step from the unstaggered
+cognition halo at the previous step's positions and levels, and every neighbor
+query that step reads it (`.grok/rules/simulation.md`).
+
+- **Key and records.** Each entry sorts by one 128-bit key: level | chunk_y |
+  chunk_x | faction | local_y | local_x | slot. Cells tile the world's chunk grid
+  at the configured cell rounded to a whole fraction of a chunk (at most 64 per
+  chunk edge), and positions off the grid clamp to its edge cells. Level and
+  chunk group entries by their storage unit; faction orders them ahead of
+  position inside the chunk because every hot query filters on it
+  (`.grok/rules/memory-performance.md` § Data-oriented design). The entry
+  columns (`x`, `y`, `agent_radius`, `entity_index`, `entity_generation`,
+  `population_row`, `cognition_phase`) are dense in key order. `agent_radius`
+  is 0 when the body has no steering component. Each populated chunk has one
+  `ChunkRecord`: per faction, a 64-bit row mask (bit y set when the faction holds
+  a cell on local row y) and its first `RowPart`, one (chunk, faction, local row)'s
+  occupied cells as a 64-bit mask. A cell's entries are one contiguous run. Each
+  level has a directory of 16-byte `ChunkSlot`s, one per world chunk, valid only
+  under the build's stamp; it grows for a body on a level past the world's, and an
+  empty build cuts it back to the world's levels. Every view structure is
+  identical for any partition of the build.
+- **Query.** `queryNeighbors` reads one level and a faction set within a world
+  radius; the scan box derives from the view's cell size. It visits the box's
+  pieces (cell row, then chunk) and, in each piece, one run per present wanted
+  faction, so allies and rows on other levels cost no check. Entries reach the
+  visitor four at a time (`NeighborLanes`: positions, `dx`, `dy`, `dist2`, and the
+  inside mask); an entry's lane is its rank in the scan order mod 4, and consumers
+  that sum floats sum in lane order. Every scanned entry of the level and factions
+  counts against the fixed check budget except `self`, compared only in the query
+  point's own piece. A visitor's `LaneStop` ends the query after one lane.
+- **Shared blocks.** A query's key is (level, own cell, scan box, factions); radius
+  and budget stay out of it. Consecutive queries with one key share one
+  `NeighborBlock`, a stack copy of the key's entry stream filled on demand, so the
+  agents of one cell walk their neighborhood once (`.grok/rules/engine-design.md`
+  § Cost model) while each still tests its own position, radius, budget, and FOV.
+  AI keeps one block per query kind per range, perception one per range, and
+  steering one per avoidance range; AI and perception each count their fills.
+- **Think set.** `ai_cognition_order` (`SimulationScopeSystem.compactCognition`)
+  keeps the indexed rows whose `cognition_phase` is this step's (or
+  `always_active`; every row with no cognition region), in cell-major order: records in key order, each by (local_y, local_x, faction, slot).
+  `CellMajorSpan` walks any window of cell-major positions, so ranges split a
+  dense chunk like any other. Rows sharing a cell sit together in every think-set
+  stage, which is what lets blocks reuse; every result is the same for any think
+  order.
+- **Workers.** The build runs three stages, each under a tuner the index owns:
+  `index_bucket` over population slots (resolve each body once, pack its key in
+  lanes, place it in one of 64 key bands chosen from a fixed 256-slot sample),
+  `index_sort` over entry keys (each band gathers its segments, sorts with
+  `core/sort.zig`'s `pdq`, and writes its entries and cells), and `index_link`
+  over cells (row parts, records, directory slots). Main picks the splitters, sums
+  the band prefixes, and fits the directories; `buildSerial` runs one band on the
+  calling thread. Only the sort, the build's cost driver, records
+  `.spatial_index_build` in the runtime perf log (`.grok/rules/threading.md`).
+
+### Perception
 
 `PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
-cognition-scoped `AiPerception` subset right after the shared spatial index is
-built, reusing the same `SpatialIndexView` `AiSystem` consumes rather than
-building its own grid. Vision applies range/FOV/line-of-sight gating (faction
-stance and same-level checks included). `hasLineOfSight` walks every grid
+think set's `AiPerception` rows. Each observer queries the shared index for the
+factions hostile to it on its own level; the player joins as a candidate only on
+its level. The first 16 candidates in scan order take a squared-form FOV test in
+the query's lanes, survivors are compacted and sorted nearest first, and a
+bounded line-of-sight raycast picks the nearest visible threat. The gather runs
+on workers into per-range windows that main merges in range order; each compute
+range derives its rows' facing and writes only its rows, and main emits the
+transition events after the join in row order. `hasLineOfSight` walks every grid
 cell the segment touches past the observer's own cell, bounded by the ray's
 own cell count (|dcx| + |dcy|). Through an exact grid corner either side cell
 blocks (pathfinding's no-corner-cutting rule), and a ray along a grid line also
@@ -816,13 +1270,14 @@ against the pipeline's real per-step event capacity, not a floating library
 default) with drops surfaced through event stats rather than an unhandled
 capacity error.
 
+### AI
+
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
-It receives const AiAgent + movement prior-position slices and a read-only
-`SpatialIndexView` from the pipeline-owned `SpatialIndexSystem`
-(`src/game/systems/spatial_index.zig`, Slice 28) — the shared per-step spatial
-index, built once from the unstaggered cognition halo, that AI
-separation queries for bounded local-separation samples instead of building
-its own grid. Think rows map into halo rows via `spatial_self_index`. Per row, `AiSystem` gathers perception/memory/affect signals
+It receives const AiAgent + movement prior-position slices and the read-only
+`SpatialIndexView`. Separation queries every faction on the row's level and
+cohere the row's friendly factions, both skipping the row itself and summing in
+lane order. Its gather runs on workers into per-range windows that main merges in
+range order. Per row, `AiSystem` gathers perception/memory/affect signals
 (each independently optional; an absent component contributes zero signal)
 into `arbitration.Signals` and runs them through
 `src/game/systems/arbitration.zig`'s pure utility-arbitration chain:
@@ -843,51 +1298,68 @@ order **heard stimulus → nearest in-range world interest marker → freshest
 The separation job queries `WorldSystem.interest_markers` read-only (fixed
 radius, not world-sized) only for rows with `gain_investigate > 0`. Gather
 stores the row's level and does not scan. Cohere reads a friendly-neighbor mean
-gathered from the same shared spatial index. This utility arbitration decides
+from the same shared index. This utility arbitration decides
 *what* an agent wants (a behavior and a goal); it is a distinct mechanism from
 `SteeringSystem`'s stream-priority arbitration below, which decides *which*
 emitter wins when multiple systems submit a `NavigationIntent` for the same
 entity. `AiSystem` then emits threaded navigation intents through
-`SimulationFrame.navigation_intents` (count/prefix/write). Separation and
-intent emission have independent AdaptiveWorkTuner state and benchmark stats
-so each stage can remain inline or thread independently; the index build has
-its own separate tuner on `SpatialIndexSystem`. `CollisionSystem`'s
+`SimulationFrame.navigation_intents` (count/prefix/write). The gather,
+separation, and intent emission have independent AdaptiveWorkTuner state and
+benchmark stats so each stage can remain inline or thread independently; the
+index's build stages have their own tuners on `SpatialIndexSystem`. `CollisionSystem`'s
 sweep-and-prune broadphase (see above) is intentionally not ported onto this
 index — it is a different, already-tuned algorithm, not a duplicate grid
 build.
 
+### Steering
+
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
-component data, movement slices, the shared static-collider rows, and
-frame-delayed `PathfindingSystem` status. It owns runtime path-following rows
-(indexed by steering row; an O(k) main-thread rekey follows the rows a commit
-swap-removed), replan cooldowns, unavailable-path backoff, stuck counters, and its
-agent grid outside `DataSystem`. Its prepare phase runs as threaded stages, each
-with its own tuner and an inline path: `agents` (runtime tick, agent snapshot,
-movement-index refresh), `select_resolve` and `select_claim` (one intent per
-steering row, banded first-appearance and best-intent claims with per-step
-stamps), `directions` (path status and base direction, SIMD tail, per-item path
-request prefixes), and `grid_bucket`/`grid_sort` (the agent grid in 64
-count-balanced cell-key bands whose splitters are quantiles of up to 256 rows
-sampled on main in a golden-ratio sequence, so clustered and corridor crowds split
-like uniform ones; a cell never straddles bands). With threads, a stage its tuner
-keeps inline runs the same job as threaded; the serial and zero-worker paths keep
-the single pass and single sort. Main keeps per-range and per-band bookkeeping,
-the splitters, and the rekey. The avoidance pass emits final NPC
-`MovementIntent`s through deterministic threaded range writes to
-`SimulationFrame.intents`, and the movement job writes path requests per range
-from the prefixes. Static avoidance queries `ColliderView.queryBox` (largest size
-class first, at most 64 box hits and 512 probes per agent) and pushes with SIMD
-over the packed hits, so a static change costs steering nothing; agent-agent
-avoidance reads the agent grid. Steering follows a `.partial` path like
-`.available`, requests the next hop on its replan cooldown once inside the end's
-refresh window, and holds at the end with no direction.
-Priority arbitration chooses the highest-priority navigation intent per entity
-with stable stream order as the tie-breaker.
-Player movement remains direct input with no steering component, while collision
-response still resolves after movement.
+component data, the previous step's movement positions and levels, the shared
+spatial index, the shared static-collider rows, and frame-delayed
+`PathfindingSystem` status. It owns runtime path-following rows outside
+`DataSystem`, one per steering row (replan cooldown, unavailable backoff, stuck
+counter, waypoint hint, previous direction). A commit that moves steering rows
+is rekeyed on the main thread after `agents`: O(rows the commit moved, added,
+or removed). `reserve` past `max_step_items` (the `u32` width) returns
+`OutOfMemory` before any growth; the step only asserts that width.
+
+Each stage has its own tuner and runs inline when the tuner or a zero-worker
+pool stays on the caller. There is no separate zero-worker pass.
+`agents` walks steering rows (32-row alignment) and ticks runtime cooldowns.
+`select_resolve` and `select_claim` keep one intent per steering row: the first
+in source order and the best by priority, ties to the earlier. Resolve places
+intents by steering-row band; claim's items are the placed intents, and a range
+owns every nonempty band whose start lies in its span, so a band is never split.
+`directions` walks steering rows (64-row alignment). A claimed row writes its
+selected intent into that range's window and writes only the runtime columns it
+changes; an unclaimed row in the span is left alone. Path status stays scalar.
+The direction smooth, including a short tail, is one masked lane kernel
+(`smoothDirectionLanes`). The other steering stages stay at 16-item alignment.
+Path requests are flagged here and merge in that steering-row order.
+
+The avoidance pass walks the selected intents. Agent avoidance queries the
+shared index on the agent's level (`visitLanes` over `NeighborLanes`, one
+`NeighborBlock` per range). The other agent's radius is masked-gathered from
+the index. Static avoidance queries `ColliderView.queryBox` (largest size class first,
+at most 64 box hits and 512 probes per agent) and pushes with SIMD over the
+packed hits, so a static change costs steering nothing on the step it commits. The pass writes
+movement intents in selected order, then a place and a sort (each its own
+tuner) order them by the movement row stored at resolve. Path requests are not
+part of that sort. An empty batch is zero ranges
+([Thread System](#thread-system)).
+
+`steering_update` reads `navigation_intents`, `path_goals`, and `spatial_index`,
+writes `movement_intents` and `path_requests`, and carries `static_colliders`,
+`movement_positions`, and `world_level`. Priority arbitration is the claim
+above. A `.partial` path is followed like `.available`: the next hop is
+requested on the replan cooldown once inside the end's refresh window, and the
+agent holds at the end with no direction. Player movement stays direct input
+with no steering component. Collision response still resolves after movement.
+
+### Path requests
 
 `PathfindingSystem` (`src/game/systems/pathfinding/`) is a frame-delayed, Z-aware
-grid pathfinding processor (rules: `.claude/rules/pathfinding.md`). It runs two
+grid pathfinding processor (rules: `.grok/rules/pathfinding.md`). It runs two
 solver modes per request kind: budget-bounded goal-keyed A* for individual goals,
 and a demand-driven shared-goal reverse-Dijkstra flow field for declared `group`
 requests. It owns the nav graph (§ Nav Graph And Reaction), the pending queue (a
@@ -922,7 +1394,7 @@ cache still does; Slice 64G checklist). The fixed-step work:
   window), or a candidate. Agents that share a goal key share one pending entry.
 - `group_field_expand` advances building fields (one item per field, an advance
   pass before the main-thread slot decisions and a begin pass after; stall rounds
-  have their own tuner).
+  fold into the pass's sample, `queueAdvancePass`).
 - The solve batch admits up to the per-step ceiling (`default_max_solves_per_frame`
   512, a fixed count; at most `max_escalated_solves_per_step` of them tier-1) and
   writes each output at its solve ordinal; branch-heavy A* frontier work stays
@@ -930,11 +1402,18 @@ cache still does; Slice 64G checklist). The fixed-step work:
 - Publish: the main thread claims slots, payloads, and long blocks in order, O(1)
   per result (a claim is never another claim's victim in the same publish);
   `publish_copy` copies path bytes and buckets each path's registry runs per shard
-  on workers. `registry_flush` then applies the owner log (retire, rename) and adds
-  per shard, appending each shard's sorted segment with one probe per run of
-  same-key records (`ChunkListMap.addAll`); its items are work units over the 16 shard pairs (a pair weighs its
-  ops plus its adds plus one), a range runs the pairs whose first unit lies in it,
-  and at most 15 workers dispatch. Pending compaction costs the solve window, not the queue.
+  on workers. `registry_flush` (`flushRegistry`) compacts the chunks a retire
+  touched, renames along each inverse chain, and appends that shard's
+  registrations onto the chunk's owner/order run. Its items are work units over
+  the 16 shard pairs (count weighs a pair's adds plus the inverse nodes its
+  retires mark plus one; apply weighs the compacted chunk lengths plus its adds
+  plus one), a range runs the pairs whose first unit lies in it, and at most 15
+  workers dispatch. The flush passes (count, apply) own tuners per phase: the
+  update's, the marks batch's eviction, and one one-off set shared by a shrink's
+  flush and a level rebuild's evictions (`flushSet` routes any flush there while
+  a shrink's truncation is pending); `FlushDispatch` carries the rename pass's
+  dispatch and derives each pass's. Pending compaction costs the solve window,
+  not the queue.
 
 Reachability answers before any search (`pathfinding.md`). Status, intake, and solve
 read, in order, the live goal (the key's cell when open, else its projection from
@@ -959,7 +1438,7 @@ cell on the agent's level. A two-tier ladder bounds each attempt: tier 0 runs in
 the participant's corridor scratch at 4096 abstract nodes and 512 stitched cells;
 exhausting it promotes the request once to tier 1, which runs in the tier-1 pool
 entry of its escalated admission index at fixed caps of 16384 nodes and 2048 cells,
-never derived from world size (`.claude/rules/budgets-capacities.md`). At tier 1:
+never derived from world size (`.grok/rules/budgets-capacities.md`). At tier 1:
 
 - a stitch stopped by its cell or segment cap publishes its prefix as `.partial`
   when the prefix leaves its start cell, else drops;
@@ -1004,7 +1483,13 @@ h = min(max(h_short, crossing distance), long term):
   heuristic nothing. Links are append-only; a future removal seam refolds both
   from the remaining links.
 
-The result cache (`caches.zig`) is goal-keyed (`.claude/rules/pathfinding.md`): a
+Registry publish costs O(shards): growth is read from the reserve calls'
+return values, never a sum over levels. `openRegistryLevels` is O(1) at
+unchanged level and chunk counts, opens only new levels on an append, and walks
+every level only when the chunk count changed; `ChunkDirectory.truncateLevels`
+drops closed levels and returns header storage once at most half is used.
+
+The result cache (`caches.zig`) is goal-keyed (`.grok/rules/pathfinding.md`): a
 `CacheCore` slot table and entry records (4 results per agent; round-robin victims,
 never a refusal; TTL 300 steps) whose record index is the owner id in the path
 registry. Each entry stores its path exactly in a paged inline stripe of
@@ -1013,11 +1498,12 @@ long block (`resultBlockWords`) from a paged pool the publish reserve grows, at 
 one per entry, plus its end and goal cell. A grow appends pages and copies nothing; a
 shrink selects survivors by an O(n) radix pass (oldest first, equal to the age
 order), `resize_copy` moves path bytes on workers, tail pages free, and the owner log
-renames registry owners. A shrink's registry flush runs at a fixed one-range-per-pair
-shape outside the flush tuner. The path registry is 16 `ChunkListMap` shards keyed
-by (level, chunk) (shard = top bits of `std.hash.int` of the key): every published
-path registers each run of consecutive cells on one level in one chunk, so eviction
-reaches exactly the results whose cells a change touches.
+renames registry owners. A shrink's registry flush records once on the one-off flush set
+(`flushSet`). The path registry is one padded `ChunkDirectory`
+of per-chunk runs (`owner`, `order`, `inverse`) plus 16 inverse pools. A chunk
+key's shard is the top bits of `std.hash.int` of the key. Every published path
+registers each run of consecutive cells on one level in one chunk, so eviction
+reads that chunk's run.
 
 Group fields (`group_field.zig`) build only for declared group requests whose
 decaying per-step tally reaches `min_group_field_agents` (1024 sharers, a fixed
@@ -1051,19 +1537,23 @@ The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects are
 plain entities processed by enemy, movement, collision, AI, or render systems.
 
+### Particles
+
 `ParticleSystem` is the transient visual-effect exception. It is owned by the
 game state instead of `DataSystem`, because particles are short-lived effect
 rows rather than persistent world entities. Particle emission and expired row
 swap-removal run on the state/main thread; threaded jobs only update assigned
 SoA ranges and render submits rectangles through `Renderer`.
 
+### Frame outputs
+
 Simulation outputs coordinate determinism, performance, and efficiency as one
 contract. Threaded processors that produce events, intents, contacts, or
 deferred structural commands use typed range-owned output buffers: count outputs
 per stable range, prefix offsets on the main thread, write contiguous output
 slices, merge by range index, and consume the result as a batch. Passes with at
-most one output per item (scope gathers and tier policy, the spatial gather, the
-collision narrowphase) write fixed per-range windows of one item-count buffer
+most one output per item (scope gathers, tier policy, and the think set; the AI
+and perception gathers; the collision narrowphase) write fixed per-range windows of one item-count buffer
 plus a padded tally and compact in range order, so their capacity-seam reserve
 covers every partition (Slice 72 C5). Events derived from per-row state after
 the join (perception transitions, affect crossings) use no output buffer at all
@@ -1086,7 +1576,7 @@ boundary. The current event payloads cover structural
 entity/component changes, world tile/obstacle changes, and navigation-region
 invalidation. Event records carry only stable entity IDs, component enums,
 reason enums, compact coordinates, and small scalar payloads
-(`.claude/rules/simulation.md`).
+(`.grok/rules/simulation.md`).
 
 High-volume streams stay specialized. Collision contacts, collision triggers,
 navigation intents, movement intents, path requests, render-prep commands, and
@@ -1106,7 +1596,7 @@ nav graph (§ Nav Graph And Reaction).
 
 The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`, the one-way
 closure in `connectivity_closure.zig`) is stored per chunk
-(`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile and
+(`.grok/rules/budgets-capacities.md`). With a world, a nav cell is a tile and
 a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
 bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
 
@@ -1120,7 +1610,7 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   4 × ceil(E / 2)), its open link-endpoint portals, the links leaving them, and one
   connectivity node per portal-bearing label. Records, link slots, and nodes are
   pools with exact free lists (`growPool`), so a release never allocates. Graph
-  node ids never leave a batch (`.claude/rules/pathfinding.md`).
+  node ids never leave a batch (`.grok/rules/pathfinding.md`).
 - **Connectivity.** Each node's row holds a comp, and every comp hangs off one
   root, so two nodes connect over border mirrors and two-way links exactly when
   their comps share a root. Over the roots sits the exact one-way closure: a
@@ -1130,16 +1620,23 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   it. Memory follows nodes and terminals; a one-way system of k terminals holds
   about k²/32 words, inherent to an exact table.
 - **Statics.** `StaticColliderSystem` rows (one per static navigation obstacle:
-  committed AABB, level, cell span) are listed per (level, chunk) in a
-  `ChunkListMap` in entity-index order, plus a query tier (a size-class map with
-  per-chunk anchor bitmaps) for `ColliderView.queryBox`. The commit seam captures
-  the step's entity changes into a persistent dirty list; `sync` applies them with
-  O(1) main work per change and a threaded `static_collider_splice` stage that
-  places list entries in entity order, so a static add, move, or destroy costs its
-  own footprint chunks, never the static count.
+  committed AABB, level, cell span) sit in a `ChunkDirectory` of per-chunk
+  column runs: nav spans, and query columns in cell then entity order, with
+  per-chunk anchor bitmaps and a size-class tier. `ColliderView.queryBox` and
+  `collectOverlaps` read the column span the box covers. The overlap test is
+  one masked compare: a full group loads four lanes, and a short slice is that
+  compare with a prefix load. The anchor walk and the chunk search stay
+  scalar. `queryBox` uses that compare and stops on its work budget and hit
+  cap; a group stops at the remaining budget, and a hit that fills the cap
+  drops later lanes. The commit seam captures the step's entity changes into a
+  persistent dirty list. `sync` plans with O(1) main work per dirty static and
+  per footprint chunk, then one `chunk_rewrite` dispatch fills fresh payloads
+  (recorded as `static_collider_splice`). A row whose chunks, AABB, and query
+  key are unchanged is not rewritten, so a static add, move, or destroy costs
+  its own footprint chunks, never the static count.
 
 `PathfindingSystem` owns the post-commit nav reaction end to end
-(`.claude/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).
+(`.grok/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).
 Writers record what changed, never the reaction: a terrain writer (the dig
 stage, plane traversal's carve batch) reserves its record before its world write
 (`reserveTerrainNavRecord`) and records its appended events right after it, even
@@ -1194,7 +1691,7 @@ equalize the family's claimed counts, and main merges claims, joins, and queue
 splices in item order at O(1) per item; every round runs under one profile selected
 once and recorded once (`RoundDispatch`). A removal therefore costs about its smaller
 side when it splits a component, or the reach until both floods meet when it does
-not, the reachability exception in `.claude/rules/budgets-capacities.md` (measured:
+not, the reachability exception in `.grok/rules/budgets-capacities.md` (measured:
 at most ~2.2× the smaller side, a thin tunnel ~2× its length, flat in level side
 256–2048, `e793590`). A change touching no one-way system does no closure work. A
 touched system re-resolves its links (threaded per link), masks the rows whose reach
@@ -1214,9 +1711,13 @@ H-component ids use the full u32.
 Every stage has its own tuner and an inline path: `nav_mark` and the eviction trio
 (`nav_evict_count`, `nav_evict`, `evict_flush`) on `PathfindingSystem`, and the
 graph's `NavStage` tuners (`plan`, `remask`, `patch`, `conn_seed`, `conn_gather`,
-`conn_flood`, `conn_closure_candidates`, `_resolve`, `_mask`, `_plan`, `_rows`,
-`_land`) under one `nav_controls`. The main thread keeps O(1) work per item
-(`.claude/rules/threading.md`); a single dominant one-way system's Tarjan is one
+`conn_flood`, `conn_closure_candidates`, `_resolve`, `_mask`, `_plan`, `_copy`
+(the relocated-span copy, before the rows), `_rows`, `_land`) under one
+`nav_controls`. The marks batch runs them on the `nav` set; level builds (world
+create, a full rebuild, a step's level appends and content rebuilds) run on the
+separate `nav_build` set, started fresh on the one-off config at every build
+(`Tuners.startNavBuild`). The main thread keeps O(1) work per item
+(`.grok/rules/threading.md`); a single dominant one-way system's Tarjan is one
 item, so it runs where the thread system places one item, and its rows thread. The
 runtime perf log records `nav_remask`, `nav_connect` (the flood rounds), `nav_closure`
 (the closure rows), and `nav_evict`. `NavUpdateStats` folds the plan, remask, and
@@ -1259,4 +1760,4 @@ or NEON on ARM targets, when the target and optimization mode make that
 profitable. Platform intrinsics such as x86 or ARM-specific calls stay hidden
 from gameplay.
 
-When to use them: `.claude/rules/memory-performance.md`.
+When to use them: `.grok/rules/memory-performance.md`.

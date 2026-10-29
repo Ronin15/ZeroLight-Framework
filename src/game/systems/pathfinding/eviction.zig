@@ -18,10 +18,11 @@ const navDispatch = @import("system.zig").navDispatch;
 const EvictItem = @import("types.zig").EvictItem;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const dilateChanged3x3 = @import("nav_grid.zig").dilateChanged3x3;
 const bitIsSet = @import("../../world/terrain.zig").bitIsSet;
@@ -30,20 +31,19 @@ const keyLevel = @import("../chunk_list_map.zig").keyLevel;
 const keyChunk = @import("../chunk_list_map.zig").keyChunk;
 const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
-const ChunkListMap = @import("../chunk_list_map.zig").ChunkListMap;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
-const no_entry = @import("../chunk_list_map.zig").no_entry;
+const registrationLen = @import("publish.zig").registrationLen;
+const registrationRun = @import("publish.zig").registrationRun;
 const GroupField = @import("group_field.zig").GroupField;
 const ResultCache = @import("caches.zig").ResultCache;
 const publish = @import("publish.zig");
 const group_service = @import("group_service.zig");
 const types = @import("types.zig");
 const NavUpdateStats = @import("types.zig").NavUpdateStats;
-const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const no_owner = @import("types.zig").no_owner;
 const CellCursor = @import("types.zig").CellCursor;
-const registry_shard_count = @import("types.zig").registry_shard_count;
-const registryShard = @import("types.zig").registryShard;
 const evict_range_alignment_items = @import("types.zig").evict_range_alignment_items;
 const hit_window_alignment_items = @import("types.zig").hit_window_alignment_items;
 
@@ -61,33 +61,35 @@ pub fn evictLevel(self: *PathfindingSystem, level: u16, stats: *NavUpdateStats) 
     for (0..self.graph.chunkCount()) |chunk| {
         // A level's chunk count stays below 2^31.
         const key = chunkKey(level, @intCast(chunk));
-        var owners = self.path_index[registryShard(key)].iterator(key);
-        while (owners.next()) |owner| {
+        const run = registrationRun(&self.path_index.directory, key);
+        for (run.owner[0..run.len]) |owner| {
             // Another run of the owner may have evicted it already.
             if (!self.completed.core.records.items[owner].live) continue;
             // A live record's key holds its probe slot.
             self.completed.removeAt(self.completed.slotIndex(self.completed.core.keyOf(owner)).?);
-            stats.evicted_results += 1;
+            if (comptime runtime_perf_log.enabled) stats.perf.evicted_results += 1;
         }
     }
     for (self.group_fields.items, 0..) |field, slot| {
         if (field.state == .empty or field.key.goal_level != level) continue;
         group_service.emptyGroupField(self, slot);
-        stats.dropped_fields += 1;
+        if (comptime runtime_perf_log.enabled) stats.perf.dropped_fields += 1;
     }
 }
 
-/// The flush of the rebuilt levels' evictions: a level's worth of retires, a one-off the
-/// flush tuner has no profile for, so a tuned dispatch runs at a fixed shape of about one
-/// pair per range, outside the tuner (as a shrink's flush), and the marks batch's flush
-/// stays the stage's one sample of the step.
-pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSystem) BatchStats {
-    var dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
-    if (dispatch) |*stage| {
-        // A flush with no publish weighs each pair at its ops plus one.
-        if (stage.adaptive and stage.items_per_range == null) stage.items_per_range = self.completed.core.ownerLog().len + 1;
-    }
-    return publish.flushRegistry(self, dispatch, null);
+/// A nav reaction's registry flush on `tuners` (an eviction phase's set), or on the one-off
+/// set while a shrink's truncation is pending (`publish.flushSet`), under the nav controls;
+/// null without a thread system.
+pub fn evictFlushDispatch(self: *PathfindingSystem, thread_system: ?*ThreadSystem, tuners: *publish.FlushTuners) ?publish.FlushDispatch {
+    const threads = thread_system orelse return null;
+    return .{ .rename = Dispatch.init(threads, &self.tuners.registry_rename, self.nav_controls), .tuners = publish.flushSet(self, tuners) };
+}
+
+/// The flush of the rebuilt levels' evictions on the one-off flush set (`one_off_flush`, a
+/// cache shrink's too): a level's worth of retires, so the marks batch's eviction flush stays
+/// its set's one sample of the step.
+pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!BatchStats {
+    return publish.flushRegistry(self, evictFlushDispatch(self, thread_system, &self.tuners.one_off_flush), null);
 }
 
 /// Eviction before the batch commit, one item per changed key (a chunk with a changed
@@ -98,10 +100,11 @@ pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSy
 /// them, O(1) per key. Reads only the batch's keys and the registry. On error the graph,
 /// cache, and registry are as they were.
 pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) !void {
-    // Every update and reaction ends flushed, so every registration names a live entry.
-    std.debug.assert(self.completed.core.ownerLog().len == 0 and self.publish_ranges == 0);
+    // The reaction finished a failed flush first, and its level rebuilds end flushed, so
+    // the walk sees every published path's runs and every registration names a live entry.
+    std.debug.assert(!publish.registryBehind(self));
     var section = StageTimer.begin();
-    defer stats.main.reserve_ns += section.lap();
+    defer stats.addMain(.reserve_ns, section.lap());
     const keys = self.graph.changed_keys.items;
     self.evict_items.clearRetainingCapacity();
     self.evict_hits.clearRetainingCapacity();
@@ -114,19 +117,20 @@ pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, 
     self.evict_items.items.len = keys.len;
     @memset(self.evict_items.items, .{});
     const count_dispatch = navDispatch(self, thread_system, &self.tuners.nav_evict_count);
-    const count_shape = stageShape(count_dispatch, keys.len, evict_range_alignment_items);
+    const count_shape = StageShape.select(count_dispatch, keys.len, evict_range_alignment_items);
     var job = EvictCountJob{
         .changed_keys = keys,
-        .readers = registryReaders(self),
+        .directory = &self.path_index.directory,
         .geometry = self.graph.chunkGeometry(),
         .items = self.evict_items.items,
         .range_count = count_shape.range_count,
     };
-    stats.main.reserve_ns += section.lap();
-    stats.evict_count_batch = runShaped(count_dispatch, count_shape, keys.len, evict_range_alignment_items, &job, evictCountJob);
+    stats.addMain(.reserve_ns, section.lap());
+    const count_batch = runShaped(count_dispatch, count_shape, keys.len, evict_range_alignment_items, &job, evictCountJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.evict_count_batch = count_batch;
     section = StageTimer.begin();
     // The walk's shape now, so each of its ranges' hit windows starts on a line.
-    self.evict_shape = stageShape(navDispatch(self, thread_system, &self.tuners.nav_evict), keys.len, evict_range_alignment_items);
+    self.evict_shape = StageShape.select(navDispatch(self, thread_system, &self.tuners.nav_evict), keys.len, evict_range_alignment_items);
     const field_count = self.group_fields.items.len;
     var total: usize = 0;
     for (self.evict_items.items, 0..) |*item, index| {
@@ -149,7 +153,7 @@ pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, 
 /// changed cells. It writes the hits into the item's window; the main thread removes them
 /// in item order (paths, then fields), O(1) each, and the flush unlinks their
 /// registrations.
-pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) void {
+pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) error{OutOfMemory}!void {
     const keys = batch.changed_keys;
     std.debug.assert(keys.len == self.evict_items.items.len and batch.changed_masks.len == keys.len);
     if (keys.len != 0) {
@@ -157,52 +161,51 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
             .cache = &self.completed,
             .changed_keys = keys,
             .masks = batch.changed_masks,
-            .readers = registryReaders(self),
+            .directory = &self.path_index.directory,
             .fields = self.group_fields.items,
             .geometry = self.graph.chunkGeometry(),
             .items = self.evict_items.items,
             .hits = self.evict_hits.items,
             .range_count = self.evict_shape.range_count,
         };
-        stats.evict_batch = runShaped(navDispatch(self, thread_system, &self.tuners.nav_evict), self.evict_shape, keys.len, evict_range_alignment_items, &job, evictJob);
+        const evict_batch = runShaped(navDispatch(self, thread_system, &self.tuners.nav_evict), self.evict_shape, keys.len, evict_range_alignment_items, &job, evictJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.evict_batch = evict_batch;
         const removal_timer = StageTimer.begin();
-        defer stats.main.evict_ns += removal_timer.lap();
+        defer stats.addMain(.evict_ns, removal_timer.lap());
         for (self.evict_items.items) |item| {
-            stats.evict_entries_visited += item.visited;
+            if (comptime runtime_perf_log.enabled) stats.perf.evict_entries_visited += item.perf.visited;
             const window = self.evict_hits.items[item.base..];
             for (window[0..item.hits]) |owner| {
                 // Another halo key's run may have hit the owner already.
                 if (!self.completed.core.records.items[owner].live) continue;
                 // A live record's key holds its probe slot.
                 self.completed.removeAt(self.completed.slotIndex(self.completed.core.keyOf(owner)).?);
-                stats.evicted_results += 1;
+                if (comptime runtime_perf_log.enabled) stats.perf.evicted_results += 1;
             }
             for (window[item.bound..][0..item.field_hits]) |slot| {
                 if (self.group_fields.items[slot].state == .empty) continue;
                 group_service.emptyGroupField(self, slot);
-                stats.dropped_fields += 1;
+                if (comptime runtime_perf_log.enabled) stats.perf.dropped_fields += 1;
             }
         }
     }
-    const flush_dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
     const flush_timer = StageTimer.begin();
-    stats.evict_flush_batch = publish.flushRegistry(self, flush_dispatch, null);
-    // The flush's code outside its dispatch, inline or not.
-    stats.main.evict_ns += flush_timer.lap() -| stats.evict_flush_batch.batch_duration_ns;
-    stats.addStageTime(stats.evict_count_batch);
-    stats.addStageTime(stats.evict_batch);
-    stats.addStageTime(stats.evict_flush_batch);
+    const flush_batch = try publish.flushRegistry(self, evictFlushDispatch(self, thread_system, &self.tuners.evict_flush), null);
+    if (comptime runtime_perf_log.enabled) {
+        const count_batch = self.perf.last_flush_count_batch;
+        // Both dispatches, inline or not: what remains is the flush's code outside them.
+        stats.addMain(.evict_ns, flush_timer.lap() -| flush_batch.batch_duration_ns -| count_batch.batch_duration_ns);
+        stats.perf.evict_flush_batch = flush_batch;
+        stats.perf.registry_flush_count_batch = count_batch;
+        stats.addStageTime(count_batch);
+        stats.addStageTime(stats.perf.evict_count_batch);
+        stats.addStageTime(stats.perf.evict_batch);
+        stats.addStageTime(flush_batch);
+    }
 }
 
 fn countEvictGrowth(self: *PathfindingSystem) void {
     self.evict_growth.record(1, .info, "path eviction scratch grew to {d} keys and {d} hits", .{ self.evict_items.capacity, self.evict_hits.capacity });
-}
-
-// Lookups of every path registry shard, for readers on workers while nothing writes.
-fn registryReaders(self: *const PathfindingSystem) [registry_shard_count]ChunkListMap.Reader {
-    var readers: [registry_shard_count]ChunkListMap.Reader = undefined;
-    for (&readers, &self.path_index) |*reader, *shard| reader.* = shard.reader();
-    return readers;
 }
 
 fn orderKey(key: u64, item: u64) std.math.Order {
@@ -239,14 +242,14 @@ fn chunkAround(geometry: ChunkGeometry, level: u16, x: usize, y: usize, dx: isiz
 const EvictCountJob = struct {
     // The batch's changed keys, sorted.
     changed_keys: []const u64,
-    readers: [registry_shard_count]ChunkListMap.Reader,
+    directory: *const publish.RegistryDirectory,
     geometry: ChunkGeometry,
     items: []EvictItem,
     range_count: usize,
 };
 
-// SIMD verdict: scalar. Binary searches over sorted u64 keys and hash probes; simd.zig has
-// no u64 lanes.
+// SIMD verdict: scalar. Binary searches over sorted u64 keys; the registration count is one
+// slot read. simd.zig has no u64 lanes.
 fn evictCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EvictCountJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
@@ -260,7 +263,7 @@ fn evictCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
             if (chunkAround(job.geometry, level, x, y, dx, dy)) |halo| {
                 // A halo key with no registration has nothing to walk.
-                const registrations = job.readers[registryShard(halo.key)].keyCount(halo.key);
+                const registrations = registrationLen(job.directory, halo.key);
                 if (registrations != 0 and ownsHalo(job.changed_keys[0..index], key, job.geometry, level, halo.x, halo.y)) {
                     item.owned |= haloBit(dx, dy);
                     item.bound += registrations;
@@ -290,7 +293,7 @@ const EvictJob = struct {
     // The batch's changed keys, sorted, and each one's flipped cells.
     changed_keys: []const u64,
     masks: []const ChunkBits,
-    readers: [registry_shard_count]ChunkListMap.Reader,
+    directory: *const publish.RegistryDirectory,
     fields: []const GroupField,
     geometry: ChunkGeometry,
     items: []EvictItem,
@@ -298,8 +301,8 @@ const EvictJob = struct {
     range_count: usize,
 };
 
-// SIMD verdict: the dilation is word-parallel scalar (`dilateChanged3x3`); the list walks
-// are pointer chases and the cell and field tests one bit or word per cell.
+// SIMD verdict: the dilation is word-parallel scalar (`dilateChanged3x3`); the registration
+// columns are contiguous and the cell and field tests are one bit or word per cell.
 fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EvictJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
@@ -323,13 +326,11 @@ fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
                 };
                 const dilated = dilateChanged3x3(job.geometry.chunk_tiles, &around);
                 if (!std.mem.allEqual(u64, &dilated, 0)) {
-                    const reader = job.readers[registryShard(halo.key)];
-                    var entry = reader.head(halo.key);
-                    while (entry != no_entry) : (entry = reader.next_entries[entry]) {
-                        visited += 1;
-                        const owner = reader.owners[entry];
+                    const run = registrationRun(job.directory, halo.key);
+                    for (run.owner[0..run.len], run.order[0..run.len]) |owner, order| {
+                        if (comptime runtime_perf_log.enabled) visited += 1;
                         if (owner == last_hit) continue;
-                        if (!runHits(job.cache, job.geometry, owner, reader.orders[entry], level, halo.x, halo.y, &dilated)) continue;
+                        if (!runHits(job.cache, job.geometry, owner, order, level, halo.x, halo.y, &dilated)) continue;
                         // Each entry hits once, and the bound counts the owned lists' entries.
                         std.debug.assert(hits < item.bound);
                         job.hits[item.base + hits] = owner;
@@ -340,7 +341,7 @@ fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             }
         };
         item.hits = hits;
-        item.visited = visited;
+        if (comptime runtime_perf_log.enabled) item.perf.visited = visited;
     }
 }
 
@@ -419,17 +420,16 @@ fn runHits(cache: *const ResultCache, geometry: ChunkGeometry, owner: u32, start
 // ----------------------------------------------------------------------------------------
 
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const PathStatus = @import("types.zig").PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
-const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
-const solve = @import("solve.zig");
 const PathfindingStats = @import("types.zig").PathfindingStats;
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const emptyKey = @import("types.zig").emptyKey;
@@ -447,6 +447,7 @@ const pocket_world_side = test_support.pocket_world_side;
 const pocketGoal = test_support.pocketGoal;
 const pocketWorld = test_support.pocketWorld;
 const publishTestPath = test_support.publishTestPath;
+const publishTestStitched = test_support.publishTestStitched;
 const registryRouteKey = test_support.registryRouteKey;
 const registrySystem = test_support.registrySystem;
 const registrySystemWith = test_support.registrySystemWith;
@@ -477,6 +478,8 @@ fn pathNearCells(system: *const PathfindingSystem, owner: u32, changed: []const 
 }
 
 test "eviction equals a brute-force reference: exactly the cached paths with a cell within one cell of a changed cell" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -505,14 +508,14 @@ test "eviction equals a brute-force reference: exactly the cached paths with a c
             flipped_count += 1;
         }
         var expected: [route_count]bool = undefined;
-        for (&expected, 0..) |*evicted, index| evicted.* = pathNearCells(&system, system.completed.core.ownerOf(registryRouteKey(&system, index, 24)).?, flipped[0..flipped_count]);
+        for (&expected, 0..) |*evicted, index| evicted.* = pathNearCells(&system, test_support.cacheOwnerOf(system.completed.core, registryRouteKey(&system, index, 24)).?, flipped[0..flipped_count]);
         if (flipped_count == 0) {
             // The cell keeps its tile: marked, but no cell changed.
             try test_support.recordTileEdits(&system, &fixture.world, &.{.{ .level = 0, .x = cells[0][0], .y = cells[0][1] }});
         } else {
             try setRegistryCells(&system, &fixture, cells, fixture.tree);
         }
-        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         var evicted_any = false;
         for (expected, 0..) |evicted, index| {
             try std.testing.expectEqual(evicted, system.completed.slotIndex(registryRouteKey(&system, index, 24)) == null);
@@ -522,12 +525,14 @@ test "eviction equals a brute-force reference: exactly the cached paths with a c
         try expectRegistryMatchesCache(&system);
         if (flipped_count != 0) {
             try setRegistryCells(&system, &fixture, cells, fixture.grass);
-            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         }
     }
 }
 
 test "a path that leaves and re-enters a chunk is evicted by a change on its second run" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -549,13 +554,14 @@ test "a path that leaves and re-enters a chunk is evicted by a change on its sec
     try publishTestPath(&system, key, &.{ cell(1, 1), cell(2, 1), cell(3, 1), cell(4, 1), cell(5, 1), cell(5, 2), cell(4, 2), cell(3, 2) }, 1, &stats);
     // (2,3) touches only the second run: two cells from every cell of the first.
     try setRegistryCells(&system, &fixture, &.{.{ 2, 3 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), reaction.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(key) == null);
     try expectRegistryMatchesCache(&system);
 }
 
 test "a path whose diagonal step corners on a changed cell in a diagonal-neighbour chunk is evicted" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -576,8 +582,7 @@ test "a path whose diagonal step corners on a changed cell in a diagonal-neighbo
     // only (4,4) neighbours (3,3), in chunk (0,0), the diagonal neighbour of (1,1).
     try publishTestPath(&system, key, &.{ cell(5, 3), cell(4, 4), cell(5, 5) }, 1, &stats);
     try setRegistryCells(&system, &fixture, &.{.{ 3, 3 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), reaction.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(key) == null);
     try expectRegistryMatchesCache(&system);
 }
@@ -585,7 +590,9 @@ test "a path whose diagonal step corners on a changed cell in a diagonal-neighbo
 // Publishes `unrelated` one-cell paths in chunks two or more chunks from (1, 1), and three
 // paths through chunk (1, 1) of a 64-tile registry world; digs (5, 5) and returns the
 // registry entries the eviction visited.
-fn visitedWithUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !usize {
+fn expectEvictedAmongUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var fixture = try registryWorld(meta, 64);
@@ -605,21 +612,22 @@ fn visitedWithUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !usize 
         try publishTestPath(&system, key, &.{ y * 64 + 4, y * 64 + 5, y * 64 + 6 }, 1, &stats);
     }
     try setRegistryCells(&system, &fixture, &.{.{ 5, 5 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 3), reaction.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+    // The three paths through the changed cell go; every unrelated one stays.
+    try std.testing.expectEqual(unrelated, system.completed.count());
     try expectRegistryMatchesCache(&system);
-    return reaction.evict_entries_visited;
 }
 
-test "path eviction visits only results registered in the changed chunks' halo (equal entries visited with 10 and 1000 unrelated results)" {
+test "path eviction removes only the results through the changed cells, with 10 or 1000 unrelated results cached" {
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
-    const few = try visitedWithUnrelated(&meta, 10);
-    try std.testing.expectEqual(few, try visitedWithUnrelated(&meta, 1000));
-    try std.testing.expectEqual(@as(usize, 3), few);
+    try expectEvictedAmongUnrelated(&meta, 10);
+    try expectEvictedAmongUnrelated(&meta, 1000);
 }
 
 test "a new link evicts no cached path" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -634,18 +642,19 @@ test "a new link evicts no cached path" {
     try solveRegistryRoutes(&system, requester, 24, 0, 40, 64, null, .{});
     const cached = system.completed.count();
     // A ramp on a cell a cached path crosses, and its far end below.
-    const first = storedPath(&system, system.completed.core.ownerOf(registryRouteKey(&system, 0, 24)).?);
+    const first = storedPath(&system, test_support.cacheOwnerOf(system.completed.core, registryRouteKey(&system, 0, 24)).?);
     const on_path: u16 = @intCast(first.cells[first.cells.len / 2]);
     const ramp_cell = @import("../../world/system.zig").CellCoord{ .x = @intCast(on_path % 24), .y = @intCast(on_path / 24) };
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 0, .cell_a = ramp_cell, .level_b = 1, .cell_b = ramp_cell, .traversal_cost = 1, .bidirectional = true });
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), reaction.evicted_results);
     try std.testing.expectEqual(cached, system.completed.count());
     try expectRegistryMatchesCache(&system);
 }
 
 test "a cached corridor is evicted only by a change on its own level's cells" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -673,32 +682,11 @@ test "a cached corridor is evicted only by a change on its own level's cells" {
     try expectRegistryMatchesCache(&system);
     // Level 0 cell (1, 1) neighbours level-0 cells 0..2 only.
     try setRegistryCells(&system, &fixture, &.{.{ 1, 1 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 2), reaction.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(keys[0]) == null);
     try std.testing.expect(system.completed.slotIndex(keys[1]) != null);
     try std.testing.expect(system.completed.slotIndex(keys[2]) == null);
     try expectRegistryMatchesCache(&system);
-}
-
-// Stores the stitched `corridor` for `key` at `step` as one publish would, its registry
-// runs included, and flushes the registry.
-fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const types.StitchedCell, step: u32, stats: *PathfindingStats) !void {
-    system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], corridor[corridor.len - 1].cell, step, stats);
-    types.writeStitched(system.completed.destination(claimed), corridor);
-    _ = publish.flushRegistry(system, null, null);
-    const view = types.stitchedView(system.completed.destination(claimed), corridor.len);
-    var starts: [64]u16 = undefined;
-    var counts: [registry_shard_count]u32 = @splat(0);
-    const geometry = system.graph.chunkGeometry();
-    const run_count = solve.splitRuns(geometry, view.cells, view.levels, 0, &starts, &counts);
-    for (starts[0..run_count]) |start| {
-        const run_key = chunkKey(view.levels[start], geometry.chunkOfCell(view.cells[start]));
-        const shard = &system.path_index[registryShard(run_key)];
-        try shard.reserve(1, 1, system.completed.logicalCapacity());
-        shard.add(claimed.owner, run_key, start);
-    }
 }
 
 // Flips one cell in each of 20 chunks (a 5 x 4 chunk block) of a 24-tile registry world.
@@ -709,7 +697,6 @@ const dense_change_cells = blk: {
 };
 
 test "eviction allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -719,7 +706,6 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try registrySystem(&data, &fixture.world, 64);
     defer system.deinit();
     system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
@@ -732,18 +718,137 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
     try solveRegistryRoutes(&system, requester, 24, 0, 60, 64, null, .{});
 
     try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
+    const cached = system.completed.count();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
     const reaction = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     setSystemAllocators(&system, std.testing.allocator);
-    const stats = try reaction;
+    _ = try reaction;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(stats.evicted_results != 0);
-    try std.testing.expect(!stats.evict_count_batch.ran_inline and !stats.evict_batch.ran_inline);
+    try std.testing.expect(system.completed.count() < cached);
+    try expectRegistryMatchesCache(&system);
+}
+
+test "a nav reaction after a registry flush that ran out of memory past its publish finishes that flush first, so a dig on a path claimed in the failed step evicts it (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const requester = try data.createEntity();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (0..16) |index| {
+        const route = test_support.registryRoute(index, 24);
+        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var behind: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fixture = try registryWorld(&meta, 24);
+        defer fixture.world.deinit();
+        var system = try registrySystem(&data, &fixture.world, 32);
+        defer system.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        setSystemAllocators(&system, failing.allocator());
+        const failed = updatePathfindingInline(&system, &stream, 32, .{});
+        setSystemAllocators(&system, std.testing.allocator);
+        if (failed) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // A failure before the claims leaves no publish behind.
+        if (system.publish_ranges == 0) continue;
+        behind += 1;
+        // A claimed path of at least three cells, dug at its middle cell.
+        var owner: u32 = 0;
+        while (!system.completed.core.records.items[owner].live or storedPath(&system, owner).cells.len < 3) owner += 1;
+        const key = system.completed.core.keyOf(owner);
+        const cells = storedPath(&system, owner).cells;
+        const middle = cells[cells.len / 2];
+        try setRegistryCells(&system, &fixture, &.{.{ @intCast(middle % 24), @intCast(middle / 24) }}, fixture.tree);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+        try std.testing.expect(system.completed.slotIndex(key) == null);
+        try std.testing.expect(!publish.registryBehind(&system));
+        try expectRegistryMatchesCache(&system);
+    }
+    try std.testing.expect(behind != 0);
+}
+
+test "a nav reaction that rebuilds a level after a registry flush that ran out of memory past its publish finishes that flush first: the failed step's paths are evicted and no registration names a retired owner (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const requester = try data.createEntity();
+    // Sixteen routes past the 64 the cache holds: each claim retires a cached victim and
+    // takes its owner id.
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (64..80) |index| {
+        const route = test_support.registryRoute(index, 24);
+        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var behind: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fixture = try registryWorld(&meta, 24);
+        defer fixture.world.deinit();
+        var system = try registrySystem(&data, &fixture.world, 16);
+        defer system.deinit();
+        for (0..4) |batch| try solveRegistryRoutes(&system, requester, 24, batch * 16, 16, 16, null, .{});
+        try std.testing.expectEqual(@as(usize, 64), system.completed.count());
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        setSystemAllocators(&system, failing.allocator());
+        const failed = updatePathfindingInline(&system, &stream, 16, .{});
+        setSystemAllocators(&system, std.testing.allocator);
+        if (failed) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // A failure before the claims leaves no publish behind.
+        if (system.publish_ranges == 0) continue;
+        // The claims logged their victims' retires, and reused owner ids wait in the
+        // publish windows.
+        try std.testing.expect(system.completed.core.ownerLog().len != 0);
+        behind += 1;
+        // Level 0 changes without per-cell events: every cached path runs on it.
+        _ = try fixture.world.addDenseLayer(0, 0, .obstacle, fixture.tree);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+        try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
+        try std.testing.expectEqual(@as(usize, 0), system.completed.count());
+        try std.testing.expect(!publish.registryBehind(&system));
+        try expectRegistryMatchesCache(&system);
+    }
+    try std.testing.expect(behind != 0);
+}
+
+test "a scoped eviction's registry flush runs on its own flush set and leaves the update flush's set untouched" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var system = try registrySystemWith(&data, &fixture.world, 64, .{ .participants = threads.participantSlotCount() });
+    defer system.deinit();
+    try solveRegistryRoutes(&system, requester, 24, 0, 60, 64, &threads, .{});
+    try std.testing.expect(system.tuners.registry_flush.get(.count).last_request != null);
+    try std.testing.expect(system.tuners.evict_flush.get(.count).last_request == null);
+    const update_flush = system.tuners.registry_flush;
+    try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
+    const cached = system.completed.count();
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expect(system.completed.count() < cached);
+    try std.testing.expect(system.tuners.evict_flush.get(.count).last_request != null);
+    try std.testing.expect(system.tuners.evict_flush.get(.apply).last_request != null);
+    try std.testing.expectEqualDeep(update_flush, system.tuners.registry_flush);
     try expectRegistryMatchesCache(&system);
 }
 
 test "an eviction reserve out of memory leaves graph, cache, registry, and marks intact, and the retry equals an unfailed apply" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -760,7 +865,7 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
     const cached = system.completed.count();
     try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
     for (dense_change_cells) |cell| try test_support.recordTileEdits(&reference, &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    _ = try reference.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try reference.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
 
     // Every allocation of the apply fails in turn; the eviction scratch grows here for the
     // first time, so some attempt fails at the eviction reserve after the graph's.
@@ -772,7 +877,7 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         system.allocator = failing.allocator();
         system.graph.allocator = failing.allocator();
-        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         system.allocator = std.testing.allocator;
         system.graph.allocator = std.testing.allocator;
         if (result) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
@@ -789,8 +894,9 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
     try expectSameRegistry(&reference, &system);
 }
 
-test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes), and the eviction stages run on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -800,7 +906,6 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var serial = try registrySystem(&data, &fixture.world, 64);
     defer serial.deinit();
     var threaded = try registrySystem(&data, &fixture.world, 64);
@@ -810,19 +915,15 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     try solveRegistryRoutes(&threaded, requester, 24, 0, 60, 64, null, .{});
     try setRegistryCells(&serial, &fixture, &dense_change_cells, fixture.tree);
     for (dense_change_cells) |cell| try test_support.recordTileEdits(&threaded, &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    const serial_stats = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.evict_count_batch.ran_inline and stats.evict_count_batch.range_count > 1);
-    try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
-    try std.testing.expect(serial_stats.evicted_results != 0);
-    try std.testing.expectEqual(serial_stats.evicted_results, stats.evicted_results);
-    try std.testing.expectEqual(serial_stats.evict_entries_visited, stats.evict_entries_visited);
+    const cached = serial.completed.count();
+    _ = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+    try std.testing.expect(serial.completed.count() < cached);
+    _ = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     try std.testing.expectEqual(serial.evict_items.items.len, threaded.evict_items.items.len);
     for (serial.evict_items.items, threaded.evict_items.items) |a, b| {
         try std.testing.expectEqual(a.bound, b.bound);
         try std.testing.expectEqual(a.owned, b.owned);
         try std.testing.expectEqual(a.hits, b.hits);
-        try std.testing.expectEqual(a.visited, b.visited);
         try std.testing.expectEqualSlices(u32, serial.evict_hits.items[a.base..][0..a.hits], threaded.evict_hits.items[b.base..][0..b.hits]);
     }
     try expectSameCache(&serial, &threaded);
@@ -851,20 +952,22 @@ fn expectHaloOwnedOnce(system: *const PathfindingSystem) !void {
         };
     }
     // A walk visits at most its owned lists: a key no changed cell neighbours is skipped.
-    for (system.evict_items.items) |item| try std.testing.expect(item.visited <= item.bound and item.hits <= item.bound);
+    for (system.evict_items.items) |item| try std.testing.expect(item.hits <= item.bound);
     for (keys) |key| {
         const x = keyChunk(key) % chunks.chunks_x;
         const y = keyChunk(key) / chunks.chunks_x;
         inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
             if (chunkAround(chunks, keyLevel(key), x, y, dx, dy)) |halo| {
                 // A key whose runs were all evicted holds none now; it was owned if it held any.
-                if (system.path_index[registryShard(halo.key)].keyCount(halo.key) != 0) try std.testing.expect(owned.contains(halo.key));
+                if (registrationLen(&system.path_index.directory, halo.key) != 0) try std.testing.expect(owned.contains(halo.key));
             }
         };
     }
 }
 
 test "one dig leaves unrelated pending requests, fields, tallies, and paths intact, and a request queued before it is solved after it" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -876,25 +979,26 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     defer system.deinit();
     // A path along the top right, and a group field inside the pocket from its own agents.
     const path_goal = tileCenter(28, 2);
-    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, tileCenter(16, 2), path_goal, .{})).available_results);
+    _ = try solveFrom(&system, requester, tileCenter(16, 2), path_goal, .{});
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, tileCenter(16, 2), 0, path_goal, .default, null).status);
     var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer group.deinit();
     for (0..3) |index| try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = pocketGoal(70 + index), .goal = pocketGoal(33) });
-    for (0..4) |_| _ = try system.updateSerial(&group, 16, .{});
+    for (0..4) |_| _ = try updatePathfindingInline(&system, &group, 16, .{});
     const field_key = system.graph.keyForWorld(0, pocketGoal(33), .default).?;
     const field_state = group_service.groupFieldOf(&system, field_key).?.state;
     try std.testing.expect(field_state != .empty);
     // A request left pending.
     const queued_goal = tileCenter(25, 28);
-    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, tileCenter(16, 20), queued_goal, .{ .max_solve_admissions_per_step = 0 })).pending_requests);
+    _ = try solveFrom(&system, requester, tileCenter(16, 20), queued_goal, .{ .max_solve_admissions_per_step = 0 });
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     const tallies = system.group_requests.items.len;
     try std.testing.expect(tallies != 0);
 
     // Dig a cell far from all of them.
     try setRegistryCells(&system, &fixture, &.{.{ 28, 26 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), reaction.evicted_results + reaction.dropped_fields);
     try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, path_goal, .default).?) != null);
     try std.testing.expectEqual(field_state, group_service.groupFieldOf(&system, field_key).?.state);
     try std.testing.expectEqual(tallies, system.group_requests.items.len);
@@ -904,8 +1008,9 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     // The queued request is solved on the next update.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const after = try system.updateSerial(&empty, 16, .{});
-    try std.testing.expectEqual(@as(usize, 1), after.available_results);
+    _ = try updatePathfindingInline(&system, &empty, 16, .{});
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, queued_goal, .default).?) != null);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, tileCenter(16, 20), 0, queued_goal, .default, null).status);
 }
 
@@ -913,6 +1018,8 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
 // expansions a step, drops on a change at `cell`; checks the brute-force rule (a changed
 // cell within one cell of a costed cell) against the field built before the change.
 fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget: usize) !bool {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var fixture = try registryWorld(meta, 24);
@@ -928,7 +1035,7 @@ fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = tileCenter(12, 12), .goal = tileCenter(9, 9) });
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     const key = system.graph.keyForWorld(0, tileCenter(9, 9), .default).?;
     const field = group_service.groupFieldOf(&system, key) orelse return error.TestExpectedField;
     try std.testing.expectEqual(@as(GroupFieldState, if (budget == 1) .building else .ready), field.state);
@@ -941,10 +1048,9 @@ fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget
         if (@abs(x - @as(isize, cell[0])) <= 1 and @abs(y - @as(isize, cell[1])) <= 1) near = true;
     }
     try setRegistryCells(&system, &fixture, &.{cell}, fixture.tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     const dropped = group_service.groupFieldOf(&system, key) == null;
     try std.testing.expectEqual(near, dropped);
-    try std.testing.expectEqual(@as(usize, @intFromBool(near)), stats.dropped_fields);
     return dropped;
 }
 
@@ -984,8 +1090,9 @@ const pocket_change_cells = blk: {
     break :blk cells;
 };
 
-test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -995,7 +1102,6 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var systems: [2]PathfindingSystem = undefined;
     var built: usize = 0;
     defer for (systems[0..built]) |*system| system.deinit();
@@ -1006,18 +1112,18 @@ test "threaded eviction with paths and fields equals serial over a dense change 
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
-        _ = try system.updateSerial(&group, 16, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
     }
     systems[1].nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
     for (pocket_change_cells) |cell| try test_support.recordTileEdits(&systems[1], &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    const serial_stats = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    const stats = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.evict_count_batch.ran_inline and stats.evict_count_batch.range_count > 1);
-    try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
-    try std.testing.expect(serial_stats.evicted_results > 1 and serial_stats.dropped_fields == 1);
-    try std.testing.expectEqual(serial_stats.evicted_results, stats.evicted_results);
-    try std.testing.expectEqual(serial_stats.dropped_fields, stats.dropped_fields);
+    const cached = systems[0].completed.count();
+    const field_key = systems[0].graph.keyForWorld(0, tileCenter(26, 26), .default).?;
+    try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) != null);
+    _ = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+    try std.testing.expect(systems[0].completed.count() + 1 < cached);
+    try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) == null);
+    _ = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     for (systems[0].evict_items.items, systems[1].evict_items.items) |a, b| {
         // Window bases follow each run's range shape.
         var a_unplaced = a;
@@ -1031,15 +1137,13 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     for (&systems) |*system| try expectRegistryMatchesCache(system);
 }
 
-test "a nav worker cap of zero keeps the mark and eviction stages inline on a multi-worker ThreadSystem and changes no result" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "a nav worker cap of zero on a multi-worker ThreadSystem changes no mark or eviction result" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     // Uncapped first, then capped: a fixed partition that runs every stage on workers
     // unless the cap holds it inline.
     const caps = [_]?usize{ null, 0 };
@@ -1060,9 +1164,6 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
             try system.reserveTerrainNavRecord(events.items.len);
             system.recordTerrainNavEvents(events.items, &world, &threads);
         }
-        try std.testing.expect(!systems[0].last_mark_batch.ran_inline and systems[0].last_mark_batch.range_count > 1);
-        try std.testing.expect(systems[1].last_mark_batch.ran_inline);
-        try std.testing.expectEqual(systems[0].last_mark_batch.item_count, systems[1].last_mark_batch.item_count);
         try std.testing.expectEqual(systems[0].nav_marks.items.len, systems[1].nav_marks.items.len);
         for (systems[0].nav_marks.items, systems[1].nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
     }
@@ -1074,37 +1175,24 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
     var systems: [2]PathfindingSystem = undefined;
     var built: usize = 0;
     defer for (systems[0..built]) |*system| system.deinit();
-    var stats: [2]NavUpdateStats = undefined;
     for (&systems, caps) |*system, cap| {
         system.* = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
         built += 1;
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
-        _ = try system.updateSerial(&group, 16, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
         system.nav_controls = .{ .adaptive = false, .items_per_range = 1, .max_worker_threads = cap };
     }
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
     for (pocket_change_cells) |cell| try test_support.recordTileEdits(&systems[1], &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    for (&systems, &stats) |*system, *step| step.* = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    for ([_][2]BatchStats{
-        .{ stats[0].evict_count_batch, stats[1].evict_count_batch },
-        .{ stats[0].evict_batch, stats[1].evict_batch },
-        .{ stats[0].evict_flush_batch, stats[1].evict_flush_batch },
-    }) |pair| {
-        try std.testing.expect(!pair[0].ran_inline and pair[0].range_count > 1);
-        try std.testing.expect(pair[1].ran_inline);
-        try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
-    }
-    try std.testing.expect(stats[0].evicted_results > 1);
-    try std.testing.expectEqual(stats[0].evicted_results, stats[1].evicted_results);
-    try std.testing.expectEqual(stats[0].dropped_fields, stats[1].dropped_fields);
+    for (&systems) |*system| _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(systems[0].evict_items.items.len, systems[1].evict_items.items.len);
     try expectSameCache(&systems[0], &systems[1]);
     try expectSameRegistry(&systems[0], &systems[1]);
 }
 
 test "eviction with paths and fields allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1114,7 +1202,6 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
     defer system.deinit();
     system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
@@ -1128,21 +1215,26 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     var route: usize = 0;
     while (route < 32) : (route += 16) try solveRegistryRoutes(&system, requester, pocket_world_side, route, 16, 16, null, .{});
-    _ = try system.updateSerial(&group, 16, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
 
     try setRegistryCells(&system, &fixture, &pocket_change_cells, fixture.tree);
+    const cached = system.completed.count();
+    const field_key = system.graph.keyForWorld(0, tileCenter(26, 26), .default).?;
+    try std.testing.expect(group_service.groupFieldOf(&system, field_key) != null);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
     const reaction = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     setSystemAllocators(&system, std.testing.allocator);
-    const stats = try reaction;
+    _ = try reaction;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(stats.evicted_results != 0 and stats.dropped_fields == 1);
-    try std.testing.expect(!stats.evict_batch.ran_inline and !stats.evict_flush_batch.ran_inline);
+    try std.testing.expect(system.completed.count() < cached);
+    try std.testing.expect(group_service.groupFieldOf(&system, field_key) == null);
     try expectRegistryMatchesCache(&system);
 }
 
 test "a level rebuilt by a content revision evicts only its own results and fields, and every pending request stays" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1167,12 +1259,12 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = level, .goal_level = level, .start = cellWorld(1, 1), .goal = cellWorld(9, 9) });
         try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start_level = level, .goal_level = level, .start = cellWorld(2, 1), .goal = cellWorld(5, 8) });
     }
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     stream.clearRetainingCapacity();
     for ([_]u16{ 0, 1 }) |level| {
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = level, .goal_level = level, .start = cellWorld(1, 1), .goal = cellWorld(10, 3) });
     }
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     const solved = [_]PathQueryKey{ system.graph.keyForWorld(0, cellWorld(9, 9), .default).?, system.graph.keyForWorld(1, cellWorld(9, 9), .default).? };
     const fields = [_]PathQueryKey{ system.graph.keyForWorld(0, cellWorld(5, 8), .default).?, system.graph.keyForWorld(1, cellWorld(5, 8), .default).? };
     for (solved, fields) |result_key, field_key| {
@@ -1183,11 +1275,9 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
 
     // A blocking fill of level 1 moves its content revision with no per-cell event.
     _ = try world.addDenseLayer(1, 0, .obstacle, tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // Level 1's two results (the group goal solved individually before its field was ready).
-    try std.testing.expectEqual(@as(usize, 2), stats.evicted_results);
-    try std.testing.expectEqual(@as(usize, 1), stats.dropped_fields);
     try std.testing.expectEqual(@as(usize, 2), system.completed.count());
     for (solved[0..1] ++ fields[0..1]) |kept| try std.testing.expect(system.completed.slotIndex(kept) != null);
     for (solved[1..2] ++ fields[1..2]) |evicted| try std.testing.expect(system.completed.slotIndex(evicted) == null);
@@ -1197,9 +1287,12 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
     try std.testing.expectEqual(@as(usize, 2), system.pending.len);
     for (0..system.pending.len) |index| try std.testing.expect(system.pending_keys.contains(system.pending.at(index).key));
     try expectRegistryMatchesCache(&system);
-    const answered = try system.updateSerial(&stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), answered.available_results);
-    try std.testing.expectEqual(@as(usize, 1), answered.unavailable_results);
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, cellWorld(10, 3), .default).?) != null);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(1, cellWorld(10, 3), .default).?) == null);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 1), 0, cellWorld(10, 3), .default, null).status);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(1, cellWorld(1, 1), 1, cellWorld(10, 3), .default, null).status);
 }
 
 // Three open 12x12 floors in 4-tile chunks: stairs link level 0 (10, 10) to level 1 (2, 2)
@@ -1251,10 +1344,10 @@ fn solveLinkedRoutes(system: *PathfindingSystem, data: *DataSystem, world: *cons
     }
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(system, &stream, 8, .{});
     for (0..16) |_| {
         if (system.pending.len == 0) break;
-        _ = try system.updateSerial(&empty, 8, .{});
+        _ = try updatePathfindingInline(system, &empty, 8, .{});
     }
     for (keys) |key| try std.testing.expect(system.completed.slotIndex(key) != null);
     return keys;
@@ -1274,6 +1367,8 @@ fn expectLinkedCached(system: *const PathfindingSystem, keys: [linked_routes.len
 }
 
 test "a rebuilt level evicts every result whose path crosses it, the goal level's or not, and keeps the results that never touch it" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1284,14 +1379,15 @@ test "a rebuilt level evicts every result whose path crosses it, the goal level'
     defer system.deinit();
     const keys = try solveLinkedRoutes(&system, &data, &world);
     try blockLevels(&world, &meta, &.{1});
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // The pass-throughs (goals on levels 2 and 0) and the goal on level 1 go.
     try expectLinkedCached(&system, keys, .{ false, true, true, false, false });
-    try std.testing.expectEqual(@as(usize, 3), stats.evicted_results);
 }
 
 test "a rebuilt start level evicts the results that leave it for a goal on another level" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1302,14 +1398,13 @@ test "a rebuilt start level evicts the results that leave it for a goal on anoth
     defer system.deinit();
     const keys = try solveLinkedRoutes(&system, &data, &world);
     try blockLevels(&world, &meta, &.{0});
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // Every route with a run on level 0 goes, its goal on level 2, 1, or 0.
     try expectLinkedCached(&system, keys, .{ false, false, true, false, false });
-    try std.testing.expectEqual(@as(usize, 4), stats.evicted_results);
 }
 
-test "two levels rebuilt in one step evict each result through either once and flush once, outside the flush tuner" {
+test "two levels rebuilt in one step evict each result through either once and flush once, on the one-off flush set" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1326,12 +1421,15 @@ test "two levels rebuilt in one step evict each result through either once and f
     try std.testing.expectEqual(@as(usize, 2), stats.levels_built);
     // Routes 0 and 4 have runs on both levels: each is evicted once.
     try expectLinkedCached(&system, keys, .{ false, true, false, false, false });
-    try std.testing.expectEqual(@as(usize, 4), stats.evicted_results);
-    // The one-off flush ran at its fixed shape, so the flush tuner selected nothing.
-    try std.testing.expect(system.tuners.evict_flush.last_request == null);
+    // The one-off flush ran on its own set; the marks batch's eviction set selected nothing.
+    try std.testing.expect(system.tuners.one_off_flush.get(.count).last_request != null);
+    try std.testing.expect(system.tuners.one_off_flush.get(.apply).last_request != null);
+    for (system.tuners.evict_flush.values) |tuner| try std.testing.expect(tuner.last_request == null);
 }
 
 test "a level build that fails after an earlier level was evicted still flushes its evictions, and the retry finishes the rest" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     var fail_index: usize = 0;
@@ -1346,7 +1444,7 @@ test "a level build that fails after an earlier level was evicted still flushes 
         try blockLevels(&world, &meta, &.{ 1, 2 });
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         setSystemAllocators(&system, failing.allocator());
-        const result = system.applyBufferedNavUpdates(no_colliders, &world, null);
+        const result = system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
         setSystemAllocators(&system, std.testing.allocator);
         _ = result catch {
             const graphs = system.graph.level_graphs.items;
@@ -1354,7 +1452,7 @@ test "a level build that fails after an earlier level was evicted still flushes 
             if (graphs[1].built_revision != world.levelContentRevision(1) or graphs[2].built_revision == world.levelContentRevision(2)) continue;
             try std.testing.expect(system.completed.slotIndex(keys[0]) == null);
             try expectLinkedCached(&system, keys, .{ false, true, true, false, false });
-            _ = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
             try expectLinkedCached(&system, keys, .{ false, true, false, false, false });
             return;
         };

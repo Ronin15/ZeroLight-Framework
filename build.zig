@@ -74,14 +74,11 @@ const shader_programs = [_]ShaderProgram{
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
-    // Release modes default to the shipped CPU floor (x86-64-v2: SSE4.2 and
-    // POPCNT, which the chunk bit ops use; apple_m1 on macOS arm64; otherwise
-    // the arch baseline, NEON on aarch64); Debug stays native. -Dtarget/-Dcpu
-    // override.
-    const target = b.standardTargetOptions(.{ .default_target = switch (optimize) {
-        .safe, .fast, .small => shippedCpuFloor(b.graph.host.result),
-        .debug => .{},
-    } });
+    // Every mode, Debug included, defaults to the shipped CPU floor (x86-64-v2:
+    // SSE4.2 and POPCNT, which the chunk bit ops use; apple_m1 on macOS arm64;
+    // otherwise the arch baseline, NEON on aarch64). -Dtarget/-Dcpu override;
+    // -Dcpu=native builds for the host.
+    const target = b.standardTargetOptions(.{ .default_target = shippedCpuFloor(b.graph.host.result) });
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
     const asset_root = b.option([]const u8, "asset-root", "Runtime asset directory") orelse "assets";
@@ -100,13 +97,33 @@ pub fn build(b: *std.Build) void {
     // useful for reading a benchmark table. An explicit -Dlog-level=debug still overrides this
     // for bench troubleshooting, same as it does for the game build.
     const bench_log_level = parseLogLevel(log_level_arg, .fast);
+    // Unit tests default to errors only (auto -> .err): the warn and info diagnostics the
+    // engine logs on recovered degradation and growth stay out of test output, and the test
+    // runner owns `std_options`, so the level is set here once. An explicit -Dlog-level still
+    // overrides it.
+    const test_log_level: std.log.Level = if (std.mem.eql(u8, log_level_arg, "auto")) .err else log_level;
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
     // Full LTO needs LLVM+LLD. Linux ships with `-flto=full`; Darwin and
     // Windows do not (see `ltoSupportedForTarget`).
     // Every other artifact and mode uses Zig's default backend/linker selection.
     const release_lto = optimize == .fast and ltoSupportedForTarget(target.result);
+    // ThreadSanitizer for the unit-test and bench artifacts only; the app and gpu-smoke
+    // are never instrumented, and SDL/GPU driver threads stay uninstrumented. TSan needs
+    // the LLVM backend, so those two artifacts force it. Not part of `verify`.
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build unit tests and benchmarks with ThreadSanitizer (LLVM backend)") orelse false;
+    const sanitize_thread_supported = tsanSupportedForTarget(target.result);
+    const callgrind = b.option(bool, "callgrind", "Run `zig build bench` under valgrind --tool=callgrind (Linux)") orelse false;
+    const callgrind_out = b.option([]const u8, "callgrind-out", "Callgrind output file, relative to the build root or absolute") orelse "benchmark_outputs/callgrind/callgrind.out";
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
     const windows_sdl_checks = windowsSdlValidateSteps(windows_sdl);
+
+    // Comptime perf-log switch (`runtime_perf_log.enabled`): the game and the tests follow
+    // the mode (Debug and ReleaseSafe on, ReleaseFast and ReleaseSmall off); benches always
+    // have it, since their pass-shape asserts and main-thread shares read the counters.
+    const perf_counters = switch (optimize) {
+        .debug, .safe => true,
+        .fast, .small => false,
+    };
 
     const buildOptions = b.addOptions();
     buildOptions.addOption([]const u8, "app_name", app_name);
@@ -116,6 +133,7 @@ pub fn build(b: *std.Build) void {
     buildOptions.addOption(bool, "debug_overlay", debug_overlay);
     buildOptions.addOption(u8, "log_level", @backingInt(log_level));
     buildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+    buildOptions.addOption(bool, "perf_counters", perf_counters);
 
     const benchBuildOptions = b.addOptions();
     benchBuildOptions.addOption([]const u8, "app_name", app_name);
@@ -125,6 +143,17 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
     benchBuildOptions.addOption(u8, "log_level", @backingInt(bench_log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+    benchBuildOptions.addOption(bool, "perf_counters", true);
+
+    const testBuildOptions = b.addOptions();
+    testBuildOptions.addOption([]const u8, "app_name", app_name);
+    testBuildOptions.addOption([]const u8, "window_title", window_title);
+    testBuildOptions.addOption([]const u8, "asset_root", asset_root);
+    testBuildOptions.addOption(bool, "gpu_debug", gpu_debug);
+    testBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
+    testBuildOptions.addOption(u8, "log_level", @backingInt(test_log_level));
+    testBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+    testBuildOptions.addOption(bool, "perf_counters", perf_counters);
 
     const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into zig-pkg/ and validate them");
     if (target.result.os.tag != .windows) {
@@ -162,15 +191,34 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{
         .name = "benchmarks",
         .root_module = benchModule,
+        .use_llvm = if (sanitize_thread) true else null,
     });
 
-    const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
+    const unitTestsModule = createSdlModule(b, target, optimize, testBuildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
     // Repeatable; only tests whose names contain one of these texts compile and run.
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{
         .root_module = unitTestsModule,
         .filters = test_filters,
+        .use_llvm = if (sanitize_thread) true else null,
     });
+
+    if (sanitize_thread) {
+        if (sanitize_thread_supported) {
+            // Imported modules (`sdl_c`, `build_options`) inherit it from the root.
+            unitTestsModule.sanitize_thread = true;
+            benchModule.sanitize_thread = true;
+        } else {
+            // Fail every step that builds a sanitized artifact (check, test, bench,
+            // verify) instead of a libtsan sub-compilation error or an uninstrumented build.
+            const tsan_unsupported = b.addFail(b.fmt(
+                "-Dsanitize-thread is not enabled for target {s}-{s}-{s}; enabled only for x86_64 or aarch64 on Linux (glibc), macOS, or FreeBSD",
+                .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag), @tagName(target.result.abi) },
+            ));
+            unit_tests.step.dependOn(&tsan_unsupported.step);
+            bench_exe.step.dependOn(&tsan_unsupported.step);
+        }
+    }
 
     // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and
     // dead-code elimination when the target supports it (see `release_lto`).
@@ -231,9 +279,31 @@ pub fn build(b: *std.Build) void {
     const test_run = b.addRunArtifact(unit_tests);
     addWindowsSdlRunRuntime(test_run, windows_sdl_runtime);
     test_step.dependOn(&test_run.step);
+    // The test binary's compile step. A `-Dtest-filter` compiles only the tests
+    // it names, so type-checking the suite is this step with no filter.
+    const test_compile_step = b.step("test-compile", "Type-check unit tests without running them");
+    test_compile_step.dependOn(&unit_tests.step);
 
-    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_run = if (callgrind)
+        addCallgrindBenchRun(b, target.result, sanitize_thread, bench_exe, callgrind_out)
+    else
+        b.addRunArtifact(bench_exe);
     addWindowsSdlRunRuntime(bench_run, windows_sdl_runtime);
+    // Halt on the first report. A user-set TSAN_OPTIONS follows the defaults, so its flags
+    // win one by one (e.g. halt_on_error=0 to collect every report). The value is always set
+    // on the run steps so a changed TSAN_OPTIONS reruns a cached passing run; reading the
+    // environment here is invisible to the configure cache, so a sanitizing build
+    // reconfigures on every invocation.
+    if (sanitize_thread) {
+        b.graph.poisonCache();
+        const tsan_defaults = "halt_on_error=1 second_deadlock_stack=1";
+        const tsan_options = if (b.graph.environ_map.get("TSAN_OPTIONS")) |user|
+            b.fmt("{s} {s}", .{ tsan_defaults, user })
+        else
+            tsan_defaults;
+        test_run.setEnvironmentVariable("TSAN_OPTIONS", tsan_options);
+        bench_run.setEnvironmentVariable("TSAN_OPTIONS", tsan_options);
+    }
     bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run CPU gameplay processor benchmarks");
     bench_step.dependOn(&bench_run.step);
@@ -245,6 +315,8 @@ pub fn build(b: *std.Build) void {
     const idiom_lint_cmd = b.addSystemCommand(&.{ "python3", "tools/lint_idioms.py" });
     const idiom_lint_step = b.step("idiom-lint", "Lint Zig sources for idiom/currency regressions (naming, deprecated stdlib, unsafe catch unreachable)");
     idiom_lint_step.dependOn(&idiom_lint_cmd.step);
+    // Created after `check_step`: check is the iterate command, so it runs this lint.
+    check_step.dependOn(&idiom_lint_cmd.step);
 
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
     verify_step.dependOn(check_step);
@@ -742,6 +814,51 @@ comptime {
     }
 }
 
+/// The bench binary under callgrind, writing the profile to `out_path` (relative to the
+/// build root, or absolute) and valgrind's own messages to `<out_path>.log` on every run, so
+/// the bench table stays readable. Fails the bench step alone on a configuration
+/// valgrind cannot run (docs/development-workflow.md § Profiling).
+fn addCallgrindBenchRun(
+    b: *std.Build,
+    target: std.Target,
+    sanitize_thread: bool,
+    bench_exe: *std.Build.Step.Compile,
+    out_path: []const u8,
+) *std.Build.Step.Run {
+    const host = b.graph.host.result;
+    const valgrind = b.findProgram(.{ .names = &.{"valgrind"} });
+    const refusal: ?[]const u8 = if (sanitize_thread)
+        "-Dcallgrind=true cannot combine with -Dsanitize-thread=true; profile and sanitize in separate runs"
+    else if (host.os.tag != .linux or target.os.tag != .linux or target.cpu.arch != host.cpu.arch)
+        b.fmt("-Dcallgrind=true needs a native Linux build (valgrind); host {s}-{s}, target {s}-{s}", .{
+            @tagName(host.cpu.arch), @tagName(host.os.tag), @tagName(target.cpu.arch), @tagName(target.os.tag),
+        })
+    else if (target.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(target.cpu.features, .avx512f))
+        b.fmt("-Dcallgrind=true needs a target CPU without AVX-512 ({s} has it); drop -Dcpu or pass -Dcpu=x86_64_v2", .{target.cpu.model.name})
+    else if (valgrind == null)
+        "-Dcallgrind=true needs valgrind on PATH"
+    else
+        null;
+
+    const out_dir = b.addSystemCommand(&.{ "mkdir", "-p", std.fs.path.dirname(out_path) orelse "." });
+    out_dir.setCwd(b.path("."));
+    const run = b.addSystemCommand(&.{
+        valgrind orelse "valgrind",
+        "--tool=callgrind",
+        b.fmt("--callgrind-out-file={s}", .{out_path}),
+        b.fmt("--log-file={s}.log", .{out_path}),
+    });
+    run.setCwd(b.path("."));
+    run.addArtifactArg(bench_exe);
+    run.step.dependOn(&out_dir.step);
+    if (refusal) |message| {
+        const fail = b.addFail(message);
+        out_dir.step.dependOn(&fail.step);
+        run.step.dependOn(&fail.step);
+    }
+    return run;
+}
+
 fn shippedCpuFloor(host: std.Target) std.Target.Query {
     return switch (host.cpu.arch) {
         .x86_64 => .{ .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v2 } },
@@ -763,6 +880,21 @@ fn ltoSupportedForTarget(target: std.Target) bool {
         .macho, .coff => false,
         else => true,
     };
+}
+
+/// Targets `-Dsanitize-thread` is enabled for: a conservative subset of what the bundled
+/// libtsan supports; Linux requires glibc (TSan does not support musl).
+fn tsanSupportedForTarget(target: std.Target) bool {
+    const os_ok = switch (target.os.tag) {
+        .linux => target.abi.isGnu(),
+        .macos, .freebsd => true,
+        else => false,
+    };
+    const arch_ok = switch (target.cpu.arch) {
+        .x86_64, .aarch64 => true,
+        else => false,
+    };
+    return os_ok and arch_ok;
 }
 
 fn parseLogLevel(value: []const u8, optimize: std.builtin.Optimize) std.log.Level {

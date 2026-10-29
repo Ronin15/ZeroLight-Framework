@@ -2,22 +2,16 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! World-owned durable interest / affordance markers. Distinct from
-//! ephemeral `WorldStimulus` dig/footstep/impact events.
+//! World-owned durable interest markers, distinct from transient `WorldStimulus` events.
 //!
-//! Storage is **fixed inline arrays** (`interest_marker_capacity` slots) —
-//! allocation-free by construction after `init` (no heap growth path). Allocator
-//! parameters on `init`/`deinit`/`ensureCapacity` exist only for API parity with
-//! other world stores and future growth; they are unused today.
+//! Storage is fixed inline arrays of `interest_marker_capacity` slots, allocation-free after
+//! `init`; the allocator parameters of `init`/`deinit` are unused. `addMarker` fails with
+//! `error.InterestMarkerCapacityExceeded` when every slot is live.
 //!
-//! **Kinds:** `investigate` is consumed by AI arbitration. `cover`, `resource`,
-//! and `patrol` are reserved schema tags for future consumers (not AI inputs
-//! yet) — do not treat them as live investigate attractors.
-//!
-//! **Geometry:** cognition discovery uses `dist <= query_radius` only.
-//! `marker.radius` is the authored influence footprint (interaction/cover size
-//! later); it is not a discovery gate. `findBestInvestigateMarker` returns the
-//! single nearest in-range investigate marker (dist², then ascending slot).
+//! Only `investigate` markers are AI inputs. Discovery is `dist <= query_radius`;
+//! `marker.radius` is the influence footprint, never a discovery gate.
+//! `findBestInvestigateMarker` returns the nearest in-range investigate marker on the level
+//! whose faction filter accepts the agent (dist², then ascending slot).
 
 const std = @import("std");
 const Faction = @import("../faction.zig").Faction;
@@ -27,11 +21,11 @@ pub const interest_marker_capacity: usize = 128;
 pub const InterestMarkerKind = enum {
     /// Consumed by AI investigate scoring / goal resolution.
     investigate,
-    /// Reserved — no consumer yet (future cover / flee policy).
+    /// Not an AI input.
     cover,
-    /// Reserved — no consumer yet (future resource / gather).
+    /// Not an AI input.
     resource,
-    /// Reserved — no consumer yet (future patrol anchors).
+    /// Not an AI input.
     patrol,
 };
 
@@ -108,7 +102,7 @@ pub const InterestMarkerStore = struct {
     }
 
     /// Discovery geometry: agent within the query radius (marker.radius is not
-    /// a discovery gate — see module docs).
+    /// a discovery gate).
     fn inQueryRange(self: *const InterestMarkerStore, index: usize, x: f32, y: f32, query_radius: f32) bool {
         const dx = self.xs[index] - x;
         const dy = self.ys[index] - y;
@@ -155,19 +149,6 @@ pub const InterestMarkerStore = struct {
         return .{ .index = @intCast(index), .generation = generation };
     }
 
-    pub fn removeMarker(self: *InterestMarkerStore, id: InterestMarkerId) bool {
-        if (!id.isValid()) return false;
-        const index: usize = id.index;
-        if (!self.slotLive(index)) return false;
-        if (self.generations[index] != id.generation) return false;
-
-        self.generations[index] = 0;
-        self.faction_filter_present[index] = false;
-        std.debug.assert(self.live_count > 0);
-        self.live_count -= 1;
-        return true;
-    }
-
     /// Nearest in-range `investigate` marker (dist², then ascending slot).
     pub fn findBestInvestigateMarker(
         self: *const InterestMarkerStore,
@@ -206,7 +187,7 @@ pub const InterestMarkerStore = struct {
 
 const testing = std.testing;
 
-test "InterestMarkerStore capacity add remove and id invalidation" {
+test "InterestMarkerStore add, clear, and id invalidation" {
     var store = InterestMarkerStore.init(testing.allocator);
     defer store.deinit(testing.allocator);
 
@@ -220,9 +201,8 @@ test "InterestMarkerStore capacity add remove and id invalidation" {
     try testing.expect(id0.isValid());
     try testing.expectEqual(@as(usize, 1), store.count());
 
-    try testing.expect(store.removeMarker(id0));
+    store.clear();
     try testing.expectEqual(@as(usize, 0), store.count());
-    try testing.expect(!store.removeMarker(id0));
 
     const id1 = try store.addMarker(.{
         .kind = .investigate,

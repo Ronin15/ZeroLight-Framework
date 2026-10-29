@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const logging = @import("core/logging.zig");
-const gpu_smoke = @import("platform/gpu_smoke_impl.zig");
+const gpu_smoke = @import("gpu_smoke_impl.zig");
 
 pub const std_options = logging.std_options;
 

@@ -17,21 +17,23 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 - `thread_shared_record_alignment` (64) and `paddingForCacheLine` are declared
   once, in `src/app/thread_system.zig`, beside `PaddedSlot`, `SlotList`, and
   `BandPartition`; every system imports them and the private copies are deleted
-  (64G `819d8d8`). No comptime layout gate exists: padded types carry their own
-  size asserts, and no lint rejects a new private copy.
-- Padded slot types: `GatherTallySlot`, `RowCountTally`,
-  `BroadphaseRangeSlot`, `ContactCountTally`, `PerceptionRangeStatsSlot`, the
-  nav reaction's and pathfinding's range tallies, and the tier-1 corridor pool
-  entries; some carry comptime size asserts.
-- `WorkerRecord` (`thread_system.zig`, `{ id, shared, wake, thread }`) is
-  56 B with alignment 8 on x86_64-linux (Zig 0.17 probe) and allocated as one
-  slice, so records straddle lines and main's post to one worker contends
-  with its neighbor's wake.
+  (64G `819d8d8`). No lint rejects a new private copy.
+- Padded slot types: `PaddedSlot(T)` is aligned and padded by its type
+  (`4998400`), so `SlotList`s and embedded slot fields need no per-type assert;
+  the collision, nav reaction, and pathfinding range records use it (the old
+  `RowCountTally`, `BroadphaseRangeSlot`, and `ContactCountTally` are gone).
+  `GatherTallySlot` is `PaddedSlot(GatherTally)`
+  (`systems/simulation_scope.zig:500`, `750ce0a`). Records still hand-aligned
+  to `thread_shared_record_alignment`: `pathfinding/scratch.zig:352` and
+  `:394`, `pathfinding/connectivity.zig:315`; the tier-1 corridor pool
+  entries pad separately.
+- `WorkerRecord` starts its own line, comptime-asserted
+  (`thread_system.zig:1440-1455`, `fce97cd`).
 - `SimulationEvents.range_stats` (`simulation.zig`) is one unpadded record per
   range; `RangeOutputStream`'s per-range counts and write offsets are dense
   `usize` arrays. Every production event producer writes from the main thread
   today, so this is latent; Slice 56 plans a threaded range-stream emit.
-- `resolveWorkerThreadCount` returns `cpu_count - 1` when unset (VoidLight's
+- `defaultWorkerThreadCount` returns `cpu_count - 1` when unset (VoidLight's
   rule too).
 - Zig 0.17 std: Linux `setpriority` only by raw syscall, Darwin
   `pthread_set_qos_class_self_np`, no Windows `SetThreadPriority` binding.
@@ -45,7 +47,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 - The quantum is 64 B, not `std.atomic.cache_line`, because slot arrays
   multiply; `src/app/thread_system.zig` owns it with a padding helper and a
   comptime layout gate that every padded slot type calls, and an
-  `idiom-lint` rule rejects private copies (`.claude/rules/threading.md`).
+  `idiom-lint` rule rejects private copies (`.grok/rules/threading.md`).
 - `WorkerRecord` is padded unconditionally: two threads write `wake` every
   batch. The bench is a non-regression gate, not the decision.
 - Lane priority is a platform helper (`src/platform/`; app imports it, game
@@ -56,7 +58,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
   once and is never fatal; the result is diagnostics only.
 - Pool rule: `cpu_count − 1` whatever the lane does; a rule that follows
   measured interference would make worker count a function of timing
-  (`.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/simulation.md` § Determinism).
 - VoidLight: keep its `hardware_concurrency − 1` pool; do not port its
   user-space task priority queues, which cannot stop a long task holding a
   core.
@@ -66,18 +68,19 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 - [ ] Shared quantum, padding helper, and layout gate in `thread_system.zig`;
       every padded slot site imports them and gates its types; private copies
       deleted. Quantum, helper, and the deletions landed with 64G (`819d8d8`);
-      the layout gate and its use at every site remain.
+      `PaddedSlot` (`4998400`, `thread_system.zig:1526`) is the gate for slot
+      types; the sites above remain hand-aligned.
 - [ ] `idiom-lint` rule rejecting a private quantum or helper outside the
       owner.
-- [ ] `WorkerRecord` padded to exactly one line, comptime-asserted, with a
+- [x] `WorkerRecord` padded to exactly one line, comptime-asserted, with a
       test that records sit one line apart and a batch still covers every
-      item.
+      item (`fce97cd`; comptime `thread_system.zig:1453-1454`, test `:3993`).
 - [ ] `src/platform/thread_priority.zig` lowering the calling thread per OS;
       a readback test shows other threads unchanged (skips on sandboxed
       builders).
 - [ ] Lane wiring: config to keep inherited priority, the call at lane entry,
       the result in lane stats, one log line.
-- [ ] `resolveWorkerThreadCount` documents the fixed rule; `Engine.init`
+- [ ] `defaultWorkerThreadCount` documents the fixed rule; `Engine.init`
       passes the threading config unmodified.
 - [ ] `SimulationEvents` per-range stats padded, with a multi-worker parity
       test.
@@ -89,7 +92,7 @@ of CPU count with no core reserved for the lane; no dispatch regression.
       padding, pool rule) and Background Lane (priority per OS);
       `docs/development-workflow.md` bench group.
 - [ ] Add the thread-shared record rule (owner constant, layout gate, lint) to
-      `.claude/rules/threading.md` when this lands.
+      `.grok/rules/threading.md` when this lands.
 
 ### Acceptance checks
 

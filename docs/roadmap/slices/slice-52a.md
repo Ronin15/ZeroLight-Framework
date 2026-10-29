@@ -3,9 +3,10 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** The Windows LTO-off item landed 2026-10-05
-(`01754ec`); 64G set the release-mode CPU default (`46d3b7f`, `83f36a6`);
+(`01754ec`); 64G set the release-mode CPU default (`46d3b7f`, `83f36a6`); Debug
+moved to the same floor on the core branch (owner 2026-10-16, `1a50197`);
 everything else is not started. First of 52A → 52B → 52C; 52D
-needs its `-Dcpu-baseline`. Rebases on Slice 50's `build.zig` edits.
+needs its `-Dcpu-baseline`.
 
 Goal: a release build means the same ISA, Zig, SDL, and shader bytes on every
 machine that produces it. The shipped ISA is `x86_64_v2` (SSE4.2 + POPCNT) on
@@ -15,19 +16,20 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 ### Current foundation
 
-- `build.zig` defaults every release mode (ReleaseSafe soaks included) to the
-  shipped CPU: `x86_64_v2` on x86-64, `apple_m1` on macOS arm64, the arch
-  baseline elsewhere (64G P1, `build.zig:80-83`, `:750-758`); Debug resolves to
-  the host CPU; `-Dcpu`/`-Dtarget` override. There is no `-Dcpu-baseline`
+- `build.zig` defaults every optimize mode, Debug included (owner
+  2026-10-16), to the shipped CPU: `x86_64_v2` on x86-64, `apple_m1` on macOS
+  arm64, the arch baseline elsewhere (`shippedCpuFloor`); `-Dcpu`/`-Dtarget`
+  override, and `-Dcpu=native` is the dev opt-in. There is no `-Dcpu-baseline`
   option yet. A `-Dtarget` cross build without `-Dcpu` takes that target's
   default CPU (derived, not run).
 - `core/simd.zig` derives every lane count from one 16-byte register constant
   (`vector_bytes`, the SSE2/NEON width): `lane_count = 4` (`@Vector(4, f32)`) and
-  a private 8 × u16 vector behind `countUnequalU16`; nothing is wider than 128
-  bits. `src/` has no
+  private 8 × u16 (`Uint16x8`, `simd.zig:14`) and 16 × u8 (`Uint8x16`, `:17`)
+  vectors behind `countUnequalU16`, `bytesMatchingMask`, and
+  `decrementSaturatingU16`; nothing is wider than 128 bits. `src/` has no
   `@setFloatMode` or `@mulAdd`, so strict float mode keeps results
   bit-identical across `x86_64`, `x86_64_v2`, and native. Scalar==SIMD and
-  serial==threaded parity tests exist in about 18 modules.
+  serial==threaded parity tests exist across the simulation modules.
 - Windows SDL: `build.zig` / `build.zig.zon` pin SDL 3.4.10, SDL_ttf 3.2.2, and
   SDL_mixer 3.2.4 as lazy VC zips with per-file `CheckFile` validation,
   `fetch-sdl`, and a DLL install plus host PATH prepend.
@@ -49,8 +51,8 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - CPU baseline (decision): `-Dcpu-baseline=native|ship|compat`. `ship` =
   `x86_64_v2` / `apple_m1` / arch baseline; `compat` = `x86_64` (SSE2,
-  maximum reach); `native` untouched query, dev/bench only. Debug defaults to
-  `native`, every release mode to `ship`. An explicit `-Dcpu` wins; passing
+  maximum reach); `native` untouched query, dev/bench only. Every mode,
+  Debug included, defaults to `ship` (owner 2026-10-16). An explicit `-Dcpu` wins; passing
   both fails at configure. One resolved target reaches every artifact. The SDL
   source build never receives the baseline (SDL dispatches at runtime). glibc
   and macOS floors come from 52C's release `-Dtarget`, not this option.
@@ -64,7 +66,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
   compile-checks. No runtime CPU check (start code is compiled for the
   target); the minimum spec is documented.
 - Float-mode lint rejects `@setFloatMode(.optimized)` and `@mulAdd` in `src/`
-  (enforces `.claude/rules/simulation.md` § Determinism).
+  (enforces `.grok/rules/simulation.md` § Determinism).
 - Zig pin: `.minimum_zig_version` is the single exact pin; a `build.zig` guard
   rejects another minor or a lower patch; `mise.toml` mirrors it, checked in
   `verify`. Upgrades move one minor at a time, framework first on its own
@@ -102,6 +104,11 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - [ ] `-Dcpu-baseline` with `ship` / `compat` / `native` resolution, `-Dcpu`
       precedence, and the configure-time conflict error.
+- [ ] `tools/bench_ab.py` `shipped_cpu_floor` (`tools/bench_ab.py:73`) mirrors `build.zig`
+      `shippedCpuFloor`. Failure scenario: `-Dcpu-baseline` lands or the floor
+      moves, and bench_ab keeps A/B-ing at the old CPU with no error. Pass:
+      bench_ab takes the baseline from the build (or the same option), never a
+      copy.
 - [ ] `package` refuses a `native` baseline or explicit `-Dcpu`, with a fix-it.
 - [ ] Float-mode lint rules in `tools/lint_idioms.py`.
 - [ ] Zig pin guard, `mise.toml`, and a pin-consistency check in `verify`.
@@ -121,19 +128,25 @@ Linux and macOS; no shader compilers are needed for a normal build.
 - [x] (added by Slice 66) Windows LTO off under Zig 0.17: `ltoSupportedForTarget`
       excludes `.coff`; windows-gnu ReleaseFast `check` passes.
 - [ ] (added by Slice 66) "windows-gnu LTO links" on the upgrade re-check list.
+- [ ] The `addCallgrindBenchRun` doc comment points to
+      `docs/development-workflow.md § Profiling` (`build.zig:821`) (code
+      audit L9, docs audit L14; `.grok/rules/zig-style.md` § Comments).
+      Failure scenario: the section moves or is renamed, and the comment
+      sends readers to nothing. Pass: the comment states the step's contract
+      only.
 - [ ] Docs: DW sections CPU Baseline (with the A/B table and minimum spec), SDL
       Versions And Sources, Shader Artifacts, Toolchain Pins And Upgrades;
       `docs/setup.md`; `docs/rendering-assets-shaders.md` Shader Build;
-      `README.md` requirements; `CLAUDE.md` commands.
+      `README.md` requirements; `AGENTS.md` commands.
 - [ ] Rule additions when this lands: release CPU baseline and toolchain
-      upgrade policy (`.claude/rules/build-validation.md`).
+      upgrade policy (`.grok/rules/build-validation.md`).
 
 ### Acceptance checks
 
 - [ ] `zig build verify` passes on the Linux host with defaults, with
       `-Dsystem-sdl=true`, and with no shader tools on `PATH`.
-- [ ] The bench header shows `cpu_model=x86_64_v2` for a ReleaseFast run, the
-      host model in Debug, and `x86_64` under `compat`; `-Dcpu` with
+- [ ] The bench header shows `cpu_model=x86_64_v2` for a ReleaseFast run and in
+      Debug, and `x86_64` under `compat`; `-Dcpu` with
       `-Dcpu-baseline` fails at configure.
 - [ ] `package` with a `native` baseline or explicit `-Dcpu` fails with the
       fix-it.

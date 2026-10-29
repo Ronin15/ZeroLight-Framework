@@ -8,14 +8,16 @@
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
 const PathRequest = @import("../../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../game/simulation.zig").RangeOutputStream;
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../../game/systems/pathfinding.zig").PathfindingStats;
+const PathfindingConfig = @import("../../game/systems/pathfinding.zig").PathfindingConfig;
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
-const NavGraph = @import("../../game/systems/pathfinding/nav_graph.zig").NavGraph;
+const pathfinding_test_support = @import("../../game/systems/pathfinding/test_support.zig");
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const default_tier1_abstract_node_cap = @import("../../game/systems/pathfinding/types.zig").default_tier1_abstract_node_cap;
 const refLevel = @import("../../game/systems/pathfinding/types.zig").refLevel;
@@ -29,10 +31,12 @@ const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
-const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
+const coldStepConfig = @import("nav_fixtures.zig").coldStepConfig;
+const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
+const drainPending = @import("nav_fixtures.zig").drainPending;
 const StageReport = @import("nav_fixtures.zig").StageReport;
+const stepTunerSettle = @import("nav_fixtures.zig").stepTunerSettle;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const writeLevelZeroCells = @import("nav_fixtures.zig").writeLevelZeroCells;
@@ -44,6 +48,7 @@ const Reaction = @import("nav_fixtures.zig").Reaction;
 const ReactionStages = @import("nav_fixtures.zig").ReactionStages;
 const assembleReactFixture = @import("nav_fixtures.zig").assembleReactFixture;
 const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
+const toggle_batch_keys = @import("nav_fixtures.zig").toggle_batch_keys;
 
 // Nav scaling groups over a world-backed nav. A listed config whose nav storage exceeds the
 // bench's nav-size limit fails with its figure (`nav_size.checkNavSize`), and every config checks
@@ -70,10 +75,8 @@ const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
 //     and goals, each to an independent random cell at least 64 cells away. Layout 0 runs
 //     64, 256, or 1,024 teleports at 256² and 8 levels and passes when flat in teleport count.
 //     Layout 1 runs one teleport per 16 strip cells on sides 256, 1024, and 2048 at 8 levels
-//     and passes when flat in side. Layout 2 runs 16, 64, or 256 teleports at 256² and 8
-//     levels and passes when every route solves at 16; at 64 and 256 no route solves within
-//     the abstract node budget, a recorded limit (scattered random pads are not content the
-//     game makes), reported, not judged.
+//     and passes when flat in side. Layout 2 runs 16 teleports at 256² and 8 levels and
+//     passes when every route solves.
 //   - `pathfinding-cross-level-shaft`: a 256² world of 8, 32, or 128 walkable levels; a ramp
 //     shaft beside the starts joins levels 1 to the deepest, and level 0, which no ramp
 //     reaches, holds a one-way teleport from the shaft's planar cell to beside the goals.
@@ -82,7 +85,8 @@ const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
 pub const level_size_group = suite.BenchmarkGroup{
     .name = "pathfinding-level-size",
     .item_label = LevelCode.label,
-    .defaultItemCounts = levelSizeItemCounts,
+    .describe_item = LevelCode.describe,
+    .item_counts = &level_size_item_counts,
     .runCase = runLevelSizeCase,
     .write_workload = writeRouteWorkload,
 };
@@ -90,7 +94,8 @@ pub const level_size_group = suite.BenchmarkGroup{
 pub const cross_level_depth_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-depth",
     .item_label = CrossLevelCode.label,
-    .defaultItemCounts = crossLevelItemCounts,
+    .describe_item = CrossLevelCode.describe,
+    .item_counts = &cross_level_item_counts,
     .runCase = runCrossLevelDepthCase,
     .write_workload = writeRouteWorkload,
 };
@@ -98,7 +103,8 @@ pub const cross_level_depth_group = suite.BenchmarkGroup{
 pub const cross_level_teleport_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-teleport",
     .item_label = CrossLevelCode.label,
-    .defaultItemCounts = teleportItemCounts,
+    .describe_item = CrossLevelCode.describe,
+    .item_counts = &teleport_item_counts,
     .runCase = runCrossLevelTeleportCase,
     .write_workload = writeRouteWorkload,
 };
@@ -106,7 +112,8 @@ pub const cross_level_teleport_group = suite.BenchmarkGroup{
 pub const cross_level_shaft_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-shaft",
     .item_label = LevelCode.label,
-    .defaultItemCounts = crossLevelItemCounts,
+    .describe_item = LevelCode.describe,
+    .item_counts = &cross_level_item_counts,
     .runCase = runCrossLevelShaftCase,
     .write_workload = writeRouteWorkload,
 };
@@ -143,7 +150,8 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // promoted, restarts at a partial's end on its level, and repeats until a hop arrives; the
 // sample's time is the steps' total, and a hop that drops or a chain past the route's cells +
 // 64 hops fails the case.
-// A caps, probe, or crowd sample is one request cycle from empty runtime state: the first
+// A caps, probe, or crowd sample is one request cycle with nothing pending and every cached
+// result expired (untimed, through the production steps and the result TTL): the first
 // attempt's step, the escalated attempt's step when the first exhausted, then every agent's
 // status. Claims must repeat exactly across samples. Serial only: each step solves one
 // request. Each variant runs 3 route lengths per layout.
@@ -165,16 +173,24 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 pub const long_path_group = suite.BenchmarkGroup{
     .name = "pathfinding-long-path",
     .item_label = LongPathCode.label,
-    .defaultItemCounts = longPathItemCounts,
+    .describe_item = LongPathCode.describe,
+    .item_counts = &long_path_item_counts,
     .runCase = runLongPathCase,
     .write_workload = writeLongPathWorkload,
+    .cases = &suite.serial_cases,
 };
 
 // A 512² world of 8 walkable levels holding random pads: bidirectional teleports from level 0
 // to the deepest level placed as the teleport group's layout 2 (`LinkFoldCode`). One timed
 // sample runs the post-commit nav reaction that applies a batch of 64 more pads, added to the
 // world untimed. Links are append-only, so every sample (warmup included) leaves its batch in
-// the world.
+// the world. A 64-pad placement is a one-off jump amid ordinary nav work, so the case runs the
+// spike shape: the nav stage tuners settle on in-band toggles (one cell at level 1's centre,
+// which holds no pad, blocked and reacted to, then reopened and reacted to on a revert stage
+// tuner set), then at least two warmup batches grow the per-range scratch (a jump's shape,
+// held across its count band, is judged by its first two records), and each measured sample runs one
+// in-band toggle untimed before the timed fold (headline tuner: the patch). Every case runs
+// at least two toggles and then one per batch, so the world is the same in every case.
 //   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
 //     random pads too, so endpoints per touched chunk rise with pads held.
 //   - Axis 1 (probe): background pads keep off a probe region of chunk pairs (a level-0 chunk
@@ -186,14 +202,20 @@ pub const long_path_group = suite.BenchmarkGroup{
 // reaction patched; items/s is pads applied per second. Passes when the reaction's `commit`
 // section (the link fold) is flat per pad in pads held on both axes, the whole reaction is flat
 // in background pads at a fixed preload, and it grows at most linearly in endpoints per
-// touched chunk at a fixed background. `--details` prints the reaction's plan, patch, and
+// touched chunk at a fixed background, and when every timed patch batch of the tuned case is
+// a jump that reuses the judgment its count band holds (re-predicts none), with uniform
+// batches at varying chunk counts (some off the entry's count). Every batch is 64 pads, so its
+// patch count stays inside the entry's band; a count outside it would re-predict and fail
+// the run as a fixture that left the band. `--details` prints the reaction's plan, patch, and
 // connectivity gather shapes, the per-pad and per-pad `commit` cost, the mean endpoints per
 // touched chunk, the mean pads held over the timed samples, the main-thread share, and its
-// split by section.
+// split by section, and for the tuned case the patch jumps' count range, those at a count
+// other than their judgment entry's, and those re-predicted.
 pub const link_fold_group = suite.BenchmarkGroup{
     .name = "pathfinding-link-fold",
     .item_label = LinkFoldCode.label,
-    .defaultItemCounts = linkFoldItemCounts,
+    .describe_item = LinkFoldCode.describe,
+    .item_counts = &link_fold_item_counts,
     .runCase = runLinkFoldCase,
     .write_workload = writeLinkFoldWorkload,
 };
@@ -226,13 +248,7 @@ const teleport_item_counts = cross_level_item_counts ++ [_]usize{
     teleportCode(.strip, teleport_strip_rows * 1024 / 16, 1024),
     teleportCode(.strip, teleport_strip_rows * 2048 / 16, 2048),
     teleportCode(.random_pads, 16, 256),
-    teleportCode(.random_pads, 64, 256),
-    teleportCode(.random_pads, 256, 256),
 };
-
-fn teleportItemCounts(_: suite.Profile) []const usize {
-    return &teleport_item_counts;
-}
 
 // Teleport-count configs place their teleports on level-0 cells this close to the border.
 const teleport_border_band: u16 = 16;
@@ -262,18 +278,6 @@ const link_fold_item_counts = [_]usize{
     LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 4, .background_pads = 8192 }),
     LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 64, .background_pads = 8192 }),
 };
-
-fn levelSizeItemCounts(_: suite.Profile) []const usize {
-    return &level_size_item_counts;
-}
-
-fn crossLevelItemCounts(_: suite.Profile) []const usize {
-    return &cross_level_item_counts;
-}
-
-fn linkFoldItemCounts(_: suite.Profile) []const usize {
-    return &link_fold_item_counts;
-}
 
 fn writeRouteWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("abstract_nodes={} routes_solved={}", .{ stats.candidate_pairs, stats.output_count });
@@ -319,9 +323,9 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     const side = code.level_side;
     const levels = code.levels;
     if (levels != 1 or side < 256) return error.LevelSizeBadConfig;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     var size_config = routeSizeConfig(side, levels, 0, participant_count);
 
@@ -340,7 +344,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     }
     try writeLevelZeroCells(&open, wall[0..wall_len], open.blocking);
     // The built world's content sizes the nav.
-    size_config.content = NavGraph.storageContentOf(&open.world);
+    size_config.content = pathfinding_test_support.navStorageContentOf(&open.world);
     try nav_size.checkNavSize(level_size_group.name, item_count, case, size_config);
 
     // An 8x8 block of starts left of the wall and their goals mirrored right of it,
@@ -360,7 +364,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try nav_size.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
-    const stats = try runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
+    const stats = try runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr, .fail);
     try nav_size.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
     return stats;
 }
@@ -422,9 +426,9 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const levels = config.levels;
     const teleport_count = config.teleports;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const link_count: usize = levels - 1 + if (teleport_count != 0) teleport_count else @intFromBool(teleport);
     var size_config = routeSizeConfig(side, levels, link_count, participant_count);
@@ -472,7 +476,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     }
 
     // The built world's content and links size the nav.
-    size_config.content = NavGraph.storageContentOf(&open.world);
+    size_config.content = pathfinding_test_support.navStorageContentOf(&open.world);
     try nav_size.checkNavSize(group_name, item_count, case, size_config);
 
     // Starts in an 8x8 block at the level-0 center, goals in an 8x8 block below it on
@@ -493,7 +497,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try nav_size.checkNavBytes(group_name, item_count, size_config, &fixture.system);
-    const stats = try runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
+    const stats = try runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
     try nav_size.checkNavBytes(group_name, item_count, size_config, &fixture.system);
     return stats;
 }
@@ -511,9 +515,9 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     const levels = code.levels;
     if (levels <= shaft_goal_level or side < 256) return error.CrossLevelShaftBadConfig;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // Ramps join levels 1..levels-1; one teleport leaves level 0.
     const link_count: usize = levels - 2 + 1;
@@ -549,7 +553,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         .bidirectional = false,
     });
     // The built world's content and links size the nav.
-    size_config.content = NavGraph.storageContentOf(&open.world);
+    size_config.content = pathfinding_test_support.navStorageContentOf(&open.world);
     try nav_size.checkNavSize(cross_level_shaft_group.name, item_count, case, size_config);
 
     var requests: [route_request_count]PathRequest = undefined;
@@ -568,7 +572,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try nav_size.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
-    const stats = try runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
+    const stats = try runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr, .count);
     try nav_size.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
     return stats;
 }
@@ -763,10 +767,6 @@ const long_path_item_counts = [_]usize{
     LongPathConfig.code(.hops, .deep_wide, 8),
     LongPathConfig.code(.hops, .deep_wide, 16),
 };
-
-fn longPathItemCounts(_: suite.Profile) []const usize {
-    return &long_path_item_counts;
-}
 
 // Walls on every `serpentine_pitch`-th row, odd walls open at the east end and even walls at
 // the west end; returns the cells blocked.
@@ -1033,32 +1033,31 @@ const LongPathCycle = struct {
     }
 };
 
-// Times one serial step that must solve exactly one request, at `tier`, and reads that solve
+// Times one inline step that must solve exactly one request, at `tier`, and reads that solve
 // from its scratch: the participant's corridor for a first attempt, the first tier-1 pool
 // entry (the step's only escalated admission) for an escalated one.
-fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), request: PathRequest, agent_count: usize, tier: u8) !LongPathAttempt {
+fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), request: PathRequest, agent_count: usize, tier: u8) !LongPathAttempt {
     const start_ns = suite.nowNs(io);
-    const stats = try system.updateSerial(requests, agent_count, .{
-        .max_solved_requests_per_step = agent_count,
-        .max_solve_admissions_per_step = agent_count,
-    });
+    const stats = try system.update(requests, agent_count, threads, longPathAttemptConfig(agent_count));
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.unavailable_results != 0) return error.RouteUnavailable;
-    if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
-    if (stats.solve_admissions != 1 or stats.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
+    if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
+    if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
+    if (stats.perf.solve_admissions != 1 or stats.perf.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
     const corridor = if (tier == 0) &system.scratch_slots.items[0].corridor else &system.tier1_scratch.items[0].corridor;
     const abstract = &corridor.abstract;
     // A search that reached its goal leaves its corridor; a saturated one leaves it empty, or
     // cut at the corridor limit.
     const found = abstract.corridor.items.len != 0 and abstract.corridor.items.len < abstract.corridor_limit;
     const cells = if (found) corridor.stitched.items.len else 0;
-    const segments = stats.max_stitch_segments_observed;
-    const outcome: LongPathOutcome = if (stats.available_results == 1 or stats.partial_results == 1) published: {
+    const segments = stats.perf.max_stitch_segments_observed;
+    // The segment cap bounds every stitch's local searches.
+    if (segments > system.capacity.max_stitch_segments) return error.StitchSegmentsPastCap;
+    const outcome: LongPathOutcome = if (stats.perf.available_results == 1 or stats.perf.partial_results == 1) published: {
         // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
-        if (stats.abstract_solves != 1 or !found) return error.LongPathSolvedOffCorridor;
-        if (stats.partial_results == 0) break :published .available;
+        if (!found or stats.perf.abstract_solves != 1) return error.LongPathSolvedOffCorridor;
+        if (stats.perf.partial_results == 0) break :published .available;
         break :published if (corridorEndsAtGoal(system, abstract.corridor.items, request)) .partial else .abstract_partial;
-    } else if (stats.budget_exhausted != 1)
+    } else if (stats.perf.budget_exhausted != 1)
         return error.LongPathUnexpectedOutcome
     else if (!found)
         .abstract_saturated
@@ -1080,6 +1079,14 @@ fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const R
     };
 }
 
+// A long-path attempt's inline step: every agent's request may solve.
+fn longPathAttemptConfig(agent_count: usize) PathfindingConfig {
+    return .{ .max_solved_requests_per_step = agent_count, .max_solve_admissions_per_step = agent_count };
+}
+
+// A walk's or hop chain's inline step: one solve.
+const one_solve_config = PathfindingConfig{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 };
+
 // Whether a corridor ends on a goal portal of `request` (`isGoalPortal` at its live goal); a
 // least-estimate corridor ends short of one.
 fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize, request: PathRequest) bool {
@@ -1094,17 +1101,19 @@ fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize,
     return isGoalPortal(level, geometry.chunkOfCell(cell), grid.labelAt(cell), request.goal_level, geometry.chunkOfCell(goal_index), goal_grid.labelAt(goal_index));
 }
 
-// One request cycle from empty runtime state: the first attempt, the escalated attempt when
-// the first exhausted, then every agent's status. No request stays pending after the second
-// attempt: it solves or drops.
-fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
+// One request cycle with nothing pending and every cached result expired (`drainPending`,
+// `expireCachedResults`): the first attempt, the escalated attempt when the first exhausted,
+// then every agent's status. No request stays pending after the second attempt: it solves or
+// drops.
+fn runLongPathCycle(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
     const system = &fixture.system;
-    system.clearRuntimeState();
-    const first = try runLongPathAttempt(io, system, &fixture.requests, requests[0], requests.len, 0);
+    try drainPending(system, threads, requests.len, longPathAttemptConfig(requests.len));
+    expireCachedResults(system);
+    const first = try runLongPathAttempt(io, threads, system, &fixture.requests, requests[0], requests.len, 0);
     var escalated: ?LongPathAttempt = null;
     if (first.outcome != .available) {
         if (system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
-        escalated = try runLongPathAttempt(io, system, empty, requests[0], requests.len, 1);
+        escalated = try runLongPathAttempt(io, threads, system, empty, requests[0], requests.len, 1);
     }
     if (system.pending.len != 0) return error.LongPathStillPending;
     var cycle = LongPathCycle{ .first = first, .escalated = escalated, .available = 0, .partial = 0, .missing = 0 };
@@ -1145,10 +1154,12 @@ const LongPathWalk = struct {
     }
 };
 
-// Walks `request`'s agent from empty runtime state to its goal (see the group comment).
-fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
+// Walks `request`'s agent to its goal with nothing pending and every cached result expired
+// (`drainPending`, `expireCachedResults`; see the group comment).
+fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
     const system = &fixture.system;
-    system.clearRuntimeState();
+    try drainPending(system, threads, 1, one_solve_config);
+    expireCachedResults(system);
     const grid = system.graph.grid(request.start_level) orelse return error.RouteUnavailable;
     const goal_cell = grid.worldToCellClamped(request.goal);
     var position = request.start;
@@ -1180,29 +1191,29 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
         tier0_abstract.reset();
         tier1_abstract.reset();
         const start_ns = suite.nowNs(io);
-        const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+        const stats = try system.update(stream, 1, threads, one_solve_config);
         walk.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         walk.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
-        if (stats.unavailable_results != 0) return error.RouteUnavailable;
-        if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
-        walk.solves += stats.solve_admissions;
-        walk.partial_results += stats.partial_results;
-        walk.full_results += stats.available_results - stats.cache_hits;
-        walk.escalations += stats.escalated_solves;
+        if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
+        if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
+        walk.solves += stats.perf.solve_admissions;
+        walk.partial_results += stats.perf.partial_results;
+        walk.full_results += stats.perf.available_results - stats.perf.cache_hits;
+        walk.escalations += stats.perf.escalated_solves;
     }
     if (!std.meta.eql(grid.worldToCellClamped(position), goal_cell)) return error.LongPathWalkStalled;
     return walk;
 }
 
-fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
+fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, threads: *ThreadSystem, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     const step_limit = 4 * config.routeCells() + 64;
-    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, fixture, &stream, request, step_limit);
+    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, threads, fixture, &stream, request, step_limit);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathWalk = null;
     for (0..coldIterations(options)) |_| {
-        const walk = try runLongPathWalk(io, fixture, &stream, request, step_limit);
+        const walk = try runLongPathWalk(io, threads, fixture, &stream, request, step_limit);
         if (reference) |kept| {
             if (!kept.sameWork(walk)) return error.LongPathWorkVaried;
         } else reference = walk;
@@ -1210,11 +1221,8 @@ fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
     var stats = accumulator.finish();
     const walk = reference orelse return stats;
-    if (options.details) {
-        std.debug.print("  {s} {} {s}: {s} walk parameter={} route~{} cells | steps={} held={} solves={} partial={} full={} escalations={} claims={} solve={}us | blocked={}\n", .{
-            long_path_group.name,
-            item_count,
-            case.name,
+    {
+        stats.details.print("{s} walk parameter={} route~{} cells | steps={} held={} solves={} partial={} full={} escalations={} claims={} solve={}us | blocked={}\n", .{
             @tagName(config.layout),
             config.parameter,
             config.routeCells(),
@@ -1257,12 +1265,14 @@ const LongPathHops = struct {
     }
 };
 
-// Chains `request`'s hops from empty runtime state: each hop's request runs its first attempt
+// Chains `request`'s hops with nothing pending and every cached result expired
+// (`drainPending`, `expireCachedResults`): each hop's request runs its first attempt
 // and, when that promoted, its escalated attempt; a partial restarts the chain at its end, on
 // its level, until a hop arrives (`.available`) or drops (`.missing`).
-fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
+fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
     const system = &fixture.system;
-    system.clearRuntimeState();
+    try drainPending(system, threads, 1, one_solve_config);
+    expireCachedResults(system);
     const tier0_abstract = &system.scratch_slots.items[0].corridor.abstract;
     const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
     var chain = LongPathHops{};
@@ -1280,21 +1290,22 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
             tier0_abstract.reset();
             tier1_abstract.reset();
             const start_ns = suite.nowNs(io);
-            const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+            const stats = try system.update(stream, 1, threads, one_solve_config);
             chain.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
             try fixtures.writeRequests(stream, &.{});
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
-            if (stats.unavailable_results != 0) return error.RouteUnavailable;
-            if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
-            if (stats.solve_admissions != 1 or stats.cache_hits != 0) return error.LongPathNotOneSolve;
+            if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
+            if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
+            if (stats.perf.solve_admissions != 1 or stats.perf.cache_hits != 0) return error.LongPathNotOneSolve;
             chain.solves += 1;
-            chain.escalations += stats.escalated_solves;
-            if (stats.available_results == 1) break .arrived;
-            if (stats.partial_results == 1) {
+            chain.escalations += stats.perf.escalated_solves;
+            if (stats.perf.available_results == 1) break .arrived;
+            if (stats.perf.partial_results == 1) {
                 if (attempt == 1 and !corridorEndsAtGoal(system, tier1_abstract.corridor.items, hop)) chain.least_hops += 1;
                 break .partial;
             }
-            if (stats.escalated_dropped == 1) break .dropped;
+            // Neither arrived nor partial, and no longer pending: the tier-1 attempt dropped it.
+            if (attempt == 1 and system.pending.len == 0) break .dropped;
             if (attempt == 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
         } else return error.LongPathStillPending;
         switch (ended) {
@@ -1310,16 +1321,16 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
     }
 }
 
-fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
+fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, threads: *ThreadSystem, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     // Every published hop advances at least one cell.
     const hop_limit = config.routeCells() + 64;
-    for (0..coldWarmup(options)) |_| _ = try runLongPathHops(io, fixture, &stream, request, hop_limit);
+    for (0..coldWarmup(options)) |_| _ = try runLongPathHops(io, threads, fixture, &stream, request, hop_limit);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathHops = null;
     for (0..coldIterations(options)) |_| {
-        const chain = try runLongPathHops(io, fixture, &stream, request, hop_limit);
+        const chain = try runLongPathHops(io, threads, fixture, &stream, request, hop_limit);
         if (reference) |kept| {
             if (!kept.sameWork(chain)) return error.LongPathWorkVaried;
         } else reference = chain;
@@ -1327,11 +1338,8 @@ fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
     var stats = accumulator.finish();
     const chain = reference orelse return stats;
-    if (options.details) {
-        std.debug.print("  {s} {} {s}: {s} hops parameter={} route~{} cells | stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
-            long_path_group.name,
-            item_count,
-            case.name,
+    {
+        stats.details.print("{s} hops parameter={} route~{} cells | stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
             @tagName(config.layout),
             config.parameter,
             config.routeCells(),
@@ -1351,8 +1359,8 @@ fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     return stats;
 }
 
-fn printLongPathAttempt(label: []const u8, attempt: LongPathAttempt, mean_ns: u64) void {
-    std.debug.print(" | {s}: nodes={} corridor={} cells={} segments={} settles={} frozen={} outcome={s} {}us", .{
+fn writeLongPathAttempt(details: *suite.DetailLines, label: []const u8, attempt: LongPathAttempt, mean_ns: u64) void {
+    details.print(" | {s}: nodes={} corridor={} cells={} segments={} settles={} frozen={} outcome={s} {}us", .{
         label,
         attempt.nodes,
         attempt.corridor,
@@ -1366,7 +1374,9 @@ fn printLongPathAttempt(label: []const u8, attempt: LongPathAttempt, mean_ns: u6
 }
 
 fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("each step solves one request: a one-item solve batch");
+    std.debug.assert(!case.usesThreadSystem());
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
     const config = try LongPathConfig.decode(item_count);
     const levels = config.levels();
     const agent_count = config.agents();
@@ -1386,14 +1396,14 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .agent_budget = agent_count,
         .group_fields = 1,
         .batch = nav_size.NavBatch.none,
-        .content = NavGraph.storageContentOf(&open.world),
+        .content = pathfinding_test_support.navStorageContentOf(&open.world),
         .tier1_abstract_nodes = if (config.variant == .probe) long_path_probe_nodes else default_tier1_abstract_node_cap,
     };
     try nav_size.checkNavSize(long_path_group.name, item_count, case, size_config);
 
     const capacity = nav_size.navSizeCapacity(size_config);
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, null);
+    var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, &threads);
     defer fixture.deinit();
     try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var empty = RangeOutputStream(PathRequest).init(allocator);
@@ -1402,20 +1412,20 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // Every variant checks the nav's bytes again once its paths are cached and registered.
     if (config.variant == .walk or config.variant == .hops) {
         const stats = if (config.variant == .walk)
-            try runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked)
+            try runLongPathWalkCase(allocator, io, &threads, options, item_count, config, &fixture, agents[0], built.blocked)
         else
-            try runLongPathHopsCase(allocator, io, options, case, item_count, config, &fixture, agents[0]);
+            try runLongPathHopsCase(allocator, io, &threads, options, item_count, config, &fixture, agents[0]);
         try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
         return stats;
     }
 
-    for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &fixture, &empty, agents);
+    for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &threads, &fixture, &empty, agents);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathCycle = null;
     var first_ns: u64 = 0;
     var escalated_ns: u64 = 0;
     for (0..coldIterations(options)) |_| {
-        const cycle = try runLongPathCycle(io, &fixture, &empty, agents);
+        const cycle = try runLongPathCycle(io, &threads, &fixture, &empty, agents);
         if (reference) |kept| {
             if (!kept.sameWork(cycle)) return error.LongPathWorkVaried;
         } else reference = cycle;
@@ -1432,21 +1442,18 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     const cycle = reference orelse return stats;
-    if (options.details) {
+    {
         const samples: u64 = stats.iterations;
-        std.debug.print("  {s} {} {s}: {s} {s} parameter={} route~{} cells agents={}", .{
-            long_path_group.name,
-            item_count,
-            case.name,
+        stats.details.print("{s} {s} parameter={} route~{} cells agents={}", .{
             @tagName(config.layout),
             @tagName(config.variant),
             config.parameter,
             config.routeCells(),
             agent_count,
         });
-        printLongPathAttempt("first", cycle.first, first_ns / samples);
-        if (cycle.escalated) |escalated| printLongPathAttempt("escalated", escalated, escalated_ns / samples);
-        std.debug.print(" | blocked={} status available={} partial={} missing={}\n", .{ built.blocked, cycle.available, cycle.partial, cycle.missing });
+        writeLongPathAttempt(&stats.details, "first", cycle.first, first_ns / samples);
+        if (cycle.escalated) |escalated| writeLongPathAttempt(&stats.details, "escalated", escalated, escalated_ns / samples);
+        stats.details.print(" | blocked={} status available={} partial={} missing={}\n", .{ built.blocked, cycle.available, cycle.partial, cycle.missing });
     }
     stats.candidate_pairs = (cycle.escalated orelse cycle.first).nodes;
     stats.output_count = cycle.available;
@@ -1494,7 +1501,7 @@ fn addBorderTeleports(world: *WorldSystem, side: u16, deepest: u16, count: usize
 fn levelChunkIndex(world: *const WorldSystem, cell: CellCoord) usize {
     const chunk = world.chunkCoordForCell(cell.x, cell.y);
     // In range: chunk coordinates of an in-world cell are non-negative.
-    return @as(usize, @intCast(chunk.y)) * world.chunksX() + @as(usize, @intCast(chunk.x));
+    return @as(usize, @intCast(chunk.y)) * world.chunkGeometry().chunks_x + @as(usize, @intCast(chunk.x));
 }
 
 // Level cells within `teleport_border_band` of the border.
@@ -1590,55 +1597,54 @@ const UnsolvedRoutes = enum {
 
 // One cold pathfinding step of the fixture's requests. Every fixture route exists and
 // starts on an open cell, so an unavailable answer or an invalid start is a fixture fault.
-fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, unsolved_routes: UnsolvedRoutes) !PathfindingStats {
+fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase, unsolved_routes: UnsolvedRoutes) !PathfindingStats {
     const count = route_request_count;
     const stats = try runColdOnce(system, &fixture.requests, thread_system, case, count, count, count);
-    if (stats.unavailable_results != 0) return error.RouteUnavailable;
-    if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
-    std.debug.assert(stats.available_results <= count);
-    if (unsolved_routes == .fail and (stats.available_results != count or stats.pending_requests != 0)) return error.RouteUnsolved;
+    if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
+    if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
+    std.debug.assert(stats.perf.available_results <= count);
+    if (unsolved_routes == .fail and (stats.perf.available_results != count or stats.perf.pending_requests != 0)) return error.RouteUnsolved;
     return stats;
 }
 
-// Times one cold pathfinding step of the fixture's requests per iteration (runtime
-// state cleared, untimed, before each).
-fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
+// Times one cold pathfinding step of the fixture's requests per iteration, each with nothing
+// pending and every cached result expired, untimed (`drainPending`, `expireCachedResults`).
+fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: *ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
-    setPathStageTuners(system, case);
-    for (0..options.warmup_iterations) |_| {
-        system.clearRuntimeState();
+    const cold_config = coldStepConfig(case, route_request_count, route_request_count);
+    var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(stepTunerSettle(system))) {
+        try drainPending(system, thread_system, route_request_count, cold_config);
+        expireCachedResults(system);
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
-            _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
-        }
-    }
-    const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settle = stepTunerSettle(system);
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var abstract_nodes: usize = 0;
     var stage_report = StageReport{};
     for (0..options.iterations) |_| {
-        system.clearRuntimeState();
+        try drainPending(system, thread_system, route_request_count, cold_config);
+        expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, last_stats.solve_batch);
+        accumulator.record(elapsed_ns, last_stats.perf.solve_batch);
         stage_report.add(elapsed_ns, last_stats);
         abstract_nodes = lastAbstractNodesUsed(system);
     }
-    if (unsolved_routes == .count) stage_report.routes = .{ .solved = last_stats.available_results, .unsolved = route_request_count - last_stats.available_results };
-    stage_report.print(options, group_name, item_count, case);
+    if (unsolved_routes == .count) stage_report.routes = .{ .solved = last_stats.perf.available_results, .unsolved = route_request_count - last_stats.perf.available_results };
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results;
+    stage_report.write(&stats.details);
+    stats.output_count = last_stats.perf.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
+    }
     return stats;
 }
 
@@ -1680,15 +1686,19 @@ const LinkFoldConfig = struct {
 fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try LinkFoldConfig.decode(item_count);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
+    // A jump's shape, held across its count band, is judged by its first two records, so at
+    // least two untimed batches run whatever the warmup count, the same in every case.
+    const warmup_batches = @max(options.warmup_iterations, 2);
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
-    const samples = options.warmup_iterations + options.iterations;
+    const samples = warmup_batches + options.iterations;
     const peak_pads = config.padsAfter(samples);
-    // A timed batch's pads and their endpoint chunks; the probe preload is in the build.
-    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 0, .links = link_fold_batch, .keys = 2 * link_fold_batch });
+    // A timed batch's pads and their endpoint chunks, or the in-band toggle's one cell; the
+    // probe preload is in the build.
+    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 1, .links = link_fold_batch, .keys = @max(2 * link_fold_batch, toggle_batch_keys) });
     // Every pad is bidirectional.
     size_config.oneway_links = 0;
     try nav_size.checkNavSize(link_fold_group.name, item_count, case, size_config);
@@ -1700,34 +1710,82 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     fixtures.setNavTuners(&fixture.system, case);
+    // The in-band toggle's reopen reacts on its own stage tuner set.
+    var revert_tuners: fixtures.NavTuners = fixture.system.tuners;
+    try fixture.changed.ensureTotalCapacity(allocator, 1);
+    // The stage tuners train in play on ordinary nav reactions, so the tuned case settles them
+    // on in-band toggles; the pads stay fixed meanwhile, so the settle length never changes the
+    // measured world. At least two toggles in every case.
+    var warm = suite.Warmup.custom(case, 2, suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(linkFoldTunerSettle(&fixture.system, &revert_tuners))) try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
     var batch: usize = 0;
-    for (0..options.warmup_iterations) |_| {
+    // Each untimed batch after an in-band toggle grows the per-range scratch to the settled
+    // tuners' jump shape and lets the jump's records judge it.
+    for (0..warmup_batches) |_| {
+        try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
         _ = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
     }
+    const settle = linkFoldTunerSettle(&fixture.system, &revert_tuners);
+    const patch_tuner = fixture.system.tuners.nav.getPtrConst(.patch);
+    const patch_start = suite.TunerStart.of(patch_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = LinkFoldReport{};
     for (0..options.iterations) |_| {
+        try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
+        const jump_before = patch_tuner.jump_profile;
+        const skips_before = patch_tuner.shift_skip_count;
         const sample = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
-        accumulator.record(sample.reaction.elapsed_ns, sample.reaction.stats.patch_batch);
-        report.add(sample, sample.reaction.stats.plan_batch, sample.reaction.stats.patch_batch, fixture.open.world.levelLinks().len);
+        const patch = sample.reaction.stats.perf.patch_batch;
+        accumulator.record(sample.reaction.elapsed_ns, patch);
+        report.add(sample, sample.reaction.stats.perf.plan_batch, patch, fixture.open.world.levelLinks().len);
+        // A skipped record on a tuner with no threaded profile and a jump entry took the jump.
+        const jumped = patch_tuner.shift_skip_count != skips_before and !patch_tuner.has_threaded_profile;
+        if (case.adaptive and jumped) report.addPatchJump(jump_before, patch_tuner.jump_profile, patch.item_count);
     }
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;
-    report.print(options, link_fold_group.name, item_count, case);
+    if (case.adaptive and report.patch_jumps != options.iterations) return error.LinkFoldPatchNotJump;
+    if (report.patch_jump_repredicted != 0) return error.LinkFoldJumpRepredicted;
+    // Uniform batches touch varying chunk counts, so the band, not a repeated count, is reused.
+    if (case.adaptive and config.axis == .uniform and report.patch_jump_off_count == 0) return error.LinkFoldJumpCountFixed;
     try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    report.write(&stats.details);
     stats.output_count = pads_held;
     stats.candidate_pairs = report.chunks_patched;
     stats.nav_main = report.stages.nav_main;
     stats.items_per_second = suite.itemsPerSecond(link_fold_batch, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(patch_tuner, patch_start);
+    }
     return stats;
+}
+
+// The link-fold cases' census: the forward stage tuner set (the system's) and the in-band
+// toggle's revert set.
+fn linkFoldTunerSettle(system: *const PathfindingSystem, revert_tuners: *const fixtures.NavTuners) suite.TunerSettle {
+    var census = stepTunerSettle(system);
+    fixtures.addNavTuners(&census, "revert.", revert_tuners);
+    return census;
+}
+
+// The link-fold cases' in-band nav work, untimed: the cell at level 1's centre (no pad joins
+// level 1) blocked and reacted to on the forward stage tuners, then reopened and reacted to
+// on `revert_tuners` (swapped in and out), which returns terrain and nav to their state before.
+fn toggleLinkFoldInBandCell(io: std.Io, fixture: *ReactFixture, revert_tuners: *fixtures.NavTuners, thread_system: *ThreadSystem) !void {
+    const cell = [_]CellCoord{.{ .x = link_fold_side / 2, .y = link_fold_side / 2 }};
+    _ = try fixture.changeLevelAndReact(io, 1, &cell, fixture.open.blocking, thread_system);
+    fixtures.swapNavTuners(&fixture.system, revert_tuners);
+    defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
+    _ = try fixture.changeLevelAndReact(io, 1, &cell, fixture.open.walkable, thread_system);
 }
 
 // The link-fold world, with no requests: `config.pads` random pads off the first
 // `probe_pairs` probe chunk pairs, and `config.preload` pads joining each pair.
-fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, link_fold_side, link_fold_levels);
     errdefer open.world.deinit();
     const deepest = link_fold_levels - 1;
@@ -1745,8 +1803,8 @@ fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Ran
 // `deepest`, each pad between random cells of the two. Fails when a pad's span falls under
 // `random_pad_min_span`, so a pad never reads as a short link.
 fn addProbePads(world: *WorldSystem, random: std.Random, deepest: u16, first_pair: usize, pairs: usize, per_pair: usize) !void {
-    const chunks_x: usize = world.chunksX();
-    const chunks_y: usize = world.chunksY();
+    const chunks_x: usize = world.chunkGeometry().chunks_x;
+    const chunks_y: usize = world.chunkGeometry().chunks_y;
     const tiles = world.chunk_size_tiles;
     if (first_pair + pairs > chunks_x * chunks_y) return error.LinkFoldProbeTooMany;
     for (first_pair..first_pair + pairs) |pair| {
@@ -1782,7 +1840,7 @@ const LinkFoldSample = struct {
 // nav reaction that applies them and counts the touched chunks' endpoints untimed. Fails
 // unless the reaction applied every pad in one marks batch and patched exactly the touched
 // chunks.
-fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: ?*ThreadSystem) !LinkFoldSample {
+fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: *ThreadSystem) !LinkFoldSample {
     const world = &fixture.open.world;
     const graph = &fixture.system.graph;
     const applied_before = graph.links_applied;
@@ -1822,36 +1880,57 @@ fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: 
     return sample;
 }
 
+// A tuner's held jump entry, as the link-fold report reads it.
+const PatchJump = @FieldType(AdaptiveWorkTuner, "jump_profile");
+
 // The timed link-fold reactions' plan, patch, and connectivity gather shapes and main-thread
 // share and split, the chunks the last reaction patched, the endpoints of the chunks the
 // reactions touched summed with those chunks, and the pads held after each reaction, summed.
+
 const LinkFoldReport = struct {
     stages: ReactionStages = .{},
     chunks_patched: usize = 0,
     touched_chunks: usize = 0,
     touched_endpoints: usize = 0,
     pads_held: usize = 0,
+    // The tuned case's timed patch jumps: their item count range, those at a count other than
+    // their judgment entry's, and those that took a new entry (re-predicted) rather than the
+    // judged one their count band covers.
+    patch_jumps: usize = 0,
+    patch_jump_min_items: usize = std.math.maxInt(usize),
+    patch_jump_max_items: usize = 0,
+    patch_jump_off_count: usize = 0,
+    patch_jump_repredicted: usize = 0,
+
+    // A timed patch batch that took the jump branch, which reads or sets the tuner's jump
+    // entry; one without a per-item model holds none.
+    fn addPatchJump(self: *LinkFoldReport, before: PatchJump, after: PatchJump, item_count: usize) void {
+        const entry = after orelse return;
+        self.patch_jumps += 1;
+        self.patch_jump_min_items = @min(self.patch_jump_min_items, item_count);
+        self.patch_jump_max_items = @max(self.patch_jump_max_items, item_count);
+        if (entry.item_count != item_count) self.patch_jump_off_count += 1;
+        const reused = if (before) |held| held.learned_item_count == entry.learned_item_count and held.item_count == entry.item_count else false;
+        if (!reused) self.patch_jump_repredicted += 1;
+    }
 
     fn add(self: *LinkFoldReport, sample: LinkFoldSample, plan: BatchStats, patch: BatchStats, pads_held: usize) void {
-        self.stages.add(sample.reaction, .{ plan, patch, sample.reaction.stats.conn_gather_batch });
+        self.stages.add(sample.reaction, .{ plan, patch, sample.reaction.stats.perf.conn_gather_batch });
         self.chunks_patched = sample.reaction.stats.chunks_patched;
         self.touched_chunks += sample.touched_chunks;
         self.touched_endpoints += sample.touched_endpoints;
         self.pads_held += pads_held;
     }
 
-    fn print(self: LinkFoldReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+    fn write(self: LinkFoldReport, details: *suite.DetailLines) void {
         const stages = self.stages;
-        if (!options.details or stages.timed_ns == 0) return;
+        if (stages.timed_ns == 0) return;
         var shapes: [3][48]u8 = undefined;
         const labels = stages.labels(&shapes);
         var main_buffer: [320]u8 = undefined;
         const endpoints_x10 = self.touched_endpoints * 10 / self.touched_chunks;
         const pad_samples = stages.samples * link_fold_batch;
-        std.debug.print("  {s} {} {s}: plan={s} patch={s} conn_gather={s} per_pad={}ns commit_per_pad={}ns endpoints_per_touched_chunk={}.{} pads_held_mean={} main={}us ({}%) patched={}{s}\n", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("plan={s} patch={s} conn_gather={s} per_pad={}ns commit_per_pad={}ns endpoints_per_touched_chunk={}.{} pads_held_mean={} main={}us ({}%) patched={}{s}\n", .{
             labels[0],
             labels[1],
             labels[2],
@@ -1865,5 +1944,6 @@ const LinkFoldReport = struct {
             self.chunks_patched,
             suite.formatNavMainInto(&main_buffer, stages.nav_main),
         });
+        if (self.patch_jumps != 0) details.print("patch_jumps={} patch_jump_items={}-{} patch_jump_off_count={} patch_jump_repredicted={}\n", .{ self.patch_jumps, self.patch_jump_min_items, self.patch_jump_max_items, self.patch_jump_off_count, self.patch_jump_repredicted });
     }
 };

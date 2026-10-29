@@ -24,6 +24,7 @@ const TextureId = @import("../../render/resources.zig").TextureId;
 const world_gpu_tiles = @import("gpu_tiles.zig");
 const log = @import("../../core/logging.zig").game;
 const logging = @import("../../core/logging.zig");
+const pdqSort = @import("../../core/sort.zig").pdq;
 const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
 const WorldSystem = @import("system.zig").WorldSystem;
 const TileId = @import("system.zig").TileId;
@@ -446,7 +447,7 @@ fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMe
         if (!self.render_window.levelInWindow(active_level, @intCast(level), levels.max_level)) continue;
         desired.appendSliceAssumeCapacity(self.level_terrain.items[level].bandLayers());
     }
-    std.mem.sort(u32, desired.items, self, denseLayerIndexLessThan);
+    pdqSort(u32, desired.items, self, denseLayerIndexLessThan);
     std.mem.reverse(u32, desired.items);
     return desired.items;
 }
@@ -1641,7 +1642,7 @@ test "underground dense layers append in storage order not ascending render dept
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    try std.testing.expectEqual(@as(usize, 3), world.denseLayerCount());
+    try std.testing.expectEqual(@as(usize, 3), world.dense_layers.len);
     const grass_depth = denseLayerOrder(&world, 0).depth;
     const dirt_depth = denseLayerOrder(&world, 1).depth;
     const dirt_dark_depth = denseLayerOrder(&world, 2).depth;

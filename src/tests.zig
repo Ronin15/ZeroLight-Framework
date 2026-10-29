@@ -37,6 +37,7 @@ comptime {
     _ = @import("core/logging.zig");
     _ = @import("core/rng.zig");
     _ = @import("core/simd.zig");
+    _ = @import("core/sort.zig");
     _ = @import("game/ai_archetypes.zig");
     _ = @import("game/ai_debug_overlay.zig");
     _ = @import("game/audio_controller.zig");
@@ -70,8 +71,10 @@ comptime {
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");
     _ = @import("game/systems/arbitration.zig");
+    _ = @import("game/systems/banded_sort.zig");
     _ = @import("game/systems/chunk_list_map.zig");
     _ = @import("game/systems/collision.zig");
+    _ = @import("game/systems/collision_triggers.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
     _ = @import("game/systems/pathfinding.zig");
@@ -82,7 +85,10 @@ comptime {
     _ = @import("game/systems/world_gate.zig");
     _ = @import("game/systems/spatial_index.zig");
     _ = @import("game/systems/static_colliders.zig");
-    _ = @import("game/systems/steering.zig");
+    _ = @import("game/systems/steering/system.zig");
+    _ = @import("game/systems/steering/selection.zig");
+    _ = @import("game/systems/steering/directions.zig");
+    _ = @import("game/systems/steering/avoidance.zig");
     _ = @import("main.zig");
     _ = @import("render/gpu/buffer.zig");
     _ = @import("render/gpu/device.zig");

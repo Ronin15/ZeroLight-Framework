@@ -1,49 +1,43 @@
 # ZeroLight Framework
 
-A lean 2D game framework built with **Zig 0.17**, **SDL3**, and **SDL_GPU**.
-It targets predictable runtime flow, data-oriented gameplay, and a clear split
-between app coordination, rendering, assets, and simulation.
+A 2D engine for a colony sim, built with **Zig 0.17**, **SDL3**, and **SDL_GPU**.
 
-The project is actively growing toward large procedural worlds, scoped
-simulation, richer emergent AI, and production-friendly asset workflows.
+One world is playable today: many floors, ground you can dig, and people living in it. The aim is a colony that keeps going everywhere else too, on deeper stacks and in more worlds, whether you are looking or not.
+
+The engine is held to a few principles:
+
+- **Data-oriented** — gameplay data sits in dense columns and is processed in batches.
+- **Allocation-free hot paths** — a running frame and a simulation step do not allocate. Memory grows ahead of the work, and a test fails if a warmed path still asks for it.
+- **SIMD for dense math** — wide number work uses SIMD. A loop stays scalar only when SIMD cannot fit that shape, the reason is recorded, and a new hot loop proves the scalar and SIMD results match.
+- **Fully simulated** — what exists keeps advancing, in every world. Distance makes far-off work cheaper. It does not stop it.
+- **Fixed step** — the simulation runs at 60Hz, apart from the frame rate.
+- **Deterministic** — the same starting world and the same input give the same result on one core or many.
+- **Local cost** — a chunk of a floor owns its terrain, navigation, and save data. A dig costs the chunks it touches, and memory follows what exists.
+- **Separate layers** — app coordination, rendering, assets, and simulation stay apart. The game describes what to draw and never talks to the GPU.
+
+The full model is in [architecture](docs/architecture.md).
 
 ## Features
 
-- **Runnable app shell** — main menu, settings, pause overlay, loading
-  transitions, audio controls, and debug overlays on one state stack with
-  policy-driven input routing.
-- **Keyboard and gamepad** — controller support for menus, pause, dig, move,
-  and interact, with disconnect handling and held-input release when focus
-  leaves gameplay.
-- **SDL_GPU rendering** — sprites, multi-level tilemaps, camera transforms,
-  text, and ordered world drawing behind a small game-facing render API.
-- **Worlds and tilemaps** — large procedural multi-level worlds built from
-  chunks, dig and plane traversal between floors, and tile edits that feed
-  navigation and gameplay.
-- **Fixed-step simulation** — 60Hz gameplay with AI, steering, pathfinding,
-  movement, collision, particles, and small domain controllers (dig, audio,
-  interactables).
-- **Scoped simulation** — full detail near the view, cheaper tiers farther
-  out.
-- **Dig-aware pathfinding** — NPCs path across levels and long distances and
-  use newly dug tunnels and ramps right away.
-- **Emergent AI (in progress)** — agents see, hear, remember, and react with
-  simple emotions and data-authored personalities. Combat AI and deeper goals
-  are on the roadmap.
-- **Destruction and construction (in progress)** — digging, ramps, and
-  destructible objects today, built toward large-scale destruction and building.
-- **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
-  audio can be swapped without rewriting game code.
-- **Multithreaded and deterministic** — threaded systems with identical
-  serial and threaded results, memory that scales with the world,
-  allocation-free hot paths, and benchmarks that track scaling.
+- **Ground you can change** — procedural floors you can dig, ramp, and cross. A new tunnel is part of the map immediately.
+- **People who find a way** — they cross floors and long distances, and they take a tunnel or ramp as soon as it exists.
+- **Senses, memory, and mood** — they see, hear, remember, and react, with simple emotions and personalities you can edit as data. Combat and longer-term goals are still ahead.
+- **Breaking things, with building still ahead** — digging, ramps, and objects you can destroy. Cave-ins, explosions, and construction are still ahead.
+- **A steady pace** — the world advances sixty times a second, so the frame rate does not decide what happens.
+- **The same result on one core or many** — the same actions produce the same world however the work is split.
+- **Work stays local** — digging costs the ground you touched, not the whole map.
+- **Art and audio you can swap** — pictures and sounds live in packed atlases, so new content does not take new code.
+- **Keyboard and gamepad** — menus, pause, dig, move, and interact. Unplugging the pad, or leaving play, lets go of whatever you were holding.
+- **A small shell you can run** — main menu, settings, pause, and loading, plus audio controls.
+- **2D drawing** — sprites, layered maps, a camera, and text.
 
-For design detail and ownership boundaries, start with
-[architecture](docs/architecture.md). Topic guides cover
-[state and input](docs/state-stack-and-input.md),
-[rendering and shaders](docs/rendering-assets-shaders.md),
-[atlas workflow](docs/atlas-asset-workflow.md), and
-[simulation](docs/simulation-tiers-and-pipeline.md).
+## Where it is headed
+
+- Far away, people think less often instead of stopping, and the world around them keeps moving.
+- Several worlds at once, opened and closed in play, each with its own people and ground.
+- Menus, buttons, and a HUD that share one theme.
+
+Setup, input, rendering, assets, and simulation are listed under Documentation.
 
 ## Requirements
 
@@ -123,7 +117,7 @@ Generated output lives under `zig-out/` and should not be committed.
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
 - [Atlas Asset Workflow](docs/atlas-asset-workflow.md)
 - [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
-- [Rules](.claude/rules/) (coding standards, one file per topic)
+- [Rules](.grok/rules/) (coding standards, one file per topic)
 - [Roadmap](docs/framework-implementation-slices.md) (implementation slices)
 - [Changelogs](docs/changelogs/) and [module reviews](docs/reviews/)
 

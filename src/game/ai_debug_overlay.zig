@@ -250,9 +250,9 @@ pub const AiDebugOverlay = struct {
     }
 
     // Two screen-space (drawable) HUD blocks composed from cached glyphs so no
-    // per-frame string→texture work occurs (only a stack `bufPrint`): the scope
-    // tier counts, then the global per-behavior tally across all cognition
-    // agents. Read-only const-slice reads throughout.
+    // per-frame string→texture work occurs (only a stack `std.mem.print`): the
+    // scope tier counts, then the global per-behavior tally across all
+    // cognition agents. Read-only const-slice reads throughout.
     fn drawHud(self: *AiDebugOverlay, renderer: *Renderer, data: *const DataSystem) !void {
         const line_height: f32 = 18;
         const block_gap: f32 = 10;
@@ -283,14 +283,14 @@ pub const AiDebugOverlay = struct {
     }
 
     // One HUD line: the (already-colored) label followed by `value` composed
-    // from the cached yellow digit glyphs. `bufPrint` writes a fixed stack
+    // from the cached yellow digit glyphs. `std.mem.print` writes a fixed stack
     // buffer, so no allocation.
     fn drawHudLine(self: *AiDebugOverlay, renderer: *Renderer, label: PreparedText, value: usize, y: f32) !void {
         var x: f32 = 12;
         try drawHudText(renderer, label, x, y);
         x += @floatFromInt(label.width);
         var buffer: [max_hud_digits]u8 = undefined;
-        const digits = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch "0";
+        const digits = std.mem.print(&buffer, "{d}", .{value}) catch "0";
         for (digits) |ch| {
             const glyph = self.digits[ch - '0'];
             try drawHudText(renderer, glyph, x, y);

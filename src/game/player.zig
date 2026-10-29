@@ -29,7 +29,7 @@ pub const Player = struct {
 
     pub fn spawn(data: *DataSystem) !Player {
         const entity = try data.createEntity();
-        errdefer _ = data.destroyEntity(entity);
+        errdefer data.destroyCreatedEntity(entity);
 
         try data.setMovementBody(entity, .{
             .position = initial_position,
@@ -70,19 +70,22 @@ pub const Player = struct {
         }
     }
 
+    /// Keeps the player's collision box (`position + offset`, `size`) inside
+    /// `[0, bounds]` with `math.clampMinMax`, the scalar twin of the world gate's lane
+    /// clamp. A player without collision bounds has no box and is left as is.
     pub fn clampToBounds(self: Player, data: *DataSystem, bounds_width: f32, bounds_height: f32) !void {
         const body = data.movementBodyPtr(self.entity) orelse return error.MissingPlayerMovementBody;
-        const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
+        const bounds = data.collisionBoundsConst(self.entity) orelse return;
 
-        body.position_x.* = math.clamp(
+        body.position_x.* = math.clampMinMax(
             body.position_x.*,
-            0,
-            bounds_width - visual.size.x,
+            0 - bounds.offset.x,
+            bounds_width - bounds.offset.x - bounds.size.x,
         );
-        body.position_y.* = math.clamp(
+        body.position_y.* = math.clampMinMax(
             body.position_y.*,
-            0,
-            bounds_height - visual.size.y,
+            0 - bounds.offset.y,
+            bounds_height - bounds.offset.y - bounds.size.y,
         );
     }
 
@@ -126,6 +129,7 @@ test "player movement clamps to state bounds" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const player = try Player.spawn(&data);
+    try data.setCollisionBounds(player.entity, .{ .size = Player.size });
     try data.setMovementBody(player.entity, .{
         .position = .{ .x = 790, .y = -4 },
         .previous_position = .{ .x = 790, .y = -4 },
@@ -138,12 +142,34 @@ test "player movement clamps to state bounds" {
 
     try player.applyInput(&data, &input);
     var movement_slice = data.movementBodySlice();
-    movement.updateSerial(&movement_slice, 1.0);
+    var threads = try @import("../app/thread_system.zig").ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var movement_system = movement.MovementSystem.init();
+    _ = movement_system.update(&movement_slice, &threads, 1.0, .{});
     try player.clampToBounds(&data, 800, 450);
 
     const body = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(@as(f32, 768), body.position.x);
     try std.testing.expectEqual(@as(f32, 0), body.position.y);
+}
+
+test "player clamp keeps the collision box in bounds and leaves a box-less player as is" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    const body = data.movementBodyPtr(player.entity).?;
+
+    body.position_x.* = 900;
+    body.position_y.* = -50;
+    try player.clampToBounds(&data, 800, 450);
+    try std.testing.expectEqual(@as(f32, 900), body.position_x.*);
+    try std.testing.expectEqual(@as(f32, -50), body.position_y.*);
+
+    // The box spans [position + offset, position + offset + size).
+    try data.setCollisionBounds(player.entity, .{ .offset = .{ .x = 4, .y = -6 }, .size = .{ .x = 20, .y = 10 } });
+    try player.clampToBounds(&data, 800, 450);
+    try std.testing.expectEqual(@as(f32, 800 - 4 - 20), body.position_x.*);
+    try std.testing.expectEqual(@as(f32, 6), body.position_y.*);
 }
 
 test "player facing updates from movement and remains while idle" {

@@ -42,7 +42,7 @@ every existing agent is byte-identical.
 - Per-agent post data is one optional component; home and alert level are
   derived, never stored.
 - Route count and length are content-sized
-  (`.claude/rules/budgets-capacities.md`); 71A adds route data to markers,
+  (`.grok/rules/budgets-capacities.md`); 71A adds route data to markers,
   whose store 58 grows with content.
 - The leash has hysteresis read from the agent's active behavior, so a
   target at the boundary cannot cause flapping; flee is never leashed.
@@ -57,10 +57,10 @@ every existing agent is byte-identical.
   allies through the shared spatial index under a fixed per-query budget,
   plus one deferred `alarm` stimulus heard by every stagger cohort.
   Over-budget alarms defer to the next step, never drop
-  (`.claude/rules/budgets-capacities.md`). A guard is a homed agent that can
+  (`.grok/rules/budgets-capacities.md`). A guard is a homed agent that can
   fight (gain rule, not a content list).
-- Spatial rows map to entities through the index's own entity column, never
-  halo positions (rows are compacted).
+- Spatial rows map to entities through the index's own entity column (`SpatialIndexView.entityAt`,
+  `spatial_index.zig:247`), never halo positions (rows are compacted).
 - Hashed state (post store, route fields on markers, anchor routes) is
   classified in Slice 49's lists and saved by Slice 46 with relative bumps;
   the alarm controller's scratch is excluded (64B).
@@ -89,8 +89,23 @@ every existing agent is byte-identical.
       own-level `goal_level` on post goals.
 - [ ] Slice 55 hooks: posts non-coastable, post alert input.
 - [ ] `alarm` stimulus with sticky linger and deferred enqueue.
+- [ ] Stimulus storage grows, and over-budget stimuli defer instead of
+      dropping (`budgets-capacities.md`). Failure: every `SensoryBus` pool
+      is a fixed array that drops when full: the live bus
+      (`stimulus_live_capacity` 32, `simulation.zig:630`, dropped at
+      `sensory_bus.zig:60`), the deferred impacts (`stimulus_deferred_capacity`
+      16, `simulation.zig:633`, and `stimulus_max_impacts_per_step` 8, `:637`,
+      dropped at `sensory_bus.zig:184` and `:179`), and the sticky linger
+      (`stimulus_sticky_capacity`, `simulation.zig:644`, dropped at
+      `sensory_bus.zig:153`). Perception reads them, so a
+      drop changes what AI hears. Measured: `stimuli_deferred_dropped=325`
+      in 60 s of the Debug demo (owner run, 2026-10-17). The alarm stimulus
+      above lands in the same buffers. Pass: stimulus storage starts at a
+      content-derived size and grows at the step seam; an over-budget
+      impact or alarm defers to the next step in canonical order; the drop
+      counters go away, replaced by a deferral test.
 - [ ] Help-call stage with its contract, `.guard_alarm` impulse producer,
-      deferral of over-budget alarms, and the spatial index entity column.
+      deferral of over-budget alarms.
 - [ ] Archetype content: post gains for `guard` and `merchant`, an `escort`
       archetype; parity table updated.
 - [ ] Spawn anchors carry a patrol route; spawn templates attach posts;

@@ -1,0 +1,184 @@
+// Copyright (c) 2026 Hammer Forged Games
+// All rights reserved.
+// Licensed under the MIT License - see LICENSE file for details
+
+const std = @import("std");
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../app/thread_system.zig").Dispatch;
+const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
+const StageControls = @import("../app/thread_system.zig").StageControls;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const WorkerId = @import("../app/thread_system.zig").WorkerId;
+const rangeCount = @import("../app/thread_system.zig").rangeCount;
+const thread_shared_record_alignment = @import("../app/thread_system.zig").thread_shared_record_alignment;
+const fixtures = @import("fixtures.zig");
+const suite = @import("suite.zig");
+
+// `thread-dispatch`: one stage dispatch, `Dispatch.select` then `Dispatch.run`, over a
+// trivial job that increments each item of its own range once, so a sample times what a
+// stage pays per call (selection, range claims, worker wake and join, tuner bookkeeping)
+// with as little job as possible. Items are one counter each in a line-aligned column;
+// ranges align to whole cache lines, so no two ranges share a writable line.
+// `serial-direct` runs the same dispatch on a thread system with no workers, the inline
+// path production takes on a machine with no spare core (one range over every item); fixed cases pin range size and worker cap; `thread-adaptive-tuned-range` runs a stage
+// tuner of its own (`AdaptiveWorkTuner.init(.{})`, what a production stage owns). Ladder: 1, 16, 256, and 4,096 ranges at the default range size. Cost model: a
+// threaded batch costs O(ranges) claims plus O(workers) wakes plus the job, independent of
+// world size and population. At the top rung the column (1 MiB) spreads across cores'
+// caches, so its per-range time includes moving job data between cores; a before/after
+// has the same data placement on both sides, so its delta still isolates dispatch.
+// Asserts check every threaded batch's shape (range count from its range size, inline
+// exactly when no worker is active, active workers at most min(workers, ranges - 1), every
+// range claimed once, never forced inline), fixed cases' exact shape, each job's range
+// index against the selected range count, and that every item was incremented once per
+// dispatch. Pass shape: an adaptive case's tuner demotes at most once per run (a restored
+// profile keeps its bound suppression; a demoted one waits out its inline cooldown), so a
+// steady dispatch never churns between threaded and inline.
+// `--details` prints the busiest shape (`inline` or workers/ranges) with its threaded over
+// measured dispatches, the time per item, the time per range (over the mean range count),
+// and the main thread's share (the dispatch outside its batch on workers) and time per item. On multi-CCD parts the `thread-fixed-1` and `thread-fixed-2` rows swing
+// with CCD placement (bimodal unpinned); a run pinned to one CCD is the diagnostic.
+pub const group = suite.BenchmarkGroup{
+    .name = "thread-dispatch",
+    .item_label = "items",
+    .item_counts = &item_counts,
+    .runCase = runCase,
+    .write_workload = writeWorkload,
+};
+
+const Item = u32;
+const range_alignment_items = thread_shared_record_alignment / @sizeOf(Item);
+const item_counts = [_]usize{ 64, 1_024, 16_384, 262_144 };
+
+const DispatchContext = struct {
+    items: []Item,
+    // The selected batch's range count; `range.index` stays under it.
+    range_count: usize,
+};
+
+// Scalar on purpose: the job is the fixture, kept trivial; SIMD would only shrink its term.
+fn incrementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *DispatchContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start <= range.end and range.end <= job.items.len);
+    std.debug.assert(range.index < job.range_count);
+    for (job.items[range.start..range.end]) |*item| item.* += 1;
+}
+
+fn dispatchOnce(
+    context: *DispatchContext,
+    threads: *ThreadSystem,
+    tuner: *AdaptiveWorkTuner,
+    case: suite.BenchmarkCase,
+) BatchStats {
+    const item_count = context.items.len;
+    const controls: StageControls = if (case.adaptive) .{} else .{
+        .items_per_range = case.stageItemsPerRange(range_alignment_items),
+        .batches_per_participant = case.stageBatchesPerParticipant(),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = false,
+    };
+    const dispatch = Dispatch.init(threads, tuner, controls);
+    const selection = dispatch.select(item_count, range_alignment_items);
+    context.range_count = selection.range_count;
+    return dispatch.run(selection, item_count, range_alignment_items, context, incrementJob);
+}
+
+// The shape every threaded batch must have, whoever chose it.
+fn assertThreadedShape(batch: BatchStats, thread_system: *const ThreadSystem) void {
+    std.debug.assert(batch.range_count == rangeCount(batch.item_count, batch.items_per_range));
+    std.debug.assert(batch.ran_inline == (batch.active_worker_threads == 0));
+    std.debug.assert(batch.active_worker_threads <= @min(thread_system.workerThreadCount(), batch.range_count -| 1));
+    std.debug.assert(!batch.forced_inline);
+}
+
+// Fails unless a fixed case's dispatch has its shape: one range per control range of items
+// (`suite.controlItemsPerRange`, the clamp's resolved from the batch's item count), on
+// workers when there is more than one range (`suite.checkStageDispatched`,
+// `suite.checkFixedRangeCount`), with every worker the case allows up to one per range past
+// the first; inline with no worker otherwise. Checked against every measured batch, in every
+// build mode.
+fn checkFixedShape(batch: BatchStats, thread_system: *const ThreadSystem, case: suite.BenchmarkCase) !void {
+    const items_per_range = suite.controlItemsPerRange(case, thread_system, case.stageItemsPerRange(range_alignment_items), batch).?;
+    if (batch.items_per_range != items_per_range) return error.DispatchFixedRangeSize;
+    try suite.checkFixedRangeCount(case, thread_system, items_per_range, batch);
+    try suite.checkStageDispatched(case, thread_system, items_per_range, batch);
+    const ranges = rangeCount(batch.item_count, items_per_range);
+    const worker_cap = @min(case.maxWorkerThreads() orelse thread_system.workerThreadCount(), thread_system.workerThreadCount());
+    const workers: usize = if (ranges <= 1 or worker_cap == 0) 0 else @min(worker_cap, ranges - 1);
+    if (batch.ran_inline != (workers == 0)) return error.DispatchFixedInlineShape;
+    if (batch.active_worker_threads != workers) return error.DispatchFixedWorkerCount;
+}
+
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+
+    const items = try allocator.alignedAlloc(Item, .fromByteUnits(thread_shared_record_alignment), item_count);
+    defer allocator.free(items);
+    @memset(items, 0);
+    var context = DispatchContext{ .items = items, .range_count = 0 };
+    // A fixed case never consults its tuner; the tuned case runs a stage tuner of its own.
+    var tuner = AdaptiveWorkTuner.init(.{});
+
+    var dispatches: usize = 0;
+    var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
+    while (warm.next(case.adaptive and suite.tunerSettled(&tuner))) {
+        // No dispatch here is ever forced inline (a nested or foreign-thread call).
+        std.debug.assert(!dispatchOnce(&context, &threads, &tuner, case).forced_inline);
+        dispatches += 1;
+    }
+    const tuner_start = suite.TunerStart.of(&tuner, case);
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        const batch = dispatchOnce(&context, &threads, &tuner, case);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        // The whole sample is the dispatch: main is all of it but the batch on workers.
+        main_total += elapsed_ns -| offMainNs(batch);
+        dispatches += 1;
+        std.debug.assert(batch.item_count == item_count);
+        std.debug.assert(batch.main_thread_ranges + batch.worker_thread_ranges == batch.range_count);
+        std.debug.assert(!batch.forced_inline);
+        assertThreadedShape(batch, &threads);
+        if (!case.usesThreadSystem()) {
+            // No worker may take a range, so the dispatch runs one inline range.
+            std.debug.assert(batch.ran_inline and batch.range_count == 1);
+        } else if (!case.adaptive) try checkFixedShape(batch, &threads, case);
+        accumulator.record(elapsed_ns, batch);
+    }
+
+    for (items) |item| std.debug.assert(item == dispatches);
+    if (case.adaptive) std.debug.assert(tuner.demotion_count <= 1);
+    var stats = accumulator.finish();
+    stats.output_count = item_count;
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(&tuner, tuner_start);
+    }
+    return stats;
+}
+
+// `ns` divided by `count`, in ns to two decimals.
+fn writeNsPer(writer: *std.Io.Writer, label: []const u8, ns: u64, count: usize) std.Io.Writer.Error!void {
+    const hundredths: u64 = if (count == 0) 0 else std.math.lossyCast(u64, @as(u128, ns) * 100 / count);
+    try writer.print(" {s}={}.{d:0>2} ns", .{ label, hundredths / 100, hundredths % 100 });
+}
+
+// `per_range` divides by the measured dispatches' mean range count (each one's main and
+// worker ranges, averaged), not the busiest shape's.
+fn writeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (view == .details) {
+        try writer.writeAll("shape=");
+        try suite.writeStageShape(writer, stats.batch);
+    } else {
+        try writer.print("items={}", .{stats.output_count});
+    }
+    try writeNsPer(writer, "per_item", stats.mean_ns, stats.item_count);
+    try writeNsPer(writer, "per_range", stats.mean_ns, stats.batch.main_thread_ranges + stats.batch.worker_thread_ranges);
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.item_count);
+}

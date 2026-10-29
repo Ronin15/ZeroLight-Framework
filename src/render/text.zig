@@ -5,7 +5,7 @@
 //! Asset-backed SDL_ttf service for cached UI and debug text.
 //! Text rendering is synchronous on cache misses. Cache entries are
 //! reference-counted: each successful `prepareText*` retains the entry, and
-//! `destroyPreparedTexts` releases one retain. GPU textures free only when the
+//! `destroyPreparedTextsWithContext` releases one retain. GPU textures free only when the
 //! retain count reaches zero, so multi-owner glyph sets (e.g. FPS overlay and
 //! AI debug digits sharing the same cache keys) stay valid when one owner
 //! retires after a font/DPI change. Callers that re-prepare a fixed glyph set
@@ -25,7 +25,7 @@ const TextureId = @import("resources.zig").TextureId;
 const c = @import("../platform/sdl.zig").c;
 
 pub const default_font_path = "fonts/NotoSansMono-Regular.ttf";
-const default_font_size: f32 = 18;
+pub const default_font_size: f32 = 18;
 
 pub fn defaultFontDesc(point_size: f32) FontDesc {
     return .{
@@ -142,7 +142,7 @@ pub const TextRequest = struct {
     }
 };
 
-const RenderedText = struct {
+pub const RenderedText = struct {
     texture: TextureId,
     width: u32,
     height: u32,
@@ -258,26 +258,12 @@ pub const TextService = struct {
         return self.prepareText(renderer, TextRequest.init(text, self.defaultFont(), color));
     }
 
-    /// Retires the cache entries backing `prepared` texts and invalidates each
-    /// handle in place. Safe no-op for already-invalid entries. Use when a fixed
-    /// glyph set is re-prepared after a font/DPI change so prior textures do not
-    /// accumulate for the app lifetime. One GPU idle covers the whole batch;
-    /// individual releases then use the assume-idle destroy path.
-    pub fn destroyPreparedTexts(self: *TextService, renderer: *Renderer, prepared: []PreparedText) void {
-        var any_valid = false;
-        for (prepared) |entry| {
-            if (entry.isValid()) {
-                any_valid = true;
-                break;
-            }
-        }
-        if (any_valid) renderer.waitForIdle();
-        self.destroyPreparedTextsWithContext(@ptrCast(renderer), prepared);
-    }
-
-    /// Backend-context counterpart to `destroyPreparedTexts`. Does not idle the
-    /// GPU — caller must have synchronized already when releasing live textures
-    /// (the public `destroyPreparedTexts` path does this once for the batch).
+    /// Releases one retain of the cache entry backing each of `prepared` through
+    /// `backend_context` (a `*Renderer`, or a test backend) and invalidates each handle in
+    /// place. Safe no-op for already-invalid entries. Use when a fixed glyph set is
+    /// re-prepared after a font/DPI change or retired, so prior textures do not accumulate
+    /// for the app lifetime. Does not idle the GPU: a caller releasing live textures idles
+    /// once for the batch first, and each release takes the assume-idle destroy path.
     pub fn destroyPreparedTextsWithContext(self: *TextService, backend_context: *anyopaque, prepared: []PreparedText) void {
         for (prepared) |*entry| {
             if (!entry.isValid()) continue;
@@ -604,7 +590,7 @@ const TextEntrySlot = struct {
     height: u32 = 0,
     generation: u32 = 1,
     /// Live `PreparedText` holders that prepared this entry (create or cache hit).
-    /// `destroyPreparedTexts` decrements; GPU free only at zero. Teardown forces free.
+    /// `destroyPreparedTextsWithContext` decrements; GPU free only at zero. Teardown forces free.
     retain_count: u32 = 0,
     alive: bool = false,
     next_free: ?u32 = null,
@@ -698,9 +684,8 @@ fn createTextureFromTextSurface(renderer: *Renderer, surface: *c.SDL_Surface) !T
 
 fn rendererDestroyTexture(context: *anyopaque, texture: TextureId) void {
     const renderer: *Renderer = @ptrCast(@alignCast(context));
-    // TextService bulk paths (`deinit`, `destroyPreparedTexts`) idle once before
-    // releasing; mid-prepare errdefer textures were never submitted. Never re-idle
-    // per texture here.
+    // Callers idle once before a bulk release (service teardown, a glyph set's retire);
+    // mid-prepare errdefer textures were never submitted. Never re-idle per texture here.
     renderer.destroyTextureAssumeIdle(texture);
 }
 
@@ -747,74 +732,10 @@ fn nextGeneration(generation: u32) u32 {
     return if (next == 0) 1 else next;
 }
 
-/// In-process text backend for unit tests. Tracks render/destroy counts and can
-/// fail after N successful renders to exercise mid-prepare cleanup.
-pub const FakeBackend = struct {
-    next_texture_index: u32 = 0,
-    render_count: u32 = 0,
-    destroy_count: u32 = 0,
-    /// When set, any render attempted while `render_count >=` this value fails
-    /// with `error.FakeRenderFailed` without advancing the count.
-    fail_at_render_count: ?u32 = null,
-
-    pub fn backend() TextBackend {
-        return .{
-            .render_text = renderText,
-            .destroy_texture = destroyTexture,
-            .close_font = closeFont,
-        };
-    }
-
-    fn renderText(context: *anyopaque, font: *c.TTF_Font, request: TextRequest) !RenderedText {
-        _ = font;
-        const self: *FakeBackend = @ptrCast(@alignCast(context));
-        if (self.fail_at_render_count) |limit| {
-            if (self.render_count >= limit) return error.FakeRenderFailed;
-        }
-        const texture = try TextureId.init(self.next_texture_index, 1);
-        self.next_texture_index += 1;
-        self.render_count += 1;
-        return .{
-            .texture = texture,
-            .width = @intCast(request.text.len * 8),
-            .height = 18,
-        };
-    }
-
-    fn destroyTexture(context: *anyopaque, texture: TextureId) void {
-        _ = texture;
-        const self: *FakeBackend = @ptrCast(@alignCast(context));
-        self.destroy_count += 1;
-    }
-
-    fn closeFont(font: *c.TTF_Font) void {
-        _ = font;
-    }
-};
-
-pub fn initFakeTextService(allocator: std.mem.Allocator, fake: *FakeBackend) !TextService {
-    var service = TextService.initWithBackend(
-        allocator,
-        assets.AssetStore.init(allocator, std.testing.io, "assets"),
-        FakeBackend.backend(),
-    );
-    const owned_path = try allocator.dupe(u8, default_font_path);
-    errdefer allocator.free(owned_path);
-    service.default_font = try service.registerFont(.{
-        .asset_path = owned_path,
-        .point_size = default_font_size,
-    }, @ptrFromInt(1));
-    fake.* = .{};
-    return service;
-}
-
-pub fn countLiveTextEntries(service: *const TextService) u32 {
-    var live: u32 = 0;
-    for (service.entries.items) |slot| {
-        if (slot.alive) live += 1;
-    }
-    return live;
-}
+const text_test_support = @import("text_test_support.zig");
+const FakeBackend = text_test_support.FakeBackend;
+const initFakeTextService = text_test_support.initFakeTextService;
+const countLiveTextEntries = text_test_support.countLiveTextEntries;
 
 test "font descriptors require asset-backed relative paths and positive size" {
     try defaultFontDesc(18).validate();
@@ -919,7 +840,7 @@ test "prepared text cache keys include style changes" {
     try std.testing.expectEqual(@as(u32, 2), fake.render_count);
 }
 
-test "destroyPreparedTexts retires cache entries so re-prepare does not grow unboundedly" {
+test "releasing prepared texts retires cache entries so re-prepare does not grow unboundedly" {
     var fake = FakeBackend{};
     var service = try initFakeTextService(std.testing.allocator, &fake);
     defer service.deinitWithContext(&fake);

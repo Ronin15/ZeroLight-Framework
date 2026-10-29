@@ -23,12 +23,6 @@ pub const TileAnimation = struct {
     frame_duration_ms: u32,
 };
 
-/// Convenience lookup for `manifest.spriteSpec(id).metadata_path`.
-pub fn metadataPathFor(id: manifest.SpriteAssetId) LayoutMismatch![]const u8 {
-    const spec = manifest.spriteSpec(id);
-    return spec.metadata_path orelse error.MissingMetadataPath;
-}
-
 pub fn readJsonAsset(
     allocator: std.mem.Allocator,
     asset_store: AssetStore,
@@ -387,12 +381,12 @@ test "validateAnimationTileIds rejects unknown tile ids" {
     );
 }
 
-test "metadataPathFor resolves manifest metadata paths" {
+test "manifest names metadata paths only for atlases with metadata" {
     try std.testing.expectEqualStrings(
         "sprites/world_tileset.json",
-        try metadataPathFor(.world_tileset),
+        manifest.spriteSpec(.world_tileset).metadata_path.?,
     );
-    try std.testing.expectError(error.MissingMetadataPath, metadataPathFor(.demo_tile));
+    try std.testing.expect(manifest.spriteSpec(.demo_tile).metadata_path == null);
 }
 
 test "validateGridEntry rejects rects that do not match id grid position" {

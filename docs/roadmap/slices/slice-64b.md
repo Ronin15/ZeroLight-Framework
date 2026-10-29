@@ -21,7 +21,7 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
 - 49 (spec, not live) provides `StateHasher` with raw-bytes floats, checksum
   v1 over `DataSystem`, `WorldSystem`, player, seed, and step, comptime
   completeness lists, and the `simulation-checksum` bench. 50 makes owner-thread
-  `parallelFor` safe; 64A makes pause simulation-invisible, so no field needs a
+  dispatch safe (`parallelForWithOptions`, `thread_system.zig:1118`); 64A makes pause simulation-invisible, so no field needs a
   pause exemption.
 - Live carried history outside `DataSystem`/`WorldSystem`
   (`simulation_pipeline.zig` and its subsystems): `interact_held_last`;
@@ -30,8 +30,11 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   snapped goal; `SteeringSystem.runtime_rows` (per-entity history);
   `PathfindingSystem` request queues, result cache with TTL eviction and its
   path registry, group fields, and the nav graph with its connectivity ids and
-  one-way closure; `StaticColliderSystem` rows; steering's movement-index cache;
-  tuners, scratch, and the audio controller. Perception holds no LOS state.
+  one-way closure; `StaticColliderSystem` rows; `CollisionSystem.trigger_store`
+  (per-level stored-trigger page trees, `collision.zig:879`,
+  `collision_triggers.zig`); tuners, scratch, and the audio controller.
+  Perception holds no LOS state. The steering movement-index cache was
+  removed in `21851e4`.
 - Terrain is chunk-owned (64G), so the chunk is the hashing unit.
 
 ### Architecture notes
@@ -47,8 +50,8 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   count (harness, 64C runner, 52C soak). NaN-free columns hash as raw bytes.
   Vector NaN primitives live in `core/simd.zig`.
 - Terrain hashes per chunk on the thread system; serial equals threaded
-  (`.claude/rules/threading.md`); nothing is sized to level area or world
-  extent (`.claude/rules/budgets-capacities.md`); no allocation; owner thread
+  (`.grok/rules/threading.md`); nothing is sized to level area or world
+  extent (`.grok/rules/budgets-capacities.md`); no allocation; owner thread
   only. Tag is live + 1 (Table T6).
 - `buildFingerprint()` (app version, Zig version, checksum tag) is the only
   build fingerprint; its consumer is 46's save header.
@@ -61,7 +64,11 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   snapped goal, steering runtime rows, and any seam-raised ceiling that changes
   request intake are hashed. All derived nav state (graph, path requests and
   results, caches, group fields, dirty sets, any deferred rebuild) is
-  normalized, not cache, because cache warmth changes outcomes. Derived
+  normalized, not cache, because cache warmth changes outcomes. The
+  static-collider store, the per-level stored-trigger trees
+  (`CollisionSystem.trigger_store`), and the path registry are derived and
+  normalized: rebuilt on load from world and statics data, never saved
+  (`.grok/rules/simulation.md` § Persistent data). Derived
   perception state is normalized.
 - `normalizeDerivedState`: afterwards every normalized field equals a freshly
   initialized pipeline's over the same `DataSystem`, `WorldSystem`, and config,
@@ -104,8 +111,8 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
       classes, normalization); `docs/architecture.md` Gameplay Data; DW bench
       case.
 - [ ] Rule additions when this lands: checksum field classification and
-      normalized saves (`.claude/rules/simulation.md`); normalize completeness
-      (`.claude/rules/pathfinding.md`).
+      normalized saves (`.grok/rules/simulation.md`); normalize completeness
+      (`.grok/rules/pathfinding.md`).
 
 ### Acceptance checks
 
@@ -118,4 +125,4 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
       --details`: cost grows linearly with hashed state across at least three
       sizes (level size, depth, population), the threaded case is at or below
       serial, and serial shows no regression beyond spread against 49's v1
-      (`.claude/rules/tests-benchmarks.md`).
+      (`.grok/rules/tests-benchmarks.md`).

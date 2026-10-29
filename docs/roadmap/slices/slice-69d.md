@@ -29,7 +29,7 @@ needs no sweep.
 - Producers append scalar set/clear requests during the step; they apply at
   the commit seam in append order under a fixed per-step count, and requests
   past it defer in order to the next step, never refused for queue capacity
-  (`.claude/rules/budgets-capacities.md`). Invalid requests (bad region,
+  (`.grok/rules/budgets-capacities.md`). Invalid requests (bad region,
   out-of-range duration) are counted and dropped.
 - A request applied at the seam takes effect in the next step's snapshot;
   nothing is pending at a step boundary that a save would miss.

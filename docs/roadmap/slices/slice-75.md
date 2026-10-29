@@ -1,8 +1,13 @@
 ## Slice 75: Far Simulation
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 73](slice-73.md) · Track: [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: not started.**
+**Status: not started.** Its core-branch items (owner 2026-10-16; index,
+merged order 9b) are the inert-rows item and the tier mechanics: fidelity
+bands, every agent thinking at its band's cadence, whole-population index
+coverage, movement near full rate, and `dormant` for inert rows only. They
+need nothing from 73; 73's per-agent interval later takes the band as one
+input (Architecture notes).
 
 Goal: fidelity falls with distance from the observer (the camera focus, or
 a player when a game has one), and nothing that exists stops advancing.
@@ -34,9 +39,11 @@ Scope comes from one camera and puts far entities to sleep.
   movement integrates the full contiguous range.
 - Inside the cognition halo an agent thinks one step in
   `cognition_stagger_n` (4) by `stagger_phase`; `gatherAiPopulations`
-  excludes out-of-halo agents entirely; the spatial index and perception
-  candidates use the unstaggered halo; `always_active` bypasses halo,
-  stagger, and demotion.
+  excludes out-of-halo agents entirely; the spatial index (every neighbor
+  query's candidates) indexes the unstaggered halo, and the think set is its
+  rows on this step's phase, in the index's cell-major order
+  (`ai_cognition_order`, Slice 84); `always_active` bypasses halo, stagger,
+  and demotion.
 - Source: `simViewRegion` (`src/game/simulation_pipeline.zig`) reads
   `sim_view` = `GameDemoState.simViewRect()`, the camera as of the previous
   step's end (`updateCamera` runs after `pipeline.update`), anchored at
@@ -44,6 +51,23 @@ Scope comes from one camera and puts far entities to sleep.
 - Full-active fallback: a world with no chunks yields no region, so no halo,
   stagger, or demotion applies and everything runs at full cost.
 - One observer, one view, one world (74).
+- Movement integrates every row (`src/game/systems/movement.zig:55`) and the
+  tier policy scans every row (`scanTierPolicy`,
+  `src/game/systems/simulation_scope.zig:576`), rows at rest included.
+- Measured, `production-step` tuned (Debug, `5d5a089`):
+  - At the base config (spread P 4,096, 1024², 8 levels), half the rows are
+    dormant and 101 think per step. At L 32, 87% are dormant; at side
+    2048, 68%. Across spread P 1,024 → 16,384, only 28 → 436 rows think per
+    step.
+  - The step gets cheaper as rows freeze: 4.76 / 2.29 / 1.09 ms at L 1 / 8 /
+    32, and 3.12 / 2.29 / 1.28 ms at side 512 / 1024 / 2048. The group's pass
+    shape requires every row to advance.
+  - Inert rows take tiers like agents and raise the step on the
+    `production-step` inert axis ([86](../archive/slice-86.md) holds the
+    numbers). This slice's collision checklist item carries collision's share.
+  - `untimed` (stages with no perf-log timer: scope advance, tier policy,
+    collision scope gather, plane traversal, action react, dig) is 2–20% of
+    the step.
 
 ### Architecture notes
 
@@ -51,21 +75,21 @@ Scope comes from one camera and puts far entities to sleep.
   movement stays near full rate; `dormant` only for inert things, which still
   change slowly; only unimportant ambient spawns are recycled, far from the
   observer; worlds the observer is not in still step; nothing is evicted from
-  the simulation (`.claude/rules/engine-design.md` § Target scale).
+  the simulation (`.grok/rules/engine-design.md` § Target scale).
 - Tiers set fidelity, never whether an entity advances
-  (`.claude/rules/simulation.md` § Scope and tiers); the live tier policy and
+  (`.grok/rules/simulation.md` § Scope and tiers); the live tier policy and
   the halo-only AI gather contradict this and are replaced.
 - Cadences are pure functions of deterministic state (band, entity,
   `StepIndex`), never wall clock, render cadence, or measured cost
-  (`.claude/rules/simulation.md` § Determinism). Per-step work budgets are
+  (`.grok/rules/simulation.md` § Determinism). Per-step work budgets are
   fixed counts with deterministic deferral
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Scope derives from the observer's fixed-step view and defines a lowest
   band that 74 applies to worlds the observer is not in, instead of the
   full-active fallback. The Scope-and-tiers rule names a single `sim_view`
   and is updated in the same change.
 - Far agents path over the whole-world chunked nav within the fixed per-step
-  request budget (`.claude/rules/pathfinding.md`; needs 64G).
+  request budget (`.grok/rules/pathfinding.md`; needs 64G).
 - 62 owns the important/ambient population classes and the recycling
   itself; 75 provides the deterministic far-from-observer signal it uses.
 - 75 owns spatial-index coverage of the whole population: every agent thinks,
@@ -73,7 +97,15 @@ Scope comes from one camera and puts far entities to sleep.
   band.
 - Per-step cost follows population divided by each band's cadence, never
   world extent × world count; serial and threaded paths with parity
-  (`.claude/rules/threading.md`).
+  (`.grok/rules/threading.md`).
+- The think set's membership is one phase test over the indexed rows
+  (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`), and band
+  cadence replaces that test. With the whole population indexed, that pass
+  costs one compare per indexed row every step on workers, so to meet the
+  cost line above it walks only rows that can think this step, or an
+  O(think rows) producer in the same cell-major order replaces it. The think
+  set reads each entry's `population_row` as its AI row; a population 75
+  hands the index keeps that mapping.
 - Needs from 64G: whole-world chunked nav. From 73: the per-agent think
   interval, which 75's distance bands feed as one input (55's idle coasting
   is another).
@@ -85,22 +117,45 @@ Scope comes from one camera and puts far entities to sleep.
 ### Checklist
 
 - [ ] Fidelity bands from the observer, including a lowest band for 74; the
-      § Scope and tiers rule in `.claude/rules/simulation.md` updated in the
+      § Scope and tiers rule in `.grok/rules/simulation.md` updated in the
       same change.
-- [ ] Every agent thinks, at a tick 73's interval derives
-      with the band as an input; no agent is excluded from cognition by
-      distance.
+- [ ] Every agent thinks at its band's cadence; no agent is excluded from
+      cognition by distance.
+- [ ] 73's per-agent think interval takes the band as one input (after 73).
 - [ ] The spatial index covers the whole population in every band.
 - [ ] Movement and terrain gating near full rate in every band; collision
       fidelity per band set by the design pass.
 - [ ] `dormant` reserved for inert rows, which still advance (57 schedules
       item decay); agents are never dormant.
+- [ ] Rows at rest cost no per-step movement or tier-scan work
+      (`movement.zig:55`, `systems/simulation_scope.zig:576`). Failure scenario: items
+      and resource nodes at rest raise every step's cost (measured above).
+      Pass: `production-step` flat in inert rows. Collision's share is
+      the item below; render collect's is [87](slice-87.md).
+- [ ] Collision's share of rows at rest (moved from 86). Failure: an inert
+      row in a collision tier is gathered, sorted, and swept every step.
+      Measured (`production-step` tuned, Debug, `5d5a089`, spread P 4,096):
+      0, 1, 4 inert rows per agent give collision main 0.63 / 1.37 / 3.76 ms
+      and collision bodies 1,541 / 3,077 / 7,685. Pass: `production-step`
+      collision cost flat in inert rows. It runs in the inert-row step after
+      slice 88.
+- [ ] Bench-only (`--details`) timers for the untimed stages, so the
+      `production-step` census attributes the 2–20% `untimed` share before
+      this slice's policy change (`.grok/rules/threading.md`). Landed
+      (`f59cf3b`) for scope gather, cognition order, collision scope, plane
+      traversal, tier policy, and action react (`BenchTiming`,
+      `src/app/runtime_perf_log.zig:331-338`; census
+      `benchmarks/production_step.zig:668-689`). Open: `dig_world_edit` has no
+      timer in `Timing` or `BenchTiming`.
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request
       budget.
 - [ ] New persistent scope state classified for 49/64B; included in 46's
       v1.
+- [ ] The whole of `systems/simulation_scope.zig` and `simulation_scope.zig`
+      checked against the cost model and the rules (owner 2026-10-16), not only
+      the items above. Each finding becomes an item here.
 - [ ] Tests: an agent in every band advances (thinks, moves, paths) at its
       cadence; the far signal is deterministic; results are identical across render cadence and worker
       count; serial equals threaded.
@@ -114,8 +169,10 @@ Scope comes from one camera and puts far entities to sleep.
 - [ ] No entity stops advancing because of distance from the observer
       (tests over every band).
 - [ ] `far-sim` matches the cost model (linear in population ÷ cadence);
-      `scope`, `ai`, and `steering` show no near-observer regression beyond
+      `production-step`, `ai`, and `steering` show no near-observer regression beyond
       run-to-run spread.
+- [ ] `production-step` meets its pass shape on the level-count and
+      level-side axes with every row advancing at its tier.
 - [ ] Manual (display, Debug): NPCs revisited after travelling far away have
       moved and acted.
 - [ ] `zig build verify` passes.

@@ -67,13 +67,6 @@ const FieldBlock = struct {
     prev: [max_chunk_cells]u32,
 };
 
-/// Bytes one pooled `FieldBlock` holds across its columns.
-const field_block_bytes: usize = blk: {
-    var bytes: usize = 0;
-    for (@typeInfo(FieldBlock).@"struct".field_types) |T| bytes += @sizeOf(T);
-    break :blk bytes;
-};
-
 /// One chunk directory row: the chunk's block this build when `stamp` is the field's
 /// generation (stamp 0 is untouched).
 const DirEntry = extern struct {
@@ -142,7 +135,7 @@ fn blockBound(grid: *const NavGrid, max_cells: usize) u32 {
 /// in dense chunks, and a pop's new chunks; later builds reuse the high-water pool.
 pub fn initialPoolBlocks(grid: *const NavGrid, max_cells: usize, build_budget: usize) usize {
     const chunk_cells: usize = @as(usize, grid.geometry.chunk_tiles) * grid.geometry.chunk_tiles;
-    const dense = 4 + (@min(max_cells, build_budget) + chunk_cells - 1) / chunk_cells;
+    const dense = 4 + @divCeil(@min(max_cells, build_budget), chunk_cells);
     return @max(1 + perPopBlocks(grid), dense);
 }
 
@@ -196,20 +189,6 @@ pub const GroupField = struct {
         allocator.free(self.directory);
         self.blocks.deinit(allocator);
         self.* = undefined;
-    }
-
-    /// Bytes the pool and directory hold (allocated capacity).
-    pub fn residentBytes(self: *const GroupField) usize {
-        return self.blocks.capacity * field_block_bytes + self.directory.len * @sizeOf(DirEntry);
-    }
-
-    /// An over-estimate of `residentBytes` for a field capped at `max_cells` cells on a level
-    /// of `level_chunks` chunks: the pool never grows past what a build can claim, and its
-    /// directory is sized to the pool. A directory too wide to build saturates.
-    pub fn storageBytesBound(max_cells: usize, level_chunks: usize) usize {
-        const blocks = @min(@max(1, max_cells), level_chunks);
-        const rows = hashTableSlots(blocks) catch return std.math.maxInt(usize);
-        return blocks *| field_block_bytes +| rows *| @sizeOf(DirEntry);
     }
 
     /// Grows the pool to at least `min_blocks` blocks (at least doubling, never past what
@@ -595,7 +574,8 @@ const popHeap = @import("types.zig").popHeap;
 const siftUp = @import("types.zig").siftUp;
 const default_cell_size = @import("types.zig").default_cell_size;
 const default_nav_chunk_tiles = @import("types.zig").default_nav_chunk_tiles;
-const setBlockedCells = @import("test_support.zig").setBlockedCells;
+const test_support = @import("test_support.zig");
+const setBlockedCells = test_support.setBlockedCells;
 
 // Reference reverse-Dijkstra integration field over a NavGrid using a binary heap with
 // the same octile step costs, strict-improvement relaxation, and (cost, index) tie
@@ -1073,11 +1053,11 @@ test "a field built to its cap, then past it with a wider cap, stays within its 
     for ([_]usize{ 40, grid.cellCount() }) |max_cells| {
         try std.testing.expect(try beginTestBuild(allocator, &field, &grid, 0, max_cells, 1000));
         try buildToReady(allocator, &field, &grid, 1000);
-        try std.testing.expect(field.residentBytes() <= GroupField.storageBytesBound(max_cells, chunks));
+        try std.testing.expect(test_support.groupFieldResidentBytes(&field) <= test_support.groupFieldStorageBytesBound(max_cells, chunks));
     }
     // A cap past the level's cells claims every chunk: the bound is the whole level's.
-    try std.testing.expectEqual(GroupField.storageBytesBound(chunks, chunks), GroupField.storageBytesBound(grid.cellCount(), chunks));
-    try std.testing.expect(field.residentBytes() > GroupField.storageBytesBound(chunks / 2, chunks));
+    try std.testing.expectEqual(test_support.groupFieldStorageBytesBound(chunks, chunks), test_support.groupFieldStorageBytesBound(grid.cellCount(), chunks));
+    try std.testing.expect(test_support.groupFieldResidentBytes(&field) > test_support.groupFieldStorageBytesBound(chunks / 2, chunks));
 }
 
 test "an unbuilt field holds no memory and never builds" {
@@ -1086,7 +1066,7 @@ test "an unbuilt field holds no memory and never builds" {
     try grid.prepare(std.testing.allocator, 0, 32, 32, default_cell_size, default_nav_chunk_tiles);
     var field = GroupField{};
     defer field.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), field.residentBytes());
+    try std.testing.expectEqual(@as(usize, 0), test_support.groupFieldResidentBytes(&field));
     try std.testing.expect(!field.beginBuild(&grid, emptyKey(1), 0, 1, 10));
     try std.testing.expectEqual(GroupFieldState.empty, field.state);
     try std.testing.expect(field.sample(&grid, 0) == null);

@@ -17,10 +17,10 @@
 //! `world_obstacle_changed`) for the post-commit nav re-mask.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
@@ -98,7 +98,6 @@ pub const PlaneStageError = WorldEditError || error{
     UnorderedDenseChunkWrites,
     EventCapacityExceeded,
     InvalidEntity,
-    TooManyWorldLevelRows,
 };
 
 pub const DigController = struct {
@@ -117,8 +116,8 @@ pub const DigController = struct {
     /// (`plane_carves`) and grouped by chunk for the batched write (`plane_carve_next`,
     /// `plane_carve_writes`, `plane_carve_chunks`), and the carves' tile changes
     /// (`plane_tile_changes`). `reservePlaneTraversalStage` grows them before anything is
-    /// written when a step's entries exceed the reservation, counting it in
-    /// `plane_scratch_grown`; after that the step only appends into reserved capacity.
+    /// written when a step's entries exceed the reservation (`growPlaneScratch`); after
+    /// that the step only appends into reserved capacity.
     plane_moves: std.ArrayList(PlaneMove) = .empty,
     /// The landing cells this step's falls carve, keyed `(level, cell)`. Reserved with
     /// the lists above, so a step allocates nothing; a step clears it in O(1), so its
@@ -137,13 +136,17 @@ pub const DigController = struct {
     /// list's capacity, which `ensureTotalCapacity` rounds past it.
     plane_scratch_reserved: usize = 0,
     scratch_allocator: ?std.mem.Allocator = null,
-    /// Telemetry: plane-traversal steps whose possible traversals (the player's cell
-    /// entry and the gathered entries) exceeded `plane_scratch_reserved` (perf metric
-    /// `dig_plane_scratch_grown`), whether or not the scratch's rounded-up capacity
-    /// absorbed it; the stage grows the scratch first when it did not. Nonzero means the
-    /// `.plane_traversal` reservation is short of the live population; the first such
-    /// step warns once.
-    plane_scratch_grown: u64 = 0,
+    /// Set by the first plane-traversal step whose possible traversals (the player's cell
+    /// entry and the gathered entries) exceeded `plane_scratch_reserved`, whether or not
+    /// the scratch's rounded-up capacity absorbed them (the stage grows the scratch first
+    /// when it did not), which warns once: the `.plane_traversal` reservation is short of
+    /// the live population.
+    plane_scratch_growth_logged: bool = false,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the steps whose possible traversals
+    /// exceeded `plane_scratch_reserved` (perf metric `dig_plane_scratch_grown`).
+    pub const Perf = if (runtime_perf_log.enabled) struct { plane_scratch_grows: u64 = 0 } else struct {};
 
     pub fn init(config: DigConfig) DigController {
         return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
@@ -285,8 +288,7 @@ pub const DigController = struct {
     }
 
     /// Grow-only re-reserve from the pipeline's population seam, using the
-    /// allocator `reservePlaneScratch` set. Not a shortfall: `plane_scratch_grown` is
-    /// not counted.
+    /// allocator `reservePlaneScratch` set. Not a shortfall: neither counted nor warned.
     pub fn ensurePlaneScratchReserve(self: *DigController, capacity: usize) error{ OutOfMemory, PlaneScratchUnreserved }!void {
         const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
         try self.reservePlaneLists(allocator, capacity);
@@ -313,13 +315,13 @@ pub const DigController = struct {
         @branchHint(.cold);
         const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
         try self.reservePlaneLists(allocator, needed);
-        self.plane_scratch_grown += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
-            if (self.plane_scratch_grown == 1) logging.game.warn(
-                "plane traversal: {d} possible traversals exceeded the reserved scratch; grew to {d} (reservation short of the live population)",
-                .{ needed, self.plane_moves.capacity },
-            );
-        }
+        if (comptime runtime_perf_log.enabled) self.perf.plane_scratch_grows += 1;
+        if (self.plane_scratch_growth_logged) return;
+        self.plane_scratch_growth_logged = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "plane traversal: {d} possible traversals exceeded the reserved scratch; grew to {d} (reservation short of the live population)",
+            .{ needed, self.plane_moves.capacity },
+        );
     }
 
     pub fn deinit(self: *DigController) void {
@@ -377,7 +379,7 @@ pub const DigController = struct {
         player: *const Player,
         frame: *SimulationFrame,
         npc_entries: []const PlaneEntry,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
     ) PlaneStageError!PlaneTraversalReservation {
         self.plane_tile_changes.clearRetainingCapacity();
         self.plane_moves.clearRetainingCapacity();
@@ -454,7 +456,7 @@ pub const DigController = struct {
     /// (with the same `thread_system`) and nothing written since. Attaches the missing
     /// `world_level` rows (allocation-free after the reserve, and idempotent on a retry),
     /// then writes every landing carve as one batched dense edit
-    /// (`WorldSystem.applyDenseCellWrites`, its chunks on `thread_system` when given): all
+    /// (`WorldSystem.applyDenseCellWrites`, its chunks on `thread_system`): all
     /// or nothing, and its only growth is the terrain pools' (counted), so an error writes
     /// no terrain. Then publishes the carves as one event range and applies each decided
     /// traversal in order (allocation-free). The player's cell-entry latch
@@ -467,7 +469,7 @@ pub const DigController = struct {
         player: *Player,
         frame: *SimulationFrame,
         reservation: PlaneTraversalReservation,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
     ) PlaneStageError!void {
         const scratch = &self.plane_tile_changes;
         std.debug.assert(scratch.items.len == 0);
@@ -481,10 +483,9 @@ pub const DigController = struct {
 
     // The carve batch's stage threading: the world's terrain-edit tuners under
     // `carve_controls`, or inline without a thread system.
-    fn carveThreads(self: *const DigController, world: *WorldSystem, thread_system: ?*ThreadSystem) ?TerrainEditThreads {
-        const ts = thread_system orelse return null;
+    fn carveThreads(self: *const DigController, world: *WorldSystem, thread_system: *ThreadSystem) TerrainEditThreads {
         return .{
-            .thread_system = ts,
+            .thread_system = thread_system,
             .plan_tuner = &world.terrain_edit_plan_tuner,
             .write_tuner = &world.terrain_edit_write_tuner,
             .controls = self.carve_controls,
@@ -726,6 +727,7 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const warmLandingTerrain = @import("world/test_support.zig").warmLandingTerrain;
 const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlocksMovement;
+const sparseTileCellCoord = @import("world/test_support.zig").sparseTileCellCoord;
 const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 
 // One dig in stage order: reserve, then commit the reserved edit.
@@ -736,11 +738,13 @@ fn testDig(dig: *const DigController, world: *WorldSystem, data: *const DataSyst
 
 // One plane stage: a serial entry gather, the reserve, then the commit.
 fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
     defer plane_entry.deinit();
     const entries = try plane_entry.gather(data, world, player.entity, dig.tunnel_tile, null);
-    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, null);
-    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, &serial_threads);
 }
 
 // A frame with room for a small plane stage's events, its step begun.
@@ -797,13 +801,6 @@ const TestWorld = struct {
         self.meta.deinit();
     }
 };
-
-test "dig test world reads the fixture's own tileset meta" {
-    var tw: TestWorld = undefined;
-    try tw.init(.right, 0);
-    defer tw.deinit();
-    try std.testing.expect(tw.world.tilesetMeta().? == &tw.meta);
-}
 
 test "DigController plane scratch reserved-then-push is allocation-free (FailingAllocator)" {
     var dig = DigController.init(.{});
@@ -915,9 +912,9 @@ test "plane traversal grows an under-reserved scratch before any carve and match
         try std.testing.expect(!denseTileBlocksMovement(&tw.world, floor1, 4, 3));
         try std.testing.expect(!denseTileBlocksMovement(&tw.world, floor1, 6, 3));
     }
-    try std.testing.expectEqual(@as(u64, 1), dig_short.plane_scratch_grown);
+    try std.testing.expect(dig_short.plane_scratch_growth_logged);
     try std.testing.expect(dig_short.plane_tile_changes.capacity >= 2);
-    try std.testing.expectEqual(@as(u64, 0), dig_reserved.plane_scratch_grown);
+    try std.testing.expect(!dig_reserved.plane_scratch_growth_logged);
 
     // Same published changes, same order ((4,3) then (6,3)).
     var short_buf: [4]WorldTileChangedEvent = undefined;
@@ -933,7 +930,7 @@ test "plane traversal grows an under-reserved scratch before any carve and match
     try std.testing.expectEqual(@as(usize, 2), frame_reserved.events.stats.world_tile_changed);
 }
 
-test "plane traversal counts carves past the reservation even inside the scratch's slack" {
+test "plane traversal warns of carves past the reservation even inside the scratch's slack" {
     var tw: TestWorld = undefined;
     try tw.init(.right, 0);
     defer tw.deinit();
@@ -955,9 +952,9 @@ test "plane traversal counts carves past the reservation even inside the scratch
 
     try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
 
-    // Two carves against a reservation of 1: drift, counted though nothing grew.
+    // Two carves against a reservation of 1: drift, warned though nothing grew.
     try std.testing.expectEqual(capacity_before, dig.plane_tile_changes.capacity);
-    try std.testing.expectEqual(@as(u64, 1), dig.plane_scratch_grown);
+    try std.testing.expect(dig.plane_scratch_growth_logged);
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 }
 
@@ -1005,7 +1002,7 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
     try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), dig.plane_scratch_grown);
+    try std.testing.expect(!dig.plane_scratch_growth_logged);
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 }
 
@@ -1017,9 +1014,11 @@ fn runPlaneStageOverEntries(
     tw: *TestWorld,
     frame: *SimulationFrame,
 ) !usize {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const entries = try plane_entry.gather(&tw.data, &tw.world, tw.player.entity, dig.tunnel_tile, null);
-    const reservation = try dig.reservePlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, entries, null);
-    try dig.commitPlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, reservation, &serial_threads);
     return reservation.carves;
 }
 
@@ -1182,6 +1181,8 @@ fn changeLessThan(_: void, lhs: WorldTileChangedEvent, rhs: WorldTileChangedEven
 }
 
 test "plane stage decisions match the per-entry sequential traversal on shared columns, ramps, and pre-carved landings" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const allocator = std.testing.allocator;
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -1206,9 +1207,9 @@ test "plane stage decisions match the per-entry sequential traversal on shared c
         var staged_entry = PlaneEntrySystem.init(allocator);
         defer staged_entry.deinit();
         const staged_entries = try staged_entry.gather(&staged.data, &staged.world, staged.player.entity, dig.tunnel_tile, null);
-        const reservation = try dig.reservePlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, staged_entries, null);
+        const reservation = try dig.reservePlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, staged_entries, &serial_threads);
         const staged_carves = reservation.carves;
-        try dig.commitPlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, reservation, null);
+        try dig.commitPlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, reservation, &serial_threads);
 
         // The reference: the same entries in the same order, attaches first.
         var plane_entry = PlaneEntrySystem.init(allocator);
@@ -1225,7 +1226,7 @@ test "plane stage decisions match the per-entry sequential traversal on shared c
             reference_cancels += @intFromBool(entry.target.action == .fall and !pre_carved and reference.data.worldLevelConst(entry.entity).? == entry.level);
         }
 
-        for (0..staged.world.denseLayerCount()) |layer| {
+        for (0..staged.world.dense_layers.len) |layer| {
             for (0..8) |y| for (0..8) |x| {
                 try std.testing.expectEqual(reference.world.denseTile(layer, @intCast(x), @intCast(y)), staged.world.denseTile(layer, @intCast(x), @intCast(y)));
             };
@@ -1252,7 +1253,7 @@ test "plane stage decisions match the per-entry sequential traversal on shared c
 // Falls whose landings lie on two levels and four chunks, entered in AI row order that is
 // not (level, chunk) order: the stage's one carve batch, serial or on `threads`, carves
 // every landing and publishes the carves in (level, chunk, cell) order.
-fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads: ?*ThreadSystem, out: *[8]WorldTileChangedEvent) ![]WorldTileChangedEvent {
+fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads: *ThreadSystem, out: *[8]WorldTileChangedEvent) ![]WorldTileChangedEvent {
     const allocator = std.testing.allocator;
     // 8x8 cells in 4-cell chunks: four chunks per level.
     var world = try WorldSystem.initDemoFromMetaWithChunkSize(allocator, meta, meta.tileSize() * 8, meta.tileSize() * 8, 4);
@@ -1287,11 +1288,6 @@ fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads:
     try std.testing.expectEqual(holes.len, reservation.carves);
     try std.testing.expectEqual(holes.len, reservation.carve_chunks.len);
     try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, threads);
-    if (threads != null) {
-        for ([_]@TypeOf(world.last_terrain_edit_plan_batch){ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| {
-            try std.testing.expect(!batch.ran_inline and batch.range_count > 1);
-        }
-    }
     for (holes, npcs) |hole, npc| {
         try std.testing.expectEqual(@as(?u16, hole.level + 1), data.worldLevelConst(npc));
         try std.testing.expectEqual(dig.tunnel_tile, world.denseTile(world.denseFloorLayerForLevel(hole.level + 1).?, hole.cell.x, hole.cell.y));
@@ -1300,12 +1296,13 @@ fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads:
 }
 
 test "plane stage carves landings entered out of chunk order across levels in one ordered batch, serial and threaded alike" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
     var serial_buffer: [8]WorldTileChangedEvent = undefined;
-    const serial = try runCrossChunkFalls(&meta, null, &serial_buffer);
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    const serial = try runCrossChunkFalls(&meta, &serial_threads, &serial_buffer);
     // Landings on level 1 (chunks 0, 3), then level 2 (chunks 1, 2).
     const want = [_][3]u16{ .{ 1, 1, 1 }, .{ 1, 6, 6 }, .{ 2, 5, 1 }, .{ 2, 2, 6 } };
     try std.testing.expectEqual(want.len, serial.len);
@@ -1887,7 +1884,7 @@ fn addBlockingExitContent(world: *WorldSystem, meta: *const world_tileset_meta.W
 
 // The level's overlay band: the last dense layer, added by `addBlockingExitContent`.
 fn exitOverlayLayer(world: *const WorldSystem) usize {
-    return world.denseLayerCount() - 1;
+    return world.dense_layers.len - 1;
 }
 
 // Level `level`'s sparse tiles as (cell, tile) pairs in row order, into `out`.
@@ -1895,7 +1892,7 @@ fn sparseRowsOf(world: *const WorldSystem, level: u16, out: []CellTile) []CellTi
     var count: usize = 0;
     for (world.sparse_tiles.items(.level_index), 0..) |row_level, index| {
         if (row_level != level) continue;
-        out[count] = .{ .cell = world.sparseTileCellCoord(index), .tile = world.sparse_tiles.items(.tile_id)[index] };
+        out[count] = .{ .cell = sparseTileCellCoord(world, index), .tile = world.sparse_tiles.items(.tile_id)[index] };
         count += 1;
     }
     return out[0..count];

@@ -2,15 +2,33 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Extended game render-prep benchmark (R29/R32): dynamic record collection,
-//! depth-bucket sparse/dynamic emit, sprite-batch snapshot/vertex prep, and
-//! realistic static+dynamic `mergeDrawList` group counts. CPU-only; no SDL_GPU.
+//! Game render prep, CPU only, no SDL_GPU: the production-shaped frame's dynamic record
+//! collection, depth-bucket emit with sparse visible-tile submission through `WorldSystem`,
+//! sprite-batch snapshot and vertex emit, and a `mergeDrawList` against the static groups.
+//!
+//! `render-game-prep` (play level 0) and `render-game-prep-dense-deep` (play level
+//! `bench_mid_player_level`): N render entities.
+//! Timed: the bench's own phase timers, `entity_collect` (collect plus emit), `merge`,
+//! `snapshot`, and `vertex_emit` (the threaded stage); the render window sets stay untimed.
+//! Prints `vertices=`, `sprites=`, `skipped=`, `merged_groups=`, `sparse=` (sparse tiles
+//! submitted), `dynamic_records=`, `static_groups=`, `merged_tilemap_groups=`, and the phases;
+//! `--details` adds `main=` (the timed phases outside a vertex emit on workers) with
+//! `main_per_item=` (per sprite), flat across counts. Pass shape: one merged `.tilemap` group at every count and play level, so draw groups never
+//! grow with dense window depth. Asserts check that group count, that the collect returns
+//! every entity and active particle, and that a fixed threaded case dispatches the vertex
+//! emit to workers.
+//!
+//! `render-game-prep-offview` times `collectDynamicRecords` alone under the production
+//! camera window: a fixed set of rows inside it and a growing count of rows outside it on
+//! one fixed level. Pass shape: collect time and the record and command capacities flat
+//! in the off-view count. Asserts check only that the collect returns the in-view rows and
+//! active particles.
 
 const std = @import("std");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const config = @import("../config.zig");
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -24,12 +42,11 @@ const DenseLayerRenderWindow = @import("../game/world/render.zig").DenseLayerRen
 const level_z_step = @import("../game/world/system.zig").level_z_step;
 const Renderer = @import("../render/renderer.zig");
 const mergeDrawList = Renderer.mergeDrawList;
-const resources = @import("../render/resources.zig");
 const sprite_batch = @import("../render/sprite_batch.zig");
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
-const render_game_prep_range_alignment_items: usize = 1;
+const sprite_prep_range_alignment_items = sprite_batch.sprite_prep_range_alignment_items;
 const world_overscan_chunks: u16 = 1;
 /// Viewport used for world chunk visibility during sparse-layer emit only.
 const bench_viewport_w: f32 = 800;
@@ -55,67 +72,35 @@ const FixtureConfig = struct {
 
 const default_fixture_config = FixtureConfig{};
 
+pub const offview_group = suite.BenchmarkGroup{
+    .name = "render-game-prep-offview",
+    .item_label = "off-view render rows",
+    .item_counts = &offview_item_counts,
+    .runCase = runOffviewCase,
+    .write_workload = writeOffviewWorkload,
+    // Collect runs on the main thread: the serial case is its only path.
+    .cases = &suite.serial_cases,
+};
+
 pub const group = suite.BenchmarkGroup{
     .name = "render-game-prep",
     .item_label = "render entities",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeRenderGamePrepWorkload,
-    .summary_focus = .production_adaptive,
-};
-
-pub const dense_surface_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-surface",
-    .item_label = "render entities",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runDenseSurfaceCase,
-    .write_workload = writeRenderGamePrepWorkload,
-    .summary_focus = .production_adaptive,
 };
 
 pub const dense_deep_group = suite.BenchmarkGroup{
     .name = "render-game-prep-dense-deep",
     .item_label = "render entities",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runDenseDeepCase,
     .write_workload = writeRenderGamePrepWorkload,
-    .summary_focus = .production_adaptive,
-};
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-const TextureSlot = struct {
-    id: sprite_batch.TextureId,
-    desc: resources.TextureDesc,
-    alive: bool = true,
-};
-
-const TextureTable = struct {
-    slots: []const TextureSlot,
-
-    fn resolver(self: *const TextureTable) sprite_batch.TextureResolver {
-        return .{
-            .context = self,
-            .resolve = resolve,
-        };
-    }
-
-    fn resolve(context: *const anyopaque, id: sprite_batch.TextureId) ?resources.TextureDesc {
-        const self: *const TextureTable = @ptrCast(@alignCast(context));
-        if (!id.isValid()) return null;
-        for (self.slots) |slot| {
-            if (slot.alive and slot.id.matches(id.index, id.generation)) return slot.desc;
-        }
-        return null;
-    }
 };
 
 const Fixture = struct {
     data: DataSystem,
     particles: ParticleSystem,
-    tileset_meta: world_tileset_meta.WorldTilesetMeta,
     world: WorldSystem,
     scene_prep: render_prep.DynamicScenePrep,
     player_entity: EntityId,
@@ -136,7 +121,6 @@ const Fixture = struct {
         self.scene_prep.deinit();
         self.particles.deinit();
         self.world.deinit();
-        self.tileset_meta.deinit();
         self.data.deinit();
         self.* = undefined;
     }
@@ -157,10 +141,6 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return runCaseWithConfig(allocator, io, options, case, item_count, default_fixture_config);
 }
 
-pub fn runDenseSurfaceCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .player_level = 0 });
-}
-
 pub fn runDenseDeepCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCaseWithConfig(allocator, io, options, case, item_count, .{ .player_level = bench_mid_player_level });
 }
@@ -175,14 +155,7 @@ fn runCaseWithConfig(
 ) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    const slots = [_]TextureSlot{
-        .{ .id = textureId(0, 1), .desc = .{ .width = 64, .height = 64 } },
-        .{ .id = textureId(1, 1), .desc = .{ .width = 128, .height = 32 } },
-        .{ .id = textureId(2, 1), .desc = .{ .width = 32, .height = 128 } },
-        .{ .id = textureId(3, 1), .desc = .{ .width = 16, .height = 16 } },
-        .{ .id = textureId(4, 1), .desc = .{ .width = 8, .height = 8 }, .alive = false },
-    };
-    const table = TextureTable{ .slots = &slots };
+    const table = &fixtures.TextureTable.bench;
 
     const fixture = try allocator.create(Fixture);
     errdefer allocator.destroy(fixture);
@@ -203,49 +176,31 @@ fn runCaseWithConfig(
     defer draw_list.deinit(allocator);
     try draw_list.ensureTotalCapacity(allocator, fixture.static_group_count + command_capacity);
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
-    if (suite.adaptiveTunerForCase(case, render_game_prep_range_alignment_items)) |tuner| {
-        batch.adaptive_tuner = tuner;
-    }
-
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(suite.tunerSettled(&batch.adaptive_tuner))) {
         _ = try runMeasuredOnce(
             io,
             fixture,
             &batch,
             &draw_list,
             table.resolver(),
-            if (threads) |*thread_system| thread_system else null,
+            &threads,
             case,
             allocator,
         );
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runMeasuredOnce(
-                io,
-                fixture,
-                &batch,
-                &draw_list,
-                table.resolver(),
-                if (threads) |*thread_system| thread_system else null,
-                case,
-                allocator,
-            );
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
-    var phase_accumulator = PhaseAccumulator{};
+    var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderGamePrepPhaseSummary){};
     var last_prep = sprite_batch.SpritePrepStats{};
     var last_sparse_submitted: usize = 0;
     var last_merged_groups: usize = 0;
     var last_merged_tilemap_groups: usize = 0;
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const measured = try runMeasuredOnce(
             io,
@@ -253,11 +208,14 @@ fn runCaseWithConfig(
             &batch,
             &draw_list,
             table.resolver(),
-            if (threads) |*thread_system| thread_system else null,
+            &threads,
             case,
             allocator,
         );
-        accumulator.record(measured.timed_ns, measured.stats.batch);
+        accumulator.record(measured.timed_ns, measured.stats.perf.batch);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(sprite_prep_range_alignment_items), measured.stats.perf.batch);
+        // Main is the timed phases outside a vertex emit that ran on workers.
+        main_total += measured.timed_ns -| offMainNs(measured.stats.perf.batch);
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;
@@ -272,6 +230,7 @@ fn runCaseWithConfig(
     }
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = last_prep.vertex_count;
     stats.output_count = last_prep.valid_sprite_count;
     stats.deferred_count = last_prep.skipped_invalid_count;
@@ -282,7 +241,7 @@ fn runCaseWithConfig(
     stats.render_game_prep_static_groups = fixture.static_group_count;
     stats.render_game_prep_merged_tilemap_groups = last_merged_tilemap_groups;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(batch.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&batch.adaptive_tuner, adaptive_tuner_start);
     }
     return stats;
 }
@@ -297,38 +256,13 @@ const MeasuredGamePrep = struct {
     merged_tilemap_group_count: usize,
 };
 
-const PhaseAccumulator = struct {
-    entity_collect_ns: u128 = 0,
-    merge_ns: u128 = 0,
-    snapshot_ns: u128 = 0,
-    vertex_emit_ns: u128 = 0,
-
-    fn record(self: *PhaseAccumulator, phases: suite.RenderGamePrepPhaseSummary) void {
-        self.entity_collect_ns += phases.entity_collect_ns;
-        self.merge_ns += phases.merge_ns;
-        self.snapshot_ns += phases.snapshot_ns;
-        self.vertex_emit_ns += phases.vertex_emit_ns;
-    }
-
-    fn finish(self: PhaseAccumulator, iterations: usize) suite.RenderGamePrepPhaseSummary {
-        if (iterations == 0) return .{};
-        const count: u128 = iterations;
-        return .{
-            .entity_collect_ns = u128ToU64Saturated(self.entity_collect_ns / count),
-            .merge_ns = u128ToU64Saturated(self.merge_ns / count),
-            .snapshot_ns = u128ToU64Saturated(self.snapshot_ns / count),
-            .vertex_emit_ns = u128ToU64Saturated(self.vertex_emit_ns / count),
-        };
-    }
-};
-
 fn runMeasuredOnce(
     io: std.Io,
     fixture: *Fixture,
     batch: *sprite_batch.SpriteBatch,
     draw_list: *std.ArrayList(sprite_batch.DrawGroup),
     resolver: sprite_batch.TextureResolver,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
     allocator: std.mem.Allocator,
 ) !MeasuredGamePrep {
@@ -384,24 +318,15 @@ fn runMeasuredOnce(
 
 fn emitVertices(
     batch: *sprite_batch.SpriteBatch,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    if (!case.usesThreadSystem()) {
-        return batch.emitVerticesAssumeCapacity(null, .{ .adaptive = false });
-    }
-
-    return batch.emitVerticesAssumeCapacity(thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+    return batch.emitVerticesAssumeCapacity(thread_system, .{
+        .items_per_range = case.stageItemsPerRange(sprite_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(render_game_prep_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, render_game_prep_range_alignment_items);
 }
 
 // Requires `setBenchCollectChunkVisibility` first: full-world visibility is an
@@ -416,7 +341,7 @@ fn collectProductionDynamicRecords(fixture: *Fixture) !void {
         &fixture.runtime_assets,
         1.0,
     );
-    fixture.last_collected_records = fixture.scene_prep.orderedRecords().len;
+    fixture.last_collected_records = fixture.scene_prep.records.items.len;
     std.debug.assert(fixture.last_collected_records == expectedBenchCollectedRecords(fixture.item_count));
 }
 
@@ -480,8 +405,8 @@ fn emitPreparedDrawSpan(
     span: render_prep.DynamicDepthRange,
     fallback_texture: sprite_batch.TextureId,
 ) !void {
-    const sorted_indices = prep.sortedRecordIndices();
-    const records = prep.orderedRecords();
+    const sorted_indices = prep.sort_indices.items;
+    const records = prep.records.items;
     for (sorted_indices[span.start..span.end]) |record_index| {
         try emitPreparedDraw(batch, records[record_index].draw, fallback_texture);
     }
@@ -503,11 +428,6 @@ fn emitPreparedDraw(
     }
 }
 
-/// How far `initFixture` got building `Fixture`'s heap-owning fields, in
-/// construction order. Backs the single consolidated `errdefer` in
-/// `initFixture` that unwinds everything built so far on any later failure.
-const InitStage = enum(u8) { scene_prep, tileset_meta, world };
-
 fn initFixture(
     fixture: *Fixture,
     allocator: std.mem.Allocator,
@@ -517,13 +437,19 @@ fn initFixture(
 ) !void {
     const sparse_tile_count = sparseTileCount(item_count);
     const particle_capacity = particleCapacity(item_count);
-    const tile_texture = textureId(1, 1);
+    const tile_texture = fixtures.textureId(1, 1);
 
+    // A square walkable level holding the sparse grid and the entity layout.
+    const tile_size_px = world_tileset_meta.required_tile_size;
+    const entity_layout = entitySpawnLayout(item_count);
+    const sparse_grid_side = suite.ceilSqrt(sparse_tile_count);
+    const sparse_world_tiles = @max(@as(u16, @intCast(sparse_grid_side * 2 + 8)), 64);
+    const entity_tiles: u16 = @intFromFloat(@ceil(@max(entity_layout.width, entity_layout.height) / tile_size_px));
+    const world_tiles = @max(sparse_world_tiles, entity_tiles);
     fixture.* = .{
         .item_count = item_count,
         .data = DataSystem.init(allocator),
         .particles = try ParticleSystem.init(allocator, .{ .capacity = particle_capacity }),
-        .tileset_meta = undefined,
         .world = undefined,
         .scene_prep = render_prep.DynamicScenePrep.init(allocator),
         .player_entity = undefined,
@@ -532,45 +458,24 @@ fn initFixture(
         .static_group_count = 0,
         .player_level = fixture_config.player_level,
         .tile_texture = tile_texture,
-        .white_texture = textureId(0, 1),
+        .white_texture = fixtures.textureId(0, 1),
         .dynamic_record_capacity = 0,
         .sparse_tile_count = sparse_tile_count,
     };
-    // `tileset_meta`/`world` must be built directly at their final `fixture.*`
-    // address rather than a temporary local, because `WorldSystem` retains the
-    // `*const WorldTilesetMeta` pointer it's given (`buildCatalog`) for its own
-    // lifetime; moving `tileset_meta` after the fact would dangle that pointer.
-    // `stage` tracks how far construction got so this single `errdefer` is the
-    // one place responsible for unwinding everything built so far, in reverse
-    // init order — adding a future heap-owning field only needs one new
-    // `InitStage` variant, one line here, and one `stage = .field;` below,
-    // instead of a fresh standalone `errdefer` that must be placed exactly right.
-    // `data`/`particles`/`scene_prep` are all validly constructed the instant
-    // the literal above finishes (a failing `try` inside it never reaches this
-    // point), so `stage` starts past all three.
-    var stage: InitStage = .scene_prep;
     errdefer {
-        if (@backingInt(stage) >= @backingInt(InitStage.world)) fixture.world.deinit();
-        if (@backingInt(stage) >= @backingInt(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
         fixture.scene_prep.deinit();
         fixture.particles.deinit();
         fixture.data.deinit();
     }
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    fixture.world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles, 1, "grass", "grass");
+    errdefer fixture.world.deinit();
 
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
-
-    fixture.tileset_meta = try fixtures.loadTilesetMeta(allocator, io);
-    stage = .tileset_meta;
-
-    const tile_size_px = fixture.tileset_meta.tileSize();
-    const entity_layout = entitySpawnLayout(item_count);
-    const sparse_grid_side = ceilSqrt(sparse_tile_count);
-    const sparse_world_tiles = @max(@as(u16, @intCast(sparse_grid_side * 2 + 8)), 64);
-    const sparse_world_px = @as(f32, @floatFromInt(sparse_world_tiles)) * tile_size_px;
-    const world_width_px = @max(sparse_world_px, entity_layout.width);
-    const world_height_px = @max(sparse_world_px, entity_layout.height);
-    fixture.world = try WorldSystem.initDemoFromMeta(allocator, &fixture.tileset_meta, world_width_px, world_height_px);
-    stage = .world;
+    const world_px = @as(f32, @floatFromInt(world_tiles)) * tile_size_px;
+    const world_width_px = world_px;
+    const world_height_px = world_px;
 
     // Render-prep's dense-window entity cull bounds the deep submit limit by
     // the world's real level count (WorldSystem.levelInWindow), so a deep
@@ -582,7 +487,7 @@ fn initFixture(
         _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
 
-    const deco = try fixture.world.requireTileByName(&fixture.tileset_meta, "deco_0");
+    const deco = try fixture.world.requireTileByName(&tileset, "deco_0");
     // Sparse tiles sit on the player's level so both variants draw them: sparse
     // tiles draw only on the render window's levels.
     const level: u16 = fixture_config.player_level;
@@ -611,7 +516,7 @@ fn initFixture(
         syncEntityScopeChunk(&fixture.data, entity, &fixture.world, position);
         try fixture.data.setPrimitiveVisual(entity, .{
             .size = .{ .x = 14 + @as(f32, @floatFromInt(index % 5)), .y = 14 + @as(f32, @floatFromInt(index % 7)) },
-            .color = tintFor(index),
+            .color = fixtures.tintFor(index),
             .depth = benchmarkEntityDepth(index),
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
@@ -699,12 +604,6 @@ fn particleCapacity(item_count: usize) usize {
     return @max(item_count / 8, 64);
 }
 
-fn ceilSqrt(value: usize) usize {
-    var side: usize = 1;
-    while (side * side < value) side += 1;
-    return side;
-}
-
 const EntitySpawnLayout = struct {
     cols: usize,
     stride: f32,
@@ -741,7 +640,7 @@ fn entitySpawnLayout(item_count: usize) EntitySpawnLayout {
     const stride: f32 = 20;
     const max_entity_extent: f32 = 20;
     const margin: f32 = stride;
-    const rows = (item_count + cols - 1) / cols;
+    const rows = @divCeil(item_count, cols);
     const width = @as(f32, @floatFromInt(cols)) * stride + max_entity_extent + margin;
     const height = @as(f32, @floatFromInt(rows)) * stride + max_entity_extent + margin;
     return .{
@@ -777,24 +676,7 @@ fn benchmarkParticleDepth(index: usize) WorldDepth {
     return depths[index % depths.len];
 }
 
-fn tintFor(index: usize) config.Color {
-    return .{
-        .r = 0.45 + @as(f32, @floatFromInt(index % 5)) * 0.08,
-        .g = 0.55 + @as(f32, @floatFromInt(index % 7)) * 0.05,
-        .b = 0.65 + @as(f32, @floatFromInt(index % 3)) * 0.09,
-        .a = 1,
-    };
-}
-
-fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
-    return sprite_batch.TextureId.init(index, generation) catch unreachable;
-}
-
-fn u128ToU64Saturated(value: u128) u64 {
-    return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
-}
-
-fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}", .{
         stats.candidate_pairs,
         stats.output_count,
@@ -805,6 +687,162 @@ fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _:
         stats.render_game_prep_static_groups,
         stats.render_game_prep_merged_tilemap_groups,
     });
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.output_count);
     const phases = stats.render_game_prep_phases orelse return;
     try writer.print(" phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}", .{ suite.formatDuration(phases.entity_collect_ns), suite.formatDuration(phases.merge_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns) });
+}
+
+// The off-view group's fixed level side in tiles, in-view rows (a 32 x 32 grid over the
+// camera rect), and particles inside the camera rect.
+const offview_level_side: u16 = 1024;
+const offview_grid_side: usize = 32;
+const offview_visible_rows: usize = offview_grid_side * offview_grid_side;
+const offview_particles: usize = 64;
+const offview_body_size: f32 = 14;
+
+const offview_item_counts = [_]usize{ 4_096, 32_768, 262_144 };
+
+const OffviewFixture = struct {
+    data: DataSystem,
+    particles: ParticleSystem,
+    world: WorldSystem,
+    scene_prep: render_prep.DynamicScenePrep,
+    runtime_assets: RuntimeAssets,
+    player_entity: EntityId = undefined,
+
+    fn deinit(self: *OffviewFixture) void {
+        self.scene_prep.deinit();
+        self.world.deinit();
+        self.particles.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+
+    fn scene(self: *OffviewFixture) render_prep.GameplayScene {
+        return .{
+            .data = &self.data,
+            .world = &self.world,
+            .player_entity = self.player_entity,
+            .player_level = 0,
+            .particles = &self.particles,
+            .overscan_chunks = world_overscan_chunks,
+        };
+    }
+};
+
+fn addOffviewRow(fixture: *OffviewFixture, position: math.Vec2) !EntityId {
+    const entity = try fixture.data.createEntity();
+    try fixture.data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+    try fixture.data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = offview_body_size, .y = offview_body_size },
+        .color = fixtures.tintFor(entity.index),
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try fixture.data.setSimulationMetadata(entity, .{ .chunk = fixture.world.chunkCoordForWorldPos(position.x, position.y) });
+    return entity;
+}
+
+// The empty fixture: one walkable level of `offview_level_side`, no rows yet.
+fn initOffviewFixture(allocator: std.mem.Allocator, io: std.Io) !OffviewFixture {
+    var particles = try ParticleSystem.init(allocator, .{ .capacity = offview_particles });
+    errdefer particles.deinit();
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const world = try fixtures.buildBandedWorld(allocator, &tileset, offview_level_side, 1, "grass", "grass");
+    return .{
+        .data = DataSystem.init(allocator),
+        .particles = particles,
+        .world = world,
+        .scene_prep = render_prep.DynamicScenePrep.init(allocator),
+        .runtime_assets = RuntimeAssets.init(allocator),
+    };
+}
+
+// Whether `position` lies in the visible chunk region.
+fn inVisibleChunks(world: *const WorldSystem, position: math.Vec2) bool {
+    const region = world.visibleChunkRegion() orelse return false;
+    return region.containsChunk(world.chunkCoordForWorldPos(position.x, position.y));
+}
+
+fn runOffviewCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    std.debug.assert(!case.usesThreadSystem());
+    var fixture = try initOffviewFixture(allocator, io);
+    defer fixture.deinit();
+
+    const world_px = fixture.world.worldWidthPixels();
+    const camera_rect = cameraWorldRect(world_px, world_px);
+    try fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks, 0);
+    const visible = render_prep.VisibleWorldRect.fromCameraRect(camera_rect, world_overscan_chunks, fixture.world.chunk_size_tiles, fixture.world.tile_size);
+
+    // In view: a grid over the camera rect; the first row is the player.
+    const pitch_x = camera_rect.w / @as(f32, @floatFromInt(offview_grid_side));
+    const pitch_y = camera_rect.h / @as(f32, @floatFromInt(offview_grid_side));
+    for (0..offview_visible_rows) |index| {
+        const entity = try addOffviewRow(&fixture, .{
+            .x = camera_rect.x + @as(f32, @floatFromInt(index % offview_grid_side)) * pitch_x,
+            .y = camera_rect.y + @as(f32, @floatFromInt(index / offview_grid_side)) * pitch_y,
+        });
+        if (index == 0) fixture.player_entity = entity;
+    }
+    // Off view: a uniform grid over the level, cells in the visible chunks left out,
+    // widened until it holds `item_count` rows.
+    var side = suite.ceilSqrt(item_count);
+    const offview_cells = while (true) : (side += 1) {
+        const pitch = world_px / @as(f32, @floatFromInt(side));
+        var outside: usize = 0;
+        for (0..side * side) |cell| {
+            const position = math.Vec2{ .x = (@as(f32, @floatFromInt(cell % side)) + 0.5) * pitch, .y = (@as(f32, @floatFromInt(cell / side)) + 0.5) * pitch };
+            if (!inVisibleChunks(&fixture.world, position)) outside += 1;
+        }
+        if (outside >= item_count) break side;
+    };
+    const offview_pitch = world_px / @as(f32, @floatFromInt(offview_cells));
+    var placed: usize = 0;
+    for (0..offview_cells * offview_cells) |cell| {
+        if (placed == item_count) break;
+        const position = math.Vec2{ .x = (@as(f32, @floatFromInt(cell % offview_cells)) + 0.5) * offview_pitch, .y = (@as(f32, @floatFromInt(cell / offview_cells)) + 0.5) * offview_pitch };
+        if (inVisibleChunks(&fixture.world, position)) continue;
+        _ = try addOffviewRow(&fixture, position);
+        placed += 1;
+    }
+    std.debug.assert(placed == item_count);
+    for (0..offview_particles) |index| {
+        const emitted = fixture.particles.emit(.{
+            .position = .{ .x = camera_rect.x + @as(f32, @floatFromInt(index)) * pitch_x * 0.5, .y = camera_rect.y + camera_rect.h * 0.5 },
+            .start_size = 4,
+            .lifetime = 1_000_000,
+        });
+        std.debug.assert(emitted);
+    }
+    try render_prep.ensureScenePrepCapacity(&fixture.scene_prep, fixture.scene());
+    const expected_records = offview_visible_rows + fixture.particles.activeCount();
+
+    for (0..options.warmup_iterations) |_| try collectOffview(&fixture, visible, expected_records);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        try collectOffview(&fixture, visible, expected_records);
+        const end_ns = suite.nowNs(io);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), .{});
+    }
+    var stats = accumulator.finish();
+    stats.output_count = fixture.scene_prep.records.items.len;
+    stats.sample_count = offview_visible_rows;
+    stats.render_capacities = .{
+        .record_capacity = render_prep.dynamicRecordCapacity(fixture.scene()),
+        .command_capacity = render_prep.spriteCommandCapacity(fixture.scene()),
+    };
+    return stats;
+}
+
+fn collectOffview(fixture: *OffviewFixture, visible: render_prep.VisibleWorldRect, expected_records: usize) !void {
+    try render_prep.collectDynamicRecords(&fixture.scene_prep, fixture.scene(), visible, &fixture.runtime_assets, 1.0);
+    std.debug.assert(fixture.scene_prep.records.items.len == expected_records);
+}
+
+fn writeOffviewWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("in_view={} collected={}", .{ stats.sample_count, stats.output_count });
+    if (view == .summary) return;
+    const capacities = stats.render_capacities orelse return;
+    try writer.print(" record_capacity={} command_capacity={}", .{ capacities.record_capacity, capacities.command_capacity });
 }

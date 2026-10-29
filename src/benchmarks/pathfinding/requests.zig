@@ -10,7 +10,8 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const offMainNs = @import("../../app/thread_system.zig").offMainNs;
 const math = @import("../../core/math.zig");
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
 const EntityId = @import("../../game/data_system.zig").EntityId;
@@ -28,15 +29,15 @@ const default_goal_requantization_hysteresis_distance = @import("../../game/syst
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const default_group_field_build_budget = @import("../../game/systems/pathfinding/types.zig").default_group_field_build_budget;
+const groupFieldResidentBytes = @import("../../game/systems/pathfinding/test_support.zig").groupFieldResidentBytes;
 const fixtures = @import("../fixtures.zig");
 const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
-const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
+const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
 const StageReport = @import("nav_fixtures.zig").StageReport;
-const benchmarkItemsPerRange = @import("nav_fixtures.zig").benchmarkItemsPerRange;
+const stepTunerSettle = @import("nav_fixtures.zig").stepTunerSettle;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const writeLevelZeroCells = @import("nav_fixtures.zig").writeLevelZeroCells;
@@ -48,6 +49,15 @@ const PlanarRoute = @import("nav_fixtures.zig").PlanarRoute;
 // one walkable level of a fixed side per layout, so the item count varies the load and never
 // the world; every request's route is the same at every count. Each times `update` steps;
 // `--details` prints each update stage's busiest shape and the main-thread time per phase.
+// Each group's headline batch and tuner is the stage it is judged on: the solve for a cold
+// step, intake for a hit-only or folding step (`-cache-*`, `-shared-goal`,
+// `-group-field-detour`), the group-field advance for the moving and pack field groups. The
+// tuned case settles every step tuner (`stepTunerSettle`) before measuring, at the suite's
+// settle limit; the census judges only the tuners that recorded in the measured steps, so a
+// hit-only or ready-field step, which runs intake alone, leaves its setup's tuners idle. The
+// moving and pack field groups run fixed goal cycles, so the measured fixture never runs a
+// settle loop: their tuned case starts from step tuners settled on an identical twin's cycles
+// (the march from cycle 0), and its census judges them when measurement begins.
 //   - Open routes (`pathfinding`, `-drain`, `-cache-open`, `-query`): request `i`'s goal on a
 //     grid of `request_columns` columns from cell (8, 8) of a `request_side`² level, its start
 //     (`request_route_dx`, `request_route_dy`) cells further on, a route across several chunks.
@@ -57,14 +67,15 @@ const PlanarRoute = @import("nav_fixtures.zig").PlanarRoute;
 //   - `-hard-fallback*`: a `hard_fallback_side`² level with one blocking cell on every third
 //     row's center; each request crosses its row past that cell.
 
-// Cold solve curve: one cold step of distinct-goal requests (runtime state cleared before
-// it, untimed), solving min(count, the per-step solve ceiling) and deferring the rest.
+// Cold solve curve: one cold step of distinct-goal requests (every cached result expired
+// before it, untimed; a deferred backlog carries over, as in play), solving min(count, the
+// per-step solve ceiling) and deferring the rest.
 // Items/s is solves serviced. Passes when the time grows linearly to the ceiling and is flat
 // past it.
 pub const group = suite.BenchmarkGroup{
     .name = "pathfinding",
     .item_label = "path requests",
-    .defaultItemCounts = coldSolveItemCounts,
+    .item_counts = &cold_solve_counts,
     .runCase = runCase,
     .write_workload = writeSolveWorkload,
 };
@@ -75,7 +86,7 @@ pub const group = suite.BenchmarkGroup{
 pub const dedup_group = suite.BenchmarkGroup{
     .name = "pathfinding-shared-goal",
     .item_label = "path requests to one goal",
-    .defaultItemCounts = sharedGoalItemCounts,
+    .item_counts = &shared_goal_counts,
     .runCase = runDedupCase,
     .write_workload = writeDedupWorkload,
 };
@@ -86,7 +97,7 @@ pub const dedup_group = suite.BenchmarkGroup{
 pub const drain_group = suite.BenchmarkGroup{
     .name = "pathfinding-drain",
     .item_label = "queued path requests",
-    .defaultItemCounts = drainItemCounts,
+    .item_counts = &drain_counts,
     .runCase = runDrainCase,
     .write_workload = writeSolveWorkload,
 };
@@ -96,7 +107,7 @@ pub const drain_group = suite.BenchmarkGroup{
 pub const fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-cache-open",
     .item_label = "cached path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runFallbackCase,
     .write_workload = writeCacheWorkload,
 };
@@ -105,7 +116,7 @@ pub const fallback_group = suite.BenchmarkGroup{
 pub const fallback_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-cache-detour",
     .item_label = "cached detour path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runFallbackDetourCase,
     .write_workload = writeCacheWorkload,
 };
@@ -115,7 +126,7 @@ pub const fallback_detour_group = suite.BenchmarkGroup{
 pub const hard_fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback",
     .item_label = "hard fallback path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runHardFallbackCase,
     .write_workload = writeFallbackWorkload,
 };
@@ -126,7 +137,7 @@ pub const hard_fallback_group = suite.BenchmarkGroup{
 pub const hard_fallback_budget_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback-budget",
     .item_label = "hard fallback path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runHardFallbackBudgetCase,
     .write_workload = writeFallbackWorkload,
 };
@@ -140,7 +151,7 @@ pub const hard_fallback_budget_group = suite.BenchmarkGroup{
 pub const escalated_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-escalated-detour",
     .item_label = "level side (cells)",
-    .defaultItemCounts = escalatedDetourItemCounts,
+    .item_counts = &escalated_detour_counts,
     .runCase = runEscalatedDetourCase,
     .write_workload = writeSolveWorkload,
 };
@@ -152,31 +163,32 @@ pub const escalated_detour_group = suite.BenchmarkGroup{
 pub const group_field_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour",
     .item_label = "pack agents",
-    .defaultItemCounts = groupFieldDetourItemCounts,
+    .item_counts = &group_field_detour_counts,
     .runCase = runGroupFieldDetourCase,
     .write_workload = writeFieldSampleWorkload,
 };
 
 // `pathfinding-group-field-detour` with the shared goal moving one new nav cell every
-// `group_field_detour_rekey_period_steps` steps; times every step of the measured cycles.
-// Passes when the field serves part of every run, escalated solves stay at most one per
-// rekey, and the per-step time is linear in pack size.
+// `group_field_detour_rekey_period_steps` steps; 2 untimed cycles, then times every step of 6
+// measured cycles. The tuned case starts from step tuners carried from an identical twin run
+// until they settle. Passes when the field serves part of every run, escalated solves stay at
+// most one per rekey, and the per-step time is linear in pack size.
 pub const group_field_detour_moving_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour-moving",
     .item_label = "pack agents",
-    .defaultItemCounts = groupFieldDetourItemCounts,
+    .item_counts = &group_field_detour_counts,
     .runCase = runGroupFieldDetourMovingCase,
     .write_workload = writeFieldMovingWorkload,
 };
 
 // The moving goal advancing every step at the chase speed, its request goal re-keyed only past
-// `default_goal_requantization_hysteresis_distance` (`computeRequantizedGoal`). Passes when
-// rewrites stay below the measured steps, escalated solves at most one per rewrite, and the
-// per-step time is linear in pack size.
+// `default_goal_requantization_hysteresis_distance` (`computeRequantizedGoal`). Cycles and the
+// tuned case's twin carry as `-moving`. Passes when rewrites stay below the measured steps,
+// escalated solves at most one per rewrite, and the per-step time is linear in pack size.
 pub const group_field_detour_moving_hysteresis_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour-moving-hysteresis",
     .item_label = "pack agents",
-    .defaultItemCounts = groupFieldDetourItemCounts,
+    .item_counts = &group_field_detour_counts,
     .runCase = runGroupFieldDetourMovingHysteresisCase,
     .write_workload = writeFieldMovingWorkload,
 };
@@ -184,24 +196,31 @@ pub const group_field_detour_moving_hysteresis_group = suite.BenchmarkGroup{
 // Packs (the item count) of `group_field_pack_agents` agents on an open
 // `group_field_detour_side`² level, each with its own goal marching one nav cell per rekey
 // cycle, so every pack's field builds at once (one `group_field_expand` item each). Times every
-// step of the measured cycles. Passes when linear in packs. `--details` prints per-field
-// coverage, blocks, resident bytes, and pool growths.
+// step of the measured cycles; cycles and the tuned case's twin carry as `-moving`. Passes
+// when linear in packs. `--details` prints per-field coverage, blocks, resident bytes, and
+// pool growths.
 pub const group_field_packs_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-packs",
     .item_label = "packs",
-    .defaultItemCounts = groupFieldPacksItemCounts,
+    .item_counts = &group_field_packs_item_counts,
     .runCase = runGroupFieldPacksCase,
     .write_workload = writePacksWorkload,
 };
 
 // Sparse-coverage fields: four crowds on a 1024² level whose only walkable cells are a
 // lattice of 1-wide corridors every nav chunk, each flooding a field capped at the item
-// count's cells. One sample rebuilds the four fields from scratch until all are ready.
-// Passes when linear in the cell cap, every field covering its cap.
+// count's cells. One sample rebuilds the four fields from scratch until all are ready; an
+// untimed first build warms the fields' block pools. A cap within the per-step build budget
+// (`default_group_field_build_budget`, 8192) builds whole in the begin pass
+// (`group_field_begin`); a larger cap builds its first budget there and the rest in the
+// advance pass (`group_field`) over later steps. The headline batch is the busiest pass batch
+// (field count) of a build's steps, and the tuned row's work tuning is the pass that ran it,
+// the other its secondary tuning. Passes when linear in the cell cap, every field covering its
+// cap.
 pub const group_field_tunnel_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-tunnel",
     .item_label = "field cell cap",
-    .defaultItemCounts = groupFieldTunnelItemCounts,
+    .item_counts = &group_field_tunnel_item_counts,
     .runCase = runGroupFieldTunnelCase,
     .write_workload = writeTunnelWorkload,
 };
@@ -212,103 +231,25 @@ pub const group_field_tunnel_group = suite.BenchmarkGroup{
 pub const query_group = suite.BenchmarkGroup{
     .name = "pathfinding-query",
     .item_label = "querying agents",
-    .defaultItemCounts = queryDefaultItemCounts,
+    .item_counts = &query_counts,
     .runCase = runQueryCase,
     .write_workload = writeQueryWorkload,
 };
 
 // Cold solve counts: three below the per-step solve ceiling, the ceiling, and three past it,
 // so both regimes show their shape.
-const cold_solve_quick_counts = [_]usize{ 128, 256, 384, 512, 1024, 2048, 4096 };
-const cold_solve_standard_counts = [_]usize{ 128, 256, 384, 512, 1024, 4096, 8192 };
-const cold_solve_stress_counts = [_]usize{ 128, 256, 384, 512, 2048, 4096, 8192 };
-const shared_goal_quick_counts = [_]usize{ 128, 512, 2048 };
-const shared_goal_standard_counts = [_]usize{ 512, 2048, 8192 };
-const shared_goal_stress_counts = [_]usize{ 2048, 8192, 32768 };
+const cold_solve_counts = [_]usize{ 128, 256, 384, 512, 1024, 2048, 4096 };
+const shared_goal_counts = [_]usize{ 128, 512, 2048 };
 // Queue depths past the ceiling, so every drain step solves a full ceiling.
-const drain_quick_counts = [_]usize{ 1024, 2048, 4096 };
-const drain_standard_counts = [_]usize{ 1024, 4096, 16384 };
-const drain_stress_counts = [_]usize{ 2048, 8192, 16384 };
-const fallback_quick_counts = [_]usize{ 16, 64, 128 };
-const fallback_standard_counts = [_]usize{ 64, 128, 256, 1024 };
-const fallback_stress_counts = [_]usize{ 256, 512, 1024 };
-const query_quick_counts = [_]usize{ 256, 1024, 4096 };
-const query_standard_counts = [_]usize{ 1024, 4096, 16384 };
-const query_stress_counts = [_]usize{ 2048, 8192, 16384 };
+const drain_counts = [_]usize{ 1024, 2048, 4096 };
+const fallback_counts = [_]usize{ 16, 64, 128 };
+const query_counts = [_]usize{ 256, 1024, 4096 };
 // Level sides, in whole chunks, up to the largest whose detour the fixed tier-1 budget solves.
-const escalated_detour_quick_counts = [_]usize{ 64, 128, 256 };
-const escalated_detour_standard_counts = [_]usize{ 128, 256, 512 };
-const escalated_detour_stress_counts = [_]usize{ 128, 256, 512 };
+const escalated_detour_counts = [_]usize{ 64, 128, 256 };
 // Pack sizes.
-const group_field_detour_quick_counts = [_]usize{ 16, 64, 256 };
-const group_field_detour_standard_counts = [_]usize{ 16, 64, 256 };
-const group_field_detour_stress_counts = [_]usize{ 64, 256, 1024 };
+const group_field_detour_counts = [_]usize{ 16, 64, 256 };
 const group_field_packs_item_counts = [_]usize{ 1, 4, 16 };
 const group_field_tunnel_item_counts = [_]usize{ 2048, 16384, 65536 };
-
-fn coldSolveItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &cold_solve_quick_counts,
-        .standard => &cold_solve_standard_counts,
-        .stress => &cold_solve_stress_counts,
-    };
-}
-
-fn sharedGoalItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &shared_goal_quick_counts,
-        .standard => &shared_goal_standard_counts,
-        .stress => &shared_goal_stress_counts,
-    };
-}
-
-fn drainItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &drain_quick_counts,
-        .standard => &drain_standard_counts,
-        .stress => &drain_stress_counts,
-    };
-}
-
-fn fallbackDefaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &fallback_quick_counts,
-        .standard => &fallback_standard_counts,
-        .stress => &fallback_stress_counts,
-    };
-}
-
-fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &query_quick_counts,
-        .standard => &query_standard_counts,
-        .stress => &query_stress_counts,
-    };
-}
-
-fn escalatedDetourItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &escalated_detour_quick_counts,
-        .standard => &escalated_detour_standard_counts,
-        .stress => &escalated_detour_stress_counts,
-    };
-}
-
-fn groupFieldDetourItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &group_field_detour_quick_counts,
-        .standard => &group_field_detour_standard_counts,
-        .stress => &group_field_detour_stress_counts,
-    };
-}
-
-fn groupFieldPacksItemCounts(_: suite.Profile) []const usize {
-    return &group_field_packs_item_counts;
-}
-
-fn groupFieldTunnelItemCounts(_: suite.Profile) []const usize {
-    return &group_field_tunnel_item_counts;
-}
 
 fn writeSolveWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("solves={} results={} deferred={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count });
@@ -326,8 +267,10 @@ fn writeFallbackWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite
     try writer.print("solve_admissions={} admission_deferred={} deferred={} results={} evictions={}", .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions });
 }
 
-fn writeQueryWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+// Under --details, the main thread's share of the query batch, per query.
+fn writeQueryWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("warm_paths={} queries={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.output_count);
 }
 
 fn writeFieldSampleWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
@@ -419,7 +362,7 @@ const Workload = enum {
 };
 
 // `count` requests of `workload` on its level, world-backed nav built over it.
-fn initRequestFixture(allocator: std.mem.Allocator, io: std.Io, workload: Workload, count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !RouteFixture {
+fn initRequestFixture(allocator: std.mem.Allocator, io: std.Io, workload: Workload, count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !RouteFixture {
     if (count > workload.capacity()) return error.RequestLayoutTooSmall;
     var open = try buildOpenWorld(allocator, io, workload.side(), 1);
     var open_owned = true;
@@ -456,16 +399,16 @@ const MeasurementMode = enum {
 };
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, group.name, item_count, .unique_open, .cold_solve, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .cold_solve, item_count, item_count);
 }
 
 // Every request shares one goal: all but the first fold into its pending entry, so a cold
 // step is one solve. Items/s is requests answered, not solves.
 fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     // The field threshold above every sharer count (the agent ceiling clamps it), so the
     // timed step is the fold alone, never a group-field begin.
     var capacity = requestCapacity(item_count + 1, fixtures.participantCount(thread_ptr));
@@ -473,70 +416,70 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var fixture = try initRequestFixture(allocator, io, .common_goal, item_count, capacity, thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
-    for (0..1 + coldWarmup(options)) |_| {
-        system.clearRuntimeState();
+    var warm = suite.Warmup.custom(case, 1 + coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(stepTunerSettle(system))) {
+        expireCachedResults(system);
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
-            _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-        }
-    }
-    const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settle = stepTunerSettle(system);
+    const intake_start = suite.TunerStart.of(&system.tuners.intake, case);
 
+    // The headline is intake, which folds every request; the step solves one.
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
+    var stage_report = StageReport{};
     for (0..coldIterations(options)) |_| {
-        system.clearRuntimeState();
+        expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
-        if (last_stats.group_field_begin_batch.item_count != 0 or last_stats.group_fields_built != 0) return error.SharedGoalBeganField;
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        accumulator.record(elapsed_ns, last_stats.perf.intake_batch);
+        stage_report.add(elapsed_ns, last_stats);
+        if (last_stats.perf.group_field_begin_batch.item_count != 0 or last_stats.perf.group_fields_built != 0) return error.SharedGoalBeganField;
     }
-    if (last_stats.solve_admissions != 1) return error.SharedGoalNotOneSolve;
+    if (last_stats.perf.solve_admissions != 1) return error.SharedGoalNotOneSolve;
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results + last_stats.duplicate_requests + last_stats.cache_hits;
-    stats.candidate_pairs = last_stats.duplicate_requests + last_stats.cache_hits;
+    stage_report.write(&stats.details);
+    stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results + last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
+    stats.candidate_pairs = last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.intake, intake_start);
+    }
     return stats;
 }
 
 fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, fallback_group.name, item_count, .unique_open, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache, item_count, item_count);
 }
 
 fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, fallback_detour_group.name, item_count, .blocked_detour, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache, item_count, item_count);
 }
 
 fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, hard_fallback_group.name, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
 }
 
 fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const fallback_budget = @min(options.fallback_budget orelse hard_fallback_admissions, item_count);
-    return runWorkloadCase(allocator, io, options, case, hard_fallback_budget_group.name, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
+    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
 }
 
 // Admissions per step of the hard-fallback-budget case: a window narrower than its solve
 // window, so the admission limit defers the rest.
 const hard_fallback_admissions: usize = 128;
 
-fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
+fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initRequestFixture(allocator, io, workload, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
     system.clearRuntimeState();
     _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
@@ -544,47 +487,45 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     const warmup_count = if (mode.isCold()) coldWarmup(options) else options.warmup_iterations;
     const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
-    for (0..warmup_count) |_| {
-        if (mode.isCold()) system.clearRuntimeState();
+    // A cold step settles every tuner it runs; a hit-only step runs intake alone (the cache
+    // fill's solves are setup), which `warmHotCache` settled.
+    var warm = suite.Warmup.custom(case, warmup_count, if (mode.isCold()) suite.adaptiveSettleIterationLimit(options) else 0);
+    while (warm.nextSettled(stepTunerSettle(system))) {
+        if (mode.isCold()) expireCachedResults(system);
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
     }
-    if (case.adaptive and mode.isCold()) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
-            _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settle = stepTunerSettle(system);
+    // The headline: the solve when cold, intake when every request hits the cache.
+    const headline_tuner = if (mode.isCold()) &system.tuners.solve else &system.tuners.intake;
+    const headline_start = suite.TunerStart.of(headline_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
     for (0..measure_count) |_| {
-        if (mode.isCold()) system.clearRuntimeState();
+        if (mode.isCold()) expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), if (mode.isCold()) last_stats.perf.solve_batch else last_stats.perf.intake_batch);
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
-    stage_report.print(options, group_name, item_count, case);
     // Every route exists and starts open.
-    if (last_stats.unavailable_results != 0) return error.RouteUnavailable;
+    if (last_stats.perf.unavailable_results != 0) return error.RouteUnavailable;
 
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results;
-    stats.deferred_count = last_stats.pending_requests;
-    stats.fallback_deferred_count = last_stats.admission_deferred_requests;
-    stats.cache_evictions = last_stats.cache_evictions;
+    stage_report.write(&stats.details);
+    stats.output_count = last_stats.perf.available_results;
+    stats.deferred_count = last_stats.perf.pending_requests;
+    stats.fallback_deferred_count = last_stats.perf.admission_deferred_requests;
+    stats.cache_evictions = last_stats.perf.cache_evictions;
     // Throughput counts what the step serviced: cache hits when warm, admissions when cold
     // at the admission window, published results when cold; the per-step ceiling defers the
     // rest.
     const serviced: usize = switch (mode) {
-        .hot_cache => last_stats.cache_hits,
-        .cold_fallback => last_stats.solve_admissions,
-        .cold_solve => last_stats.available_results,
+        .hot_cache => last_stats.perf.cache_hits,
+        .cold_fallback => last_stats.perf.solve_admissions,
+        .cold_solve => last_stats.perf.available_results,
     };
     stats.candidate_pairs = serviced;
     switch (mode) {
@@ -594,8 +535,9 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .cold_solve => if (serviced > @min(item_count, solve_budget, default_max_solves_per_frame)) return error.SolvesPastCeiling,
     }
     stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
-    if (case.adaptive and mode.isCold()) {
-        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled_before_measurement);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(headline_tuner, headline_start);
     }
     return stats;
 }
@@ -606,20 +548,22 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     // The refill step solves one ceiling; a full-ceiling drain step needs another behind it.
     if (item_count < 2 * default_max_solves_per_frame) return error.DrainQueueBelowTwoCeilings;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
 
     // A healthy queue empties in ceil(N / ceiling) steps; past that a cycle stops.
-    const drain_step_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
+    const drain_step_limit = @divCeil(item_count, default_max_solves_per_frame) + 2;
     const drain_samples = coldIterations(options);
-    for (0..@max(@as(usize, 1), coldWarmup(options))) |_| {
+    // Each warm cycle refills the queue and drains it; the tuned case settles every step
+    // tuner the refill and drain steps run.
+    var warm = suite.Warmup.custom(case, @max(@as(usize, 1), coldWarmup(options)), suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(stepTunerSettle(system))) {
         try refillDrainQueue(system, &fixture.requests, thread_ptr, case, item_count);
         var guard: usize = drain_step_limit;
         while (system.pending.len > 0 and guard > 0) : (guard -= 1) {
@@ -629,6 +573,8 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         }
     }
 
+    const settle = stepTunerSettle(system);
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
@@ -641,41 +587,44 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
             const start_ns = suite.nowNs(io);
             last_stats = try runColdOnce(system, &empty, thread_ptr, case, item_count, item_count, item_count);
             const end_ns = suite.nowNs(io);
-            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
+            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.solve_batch);
             stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
             if (system.pending.len >= before) return error.DrainStalled;
         }
     }
-    stage_report.print(options, drain_group.name, item_count, case);
 
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
-    stats.candidate_pairs = last_stats.solved_requests;
-    stats.deferred_count = last_stats.pending_requests;
-    stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), false);
+    stage_report.write(&stats.details);
+    stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results;
+    stats.candidate_pairs = last_stats.perf.solved_requests;
+    stats.deferred_count = last_stats.perf.pending_requests;
+    stats.items_per_second = suite.itemsPerSecond(last_stats.perf.solved_requests, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
+    }
     return stats;
 }
 
-// Clears the runtime state and accepts every distinct goal in one step, which also solves
-// the first ceiling; the queue carries the rest.
-fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
-    system.clearRuntimeState();
+// Expires every cached result (`expireCachedResults`) and accepts every distinct goal in one
+// step, which also solves the first ceiling; the queue carries the rest.
+fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
+    expireCachedResults(system);
     _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
 }
 
 // Steps until every request is a cache hit and, for an adaptive case, the intake tuner has
 // settled (bounded), so the timed steps are the hit path only.
-fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
-    const fill_limit = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
+fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
+    const fill_limit = @divCeil(item_count, default_max_solves_per_frame) + 2;
     const settle_limit = fill_limit + suite.adaptiveSettleIterationLimit(options);
     var steps: usize = 0;
     while (true) {
         const stats = try runColdOnce(system, requests, thread_system, case, item_count, item_count, item_count);
         steps += 1;
-        const all_hits = stats.cache_hits == item_count;
+        const all_hits = stats.perf.cache_hits == item_count;
         if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
-        const tuner_ready = !case.adaptive or system.tuners.intake.isSettled() or steps >= settle_limit;
+        const tuner_ready = !case.adaptive or suite.tunerSettled(&system.tuners.intake) or steps >= settle_limit;
         if (all_hits and tuner_ready) return;
     }
 }
@@ -701,33 +650,31 @@ fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void
     }
 }
 
-fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, item_count: usize) BatchStats {
-    if (thread_system) |ts| {
-        return ts.parallelForWithOptions(item_count, ctx, queryJob, .{
-            .items_per_range = benchmarkItemsPerRange(case),
-            .max_worker_threads = case.maxWorkerThreads(),
-            .range_alignment_items = pathfinding_range_alignment_items,
-            .adaptive = case.adaptive,
-        });
-    }
-    queryJob(@ptrCast(ctx), .{ .start = 0, .end = item_count }, WorkerId.main);
-    return inlineBatch(item_count, pathfinding_range_alignment_items);
+fn runQueries(ctx: *QueryContext, thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner, case: suite.BenchmarkCase, item_count: usize) BatchStats {
+    return thread_system.parallelForWithOptions(item_count, ctx, queryJob, .{
+        .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .range_alignment_items = pathfinding_range_alignment_items,
+        .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
+        .adaptive_tuner = tuner,
+    });
 }
 
 // Per-agent statusForWorld against a warm cache: each agent queries from the midpoint of
 // its own cached path, so the waypoint scan has a deep match to find.
 fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
 
     // Warm: the per-step solve ceiling caps each step, so enough steps drain the queue.
     const warm_steps = item_count / default_max_solves_per_frame + 4;
-    for (0..warm_steps) |_| _ = try system.updateSerial(&fixture.requests, item_count, .{});
+    for (0..warm_steps) |_| _ = try system.update(&fixture.requests, item_count, thread_ptr, .{});
 
     const starts = try allocator.alloc(math.Vec2, item_count);
     defer allocator.free(starts);
@@ -765,18 +712,28 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (warm_paths != item_count) return error.QueryCacheNotWarm;
 
     var context = QueryContext{ .system = system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
+    // The query batch's own stage tuner.
+    var tuner = AdaptiveWorkTuner.init(.{});
     // Warmup also settles each agent's hint to its midpoint index.
-    for (0..options.warmup_iterations) |_| _ = runQueries(&context, thread_ptr, case, item_count);
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(suite.tunerSettled(&tuner))) _ = runQueries(&context, thread_ptr, &tuner, case, item_count);
+    const tuner_start = suite.TunerStart.of(&tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runQueries(&context, thread_ptr, case, item_count);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), batch);
+        const batch = runQueries(&context, thread_ptr, &tuner, case, item_count);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        accumulator.record(elapsed_ns, batch);
+        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(pathfinding_range_alignment_items), batch);
+        main_total += elapsed_ns -| offMainNs(batch);
     }
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = item_count;
     stats.candidate_pairs = warm_paths;
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&tuner, tuner_start);
     return stats;
 }
 
@@ -809,9 +766,9 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = std.math.cast(u16, item_count) orelse return error.EscalatedDetourSideTooWide;
     if (side % default_chunk_size_tiles != 0 or side < 4 * default_chunk_size_tiles) return error.EscalatedDetourSideNotChunked;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const open = try buildDetourWorld(allocator, io, side);
     var request = [_]PathRequest{.{
         .entity = undefined,
@@ -830,33 +787,41 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
 
-    for (0..coldWarmup(options)) |_| {
+    // A sample is the untimed promote and the timed solve, both every step tuner's.
+    var warm = suite.Warmup.custom(case, coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(stepTunerSettle(system))) {
         try promoteDetour(system, &fixture.requests, thread_ptr, case);
         _ = try runColdOnce(system, &empty, thread_ptr, case, 1, 1, 1);
     }
+    const settle = stepTunerSettle(system);
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     for (0..coldIterations(options)) |_| {
         try promoteDetour(system, &fixture.requests, thread_ptr, case);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &empty, thread_ptr, case, 1, 1, 1);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.perf.solve_batch);
     }
     // The fixed tier-1 budget solves the detour; a second exhaustion would drop it.
-    if (last_stats.available_results != 1 or last_stats.escalated_solves != 1) return error.EscalatedDetourUnsolved;
+    if (last_stats.perf.available_results != 1 or last_stats.perf.escalated_solves != 1) return error.EscalatedDetourUnsolved;
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results;
-    stats.candidate_pairs = last_stats.solved_requests;
+    stats.output_count = last_stats.perf.available_results;
+    stats.candidate_pairs = last_stats.perf.solved_requests;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
+    }
     return stats;
 }
 
-// The untimed setup step: submits the request on cleared state and exhausts its first
-// attempt, leaving it pending at tier 1.
-fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !void {
-    system.clearRuntimeState();
+// The untimed setup step: submits the request with its cached result expired
+// (`expireCachedResults`) and exhausts its first attempt, leaving it pending at tier 1.
+fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
+    expireCachedResults(system);
     const stats = try runColdOnce(system, requests, thread_system, case, 1, 1, 1);
-    if (stats.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
+    if (stats.perf.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
 }
 
 // The group-field detour level side: a whole-level field builds within the rebuild throttle
@@ -922,7 +887,7 @@ const PackFixture = struct {
     }
 };
 
-fn initPackFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !PackFixture {
+fn initPackFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !PackFixture {
     const side = group_field_detour_side;
     if (agent_count > (side / 2 - 2) * ((side - 8) / 3)) return error.PackLayoutTooSmall;
     var open = try buildDetourWorld(allocator, io, side);
@@ -953,22 +918,26 @@ fn packCapacity(agent_count: usize, participant_count: usize) PathfindingCapacit
 // the same pack and every member samples the field.
 fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
-    setPathStageTuners(system, case);
     try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.open.cellCenter(packGoal(group_field_detour_side, 0)));
 
     var last_stats = PathfindingStats{};
     var guard: usize = group_field_detour_setup_guard;
-    while (guard > 0 and last_stats.group_field_samples < item_count) : (guard -= 1) {
+    while (guard > 0 and last_stats.perf.group_field_samples < item_count) : (guard -= 1) {
         last_stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
     }
-    if (last_stats.group_field_samples != item_count) return error.GroupFieldNotReady;
-    for (0..options.warmup_iterations) |_| _ = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+    if (last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotReady;
+    // A ready field's step runs intake alone, which samples the field for every member; the
+    // field build's stages ran only in setup, so the step census leaves them idle.
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.nextSettled(stepTunerSettle(system))) _ = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
+    const settle = stepTunerSettle(system);
+    const intake_start = suite.TunerStart.of(&system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
@@ -976,17 +945,21 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, last_stats.solve_batch);
+        accumulator.record(elapsed_ns, last_stats.perf.intake_batch);
         stage_report.add(elapsed_ns, last_stats);
         // A ready field answers every member: no build, no per-agent solve.
-        if (last_stats.group_fields_built != 0 or last_stats.group_field_samples != item_count) return error.GroupFieldNotSampled;
+        if (last_stats.perf.group_fields_built != 0 or last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotSampled;
     }
-    stage_report.print(options, group_field_detour_group.name, item_count, case);
 
     var stats = accumulator.finish();
-    stats.output_count = last_stats.duplicate_requests;
-    stats.candidate_pairs = last_stats.group_field_samples;
+    stage_report.write(&stats.details);
+    stats.output_count = last_stats.perf.duplicate_requests;
+    stats.candidate_pairs = last_stats.perf.group_field_samples;
     stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.intake, intake_start);
+    }
     return stats;
 }
 
@@ -998,10 +971,10 @@ const MovingTotals = struct {
     samples: usize = 0,
 
     fn add(self: *MovingTotals, stats: PathfindingStats) void {
-        self.escalated += stats.escalated_solves;
-        self.throttled += stats.group_field_rebuild_throttled;
-        self.built += stats.group_fields_built;
-        self.samples += stats.group_field_samples;
+        self.escalated += stats.perf.escalated_solves;
+        self.throttled += stats.perf.group_field_rebuild_throttled;
+        self.built += stats.perf.group_fields_built;
+        self.samples += stats.perf.group_field_samples;
     }
 
     fn into(self: MovingTotals, stats: *suite.RunStats) void {
@@ -1012,104 +985,207 @@ const MovingTotals = struct {
     }
 };
 
+// The goal cycles a moving or pack field group runs: the march `writeGroupFieldPackRequests`
+// bounds, so no cycle's goal leaves the level or revisits an earlier one.
+const group_field_march_cycles: usize = group_field_detour_side / 2;
+
+// The measured steps of a moving or pack field group: their times and headline batch (the
+// group-field advance), stage shapes, and totals.
+const CycleSink = struct {
+    accumulator: suite.StatsAccumulator,
+    stage_report: StageReport = .{},
+    totals: MovingTotals = .{},
+
+    fn add(self: *CycleSink, elapsed_ns: u64, stats: PathfindingStats) void {
+        self.accumulator.record(elapsed_ns, stats.perf.group_field_batch);
+        self.stage_report.add(elapsed_ns, stats);
+        self.totals.add(stats);
+    }
+};
+
+// The pathfinding step a moving or pack field group's cycles run, with `agent_count` agents
+// under `case`.
+const CycleStepper = struct {
+    io: std.Io,
+    threads: *ThreadSystem,
+    case: suite.BenchmarkCase,
+    agent_count: usize,
+
+    // One step of `system` over `stream`, timed into `sink` when measured.
+    fn step(self: CycleStepper, system: *PathfindingSystem, stream: *RangeOutputStream(PathRequest), sink: ?*CycleSink) !void {
+        const start_ns = suite.nowNs(self.io);
+        const stats = try runColdOnce(system, stream, self.threads, self.case, self.agent_count, self.agent_count, self.agent_count);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(self.io));
+        if (sink) |measured| measured.add(elapsed_ns, stats);
+    }
+};
+
+// The tuned case's start: step tuners settled on an identical twin's cycles, which run from
+// cycle 0 until every tuner that recorded since the twin's warmup cycles is settled, within the
+// march. The measured fixture then runs its own fixed cycles from these tuners, so its goals
+// and steps are the same in every case and run.
+fn twinWarmup(case: suite.BenchmarkCase) suite.Warmup {
+    return suite.Warmup.custom(case, group_field_detour_moving_warmup_cycles, group_field_march_cycles - group_field_detour_moving_warmup_cycles);
+}
+
+// The measured fixture's cycle at which measurement begins: its census snapshot and the
+// headline group-field advance tuner's start.
+const CycleWindow = struct {
+    settle: suite.TunerSettle,
+    start: suite.TunerStart,
+
+    fn begin(system: *const PathfindingSystem, case: suite.BenchmarkCase) CycleWindow {
+        return .{ .settle = stepTunerSettle(system), .start = .of(&system.tuners.group_field, case) };
+    }
+
+    fn report(self: *const CycleWindow, stats: *suite.RunStats, system: *const PathfindingSystem, case: suite.BenchmarkCase) void {
+        if (!case.adaptive) return;
+        stats.tuner_settle = self.settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.group_field, self.start);
+    }
+};
+
+// Cycle `cycle` of the moving group: the pack re-keyed to the march's goal for `cycle`, then
+// the rekey period's steps.
+fn movingCycle(allocator: std.mem.Allocator, stepper: CycleStepper, fixture: *PackFixture, cycle: usize, sink: ?*CycleSink) !void {
+    try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.open.cellCenter(packGoal(group_field_detour_side, cycle)));
+    for (0..group_field_detour_rekey_period_steps) |_| try stepper.step(&fixture.system, &fixture.stream, sink);
+}
+
 // A moving shared goal at the chase cadence: each cycle re-keys the pack's goal to a nav cell
 // no earlier cycle targeted (a strict march, so no cycle rides an earlier cached result), then
 // steps the rekey period. The first request for a new goal is always one bounded solve (the
 // field cannot be ready for it yet); the throttle must let the field serve the rest.
-fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     // Fixed cycle counts: --warmup and --iterations do not apply.
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
+    const capacity = packCapacity(item_count, fixtures.participantCount(thread_ptr));
+    const stepper = CycleStepper{ .io = io, .threads = thread_ptr, .case = case, .agent_count = item_count };
+
+    var carried: ?fixtures.NavTuners = null;
+    if (case.adaptive) {
+        var twin = try initPackFixture(allocator, io, item_count, capacity, thread_ptr);
+        defer twin.deinit(allocator);
+        var warm = twinWarmup(case);
+        var cycle: usize = 0;
+        while (warm.nextSettled(stepTunerSettle(&twin.system))) : (cycle += 1) try movingCycle(allocator, stepper, &twin, cycle, null);
+        std.debug.assert(cycle <= group_field_march_cycles);
+        carried = twin.system.tuners;
+    }
+    var fixture = try initPackFixture(allocator, io, item_count, capacity, thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
-    setPathStageTuners(system, case);
+    if (carried) |tuners| system.tuners = tuners;
 
-    var totals = MovingTotals{};
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var stage_report = StageReport{};
-    for (0..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
-        try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.open.cellCenter(packGoal(group_field_detour_side, cycle)));
-        const measured = cycle >= group_field_detour_moving_warmup_cycles;
-        for (0..group_field_detour_rekey_period_steps) |_| {
-            const start_ns = suite.nowNs(io);
-            const stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
-            const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-            if (!measured) continue;
-            accumulator.record(elapsed_ns, stats.solve_batch);
-            stage_report.add(elapsed_ns, stats);
-            totals.add(stats);
-        }
+    var sink = CycleSink{ .accumulator = .init(item_count) };
+    for (0..group_field_detour_moving_warmup_cycles) |cycle| try movingCycle(allocator, stepper, &fixture, cycle, null);
+    const window = CycleWindow.begin(system, case);
+    for (group_field_detour_moving_warmup_cycles..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
+        try movingCycle(allocator, stepper, &fixture, cycle, &sink);
     }
-    stage_report.print(options, group_field_detour_moving_group.name, item_count, case);
     // The throttle lets the field reach ready and serve part of the run; escalated solves stay
     // at one per rekey.
-    if (totals.samples == 0) return error.GroupFieldNeverSampled;
-    if (totals.escalated > group_field_detour_moving_cycles) return error.GroupFieldEscalationsPastRekeys;
-    var stats = accumulator.finish();
-    totals.into(&stats);
+    if (sink.totals.samples == 0) return error.GroupFieldNeverSampled;
+    if (sink.totals.escalated > group_field_detour_moving_cycles) return error.GroupFieldEscalationsPastRekeys;
+    var stats = sink.accumulator.finish();
+    sink.stage_report.write(&stats.details);
+    sink.totals.into(&stats);
+    window.report(&stats, system, case);
     return stats;
 }
 
-// The live goal advancing every step at the chase speed (one nav cell per rekey period), the
-// request goal re-keyed only past the AI's requantization hysteresis
-// (`computeRequantizedGoal`, the function `AiSystem.requantizeGoal` wraps).
-fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    // Fixed cycle counts: --warmup and --iterations do not apply.
-    _ = options;
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-    var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
-    defer fixture.deinit(allocator);
-    const system = &fixture.system;
-    setPathStageTuners(system, case);
+// The hysteresis group's goal: the live goal advancing every step at the chase speed (one nav
+// cell per rekey period), and the request goal re-keyed only past the AI's requantization
+// hysteresis (`computeRequantizedGoal`, the function `AiSystem.requantizeGoal` wraps).
+const HysteresisGoal = struct {
+    start_goal: math.Vec2,
+    px_per_step: f32,
+    snapped_goal: math.Vec2,
+    snapped_initialized: bool = false,
+    last_written_goal: ?math.Vec2 = null,
 
-    const start_goal = fixture.open.cellCenter(packGoal(group_field_detour_side, 0));
-    const px_per_step: f32 = fixture.open.world.tile_size / @as(f32, @floatFromInt(group_field_detour_rekey_period_steps));
-    var snapped_goal = start_goal;
-    var snapped_initialized = false;
-    var last_written_goal: ?math.Vec2 = null;
-    // Goal rewrites past the hysteresis over the measured steps.
-    var rewrite_count: usize = 0;
-    const total_steps = (group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) * group_field_detour_rekey_period_steps;
-    const warmup_steps = group_field_detour_moving_warmup_cycles * group_field_detour_rekey_period_steps;
+    fn init(fixture: *const PackFixture) HysteresisGoal {
+        const start_goal = fixture.open.cellCenter(packGoal(group_field_detour_side, 0));
+        return .{
+            .start_goal = start_goal,
+            .px_per_step = fixture.open.world.tile_size / @as(f32, @floatFromInt(group_field_detour_rekey_period_steps)),
+            .snapped_goal = start_goal,
+        };
+    }
+};
 
-    var totals = MovingTotals{};
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    for (0..total_steps) |step_index| {
-        const live = math.Vec2{ .x = start_goal.x, .y = start_goal.y - @as(f32, @floatFromInt(step_index)) * px_per_step };
+// Cycle `cycle` of the hysteresis group: the rekey period's steps, each advancing the live
+// goal and rewriting the pack's requests when the requantized goal moved. Returns the
+// rewrites.
+fn hysteresisCycle(allocator: std.mem.Allocator, stepper: CycleStepper, fixture: *PackFixture, goal: *HysteresisGoal, cycle: usize, sink: ?*CycleSink) !usize {
+    var rewrites: usize = 0;
+    for (cycle * group_field_detour_rekey_period_steps..(cycle + 1) * group_field_detour_rekey_period_steps) |step_index| {
+        const live = math.Vec2{ .x = goal.start_goal.x, .y = goal.start_goal.y - @as(f32, @floatFromInt(step_index)) * goal.px_per_step };
         const requantized = computeRequantizedGoal(
-            AiDir{ .x = snapped_goal.x, .y = snapped_goal.y },
-            snapped_initialized,
+            AiDir{ .x = goal.snapped_goal.x, .y = goal.snapped_goal.y },
+            goal.snapped_initialized,
             AiDir{ .x = live.x, .y = live.y },
             default_goal_requantization_hysteresis_distance,
         );
-        snapped_goal = .{ .x = requantized.goal.x, .y = requantized.goal.y };
-        snapped_initialized = requantized.initialized;
-        const measured = step_index >= warmup_steps;
-        if (last_written_goal == null or last_written_goal.?.x != snapped_goal.x or last_written_goal.?.y != snapped_goal.y) {
-            try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, snapped_goal);
-            last_written_goal = snapped_goal;
-            if (measured) rewrite_count += 1;
+        goal.snapped_goal = .{ .x = requantized.goal.x, .y = requantized.goal.y };
+        goal.snapped_initialized = requantized.initialized;
+        const snapped = goal.snapped_goal;
+        if (goal.last_written_goal == null or goal.last_written_goal.?.x != snapped.x or goal.last_written_goal.?.y != snapped.y) {
+            try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, snapped);
+            goal.last_written_goal = snapped;
+            rewrites += 1;
         }
-        const start_ns = suite.nowNs(io);
-        const stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
-        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        if (!measured) continue;
-        accumulator.record(elapsed_ns, stats.solve_batch);
-        totals.add(stats);
+        try stepper.step(&fixture.system, &fixture.stream, sink);
+    }
+    return rewrites;
+}
+
+fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    // Fixed cycle counts: --warmup and --iterations do not apply.
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
+    const capacity = packCapacity(item_count, fixtures.participantCount(thread_ptr));
+    const stepper = CycleStepper{ .io = io, .threads = thread_ptr, .case = case, .agent_count = item_count };
+
+    var carried: ?fixtures.NavTuners = null;
+    if (case.adaptive) {
+        var twin = try initPackFixture(allocator, io, item_count, capacity, thread_ptr);
+        defer twin.deinit(allocator);
+        var twin_goal = HysteresisGoal.init(&twin);
+        var warm = twinWarmup(case);
+        var cycle: usize = 0;
+        while (warm.nextSettled(stepTunerSettle(&twin.system))) : (cycle += 1) _ = try hysteresisCycle(allocator, stepper, &twin, &twin_goal, cycle, null);
+        std.debug.assert(cycle <= group_field_march_cycles);
+        carried = twin.system.tuners;
+    }
+    var fixture = try initPackFixture(allocator, io, item_count, capacity, thread_ptr);
+    defer fixture.deinit(allocator);
+    const system = &fixture.system;
+    if (carried) |tuners| system.tuners = tuners;
+
+    var goal = HysteresisGoal.init(&fixture);
+    var sink = CycleSink{ .accumulator = .init(item_count) };
+    for (0..group_field_detour_moving_warmup_cycles) |cycle| _ = try hysteresisCycle(allocator, stepper, &fixture, &goal, cycle, null);
+    const window = CycleWindow.begin(system, case);
+    // Goal rewrites past the hysteresis over the measured steps.
+    var rewrite_count: usize = 0;
+    for (group_field_detour_moving_warmup_cycles..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
+        rewrite_count += try hysteresisCycle(allocator, stepper, &fixture, &goal, cycle, &sink);
     }
     // The field still serves part of the run; escalated solves follow the hysteresis-reduced
     // rewrites, which stay below the per-step count.
-    if (totals.samples == 0) return error.GroupFieldNeverSampled;
-    if (rewrite_count >= total_steps - warmup_steps) return error.GroupFieldRewroteEveryStep;
-    if (totals.escalated > rewrite_count) return error.GroupFieldEscalationsPastRewrites;
-    var stats = accumulator.finish();
-    totals.into(&stats);
+    if (sink.totals.samples == 0) return error.GroupFieldNeverSampled;
+    if (rewrite_count >= group_field_detour_moving_cycles * group_field_detour_rekey_period_steps) return error.GroupFieldRewroteEveryStep;
+    if (sink.totals.escalated > rewrite_count) return error.GroupFieldEscalationsPastRewrites;
+    var stats = sink.accumulator.finish();
+    sink.stage_report.write(&stats.details);
+    sink.totals.into(&stats);
+    window.report(&stats, system, case);
     return stats;
 }
 
@@ -1138,67 +1214,98 @@ fn writeGroupFieldPackRequests(allocator: std.mem.Allocator, stream: *RangeOutpu
     try fixtures.writeRequests(stream, scratch.items);
 }
 
-fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+// `packs` packs on an open `group_field_pack_side`² level: their entities, request stream,
+// and world-backed nav with a field slot per pack.
+const PacksFixture = struct {
+    packs: usize,
+    open: OpenWorld,
+    data: DataSystem,
+    entities: []EntityId,
+    scratch: std.ArrayList(PathRequest) = .empty,
+    stream: RangeOutputStream(PathRequest),
+    system: PathfindingSystem,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, packs: usize, thread_system: *ThreadSystem) !PacksFixture {
+        var open = try buildOpenWorld(allocator, io, group_field_pack_side, 1);
+        errdefer open.world.deinit();
+        var data = DataSystem.init(allocator);
+        errdefer data.deinit();
+        const entities = try allocator.alloc(EntityId, packs * group_field_pack_agents);
+        errdefer allocator.free(entities);
+        for (entities) |*entity| entity.* = try data.createEntity();
+        var system = PathfindingSystem.init(allocator);
+        errdefer system.deinit();
+        var capacity = packCapacity(entities.len, fixtures.participantCount(thread_system));
+        capacity.max_group_fields = packs;
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_system);
+        return .{ .packs = packs, .open = open, .data = data, .entities = entities, .stream = RangeOutputStream(PathRequest).init(allocator), .system = system };
+    }
+
+    fn deinit(self: *PacksFixture, allocator: std.mem.Allocator) void {
+        self.system.deinit();
+        self.stream.deinit();
+        self.scratch.deinit(allocator);
+        allocator.free(self.entities);
+        self.data.deinit();
+        self.open.world.deinit();
+        self.* = undefined;
+    }
+};
+
+// Cycle `cycle` of the packs group: every pack re-keyed to its march goal for `cycle`, then
+// the rekey period's steps.
+fn packsCycle(allocator: std.mem.Allocator, stepper: CycleStepper, fixture: *PacksFixture, cycle: usize, sink: ?*CycleSink) !void {
+    try writeGroupFieldPackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.packs, cycle);
+    for (0..group_field_detour_rekey_period_steps) |_| try stepper.step(&fixture.system, &fixture.stream, sink);
+}
+
+fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const packs = item_count;
     if (packs == 0 or group_field_pack_side / packs < group_field_pack_band_min) return error.GroupFieldPacksTooMany;
-    const agent_count = packs * group_field_pack_agents;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
+    const stepper = CycleStepper{ .io = io, .threads = thread_ptr, .case = case, .agent_count = packs * group_field_pack_agents };
 
-    var open = try buildOpenWorld(allocator, io, group_field_pack_side, 1);
-    defer open.world.deinit();
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-    const entities = try allocator.alloc(EntityId, agent_count);
-    defer allocator.free(entities);
-    for (entities) |*entity| entity.* = try data.createEntity();
-    var system = PathfindingSystem.init(allocator);
-    defer system.deinit();
-    var capacity = packCapacity(agent_count, fixtures.participantCount(thread_ptr));
-    capacity.max_group_fields = packs;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
-    setPathStageTuners(&system, case);
-
-    var stream = RangeOutputStream(PathRequest).init(allocator);
-    defer stream.deinit();
-    var scratch: std.ArrayList(PathRequest) = .empty;
-    defer scratch.deinit(allocator);
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var stage_report = StageReport{};
-    var built_total: usize = 0;
-    var samples_total: usize = 0;
-    for (0..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
-        try writeGroupFieldPackRequests(allocator, &stream, &scratch, &open, entities, packs, cycle);
-        const measured = cycle >= group_field_detour_moving_warmup_cycles;
-        for (0..group_field_detour_rekey_period_steps) |_| {
-            const start_ns = suite.nowNs(io);
-            const stats = try runColdOnce(&system, &stream, thread_ptr, case, agent_count, agent_count, agent_count);
-            const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-            if (!measured) continue;
-            accumulator.record(elapsed_ns, stats.group_field_batch);
-            stage_report.add(elapsed_ns, stats);
-            built_total += stats.group_fields_built;
-            samples_total += stats.group_field_samples;
-        }
+    var carried: ?fixtures.NavTuners = null;
+    if (case.adaptive) {
+        var twin = try PacksFixture.init(allocator, io, packs, thread_ptr);
+        defer twin.deinit(allocator);
+        var warm = twinWarmup(case);
+        var cycle: usize = 0;
+        while (warm.nextSettled(stepTunerSettle(&twin.system))) : (cycle += 1) try packsCycle(allocator, stepper, &twin, cycle, null);
+        std.debug.assert(cycle <= group_field_march_cycles);
+        carried = twin.system.tuners;
     }
-    stage_report.print(options, group_field_packs_group.name, item_count, case);
-    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
-    // Every pack's field builds each rekey and is sampled.
-    if (built_total < packs * group_field_detour_moving_cycles or samples_total == 0) return error.GroupFieldPacksNotEngaged;
+    var fixture = try PacksFixture.init(allocator, io, packs, thread_ptr);
+    defer fixture.deinit(allocator);
+    const system = &fixture.system;
+    if (carried) |tuners| system.tuners = tuners;
 
-    var stats = accumulator.finish();
+    var sink = CycleSink{ .accumulator = .init(item_count) };
+    for (0..group_field_detour_moving_warmup_cycles) |cycle| try packsCycle(allocator, stepper, &fixture, cycle, null);
+    const window = CycleWindow.begin(system, case);
+    for (group_field_detour_moving_warmup_cycles..group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles) |cycle| {
+        try packsCycle(allocator, stepper, &fixture, cycle, &sink);
+    }
+    // Every pack's field builds each rekey and is sampled.
+    const built_total = sink.totals.built;
+    if (built_total < packs * group_field_detour_moving_cycles or sink.totals.samples == 0) return error.GroupFieldPacksNotEngaged;
+
+    var stats = sink.accumulator.finish();
+    sink.stage_report.write(&stats.details);
+    writeFieldMemory(&stats.details, system);
     stats.output_count = built_total;
-    stats.candidate_pairs = samples_total;
+    stats.candidate_pairs = sink.totals.samples;
     stats.items_per_second = suite.itemsPerSecond(built_total, stats.mean_ns *| stats.iterations);
+    window.report(&stats, system, case);
     return stats;
 }
 
 // Per-field coverage and memory of a system's fields, averaged over the built fields.
-fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase, system: *const PathfindingSystem) void {
-    if (!options.details) return;
+fn writeFieldMemory(details: *suite.DetailLines, system: *const PathfindingSystem) void {
     var fields: usize = 0;
     var covered: usize = 0;
     var blocks: usize = 0;
@@ -1208,20 +1315,17 @@ fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: 
         fields += 1;
         covered += field.pushed_count;
         blocks += field.used_blocks;
-        resident += field.residentBytes();
+        resident += groupFieldResidentBytes(field);
     }
     if (fields == 0) return;
-    std.debug.print("  {s} {} {s}: fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
-        group_name,
-        item_count,
-        case.name,
+    details.print("fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
         fields,
         covered / fields,
         blocks / fields,
         resident / fields,
         resident / @max(@as(usize, 1), covered),
-        system.group_field_pool_growth.count,
-        system.group_field_pool_failure.count,
+        system.group_field_pool_growth.perf.count,
+        system.group_field_pool_failure.perf.count,
     });
 }
 
@@ -1259,20 +1363,37 @@ fn tunnelRequests(open: *const OpenWorld, requests: []PathRequest) void {
     }
 }
 
-// Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps.
-fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
+// A group-field pass: the advance or the begin.
+const TunnelPass = enum { advance, begin };
+
+// One tunnel field build: its steps' time, and the busiest group-field begin or advance pass
+// batch of its steps and which pass ran it.
+const TunnelBuild = struct {
+    elapsed_ns: u64 = 0,
+    batch: BatchStats = .{},
+    batch_pass: TunnelPass = .advance,
+};
+
+// Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps,
+// each added to `report` when given.
+fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, report: ?*StageReport) !TunnelBuild {
     system.clearRuntimeState();
-    var elapsed_ns: u64 = 0;
-    var batch = BatchStats{};
+    var build = TunnelBuild{};
     for (0..group_field_tunnel_build_guard) |_| {
         const start_ns = suite.nowNs(io);
         const stats = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
-        elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
-        if (stats.group_field_begin_batch.item_count > batch.item_count) batch = stats.group_field_begin_batch;
-        if (stats.group_field_batch.item_count > batch.item_count) batch = stats.group_field_batch;
+        const step_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        build.elapsed_ns += step_ns;
+        if (report) |stage_report| stage_report.add(step_ns, stats);
+        for ([_]BatchStats{ stats.perf.group_field_batch, stats.perf.group_field_begin_batch }, [_]TunnelPass{ .advance, .begin }) |batch, pass| {
+            if (batch.item_count > build.batch.item_count) {
+                build.batch = batch;
+                build.batch_pass = pass;
+            }
+        }
         var ready: usize = 0;
         for (system.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
-        if (ready == group_field_tunnel_fields) return .{ .elapsed_ns = elapsed_ns, .batch = batch };
+        if (ready == group_field_tunnel_fields) return build;
     }
     return error.GroupFieldTunnelBuildStalled;
 }
@@ -1280,9 +1401,9 @@ fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOut
 fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const agent_count = group_field_tunnel_fields * group_field_tunnel_agents;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var open = try buildOpenWorld(allocator, io, group_field_tunnel_side, 1);
     var open_owned = true;
@@ -1304,22 +1425,46 @@ fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: su
     }, thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
-    for (0..coldWarmup(options)) |_| _ = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count);
+    // Setup: the first build warms the fields' block pools, which persist across builds.
+    _ = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count, null);
+    // A sample is one whole build; the tuned case settles every step tuner it runs.
+    var warm = suite.Warmup.custom(case, coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(stepTunerSettle(system))) _ = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count, null);
+    const settle = stepTunerSettle(system);
+    const field_start = suite.TunerStart.of(&system.tuners.group_field, case);
+    const field_begin_start = suite.TunerStart.of(&system.tuners.group_field_begin, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var stage_report = StageReport{};
+    // Every build runs the same requests from a cleared state, so one pass supplies every
+    // measured build's headline batch.
+    var headline_pass: ?TunnelPass = null;
     for (0..@max(@as(usize, 1), coldIterations(options))) |_| {
-        const built = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count);
+        const built = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count, &stage_report);
         accumulator.record(built.elapsed_ns, built.batch);
+        if (headline_pass) |pass| {
+            if (pass != built.batch_pass) return error.GroupFieldTunnelHeadlinePassShift;
+        } else headline_pass = built.batch_pass;
     }
     var covered: usize = 0;
     for (system.group_fields.items) |field| covered += field.pushed_count;
     // Every field covers its cap: the lattice's corridor cells reach past the largest cap.
     if (covered != group_field_tunnel_fields * item_count) return error.GroupFieldTunnelShortOfCap;
-    printFieldMemory(options, group_field_tunnel_group.name, item_count, case, system);
 
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    writeFieldMemory(&stats.details, system);
     stats.output_count = covered;
     stats.items_per_second = suite.itemsPerSecond(covered, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        // The primary tuning is the pass that supplied the headline batch, so the row's shape
+        // and tuning describe one pass; the other is secondary.
+        const advance = suite.workTuningSummary(&system.tuners.group_field, field_start);
+        const begin = suite.workTuningSummary(&system.tuners.group_field_begin, field_begin_start);
+        const advance_leads = headline_pass.? == .advance;
+        stats.work_tuning = if (advance_leads) advance else begin;
+        stats.secondary_work_tuning = if (advance_leads) begin else advance;
+    }
     return stats;
 }

@@ -28,7 +28,8 @@ pub const DestructibleStore = struct {
     }
 
     pub fn append(self: *DestructibleStore, allocator: std.mem.Allocator, entity: EntityId, value: Destructible) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyDestructibleRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -153,4 +154,10 @@ test "DestructibleStore sliceConst exposes aligned columns" {
     try std.testing.expectEqual(const_slice.entities.len, const_slice.destroy_on_interact.len);
     try std.testing.expectEqual(const_slice.entities.len, const_slice.destroy_on_attack.len);
     try std.testing.expectEqual(@as(u8, 4), const_slice.hit_points[1]);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "DestructibleStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(DestructibleStore, Destructible{});
 }

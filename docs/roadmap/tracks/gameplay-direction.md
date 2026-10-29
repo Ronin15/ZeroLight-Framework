@@ -3,7 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md)
 
 Future features land as slices (Goal, Checklist, Acceptance before
-implementation); the rules they follow are in `.claude/rules/`
+implementation); the rules they follow are in `.grok/rules/`
 (`engine-design.md` § Target scale for scale, `simulation.md` for
 controllers, processors, AI, and events). Durable boundaries:
 [architecture.md](../../architecture.md); emergent-AI shared contracts:
@@ -13,7 +13,7 @@ authoritative cross-slice tables: [VoidLight Port Track Overview](voidlight-port
 
 ### Direction (owner, fixed)
 
-The direction is `.claude/rules/engine-design.md` § Target scale (summary:
+The direction is `.grok/rules/engine-design.md` § Target scale (summary:
 `docs/architecture.md` § Target Model). Owner decisions it does not state:
 
 - One observer only; there is no multi-player design.
@@ -21,7 +21,7 @@ The direction is `.claude/rules/engine-design.md` § Target scale (summary:
   level.
 - Compose signals rather than hardcode stories; domain controllers (combat,
   spawning, rules, encounters) orchestrate while SoA processors scale
-  (`.claude/rules/simulation.md`).
+  (`.grok/rules/simulation.md`).
 
 ### Slices that carry it
 

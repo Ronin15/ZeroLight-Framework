@@ -12,7 +12,7 @@ uses existing signals and goals is a content change, never per-drive or
 per-behavior code. Per-agent cost follows the drives and behaviors its
 archetype uses, never catalog size, so cognition stays affordable for every
 agent in every world, including far from the observer at the slower ticks
-of Slice 75 (`.claude/rules/engine-design.md` § Target scale).
+of Slice 75 (`.grok/rules/engine-design.md` § Target scale).
 
 ### Current foundation
 
@@ -58,11 +58,11 @@ sized to today's four drives and five behaviors:
   (`src/game/simulation_scope.zig` `cognition_halo_chunks`,
   `cognition_stagger_n`); beyond the tier bands entities are `dormant`.
   Slice 75 replaces that with slower ticks.
-- `.claude/rules/simulation.md` § AI and affect ("appends an `AiAffectDrive`
+- `.grok/rules/simulation.md` § AI and affect ("appends an `AiAffectDrive`
   tag, its columns, one appraisal path, and one weight-table row") and the
   Emergent AI track's former add-a-feeling procedure encode the one-at-a-time
   shape.
-- Benches: `ai`, `ai-affect`, `scope`, `perception`.
+- Benches: `ai`, `ai-affect`, `production-step`, `perception`.
 
 ### Architecture notes
 
@@ -71,13 +71,13 @@ sized to today's four drives and five behaviors:
   content; no per-drive or per-behavior code; sparse couplings and
   per-archetype behavior sets; a data-driven task/sequence layer under
   utility selection; the `u8` mask cap and the
-  `.claude/rules/simulation.md` § AI and affect edit land with the design.
+  `.grok/rules/simulation.md` § AI and affect edit land with the design.
 - Owner decisions (2026-10-08): factions are content, owned here (63 builds
   on them); only NPCs whose archetype can dig or has a reason to go
   underground choose goals on other levels, authored as archetype data and
   run by the task layer.
 - Data resolves at load into dense ids and tables; hot paths never parse
-  content or hash names (`.claude/rules/simulation.md` § AI and affect).
+  content or hash names (`.grok/rules/simulation.md` § AI and affect).
 - Engine code provides a fixed set of signal and goal primitives
   (perception, memory, stimuli, markers, neighbors, focus; today's
   pursue/flee/investigate/cohere/wander goals) that content composes. The
@@ -88,14 +88,21 @@ sized to today's four drives and five behaviors:
   tree. Task progress is persistent per-agent state.
 - Per-agent storage and work follow the archetype's drives, behaviors, and
   nonzero couplings; catalogs grow at load; nothing is sized to a fixed
-  drive or behavior count (`.claude/rules/budgets-capacities.md`).
+  drive or behavior count (`.grok/rules/budgets-capacities.md`).
 - 73 owns the per-agent think interval; 55's idle coasting and 75's
   distance bands are inputs to it. Drive decay and task timing are defined
   per elapsed step, so a slower tick lowers fidelity without changing
   rates.
+- The interval decides think-set membership, never its order: due agents
+  reach the think-set stages in the index's cell-major order (Slice 84;
+  `docs/architecture.md`). A test inside the think set's phase test
+  (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`) keeps that
+  order; a schedule that emits due agents unordered (a timing wheel) buckets
+  them by index cell first, O(due agents). An unordered think set stays
+  correct but loses neighbor-block reuse.
 - Serial equals threaded, SIMD equals scalar, and same-seed runs are
-  bit-identical (`.claude/rules/threading.md`,
-  `.claude/rules/memory-performance.md`, `.claude/rules/simulation.md`
+  bit-identical (`.grok/rules/threading.md`,
+  `.grok/rules/memory-performance.md`, `.grok/rules/simulation.md`
   § Determinism).
 - Persistent cognition state is `DataSystem`-owned, classified for 49/64B,
   and included in 46's v1; content fingerprints join 46's content
@@ -109,7 +116,7 @@ sized to today's four drives and five behaviors:
 
 ### Checklist
 
-- [ ] `.claude/rules/simulation.md` § AI and affect rewritten for
+- [ ] `.grok/rules/simulation.md` § AI and affect rewritten for
       catalog-defined drives and behaviors, in the same change as the
       design.
 - [ ] Drive catalog in content (defaults, decay, thresholds, appraisal
@@ -134,6 +141,13 @@ sized to today's four drives and five behaviors:
 - [ ] Persistence: classified for 49/64B; included in 46's v1; content
       fingerprint; relative version bumps; stages and components stated for
       Tables T4/T5.
+- [ ] Appraisal and memory decay use one masked kernel. Failure: the four
+      drive loops (`affect.zig:464`, `:507`, `:556`, `:603`) and the memory
+      decay (`ai_memory.zig:533`) run the lane kernel, then repeat that
+      math one row at a time (`memory-performance.md` § SIMD and core math).
+      The per-drive loops go away with the content appraisal. Pass: each
+      loop that remains ends in that kernel with a mask. Inactive lanes do
+      not write past the range.
 - [ ] Tests: strict catalog validation, parity, serial == threaded, SIMD ==
       scalar, missing-signal zero, `FailingAllocator` proofs.
 - [ ] Docs: `docs/architecture.md`, `docs/simulation-tiers-and-pipeline.md`,
@@ -150,7 +164,7 @@ sized to today's four drives and five behaviors:
 - [ ] A `cognition-scale` bench group (agent count, catalog size, and
       archetype set size, three points each) shows per-agent cost flat in
       catalog size and linear in agent count and used set size
-      (`.claude/rules/tests-benchmarks.md`).
-- [ ] `ai`, `ai-affect`, and `scope` show no regression against a baseline
+      (`.grok/rules/tests-benchmarks.md`).
+- [ ] `ai`, `ai-affect`, and `production-step` show no regression against a baseline
       taken before the first change.
 - [ ] `zig build verify` passes.

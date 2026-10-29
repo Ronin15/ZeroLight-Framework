@@ -14,6 +14,9 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../../app/thread_system.zig").SlotList;
+const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ElementMap = @import("connectivity.zig").ElementMap;
@@ -36,7 +39,6 @@ pub const project_range_alignment_items: usize = thread_shared_record_alignment 
 
 comptime {
     std.debug.assert(scan_range_alignment_items % simd.lane_count == 0);
-    std.debug.assert(@sizeOf(ScanTally) % thread_shared_record_alignment == 0);
 }
 
 /// Each traversal's nav graph. Every graph covers the world's extent.
@@ -61,10 +63,10 @@ fn refCell(ref: u64) u32 {
     return @truncate(ref);
 }
 
-/// One `goal_scan` range's count of distinct refs in its window and of blocked intents,
-/// on its own cache line.
+/// One `goal_scan` range's count of distinct refs in its window and of blocked intents (a
+/// `PaddedSlot` of `GoalTable.scan_tallies`).
 const ScanTally = struct {
-    count: usize align(thread_shared_record_alignment) = 0,
+    count: usize = 0,
     blocked: usize = 0,
 };
 
@@ -86,9 +88,9 @@ pub const GoalTable = struct {
     refs: std.ArrayList(u64) = .empty,
     live: LineList(u32) = .empty,
     // `goal_scan` staging: range r writes its distinct refs from `r * items_per_range`, and
-    // its tally.
+    // its padded tally.
     scan_refs: LineList(u64) = .empty,
-    scan_tallies: LineList(ScanTally) = .empty,
+    scan_tallies: SlotList(ScanTally) = .empty,
     // Intents one resolve covers without growing; assigned only after every reserve
     // succeeded.
     limit: usize = 0,
@@ -124,19 +126,6 @@ pub const GoalTable = struct {
         std.debug.assert(self.refs.capacity >= limit and self.live.capacity >= limit and self.scan_refs.capacity >= limit);
     }
 
-    /// Bytes the map, entries, and scan staging hold (allocated capacity).
-    pub fn residentBytes(self: *const GoalTable) usize {
-        return self.map.residentBytes() + self.refs.capacity * @sizeOf(u64) + self.live.capacity * @sizeOf(u32) +
-            self.scan_refs.capacity * @sizeOf(u64) + self.scan_tallies.capacity * @sizeOf(ScanTally);
-    }
-
-    /// `residentBytes` once reserved for at most `limit` intents. Saturates.
-    pub fn storageBytesBound(limit: usize) usize {
-        return ElementMap.storageBytesBound(limit) +| std.ArrayList(u64).growCapacity(limit) *| @sizeOf(u64) +|
-            LineList(u32).growCapacity(limit) *| @sizeOf(u32) +| LineList(u64).growCapacity(limit) *| @sizeOf(u64) +|
-            LineList(ScanTally).growCapacity(maxRangeCount(limit, scan_range_alignment_items)) *| @sizeOf(ScanTally);
-    }
-
     pub fn invalidate(self: *GoalTable) void {
         self.valid = false;
     }
@@ -158,8 +147,7 @@ pub const GoalTable = struct {
         std.debug.assert(self.scan_refs.capacity >= item_count and self.scan_tallies.capacity >= range_count);
         self.valid = false;
         self.scan_refs.items.len = item_count;
-        self.scan_tallies.items.len = range_count;
-        @memset(self.scan_tallies.items, .{});
+        setSlotCount(ScanTally, &self.scan_tallies, range_count);
     }
 
     /// The scan's ordered merge: each range's window of distinct refs in range order, each
@@ -169,7 +157,8 @@ pub const GoalTable = struct {
         self.map.clear();
         self.refs.clearRetainingCapacity();
         var blocked: usize = 0;
-        for (self.scan_tallies.items, 0..) |tally, range_index| {
+        for (self.scan_tallies.items, 0..) |slot, range_index| {
+            const tally = slot.value;
             blocked += tally.blocked;
             for (self.scan_refs.items[range_index * items_per_range ..][0..tally.count]) |ref| {
                 const entry = self.map.getOrPut(ref);
@@ -233,7 +222,7 @@ pub fn ScanJob(comptime Intent: type) type {
         graphs: Graphs,
         items_per_range: usize,
         refs: []u64,
-        tallies: []ScanTally,
+        tallies: []PaddedSlot(ScanTally),
 
         // SIMD verdict: goal cells four-lane (`positionCells`); the blocked read is a directory
         // and bit gather and the recent-ref probe a key compare, both scalar.
@@ -263,7 +252,7 @@ pub fn ScanJob(comptime Intent: type) type {
                     tally.count += 1;
                 }
             }
-            job.tallies[range.index] = tally;
+            job.tallies[range.index].value = tally;
         }
     };
 }
@@ -406,6 +395,8 @@ fn expectReferenceTable(system: *const PathfindingSystem, intents: []const TestI
 }
 
 test "the goal table holds exactly the distinct blocked goals in first-seen order with their projections, and nothing for open goals or unbuilt levels" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -414,7 +405,7 @@ test "the goal table holds exactly the distinct blocked goals in first-seen orde
     var intents: [97]TestIntent = undefined;
     mixedIntents(grid, &intents);
     try system.reserveGoals(intents.len);
-    const stats = try system.resolveGoals(TestIntent, &intents, null, .{});
+    const stats = try system.resolveGoals(TestIntent, &intents, &serial_threads, .{});
     try expectReferenceTable(&system, &intents);
     try std.testing.expectEqual(intents.len, stats.intents);
     try std.testing.expectEqual(system.goals.refs.items.len, stats.distinct);
@@ -431,6 +422,8 @@ test "the goal table holds exactly the distinct blocked goals in first-seen orde
 }
 
 test "the goal table is equal serial and threaded across worker counts and range sizes, with both stages on workers" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -438,7 +431,7 @@ test "the goal table is equal serial and threaded across worker counts and range
     var intents: [203]TestIntent = undefined;
     mixedIntents(system.graph.grid(0).?, &intents);
     try system.reserveGoals(intents.len);
-    _ = try system.resolveGoals(TestIntent, &intents, null, .{});
+    _ = try system.resolveGoals(TestIntent, &intents, &serial_threads, .{});
     const serial_refs = try std.testing.allocator.dupe(u64, system.goals.refs.items);
     defer std.testing.allocator.free(serial_refs);
     const serial_live = try std.testing.allocator.dupe(u32, system.goals.live.items);
@@ -447,12 +440,10 @@ test "the goal table is equal serial and threaded across worker counts and range
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
         for ([_]usize{ 1, 2, 7, 8 }) |items_per_range| {
-            const stats = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = false });
+            _ = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = false });
             try std.testing.expectEqualSlices(u64, serial_refs, system.goals.refs.items);
             try std.testing.expectEqualSlices(u32, serial_live, system.goals.live.items);
             for (serial_refs, serial_live) |ref, live| try std.testing.expectEqual(live, system.goals.lookup(ref).?);
-            try std.testing.expect(!stats.scan_batch.ran_inline and stats.scan_batch.range_count > 1);
-            try std.testing.expect(!stats.project_batch.ran_inline and stats.project_batch.range_count > 1);
         }
         // No intents, and intents with no blocked goal: empty stages, a valid empty table.
         const open_goals = [_]TestIntent{ .{ .goal = cellPosition(.{ .x = 9, .y = 9 }) }, .{ .goal = cellPosition(.{ .x = 0, .y = 9 }) } };
@@ -465,7 +456,8 @@ test "the goal table is equal serial and threaded across worker counts and range
 }
 
 test "a reserved goal resolve allocates nothing on a real multi-worker thread system, and a failed growth leaves the table invalid and its storage intact (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -475,15 +467,13 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     mixedIntents(grid, &intents);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     try system.reserveGoals(intents.len);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();
     for ([_]?usize{ 1, 7, null }) |items_per_range| {
         const stats = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = items_per_range == null });
         try std.testing.expect(stats.distinct != 0);
-        try std.testing.expect(!stats.scan_batch.ran_inline or items_per_range == null);
-        _ = try system.resolveGoals(TestIntent, intents[0..17], null, .{});
+        _ = try system.resolveGoals(TestIntent, intents[0..17], &serial_threads, .{});
     }
     try expectReferenceTable(&system, intents[0..17]);
     // Past the limit the resolve grows at its entry; the failed growth writes no entry.
@@ -496,11 +486,11 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     try std.testing.expectEqual(limit_before, system.goals.limit);
     try std.testing.expectEqual(refs_before, system.goals.refs.items.len);
     try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(system.goals.refs.items[0]));
-    // The retry with memory grows, counted.
+    // The retry with memory grows the table and logs it.
     system.allocator = std.testing.allocator;
-    const grows_before = system.goal_table_growth.count;
     _ = try system.resolveGoals(TestIntent, &more, &threads, .{});
-    try std.testing.expectEqual(grows_before + 1, system.goal_table_growth.count);
+    try std.testing.expect(system.goals.limit > limit_before);
+    try std.testing.expect(system.goal_table_growth.logged);
     try expectReferenceTable(&system, &more);
 }
 
@@ -509,12 +499,14 @@ test "a reserved goal table holds exactly its storage bound, and a smaller reser
     var table = GoalTable{};
     defer table.deinit(allocator);
     try table.reserve(allocator, 1000);
-    try std.testing.expectEqual(GoalTable.storageBytesBound(1000), table.residentBytes());
+    try std.testing.expectEqual(test_support.goalTableStorageBytesBound(1000), test_support.goalTableResidentBytes(&table));
     try table.reserve(allocator, 10);
-    try std.testing.expectEqual(GoalTable.storageBytesBound(1000), table.residentBytes());
+    try std.testing.expectEqual(test_support.goalTableStorageBytesBound(1000), test_support.goalTableResidentBytes(&table));
 }
 
 test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, and lookups then compute the projection on the grid now" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const allocator = std.testing.allocator;
     var meta = try test_support.loadTestWorldMeta(allocator);
     defer meta.deinit();
@@ -539,7 +531,7 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
     // Each opened cell comes first in the projection's ring scan over the cells opened so far.
     const changes = [_][3]u16{ .{ 4, 6, 0 }, .{ 6, 5, 1 }, .{ 4, 5, 2 } };
     for (changes) |change| {
-        _ = try system.resolveGoals(TestIntent, &intents, null, .{});
+        _ = try system.resolveGoals(TestIntent, &intents, &serial_threads, .{});
         try std.testing.expect(system.goals.lookup(ref) != null);
         // Open a cell of the block, so the projection moves to it.
         const changed = (try world.setDenseTile(obstacle, change[0], change[1], grass)).?;
@@ -547,31 +539,32 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
             0 => _ = try test_support.applyTileChange(&system, &test_support.no_colliders, &world, changed),
             1 => {
                 try test_support.recordTileChange(&system, &world, changed);
-                _ = try system.applyBufferedNavUpdates(&test_support.no_colliders, &world, null);
+                _ = try system.applyBufferedNavUpdates(&test_support.no_colliders, &world, &serial_threads);
             },
             else => try system.rebuildStaticNavGridWithWorld(&data, &world, null),
         }
         try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(ref));
         const grid = system.graph.grid(0).?;
+        // The table misses the key, so the live goal is the projection computed now.
         const live = system.liveGoal(if (change[2] == 2) system.graph.keyForWorld(0, intents[0].goal, .default).? else key, grid);
-        try std.testing.expect(live.fallback);
         try std.testing.expectEqual(grid.projectToNearestOpen(.{ .x = 5, .y = 5 }, default_goal_projection_radius), live.cell);
         try std.testing.expectEqual(@as(?usize, @as(usize, change[1]) * 10 + change[0]), live.cell);
     }
 }
 
 test "an empty goal table that reserved no slots misses every lookup, and the live goal is computed" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
     defer system.deinit();
-    const stats = try system.resolveGoals(TestIntent, &.{}, null, .{});
+    const stats = try system.resolveGoals(TestIntent, &.{}, &serial_threads, .{});
     try std.testing.expectEqual(@as(usize, 0), stats.distinct);
     try std.testing.expect(system.goals.valid and system.goals.limit == 0);
     const ref = goalRef(.walk, 0, 3 * 10 + 3);
     try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(ref));
     const grid = system.graph.grid(0).?;
     const live = system.liveGoal(system.graph.keyForWorld(0, cellPosition(.{ .x = 3, .y = 3 }), .default).?, grid);
-    try std.testing.expect(live.fallback);
     try std.testing.expectEqual(grid.projectToNearestOpen(.{ .x = 3, .y = 3 }, default_goal_projection_radius), live.cell);
 }

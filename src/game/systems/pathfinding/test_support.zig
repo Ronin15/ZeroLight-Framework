@@ -23,12 +23,72 @@ const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavGrid = @import("nav_grid.zig").NavGrid;
+const ChunkForm = @import("../../world/terrain.zig").ChunkForm;
 const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
-const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEvent;
 const NavUpdateStats = @import("types.zig").NavUpdateStats;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const SearchScratch = @import("scratch.zig").SearchScratch;
+const Tier1Scratch = @import("scratch.zig").Tier1Scratch;
+const CorridorScratch = @import("scratch.zig").CorridorScratch;
+const ResultCache = @import("caches.zig").ResultCache;
+const KeySet = @import("caches.zig").KeySet;
+const GroupKeyMap = @import("caches.zig").GroupKeyMap;
+const GoalTable = @import("goal_table.zig").GoalTable;
+const GroupField = @import("group_field.zig").GroupField;
+const IntakeRecordList = @import("intake.zig").IntakeRecordList;
+const GroupKeyCountList = @import("intake.zig").GroupKeyCountList;
+const RegRecordList = @import("publish.zig").RegRecordList;
+const NavMarkList = @import("nav_reaction.zig").NavMarkList;
+const nav_mark_range_alignment_items = @import("nav_reaction.zig").nav_mark_range_alignment_items;
+const EvictItemList = @import("eviction.zig").EvictItemList;
+const HitList = @import("eviction.zig").HitList;
+const caches = @import("caches.zig");
+const ResizeMove = caches.ResizeMove;
+const CrossingScratch = @import("scratch.zig").CrossingScratch;
+const AbstractScratch = @import("scratch.zig").AbstractScratch;
+const CrossingBoxSlot = @import("scratch.zig").CrossingBoxSlot;
+const CrossingLevelSlot = @import("scratch.zig").CrossingLevelSlot;
+const AbstractSlot = @import("scratch.zig").AbstractSlot;
+const SearchSlot = @import("scratch.zig").SearchSlot;
+const OpenNode = types.OpenNode;
+const StitchedCell = types.StitchedCell;
+const OwnerOp = types.OwnerOp;
+const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
+const hashTableSlots = @import("../../stamped_table.zig").hashTableSlots;
+const scan_range_alignment_items = @import("goal_table.zig").scan_range_alignment_items;
+const cell_block_bytes = @import("nav_grid.zig").cell_block_bytes;
+const NavLevelGraph = @import("nav_graph.zig").NavLevelGraph;
+const NavPortal = @import("nav_graph.zig").NavPortal;
+const NavLink = @import("nav_graph.zig").NavLink;
+const PatchInfo = @import("nav_graph.zig").PatchInfo;
+const borderPortalBound = @import("nav_graph.zig").borderPortalBound;
+const record_row_bytes = @import("nav_graph.zig").record_row_bytes;
+const key_window_alignment = @import("nav_graph.zig").key_window_alignment;
+const plan_streams = @import("nav_graph.zig").plan_streams;
+const LevelCrossings = @import("link_bounds.zig").LevelCrossings;
+const NodeRow = @import("connectivity.zig").NodeRow;
+const default_flood_window = @import("connectivity.zig").default_flood_window;
+const default_flood_budget_cap = @import("connectivity.zig").default_flood_budget_cap;
+const span_words = @import("connectivity_closure.zig").span_words;
+const bitSetBytesFor = @import("../chunk_list_map.zig").bitSetBytesFor;
+const OrderedIndexSet = @import("../chunk_list_map.zig").OrderedIndexSet;
+const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
+const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const RegRecord = types.RegRecord;
+const PathSolveResult = types.PathSolveResult;
+const GroupRequestTally = types.GroupRequestTally;
+const PendingRequest = types.PendingRequest;
+const NavMark = types.NavMark;
+const EvictItem = types.EvictItem;
+const IntakeRecord = types.IntakeRecord;
+const GroupKeyCount = types.GroupKeyCount;
+const registry_shard_count = types.registry_shard_count;
+const reg_window_alignment_items = types.reg_window_alignment_items;
+const hit_window_alignment_items = types.hit_window_alignment_items;
+const intake_range_alignment_items = types.intake_range_alignment_items;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const LabelSet = @import("nav_graph.zig").LabelSet;
@@ -41,9 +101,10 @@ const no_hcomp = @import("connectivity_closure.zig").no_hcomp;
 const no_oneway = @import("connectivity.zig").no_oneway;
 const no_index = @import("connectivity_closure.zig").no_index;
 const CellCoord = @import("../../world/system.zig").CellCoord;
-const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const types = @import("types.zig");
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
+const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const Connectivity = @import("connectivity.zig").Connectivity;
 const StagingSizes = @import("connectivity.zig").StagingSizes;
@@ -54,11 +115,65 @@ const publish = @import("publish.zig");
 const solve = @import("solve.zig");
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const PathfindingStats = @import("types.zig").PathfindingStats;
+const PathStatus = @import("types.zig").PathStatus;
 const PathfindingConfig = @import("types.zig").PathfindingConfig;
-const registry_shard_count = @import("types.zig").registry_shard_count;
 const registryShard = @import("types.zig").registryShard;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const no_entry = @import("../chunk_list_map.zig").no_entry;
+const empty_block = @import("../chunk_list_map.zig").empty_block;
+
+/// `OrderedIndexSet.residentBytes` of a set reserved for indices below `bits`: its tiers as
+/// `reserve` builds them.
+fn orderedIndexSetStorageBytesBound(bits: usize) usize {
+    var bytes: usize = 0;
+    var tier_bits = bits;
+    while (true) {
+        bytes +|= bitSetBytesFor(tier_bits);
+        if (tier_bits <= @bitSizeOf(OrderedIndexSet.Word)) break;
+        tier_bits = OrderedIndexSet.maskCount(tier_bits);
+    }
+    return bytes;
+}
+
+/// `NavStorageContent` of `world` from its composed chunk forms and link endpoint counts,
+/// for a nav whose chunks are the world's: O(levels x chunks). Static colliders are not
+/// counted; a nav over static bodies needs their chunks counted mixed.
+pub fn navStorageContentOf(world: *const WorldSystem) NavStorageContent {
+    var content = NavStorageContent{};
+    const chunks = world.chunkCountPerLevel();
+    for (0..world.levelCount()) |level_index| {
+        const level: u16 = @intCast(level_index);
+        var open: usize = 0;
+        var mixed: usize = 0;
+        for (0..chunks) |chunk_index| {
+            const chunk: u32 = @intCast(chunk_index);
+            switch (world.levelChunkBlockedForm(level, chunk)) {
+                .open => open += 1,
+                .mixed => mixed += 1,
+                .blocked => {},
+            }
+            const endpoints = world.levelChunkLinkEndpointCount(level, chunk);
+            content.endpoint_chunks += @intFromBool(endpoints != 0);
+            content.max_chunk_endpoints = @max(content.max_chunk_endpoints, endpoints);
+        }
+        content.open_chunks += open;
+        content.mixed_chunks += mixed;
+        content.max_level_open = @max(content.max_level_open, open);
+        content.max_level_mixed = @max(content.max_level_mixed, mixed);
+    }
+    return content;
+}
+
+/// The owner id of `key`'s entry in a cache core (a core or a pointer to one), or null.
+pub fn cacheOwnerOf(core: anytype, key: PathQueryKey) ?u32 {
+    const index = core.slotIndex(key) orelse return null;
+    return core.slots.items[index].payload_index;
+}
+
+/// Live terminals of a connectivity closure (a `Closure` or a pointer to one).
+pub fn closureTermCount(closure: anytype) usize {
+    return closure.terms.len - closure.term_free.items.len;
+}
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -80,6 +195,13 @@ pub fn appendPathRequest(stream: *RangeOutputStream(PathRequest), request: PathR
 
 // Field cell cap for the small test worlds; keeps each field's table small.
 const test_group_field_max_cells: usize = 4096;
+
+/// `PathfindingSystem.update` inline as one range: a thread system with no workers.
+pub fn updatePathfindingInline(system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig) !PathfindingStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    return system.update(requests, agent_count, &threads, config);
+}
 
 pub fn baselineCapacity() PathfindingCapacity {
     // Per-step request/cache caps are derived elastically from the agent count
@@ -136,28 +258,8 @@ pub const no_colliders = StaticColliderSystem.init(std.testing.failing_allocator
 pub fn worldColliders(data: *const DataSystem, world: *const WorldSystem) !StaticColliderSystem {
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     errdefer colliders.deinit();
-    try colliders.rebuild(data, try (NavExtent{ .world = world }).colliderGeometry());
+    try colliders.rebuild(data, try (NavExtent{ .world = world }).colliderGeometry(), null);
     return colliders;
-}
-
-/// The commit seam for statics: reserves the colliders and `system`'s static marks,
-/// commits `commands`, captures and syncs the colliders, then records the sync's changes in
-/// `system` for the nav reaction.
-pub fn commitWithColliders(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, system: *PathfindingSystem, commands: []const StructuralCommand) !void {
-    frame.beginStep();
-    try colliders.reserveForCommit(data, commands.len);
-    try system.reserveStaticColliderMarks(colliders.pendingChangeCount() + commands.len);
-    try frame.structural_commands.prepareRangeCounts(1);
-    frame.structural_commands.addCount(0, commands.len);
-    try frame.structural_commands.prefix();
-    var writer = frame.structural_commands.rangeWriter(0);
-    for (commands) |command| writer.write(command);
-    writer.finish();
-    frame.structural_commands.finishWrite();
-    _ = try frame.applyStructuralCommands(data);
-    colliders.capture(frame);
-    try colliders.sync(data, null);
-    system.recordStaticColliderChanges(colliders.changesThisStep());
 }
 
 /// A terrain writer's nav record over `events` (terrain events only): its reserve, then the
@@ -198,14 +300,18 @@ pub fn recordTileEdits(system: *PathfindingSystem, world: *const WorldSystem, ed
 
 /// `recordTileChange`, then applies every pending nav change serially.
 pub fn applyTileChange(system: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, change: WorldTileChangedEvent) !NavUpdateStats {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     try recordTileChange(system, world, change);
-    return system.applyBufferedNavUpdates(colliders, world, null);
+    return system.applyBufferedNavUpdates(colliders, world, &serial_threads);
 }
 
 /// `recordTileEdits`, then applies every pending nav change serially.
 pub fn applyTileEdits(system: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, edits: []const TileEdit) !NavUpdateStats {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     try recordTileEdits(system, world, edits);
-    return system.applyBufferedNavUpdates(colliders, world, null);
+    return system.applyBufferedNavUpdates(colliders, world, &serial_threads);
 }
 
 /// Sets `cells` ((x, y) pairs) of an all-open prepared `grid` blocked, through the same
@@ -242,9 +348,11 @@ pub fn cellOfLocal(geometry: ChunkGeometry, chunk: u32, local: u8) u32 {
     return @intCast((bounds.y0 + (@as(usize, local) >> geometry.shift)) * geometry.width + bounds.x0 + (local & mask));
 }
 
-/// Mixed chunks of `grid` holding a cell block.
-pub fn liveBlockCount(grid: *const NavGrid) usize {
-    return grid.blocks.len - grid.block_free.items.len;
+/// `grid`'s form at `chunk`: mixed when it holds a cell block, else open or blocked by its
+/// blocked count.
+pub fn navChunkForm(grid: *const NavGrid, chunk: u32) ChunkForm {
+    if (grid.chunkBlock(chunk) != null) return .mixed;
+    return if (grid.chunkBlockedCount(chunk) == 0) .open else .blocked;
 }
 
 /// Portals across every record of every level of `graph`.
@@ -525,7 +633,7 @@ fn closureRootAt(graph: *const NavGraph, level: u16, cell: CellCoord) ?u32 {
 /// live block exactly its words and every free id blockless; every block at least a quarter
 /// full from 64 indices up; live words summing the live blocks; and each terminal's row equal
 /// to a search over live links between roots.
-pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem) !void {
+fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem) !void {
     const t = std.testing;
     const allocator = t.allocator;
     const conn = &graph.connectivity;
@@ -580,7 +688,7 @@ pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem
         try t.expectEqual(@as(u32, @intCast(root)), closure.term.root[term]);
         try terminals.append(allocator, @intCast(root));
     }
-    try t.expectEqual(terminals.items.len, closure.termCount());
+    try t.expectEqual(terminals.items.len, closureTermCount(closure));
     // Components: maps, free lists, zero rows and columns, links, words.
     var live_words: usize = 0;
     var listed_links: usize = 0;
@@ -670,27 +778,12 @@ pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem
     }
 }
 
-/// Every live one-way closure block's rows and handed-out map entries, in H-component order,
-/// for a before-and-after compare. The caller frees the slice.
-pub fn dupeClosureBlocks(allocator: std.mem.Allocator, graph: *const NavGraph) ![]u32 {
-    const closure = &graph.connectivity.closure;
-    var words: std.ArrayList(u32) = .empty;
-    errdefer words.deinit(allocator);
-    for (closure.hcomp.k_cap, closure.hcomp.k_high, closure.hcomp.block) |k_cap, k_high, block| {
-        if (k_cap == 0) continue;
-        const rows = @as(usize, k_cap) * @max(1, k_cap / 32);
-        try words.appendSlice(allocator, block[0..rows]);
-        try words.appendSlice(allocator, block[rows..][0..k_high]);
-    }
-    return words.toOwnedSlice(allocator);
-}
-
 /// Asserts `a` and `b` hold the same terminals, keyed by a node of their root, with the same
 /// closure reach between every pair (ids, indices, and blocks may differ).
 pub fn expectSameClosure(a: *const NavGraph, b: *const NavGraph) !void {
     const t = std.testing;
     const allocator = t.allocator;
-    try t.expectEqual(a.connectivity.closure.termCount(), b.connectivity.closure.termCount());
+    try t.expectEqual(closureTermCount(a.connectivity.closure), closureTermCount(b.connectivity.closure));
     // Per terminal of `a`: the terminal of `b` at one of its root's nodes.
     var pairs: std.ArrayList([2]u32) = .empty;
     defer pairs.deinit(allocator);
@@ -875,6 +968,7 @@ pub fn forcedNavThreads(system: *PathfindingSystem, threads: *ThreadSystem) NavU
     return .{
         .thread_system = threads,
         .tuners = &system.tuners.nav,
+        .build_tuners = &system.tuners.nav_build,
         .controls = .{ .adaptive = false, .items_per_range = 1 },
     };
 }
@@ -953,6 +1047,8 @@ pub const ExhaustedPool = enum { comps, terms };
 /// what failed (a warmed batch asks nothing before its id growth). The graph stays as
 /// `before` with the change pending, and the retry with the rows freed equals a rebuild.
 pub fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem, before: *const PathfindingSystem, pool: ExhaustedPool, arm: bool) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const conn = &system.graph.connectivity;
     const closure = &conn.closure;
     const len = switch (pool) {
@@ -977,7 +1073,7 @@ pub fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem,
     }
     len.* = sentinel - 1;
     free.items.len = 0;
-    const result = system.applyBufferedNavUpdates(&no_colliders, &fixture.world, null);
+    const result = system.applyBufferedNavUpdates(&no_colliders, &fixture.world, &serial_threads);
     system.allocator = std.testing.allocator;
     system.graph.allocator = std.testing.allocator;
     len.* = live_rows;
@@ -991,7 +1087,7 @@ pub fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem,
     try expectSameConnectivityPartition(&system.graph, &before.graph);
     try expectSameClosure(&system.graph, &before.graph);
     try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
-    _ = try system.applyBufferedNavUpdates(&no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(&no_colliders, &fixture.world, &serial_threads);
     try fixture.expectMatchesRebuild(system);
 }
 
@@ -1015,21 +1111,71 @@ pub fn appendIndividual(stream: *RangeOutputStream(PathRequest), entity: EntityI
 /// Stores the level-0 plain `path` for `key` at `step` as one publish would, its registry
 /// runs included, and flushes the registry.
 pub fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
-    system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
-    @memcpy(system.completed.destination(claimed)[0..path.len], path);
-    _ = publish.flushRegistry(system, null, null);
-    const starts = try std.testing.allocator.alloc(u16, path.len);
-    defer std.testing.allocator.free(starts);
-    var counts: [registry_shard_count]u32 = @splat(0);
-    const geometry = system.graph.chunkGeometry();
-    const run_count = solve.splitRuns(geometry, path, null, 0, starts, &counts);
-    for (starts[0..run_count]) |start| {
-        const run_key = chunkKey(0, geometry.chunkOfCell(path[start]));
-        const shard = &system.path_index[registryShard(run_key)];
-        try shard.reserve(1, 1, system.completed.logicalCapacity());
-        shard.add(claimed.owner, run_key, start);
+    try stageTestPath(system, key, path, step, stats);
+    _ = try publish.flushRegistry(system, null, null);
+}
+
+/// Stores the stitched `corridor` for `key` at `step` as one publish would, its registry runs
+/// included, and flushes the registry.
+pub fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const StitchedCell, step: u32, stats: *PathfindingStats) !void {
+    try stageTestStitched(system, key, corridor, step, stats);
+    _ = try publish.flushRegistry(system, null, null);
+}
+
+/// `publishTestPath` without its flush: the plain level-0 `path` is the step's one solved
+/// result, recorded by production (`solve.recordPath`) at solve ordinal 0 and published
+/// through production (`publishSolved`); its runs wait in one publish range for the
+/// caller's flush.
+pub fn stageTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
+    const stripe = try solvedStripe(system);
+    if (path.len == 0 or path.len > stripe.len) return error.TestUnexpectedResult;
+    system.solved_paths.items.len = 1;
+    solve.recordPath(system, 0, path, 0, path[path.len - 1]);
+    try publishSolved(system, key, step, stats);
+}
+
+// `stageTestPath` of the stitched `corridor` (`solve.recordStitched`), starting on its first
+// cell's level.
+fn stageTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const StitchedCell, step: u32, stats: *PathfindingStats) !void {
+    const stripe = try solvedStripe(system);
+    if (corridor.len == 0 or types.stitchedWords(corridor.len) > stripe.len) return error.TestUnexpectedResult;
+    system.solved_paths.items.len = 1;
+    solve.recordStitched(system, 0, corridor, corridor[0].level, corridor[corridor.len - 1].cell);
+    try publishSolved(system, key, step, stats);
+}
+
+// Solve ordinal 0's output stripe in the reserved solve pool; the reserved solve slots hold
+// the step's one result, which the caller opens for the production writer and
+// `publishSolved` empties.
+fn solvedStripe(system: *PathfindingSystem) ![]u32 {
+    const words = system.stripe_words;
+    if (words == 0 or system.worker_path_pool.items.len < words or system.worker_run_starts.items.len < words) return error.TestUnexpectedResult;
+    if (system.solve_results.capacity < 1 or system.solved_paths.capacity < 1) return error.TestUnexpectedResult;
+    return system.worker_path_pool.items[0..words];
+}
+
+// Publishes the result recorded at solve ordinal 0 as the step's one result for `key` through
+// the production publish: `reservePublish`, `claimPublish` at `step`, and `publish_copy` on
+// one inline range. The step's solve slots are emptied after it, so nothing later reads them.
+fn publishSolved(system: *PathfindingSystem, key: PathQueryKey, step: u32, stats: *PathfindingStats) !void {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var tuner: AdaptiveWorkTuner = .init(.{});
+    defer {
+        system.solve_results.clearRetainingCapacity();
+        system.solved_paths.clearRetainingCapacity();
+        system.publish_records.clearRetainingCapacity();
     }
+    system.solve_results.items.len = 1;
+    system.solve_results.items[0] = .{ .available = key };
+    try publish.reservePublish(system);
+    const step_counter = system.step_counter;
+    system.step_counter = step;
+    publish.claimPublish(system, stats);
+    system.step_counter = step_counter;
+    if (system.publish_records.items[0] == null) return error.TestUnexpectedResult;
+    _ = publish.publishCopy(system, Dispatch.init(&threads, &tuner, .{ .adaptive = false }));
+    try std.testing.expectEqual(@as(usize, 1), system.publish_ranges);
 }
 
 /// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.
@@ -1037,7 +1183,32 @@ pub fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goa
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     for (goals) |goal| try appendIndividual(&stream, requester, goal);
-    return system.updateSerial(&stream, agent_count, .{});
+    return updatePathfindingInline(system, &stream, agent_count, .{});
+}
+
+/// Ages every cached result past the cache TTL: the next request of its goal removes it at
+/// intake and solves it again in the same step, so that step's flush retires and re-adds
+/// its registrations together and a chunk holding them keeps its block. The second such
+/// step of the same requests finds every payload grown for both.
+pub fn expireCachedResults(system: *PathfindingSystem) void {
+    for (system.completed.core.records.items) |*record| {
+        if (record.live) record.stamp -%= types.default_cache_ttl_steps + 1;
+    }
+}
+
+/// Ages `key`'s cached result past the cache TTL (`expireCachedResults`).
+pub fn expireCachedResult(system: *PathfindingSystem, key: PathQueryKey) void {
+    const owner = cacheOwnerOf(system.completed.core, key).?;
+    system.completed.core.records.items[owner].stamp -%= types.default_cache_ttl_steps + 1;
+}
+
+/// The last update published every goal's level-0 result, and each reads available from
+/// cellWorld(1, 2), the start `solveIndividualGoals` requests from.
+pub fn expectGoalsSolved(system: *const PathfindingSystem, goals: []const math.Vec2) !void {
+    for (goals) |goal| {
+        try std.testing.expect(solvedLastStep(system, goal));
+        try std.testing.expectEqual(PathStatus.available, statusOf(system, cellWorld(1, 2), goal));
+    }
 }
 
 /// The stored cells of `goal`'s cached plain path, copied out.
@@ -1048,6 +1219,26 @@ pub fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.A
     errdefer cells.deinit(std.testing.allocator);
     try cells.appendSlice(std.testing.allocator, system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len));
     return cells;
+}
+
+/// Level-0 `start`'s path status toward level-0 `goal` for the default agent class.
+pub fn statusOf(system: *const PathfindingSystem, start: math.Vec2, goal: math.Vec2) PathStatus {
+    return system.statusForWorld(0, start, 0, goal, .default, null).status;
+}
+
+/// The step `key`'s cached result was stored at (its solve's publish); null when none is
+/// cached. A cache hit leaves it as it was.
+pub fn cachedStep(system: *const PathfindingSystem, key: PathQueryKey) ?u32 {
+    const slot = system.completed.slotIndex(key) orelse return null;
+    return system.completed.core.records.items[system.completed.core.slots.items[slot].payload_index].stamp;
+}
+
+/// Whether the last update's publish stored the result for `goal`'s level-0 default-class
+/// key: a solve, never a cache hit.
+pub fn solvedLastStep(system: *const PathfindingSystem, goal: math.Vec2) bool {
+    const key = system.graph.keyForWorld(0, goal, .default) orelse return false;
+    const stored_step = cachedStep(system, key) orelse return false;
+    return stored_step == system.step_counter;
 }
 
 /// A world `side` tiles a side in 4-tile chunks, open grass, with an obstacle layer to flip.
@@ -1125,7 +1316,7 @@ pub fn solveRegistryRoutes(system: *PathfindingSystem, requester: EntityId, side
         if (threads) |thread_system| {
             _ = try system.update(requests, agent_count, thread_system, config);
         } else {
-            _ = try system.updateSerial(requests, agent_count, config);
+            _ = try updatePathfindingInline(system, requests, agent_count, config);
         }
         requests = &empty;
         if (system.pending.len == 0) return;
@@ -1187,26 +1378,35 @@ pub fn expectRegistryMatchesCache(system: *const PathfindingSystem) !void {
         const run_count = solve.splitRuns(geometry, path.cells, path.levels, path.level, starts, &counts);
         for (starts[0..run_count]) |start| try expected.append(allocator, .{ .key = chunkKey(path.levelAt(start), geometry.chunkOfCell(path.cells[start])), .owner = owner, .start = start });
     }
-    for (&system.path_index, 0..) |*shard, shard_index| {
-        for (shard.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            try std.testing.expectEqual(shard_index, registryShard(key));
-            var length: u32 = 0;
-            var entry = shard.slot_heads[slot];
-            while (entry != no_entry) : (entry = shard.entry_next[entry]) {
-                length += 1;
-                try actual.append(allocator, .{ .key = key, .owner = shard.entry_owner[entry], .start = shard.entry_order[entry] });
+    const directory = &system.path_index.directory;
+    var level: u32 = 0;
+    while (level < directory.levelCount()) : (level += 1) {
+        var slot: usize = 0;
+        while (slot < directory.slotCount(level)) : (slot += 1) {
+            const key = chunkKey(@intCast(level), @intCast(slot));
+            const run = publish.registrationRun(directory, key);
+            if (run.len == 0) continue;
+            for (run.owner[0..run.len], run.order[0..run.len], run.inverse[0..run.len], 0..) |owner, start, node, index| {
+                try actual.append(allocator, .{ .key = key, .owner = owner, .start = start });
+                const pool = &system.path_index.pools[registryShard(key)];
+                try std.testing.expectEqual(key, pool.node_chunk[node]);
+                try std.testing.expectEqual(@as(u32, @intCast(index)), pool.node_index[node]);
             }
-            try std.testing.expect(length != 0);
-            try std.testing.expectEqual(length, shard.slot_counts[slot]);
         }
-        try std.testing.expect(shard.owner_heads.items.len >= system.completed.logicalCapacity());
-        for (shard.owner_heads.items, 0..) |owner_head, owner| {
-            var entry = owner_head;
-            while (entry != no_entry) : (entry = shard.entry_owner_next[entry]) {
-                try std.testing.expectEqual(@as(u32, @intCast(owner)), shard.entry_owner[entry]);
+    }
+    for (&system.path_index.pools) |*pool| {
+        try std.testing.expect(pool.owner_heads.items.len >= system.completed.logicalCapacity());
+        for (pool.owner_heads.items, 0..) |head, owner| {
+            var node = head.node;
+            var seen: u32 = 0;
+            while (node != no_entry) : (node = pool.node_next[node]) {
+                seen += 1;
+                const key = pool.node_chunk[node];
+                const run = publish.registrationRun(directory, key);
+                try std.testing.expectEqual(@as(u32, @intCast(owner)), run.owner[pool.node_index[node]]);
                 try std.testing.expect(system.completed.core.records.items[owner].live);
             }
+            try std.testing.expectEqual(head.len, seen);
         }
     }
     std.mem.sort(Registration, expected.items, {}, Registration.lessThan);
@@ -1217,19 +1417,20 @@ pub fn expectRegistryMatchesCache(system: *const PathfindingSystem) !void {
 /// Two systems' registries hold the same keys in the same slots and the same lists in the
 /// same order.
 pub fn expectSameRegistry(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
-    for (&a.path_index, &b.path_index) |*shard_a, *shard_b| {
-        try std.testing.expectEqualSlices(u64, shard_a.slot_keys, shard_b.slot_keys);
-        for (shard_a.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            var entry_a = shard_a.slot_heads[slot];
-            var entry_b = shard_b.slot_heads[slot];
-            while (entry_a != no_entry or entry_b != no_entry) {
-                try std.testing.expect(entry_a != no_entry and entry_b != no_entry);
-                try std.testing.expectEqual(shard_a.entry_owner[entry_a], shard_b.entry_owner[entry_b]);
-                try std.testing.expectEqual(shard_a.entry_order[entry_a], shard_b.entry_order[entry_b]);
-                entry_a = shard_a.entry_next[entry_a];
-                entry_b = shard_b.entry_next[entry_b];
-            }
+    const directory_a = &a.path_index.directory;
+    const directory_b = &b.path_index.directory;
+    try std.testing.expectEqual(directory_a.levelCount(), directory_b.levelCount());
+    var level: u32 = 0;
+    while (level < directory_a.levelCount()) : (level += 1) {
+        try std.testing.expectEqual(directory_a.slotCount(level), directory_b.slotCount(level));
+        var slot: usize = 0;
+        while (slot < directory_a.slotCount(level)) : (slot += 1) {
+            const key = chunkKey(@intCast(level), @intCast(slot));
+            try std.testing.expectEqual(directory_a.slot(level, slot) == empty_block, directory_b.slot(level, slot) == empty_block);
+            const run_a = publish.registrationRun(directory_a, key);
+            const run_b = publish.registrationRun(directory_b, key);
+            try std.testing.expectEqualSlices(u32, run_a.owner[0..run_a.len], run_b.owner[0..run_b.len]);
+            try std.testing.expectEqualSlices(u32, run_a.order[0..run_a.len], run_b.order[0..run_b.len]);
         }
     }
 }
@@ -1262,23 +1463,16 @@ pub fn setRegistryCells(system: *PathfindingSystem, fixture: *RegistryWorld, cel
     }
 }
 
-/// Points every allocator `system` uses (its own, its graph's, and each registry shard's) at
-/// `allocator`.
+/// Points every allocator `system` uses (its own and its graph's) at `allocator`. The
+/// registry's directory and inverse pools allocate through the system allocator.
 pub fn setSystemAllocators(system: *PathfindingSystem, allocator: std.mem.Allocator) void {
     system.allocator = allocator;
     system.graph.allocator = allocator;
-    for (&system.path_index) |*shard| shard.allocator = allocator;
 }
 
 /// A fixed-range threaded control: one item per range, so every stage with two or more items
 /// runs on workers.
 pub const fixed_threads_config = PathfindingConfig{ .adaptive = false, .items_per_range = 1 };
-
-/// Work units of a registry flush over `ops` logged ops and `adds` pending registrations:
-/// every pair weighs the whole log, its adds, and one.
-pub fn flushUnits(ops: usize, adds: usize) usize {
-    return registry_shard_count * (ops + 1) + adds;
-}
 
 /// Two registry systems filled alike with long and inline results, for a shrink to the
 /// floor's 32 entries.
@@ -1292,18 +1486,6 @@ pub fn shrinkFixture(data: *const DataSystem, fixture: *const RegistryWorld, req
 
 /// The agent count the request-side stage tests pass to `update`.
 pub const intake_test_agents: usize = 40;
-
-/// Two updates' request-side stats match, field by field.
-pub fn expectRequestStatsEqual(expected: PathfindingStats, actual: PathfindingStats) !void {
-    inline for (.{
-        "accepted_requests", "duplicate_requests",  "pending_requests",    "dropped_requests",
-        "cache_hits",        "available_results",   "unavailable_results", "group_field_samples",
-        "goal_projected",    "group_fields_built",  "group_field_reuses",  "group_field_rebuild_throttled",
-        "cache_evictions",   "distinct_group_keys", "goal_fallbacks",      "group_field_evictions",
-    }) |name| {
-        try std.testing.expectEqual(@field(expected, name), @field(actual, name));
-    }
-}
 
 /// Same pending queue, group tallies, and cached result slots.
 pub fn expectRequestStateEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
@@ -1424,7 +1606,7 @@ pub fn solveFrom(system: *PathfindingSystem, requester: EntityId, start: math.Ve
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-    return system.updateSerial(&stream, 16, config);
+    return updatePathfindingInline(system, &stream, 16, config);
 }
 
 /// Builds a 12x12-tile single-level world with a vertical tree wall at column 5 that
@@ -1454,5 +1636,672 @@ pub fn solveStep(system: *PathfindingSystem, requester: EntityId, start: math.Ve
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-    return system.updateSerial(&stream, 8, .{});
+    return updatePathfindingInline(system, &stream, 8, .{});
+}
+
+// ---- Request-side byte accounting -------------------------------------------------------
+
+/// The request side's storage by part: per-participant search scratch, the tier-1
+/// corridor pool, the result cache with the solve slots' path stripes and records, the
+/// path registry with its registration windows, the goal table, the request queues and
+/// per-step lists (pending queue and keys, intake staging, solve slots, group tallies and
+/// field headers, publish windows, resize snapshots), and the nav change scratch (marks
+/// and their staging, the eviction scratch). With the graph and the group fields' pools,
+/// every allocation the system owns.
+pub const RequestStorage = struct {
+    search: usize = 0,
+    tier1: usize = 0,
+    results: usize = 0,
+    registry: usize = 0,
+    goals: usize = 0,
+    queues: usize = 0,
+    change_scratch: usize = 0,
+};
+
+/// What sizes the request side for `requestStorageBytesBound`, beyond its capacity.
+pub const RequestShape = struct {
+    /// The most cached results whose path outgrows the inline stripe at once.
+    long_results: usize = std.math.maxInt(usize),
+    /// The most registry runs (chunk-local stretches of a stored path) one result holds;
+    /// null is one per stored cell, the most a plain or stitched path holds.
+    runs_per_result: ?usize = null,
+    /// Chunks over every level. The registry directory opens one slot per chunk when
+    /// the nav levels open, and a registry key is a chunk, so keys never pass it.
+    chunks: usize = std.math.maxInt(usize),
+    /// Open nav levels.
+    levels: usize,
+    /// The most nav marks recorded between two nav batches (a terrain record's events or
+    /// two per static change), and the most chunk keys one batch changes.
+    marks: usize = 0,
+    batch_keys: usize = 0,
+};
+
+/// `RequestStorage` held now (allocated capacity). O(participants + shards + the result
+/// cache's pages).
+pub fn requestResidentBytes(system: *const PathfindingSystem) RequestStorage {
+    var storage = RequestStorage{
+        .search = system.scratch_slots.capacity * @sizeOf(SearchScratch),
+        .tier1 = system.tier1_scratch.capacity * @sizeOf(Tier1Scratch),
+        .results = resultCacheResidentBytes(&system.completed) + system.worker_path_pool.capacity * @sizeOf(u32) +
+            system.worker_run_starts.capacity * @sizeOf(u16) + system.solved_paths.capacity * @sizeOf(PathfindingSystem.SolvedPath) +
+            system.publish_records.capacity * @sizeOf(?ResultCache.Claimed),
+        .registry = system.reg_buckets.capacity * @sizeOf(RegRecord),
+        .goals = goalTableResidentBytes(&system.goals),
+        .queues = system.pending.buffer.len * @sizeOf(PendingRequest) + keySetResidentBytes(&system.pending_keys) +
+            system.intake_records.capacity * @sizeOf(IntakeRecord) + system.intake_group_counts.capacity * @sizeOf(GroupKeyCount) +
+            system.intake_tallies.capacity * @sizeOf(FieldElem(PathfindingSystem, "intake_tallies")) + system.solve_results.capacity * @sizeOf(PathSolveResult) +
+            system.solve_indices.capacity * @sizeOf(usize) + system.solve_tier1_slot.capacity * @sizeOf(u32) +
+            system.group_fields.capacity * @sizeOf(GroupField) + groupKeyMapResidentBytes(&system.group_field_keys) +
+            system.group_field_slots.capacity * @sizeOf(usize) + system.group_requests.capacity * @sizeOf(GroupRequestTally) +
+            groupKeyMapResidentBytes(&system.group_key_map) + system.publish_range_bases.capacity * @sizeOf(usize) +
+            system.publish_bands.capacity * @sizeOf(FieldElem(PathfindingSystem, "publish_bands")) + system.rotate_back_scratch.capacity * @sizeOf(PendingRequest) +
+            system.resize_pending_snapshot.capacity * @sizeOf(PendingRequest) + system.resize_group_snapshot.capacity * @sizeOf(GroupRequestTally),
+        .change_scratch = system.nav_marks.capacity * @sizeOf(NavMark) + system.nav_mark_staging.capacity * @sizeOf(NavMark) +
+            system.nav_mark_tallies.capacity * @sizeOf(FieldElem(PathfindingSystem, "nav_mark_tallies")) + system.evict_items.capacity * @sizeOf(EvictItem) +
+            system.evict_hits.capacity * @sizeOf(u32),
+    };
+    for (system.scratch_slots.items) |*scratch| storage.search += searchScratchResidentBytes(scratch);
+    for (system.tier1_scratch.items) |*entry| storage.tier1 += corridorScratchResidentBytes(&entry.corridor);
+    storage.registry += registryResidentBytes(&system.path_index);
+    return storage;
+}
+
+fn registryResidentBytes(index: *const publish.PathIndex) usize {
+    comptime assertFieldsClassified(publish.PathIndex, &.{
+        "directory", "pools", "growth", "compact", "fresh", "plan", "plan_replacement", "shard_ops", "emptied",
+    }, &.{ "growth_base", "compact_base", "counts", "shard_op_base", "shard_op_count", "retire_node_count", "emptied_step" });
+    var bytes = directoryResidentBytes(&index.directory);
+    bytes += index.growth.capacity * @sizeOf(FieldElem(publish.PathIndex, "growth")) + index.compact.capacity * @sizeOf(FieldElem(publish.PathIndex, "compact"));
+    bytes += index.fresh.capacity * @sizeOf(FieldElem(publish.PathIndex, "fresh")) + index.emptied.capacity * @sizeOf(FieldElem(publish.PathIndex, "emptied"));
+    bytes += retirePlanResidentBytes(&index.plan) + index.shard_ops.capacity * @sizeOf(FieldElem(publish.PathIndex, "shard_ops"));
+    if (index.plan_replacement) |*replacement| bytes += retirePlanResidentBytes(replacement);
+    for (&index.pools) |*pool| bytes += inversePoolResidentBytes(pool);
+    return bytes;
+}
+
+// Bytes of the owner log's plan: its owner-id columns and its per-op plans.
+fn retirePlanResidentBytes(plan: *const publish.RetirePlan) usize {
+    const Plan = publish.RetirePlan;
+    comptime assertFieldsClassified(Plan, &.{ "ids", "at", "origin", "shards", "rename_to", "ops" }, &.{});
+    return plan.ids.capacity * @sizeOf(FieldElem(Plan, "ids")) + plan.at.capacity * @sizeOf(FieldElem(Plan, "at")) +
+        plan.origin.capacity * @sizeOf(FieldElem(Plan, "origin")) + plan.shards.capacity * @sizeOf(FieldElem(Plan, "shards")) +
+        plan.rename_to.capacity * @sizeOf(FieldElem(Plan, "rename_to")) + plan.ops.capacity * @sizeOf(FieldElem(Plan, "ops"));
+}
+
+/// Payload bytes plus inverse-pool bytes. Directory slots opened with the nav level are
+/// not included: a publish grows the payloads and the node pools.
+pub fn registryContentBytes(index: *const publish.PathIndex) usize {
+    var bytes: usize = 0;
+    for (index.directory.blocks.items) |block| bytes += block.bytes.len;
+    for (&index.pools) |*pool| bytes += inversePoolResidentBytes(pool);
+    return bytes;
+}
+
+// ---- Path registry byte counts ------------------------------------------------------------
+// Built from the registry's own types: the directory's `Level` and `Block` records and
+// slot columns, the inverse pools' node and head rows, and a payload's row bytes.
+
+const RegistryDirectory = publish.RegistryDirectory;
+const InversePool = publish.InversePool;
+const DirectoryLevel = RegistryDirectory.Level;
+const DirectoryBlock = RegistryDirectory.Block;
+const InverseNodes = @FieldType(InversePool, "nodes");
+const OwnerHead = FieldElem(InversePool, "owner_heads");
+// Bytes of one chunk's directory columns: its block id and its pending count.
+const directory_chunk_bytes = @sizeOf(@typeInfo(@FieldType(DirectoryLevel, "slots")).pointer.child) +
+    @sizeOf(@typeInfo(@FieldType(DirectoryLevel, "pending")).pointer.child);
+
+/// The element type of `T.field`: a std list's, a `MultiArrayList`'s row, or a slice's.
+fn FieldElem(comptime T: type, comptime field: []const u8) type {
+    const List = @FieldType(T, field);
+    if (@typeInfo(List) == .pointer) return @typeInfo(List).pointer.child;
+    if (@hasField(List, "items")) return @typeInfo(@FieldType(List, "items")).pointer.child;
+    return @typeInfo(@TypeOf(List.get)).@"fn".return_type.?;
+}
+
+/// Bytes of a registry directory: its level list, each open level's slot and pending
+/// columns, the block pool and its free ids, and every block's payload.
+fn directoryResidentBytes(directory: *const RegistryDirectory) usize {
+    comptime assertFieldsClassified(RegistryDirectory, &.{ "levels", "blocks", "block_free" }, &.{});
+    var bytes = directory.levels.capacity * @sizeOf(DirectoryLevel) +
+        directory.blocks.capacity * @sizeOf(DirectoryBlock) +
+        directory.block_free.capacity * @sizeOf(FieldElem(RegistryDirectory, "block_free"));
+    var level: u32 = 0;
+    while (level < directory.levelCount()) : (level += 1) bytes += directory.slotCount(level) * directory_chunk_bytes;
+    for (directory.blocks.items) |block| bytes += block.bytes.len;
+    return bytes;
+}
+
+/// Bytes of one inverse pool: its node columns, free ids, and owner heads, including a
+/// prepared or retired truncation.
+fn inversePoolResidentBytes(pool: *const InversePool) usize {
+    comptime assertFieldsClassified(InversePool, &.{ "nodes", "node_free", "owner_heads", "replacement", "retired" }, &.{ "node_next", "node_chunk", "node_index" });
+    var bytes = InverseNodes.capacityInBytes(pool.nodes.capacity) +
+        pool.node_free.capacity * @sizeOf(FieldElem(InversePool, "node_free")) +
+        pool.owner_heads.capacity * @sizeOf(OwnerHead) +
+        pool.retired.capacity * @sizeOf(OwnerHead);
+    if (pool.replacement) |replacement| bytes += replacement.capacity * @sizeOf(OwnerHead);
+    return bytes;
+}
+
+/// An over-estimate of one registry: `levels` level records and `chunks` chunks of
+/// directory columns, a block per chunk holding registrations or held a step after they
+/// retired (at most min(chunks, entries)) in a pool doubled ahead of need, a geometric payload for `entries`
+/// registrations, and `shards` inverse pools whose nodes sum to `entries` and whose owner
+/// heads hold `owners` ids. Saturates.
+fn pooledStorageBytesBound(shards: usize, levels: usize, chunks: usize, entries: usize, owners: usize) usize {
+    const blocks = @min(chunks, entries);
+    // A payload's cap is a power of two at most twice the most registrations it held.
+    const payload = (entries *| 2) *| publish.reg_row_bytes;
+    const directory = listBytesBound(DirectoryLevel, levels) +| chunks *| directory_chunk_bytes +|
+        listBytesBound(DirectoryBlock, blocks *| 2) +| listBytesBound(FieldElem(RegistryDirectory, "block_free"), blocks *| 2);
+    const node_capacity = InverseNodes.growCapacity(entries *| 2) +| shards *| InverseNodes.growCapacity(0);
+    const node_pool = InverseNodes.capacityInBytes(InverseNodes.growCapacity(entries *| 2)) +| shards *| InverseNodes.capacityInBytes(InverseNodes.growCapacity(0));
+    const free_ids = pooledFreeIds(shards, entries);
+    const heads = shards *| listBytesBound(OwnerHead, owners);
+    // Count windows, growth and compact: one record per registration a flush adds or
+    // retires, each shard's window starting on a cache line.
+    const ChunkRef = FieldElem(publish.PathIndex, "compact");
+    const windows = 2 *| listBytesBound(ChunkRef, entries *| 2 +| shards *| @divExact(thread_shared_record_alignment, @sizeOf(ChunkRef)));
+    // Held emptied chunks: room for one per block of the pool.
+    const emptied = listBytesBound(FieldElem(publish.PathIndex, "emptied"), blocks *| 2);
+    // The owner log's plan: its owner-id columns, a plan per op of a log of
+    // `ops_per_entry` ops per owner id, and the log bucketed by shard: an op's entries are
+    // the shards its chain has nodes in, and each chain takes at most `ops_per_entry` ops,
+    // so at most that many entries per inverse node slot the pools hold and per owner id in
+    // each shard.
+    const Plan = publish.RetirePlan;
+    const plan = listBytesBound(FieldElem(Plan, "ids"), owners) +| listBytesBound(FieldElem(Plan, "at"), owners) +|
+        listBytesBound(FieldElem(Plan, "origin"), owners) +| listBytesBound(FieldElem(Plan, "shards"), owners) +|
+        listBytesBound(FieldElem(Plan, "rename_to"), owners) +| listBytesBound(FieldElem(Plan, "ops"), caches.ops_per_entry *| owners) +|
+        listBytesBound(FieldElem(publish.PathIndex, "shard_ops"), @min(caches.ops_per_entry *| node_capacity, shards *| caches.ops_per_entry *| owners));
+    return directory +| payload +| node_pool +| free_ids +| heads +| windows +| emptied +| plan;
+}
+
+fn pooledFreeIds(shards: usize, entries: usize) usize {
+    const Ids = std.ArrayList(u32);
+    return Ids.growCapacity(entries *| 2) *| @sizeOf(u32) +| shards *| Ids.growCapacity(0) *| @sizeOf(u32);
+}
+
+/// An over-estimate of `requestResidentBytes` for a system never reserved past
+/// `capacity` (its pools at the limits of `max_agent_budget` agents), whose results and
+/// nav changes fit `shape`, and whose goal table grew from one intent per agent. Search
+/// scratch and the tier-1 pool follow the node budgets, never level cells. The registry
+/// is charged its shards' summed peaks at their pooled share: one key hash spreads any
+/// workload's runs over the shards alike, so the shards peak together. Saturates.
+pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestShape) RequestStorage {
+    const limits = PathfindingSystem.deriveLimits(capacity, capacity.max_agent_budget);
+    const participants = @max(@as(usize, 1), capacity.worker_participant_count);
+    const tier0_abstract_nodes = @min(capacity.tier0_abstract_node_cap, capacity.max_abstract_nodes);
+    const tier0_stitched_cells = @min(capacity.tier0_stitched_cell_cap, capacity.max_stitched_path_cells);
+    const stripe_words = types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells);
+    const solves = limits.solves_per_step;
+    const frames = limits.frame_requests;
+    const pool_words = solves *| stripe_words;
+    // A stored path holds at most one run per cell, plain or stitched.
+    const runs_per_result = shape.runs_per_result orelse @max(capacity.max_stored_path_cells, capacity.max_stitched_path_cells);
+    // A step registers at most its solves' runs, on top of the live results' runs; a
+    // shard reserves table room for each, its live keys aside.
+    const step_runs = solves *| runs_per_result;
+    const live_runs = limits.cached_results *| runs_per_result +| step_runs;
+    const windows = step_runs +| (reg_window_alignment_items - 1) *| maxRangeCount(solves, 1);
+    const marks = @max(frames, shape.marks);
+    // Per changed key, its halos' registrations (each halo owned by one key) and a slot per
+    // group field, each range's window on a line.
+    const hits = live_runs +| shape.batch_keys *| (capacity.max_group_fields +| hit_window_alignment_items);
+    return .{
+        .search = listBytesBound(SearchScratch, participants) +|
+            participants *| searchScratchStorageBytesBound(capacity.max_explored_nodes, tier0_abstract_nodes, tier0_stitched_cells),
+        .tier1 = listBytesBound(Tier1Scratch, capacity.max_escalated_solves_per_step) +|
+            capacity.max_escalated_solves_per_step *| corridorScratchStorageBytesBound(capacity.max_abstract_nodes, capacity.max_stitched_path_cells),
+        .results = resultCacheStorageBytesBound(limits.cached_results, capacity.max_stored_path_cells, stripe_words, shape.long_results) +|
+            listBytesBound(u32, pool_words) +| listBytesBound(u16, pool_words) +| listBytesBound(PathfindingSystem.SolvedPath, solves) +|
+            listBytesBound(?ResultCache.Claimed, solves),
+        // One directory slot per chunk of the open levels (`openRegistryLevels`), whether
+        // or not a run is stored there. The run charge stays the stored paths' runs.
+        .registry = pooledStorageBytesBound(registry_shard_count, @min(shape.levels, shape.chunks), shape.chunks, live_runs, limits.cached_results) +|
+            RegRecordList.growCapacity(windows) *| @sizeOf(RegRecord),
+        // A resolve past the limit doubles it, so one intent per agent reserves at most twice that.
+        .goals = goalTableStorageBytesBound(2 *| limits.pending_requests),
+        .queues = limits.pending_requests *| @sizeOf(PendingRequest) +| keySetStorageBytesBound(limits.pending_requests) +|
+            IntakeRecordList.growCapacity(frames) *| @sizeOf(IntakeRecord) +| GroupKeyCountList.growCapacity(frames) *| @sizeOf(GroupKeyCount) +|
+            @FieldType(PathfindingSystem, "intake_tallies").growCapacity(maxRangeCount(frames, intake_range_alignment_items)) *| @sizeOf(FieldElem(PathfindingSystem, "intake_tallies")) +|
+            listBytesBound(PathSolveResult, solves) +| listBytesBound(usize, solves) +| listBytesBound(u32, solves) +|
+            listBytesBound(GroupField, capacity.max_group_fields) +| groupKeyMapStorageBytesBound(capacity.max_group_fields) +|
+            listBytesBound(usize, capacity.max_group_fields) +| listBytesBound(GroupRequestTally, solves) +|
+            groupKeyMapStorageBytesBound(solves) +| listBytesBound(usize, maxRangeCount(solves, 1)) +|
+            @FieldType(PathfindingSystem, "publish_bands").growCapacity(maxRangeCount(solves, 1)) *| @sizeOf(FieldElem(PathfindingSystem, "publish_bands")) +| listBytesBound(PendingRequest, solves) +|
+            listBytesBound(PendingRequest, limits.pending_requests) +| listBytesBound(GroupRequestTally, solves),
+        .change_scratch = listBytesBound(NavMark, marks) +| NavMarkList.growCapacity(marks) *| @sizeOf(NavMark) +|
+            @FieldType(PathfindingSystem, "nav_mark_tallies").growCapacity(maxRangeCount(marks, nav_mark_range_alignment_items)) *| @sizeOf(FieldElem(PathfindingSystem, "nav_mark_tallies")) +|
+            EvictItemList.growCapacity(shape.batch_keys) *| @sizeOf(EvictItem) +| HitList.growCapacity(hits) *| @sizeOf(u32),
+    };
+}
+
+// ---- Byte counts and bounds --------------------------------------------------------------
+// The live byte counts production does not report, and the over-estimates the nav-size
+// bench and the bound tests check them against, built from each structure's layout.
+
+/// Bytes of a std list of `T` that `ensureTotalCapacity` grew to hold `need`: std's growth
+/// past it, first slots included. Storage bounds charge each list with it.
+fn listBytesBound(comptime T: type, need: usize) usize {
+    return std.ArrayList(T).growCapacity(need) *| @sizeOf(T);
+}
+
+/// `listBytesBound` for a `std.MultiArrayList(Row)`, at the padded row size the resident
+/// counts charge.
+fn rowsBytesBound(comptime Row: type, need: usize) usize {
+    return std.MultiArrayList(Row).growCapacity(need) *| @sizeOf(Row);
+}
+
+// Bytes of `pools` std lists of `T`, each grown by std to its own need, whose needs sum to
+// `need`.
+fn pooledList(comptime T: type, pools: usize, need: usize) usize {
+    return (need +| need / 2 +| pools *| std.ArrayList(T).growCapacity(0)) *| @sizeOf(T);
+}
+
+/// What sizes a nav for `navStorageBytesBound`. Counts past what the nav can hold clamp.
+pub const NavStorageShape = struct {
+    /// Chunks per level.
+    chunks: usize,
+    levels: usize,
+    chunk_tiles: u16 = default_nav_chunk_tiles,
+    links: usize = 0,
+    /// One-way links among `links`.
+    oneway_links: usize = std.math.maxInt(usize),
+    /// The most terminals one one-way system (H-component) holds.
+    oneway_system_terminals: usize = std.math.maxInt(usize),
+    participants: usize = 1,
+    /// The largest marks batch: the chunks its marks span (each mark counted, at most one
+    /// per changed cell or obstacle rect), its new links, and its distinct patch keys.
+    batch_mark_chunks: usize = std.math.maxInt(usize),
+    batch_links: usize = std.math.maxInt(usize),
+    batch_keys: usize = std.math.maxInt(usize),
+    /// The world's chunk forms and link endpoints before the build;
+    /// null charges every chunk mixed and `2 * links` endpoints wherever they fit.
+    content: ?NavStorageContent = null,
+};
+
+/// What a world holds that sizes its nav, counted before a build: its open and mixed
+/// chunks over every level and on the level holding the most, and the chunks holding
+/// link endpoints and the most one holds. A batch may turn its own chunks mixed; the
+/// bound adds them.
+pub const NavStorageContent = struct {
+    open_chunks: usize = 0,
+    mixed_chunks: usize = 0,
+    max_level_open: usize = 0,
+    max_level_mixed: usize = 0,
+    endpoint_chunks: usize = 0,
+    max_chunk_endpoints: usize = 0,
+};
+
+/// An over-estimate of `NavGraph.residentBytes` for `shape`: the grids' blocks for the
+/// mixed chunks; a record per open or mixed chunk and per chunk holding a link endpoint,
+/// each with a full border window; a node per open chunk, a border window's worth per
+/// mixed chunk, and one per link endpoint; the batch buffers of one level build or the
+/// largest marks batch, whose chunks may turn mixed (the same ones every batch); the plan
+/// sets; and reachability (`connectivityStorageBytesBound`). Pools are charged at their
+/// doubling and lists at std's growth past their need.
+pub fn navStorageBytesBound(shape: NavStorageShape) usize {
+    const levels = @max(1, shape.levels);
+    const chunks = shape.chunks;
+    const all_chunks = levels *| chunks;
+    const chunk_cells = @as(usize, shape.chunk_tiles) * shape.chunk_tiles;
+    const border_stride = borderPortalBound(shape.chunk_tiles);
+    const endpoints = 2 *| shape.links;
+    const mark_chunks = @min(shape.batch_mark_chunks, all_chunks *| chunk_cells);
+    const batch_links = @min(shape.batch_links, shape.links);
+    const batch_keys = @min(shape.batch_keys, @min(all_chunks, 5 *| mark_chunks +| 2 *| batch_links));
+    const content: NavStorageContent = shape.content orelse .{
+        .mixed_chunks = all_chunks,
+        .max_level_mixed = chunks,
+        .endpoint_chunks = @min(all_chunks, endpoints),
+        .max_chunk_endpoints = @min(endpoints, chunk_cells),
+    };
+    const chunk_endpoints = content.max_chunk_endpoints;
+    // Chunks a batch changes may turn mixed; its keys bound them.
+    const mixed = @min(all_chunks, content.mixed_chunks +| batch_keys);
+    const level_mixed = @min(chunks, content.max_level_mixed +| batch_keys);
+    const nonblocked = @min(all_chunks, content.open_chunks +| mixed);
+    const live_nodes = content.open_chunks +| mixed *| border_stride +| endpoints;
+    const batch_nodes = batch_keys *| border_stride +| @min(batch_keys *| chunk_endpoints, endpoints);
+    const records = nonblocked +| content.endpoint_chunks +| batch_keys;
+    const slot_need = content.endpoint_chunks +| @min(batch_keys, content.endpoint_chunks);
+    const graphs = navLevelGraphsStorageBytesBound(levels, chunks, border_stride, records, live_nodes +| batch_nodes, slot_need, chunk_endpoints);
+    const grids = navGridStorageBytesBound(levels, chunks, mixed +| @min(mark_chunks, batch_keys));
+    const level_nodes = @min(chunks, content.max_level_open +| level_mixed) +| level_mixed *| border_stride +|
+        @min(chunks *| chunk_endpoints, endpoints);
+    return grids +| graphs +| listBytesBound(LevelCrossings, levels) +|
+        navBatchBytesBound(chunks, mark_chunks, batch_links, batch_keys) +|
+        orderedIndexSetStorageBytesBound(2 *| levels) +|
+        connectivityStorageBytesBound(.{
+            .nodes = live_nodes,
+            .level_chunks = chunks,
+            .level_nodes = level_nodes,
+            .batch_keys = batch_keys,
+            .batch_links = batch_links,
+            .border_stride = border_stride,
+            .chunk_endpoints = chunk_endpoints,
+            .links = shape.links,
+            .oneway_links = @min(shape.oneway_links, shape.links),
+            .system_terminals = shape.oneway_system_terminals,
+            .participants = @max(1, shape.participants),
+        });
+}
+
+// An over-estimate of `NavLevelGraph.residentBytes` summed over `levels` levels of `chunks`
+// chunks each, whose record, node row, and link slot needs (live plus what a batch claims
+// before it frees the old) sum to `record_need`, `node_need`, and `slot_need` over the
+// levels, each slot's lists at most `chunk_endpoints` long. Each pool is charged at its
+// doubling past its need, each list at std's growth; both are linear past their first
+// slots, so the needs sum across levels.
+fn navLevelGraphsStorageBytesBound(levels: usize, chunks: usize, border_stride: usize, record_need: usize, node_need: usize, slot_need: usize, chunk_endpoints: usize) usize {
+    // `growPool` grows each pool to at most twice its own need, its free list exactly.
+    const records = 2 *| record_need;
+    const nodes = 2 *| node_need;
+    const slots = 2 *| slot_need;
+    const slot_lists = listBytesBound(NavPortal, chunk_endpoints) +| listBytesBound(NavLink, chunk_endpoints);
+    // A level's plan sets: its patch order and changed and dirty bits over its chunks.
+    const plan_sets = orderedIndexSetStorageBytesBound(chunks) +| 2 *| bitSetBytesFor(chunks);
+    return levels *| (listBytesBound(u32, chunks) +| plan_sets) +|
+        records *| (record_row_bytes +| @sizeOf(u32)) +| pooledList(NavPortal, levels, records *| border_stride) +|
+        nodes *| (@sizeOf(NodeRow) +| @sizeOf(u32)) +|
+        slots *| (@sizeOf(FieldElem(NavLevelGraph, "link_slots")) +| slot_lists +| @sizeOf(u32));
+}
+
+// The batch buffers' share of `navStorageBytesBound`: a level build over `chunks` keys, or a
+// marks batch whose `mark_chunks` and `batch_links` stage at most five and two keys each
+// per stream before dedupe, at most one plan range per item, each range's windows padded
+// to a cache line.
+// A key list may swap with a staging list, so every one is charged the larger.
+fn navBatchBytesBound(chunks: usize, mark_chunks: usize, batch_links: usize, batch_keys: usize) usize {
+    const KeyList = @FieldType(NavGraph, "changed_keys");
+    const PlanTallyList = @FieldType(NavGraph, "plan_tallies");
+    const ranges = @max(1, mark_chunks +| batch_links);
+    const staged = 5 *| mark_chunks +| 2 *| batch_links +| ranges *| (key_window_alignment - 1);
+    const keys = @max(chunks, staged);
+    const changed = @max(chunks, mark_chunks);
+    return 2 *| plan_streams *| KeyList.growCapacity(keys) *| @sizeOf(u64) +|
+        listBytesBound(ChunkBits, changed) +| listBytesBound(u32, changed) +| listBytesBound(i32, changed) +|
+        listBytesBound(PatchInfo, @max(chunks, batch_keys)) +|
+        listBytesBound(FieldElem(NavGraph, "plan_windows"), ranges) +|
+        PlanTallyList.growCapacity(ranges) *| @sizeOf(FieldElem(NavGraph, "plan_tallies"));
+}
+
+/// An over-estimate of `NavGrid.residentBytes` summed over `levels` levels of `chunks`
+/// chunks each, whose block needs (mixed chunks, plus the fresh blocks a batch takes before
+/// it frees the old) sum to `block_need`: the directories, and each level's block pool and
+/// free list at their worst growth (`growPool`: the pool at most twice its need, the free
+/// list exactly the pool).
+pub fn navGridStorageBytesBound(levels: usize, chunks: usize, block_need: usize) usize {
+    const blocks = 2 *| block_need;
+    return levels *| listBytesBound(u32, chunks) +| blocks *| (cell_block_bytes +| @sizeOf(u32));
+}
+
+/// What sizes a world's reachability for `connectivityStorageBytesBound`.
+pub const ConnectivityStorageShape = struct {
+    /// The most live node rows over every level.
+    nodes: usize,
+    /// The chunks one level build patches and the most nodes it gathers.
+    level_chunks: usize,
+    level_nodes: usize,
+    /// The patch keys and new links of the largest marks batch.
+    batch_keys: usize,
+    batch_links: usize,
+    border_stride: usize,
+    /// The most link endpoints one chunk holds.
+    chunk_endpoints: usize,
+    links: usize,
+    oneway_links: usize,
+    /// The most terminals one H-component holds, clamped to every terminal.
+    system_terminals: usize = std.math.maxInt(usize),
+    participants: usize,
+};
+
+/// An over-estimate of `Connectivity.residentBytes` for `shape`.
+/// Every list is charged at std's growth past the most it is reserved for, every pool at its
+/// doubling past its need. Staging is the larger of one level build and the largest marks
+/// batch, per list: a key holds at most `border_stride + chunk_endpoints` nodes. Comps and
+/// roots cover the live nodes plus a batch's fresh ids; the closure covers two terminals per
+/// one-way link, H-components of at most `system_terminals` each, its blocks and a batch's
+/// tail at three times the live blocks plus a span per piece, and a batch's closure staging at
+/// its worst.
+pub fn connectivityStorageBytesBound(shape: ConnectivityStorageShape) usize {
+    const C = Connectivity;
+    const node_bound = shape.border_stride + shape.chunk_endpoints;
+    const marks_keys = shape.batch_keys;
+    const build_keys = shape.level_chunks;
+    const keys = @max(marks_keys, build_keys);
+    const items = @max(marks_keys +| shape.batch_links, build_keys);
+    // Every key's border window, and the link endpoints its chunks hold: at most
+    // `chunk_endpoints` each and every endpoint of the world in all.
+    const endpoints = 2 *| shape.links;
+    const marks_nodes = marks_keys *| shape.border_stride +| @min(marks_keys *| shape.chunk_endpoints, endpoints);
+    const build_endpoints = @min(build_keys *| shape.chunk_endpoints, endpoints);
+    // A build gathers a row per label (at most its nodes) and an edge per border run and
+    // endpoint of every chunk.
+    const build_labels = @min(shape.level_nodes, build_keys *| shape.border_stride +| build_endpoints);
+    const build_edges = build_keys *| shape.border_stride +| build_endpoints;
+    // A marks key gathers its old labels and new nodes as rows, an edge per node, and seeds
+    // each node.
+    const seeds = @max(marks_nodes, build_endpoints);
+    const rows = @max(2 *| marks_nodes, build_labels);
+    const edges = @max(marks_nodes +| shape.batch_links, build_edges);
+    const marks_elements = 5 *| marks_nodes +| shape.batch_links;
+    const build_elements = build_labels +| 2 *| build_endpoints +| 1;
+    const elements = @max(marks_elements, build_elements);
+    // Elements plus the roots of kept elements share the map.
+    const map_slots = MergeMap.slotCount(2 *| elements) catch std.math.maxInt(usize);
+    const EdgeEntry = FieldElem(C, "seed_edges");
+    const staging = listBytesBound(usize, keys +| 1) +| listBytesBound(u32, keys) +| listBytesBound(EdgeEntry, seeds) +|
+        listBytesBound(bool, keys) +|
+        2 *| (listBytesBound(usize, items +| 1) +| listBytesBound(u32, items)) +|
+        listBytesBound(FieldElem(C, "gather_rows"), rows) +| listBytesBound(EdgeEntry, edges) +|
+        rowsBytesBound(FieldElem(C, "elements"), elements) +| rowsBytesBound(FieldElem(C, "units"), elements) +|
+        rowsBytesBound(FieldElem(C, "sets"), elements) +|
+        rowsBytesBound(FieldElem(C, "families"), elements) +| rowsBytesBound(FieldElem(C, "groups"), elements) +|
+        5 *| listBytesBound(u32, elements) +|
+        map_slots *| (@sizeOf(u64) + 2 * @sizeOf(u32));
+    // A pool doubles past its need and its free list covers it exactly.
+    const ids = 2 *| (shape.nodes +| elements);
+    const pools = ids *| (@sizeOf(FieldElem(C, "comps")) + @sizeOf(u32) + @sizeOf(FieldElem(C, "roots")) + @sizeOf(u32));
+    const flood_window = @max(default_flood_window, default_flood_budget_cap) + node_bound;
+    // A round's items shrink as a node's slack grows: charged at the least slack.
+    const flood_items = flood_window / (1 + shape.border_stride);
+    const table_slots = std.math.ceilPowerOfTwo(usize, 2 * (default_flood_budget_cap + node_bound)) catch std.math.maxInt(usize);
+    const flood = listBytesBound(FieldElem(C, "flood_items"), flood_items) +| listBytesBound(FieldElem(C, "flood_outs"), flood_items) +|
+        listBytesBound(FieldElem(C, "proposals"), flood_window) +| listBytesBound(FieldElem(C, "flood_scratch"), shape.participants) +|
+        shape.participants *| table_slots *| (@sizeOf(u64) + @sizeOf(u32));
+    // Every world link holds a registry entry, one-way or not.
+    const registry = listBytesBound(u32, shape.links);
+    const key_nodes = keys *| shape.border_stride +| @min(keys *| shape.chunk_endpoints, endpoints);
+    return staging +| pools +| flood +| registry +| closureStorageBytesBound(shape, keys, key_nodes);
+}
+
+// The closure's share of `connectivityStorageBytesBound`: its one-way rows, terminal and
+// H-component pools, blocks and tail, and a batch's staging over `keys` keys holding at most
+// `key_nodes` nodes. A batch holds at most every terminal as an old or popped one, every
+// one-way link live or loose, and blocks whose caps sum to twice the terminals.
+fn closureStorageBytesBound(shape: ConnectivityStorageShape, keys: usize, key_nodes: usize) usize {
+    const Closure = @FieldType(Connectivity, "closure");
+    if (shape.oneway_links == 0) return 0;
+    const terminals = 2 *| shape.oneway_links;
+    const system = @max(1, @min(shape.system_terminals, terminals));
+    // A block's cap is a power of two below twice its component's terminals.
+    const cap_max = std.math.ceilPowerOfTwo(usize, 2 *| system) catch std.math.maxInt(usize);
+    const row_words = @max(1, cap_max / 32);
+    const spans = @divCeil(row_words, span_words);
+    const live_words = 2 *| terminals *| (row_words +| 2) +| span_words *| terminals;
+    const blocks = (3 *| live_words +| span_words *| terminals) *| @sizeOf(u32);
+    const registry = rowsBytesBound(FieldElem(Closure, "oneway"), shape.oneway_links);
+    // Terminals pop up to twice the live ones; H-components split into a piece per link.
+    const pools = 2 *| 3 *| terminals *| (@sizeOf(FieldElem(Closure, "terms")) + @sizeOf(u32)) +|
+        2 *| 2 *| terminals *| (@sizeOf(FieldElem(Closure, "hcomps")) + @sizeOf(u32));
+    const staging = 2 *| listBytesBound(usize, keys +| 1) +| 2 *| listBytesBound(u32, keys) +| listBytesBound(FieldElem(Closure, "cand_tallies"), keys) +|
+        listBytesBound(u32, 3 *| key_nodes) +|
+        listBytesBound(FieldElem(Closure, "ow_entries"), @min(keys *| shape.chunk_endpoints, 2 *| shape.links)) +|
+        listBytesBound(u32, terminals) +| rowsBytesBound(FieldElem(Closure, "touched"), terminals) +|
+        listBytesBound(u32, terminals / 16 +| terminals) +| listBytesBound(u32, 2 *| terminals) +|
+        3 *| listBytesBound(u32, terminals) +| listBytesBound(FieldElem(Closure, "resolve_out"), terminals) +|
+        rowsBytesBound(FieldElem(Closure, "slots"), 2 *| terminals) +| rowsBytesBound(FieldElem(Closure, "pieces"), terminals) +|
+        2 *| listBytesBound(u32, terminals) +| listBytesBound(FieldElem(Closure, "freed_indices"), terminals) +|
+        listBytesBound(FieldElem(Closure, "mask_items"), terminals) +|
+        rowsBytesBound(FieldElem(Closure, "apos"), 2 *| terminals) +|
+        listBytesBound(FieldElem(Closure, "copy_items"), 6 *| terminals *| spans) +| listBytesBound(FieldElem(Closure, "round_items"), 3 *| terminals *| spans) +|
+        listBytesBound(usize, 2 *| terminals +| 2) +| listBytesBound(FieldElem(Closure, "residents"), terminals);
+    return registry +| pools +| blocks +| staging;
+}
+
+/// Bytes a connectivity element map's slots hold (allocated capacity).
+fn elementMapResidentBytes(map: anytype) usize {
+    return map.keys.capacity * @sizeOf(u64) + map.values.capacity * @sizeOf(u32) + map.stamps.capacity * @sizeOf(u32);
+}
+
+/// `elementMapResidentBytes` of a `Map` once reserved for at most `limit` keys. Saturates.
+fn elementMapStorageBytesBound(comptime Map: type, limit: usize) usize {
+    const slots = Map.slotCount(limit) catch return std.math.maxInt(usize);
+    return slots *| (@sizeOf(u64) + 2 * @sizeOf(u32));
+}
+
+// Bytes a cache probe table's slots hold (allocated capacity).
+fn probeTableResidentBytes(table: anytype) usize {
+    return table.slots.capacity * @sizeOf(FieldElem(@TypeOf(table.*), "slots"));
+}
+
+// `probeTableResidentBytes` of a `Table` once reserved for at most `capacity` keys: two slots
+// each, exact.
+fn probeTableStorageBytesBound(comptime Table: type, capacity: usize) usize {
+    return capacity *| 2 *| @sizeOf(FieldElem(Table, "slots"));
+}
+
+/// Bytes `set` holds (allocated capacity).
+fn keySetResidentBytes(set: *const KeySet) usize {
+    return probeTableResidentBytes(&set.table);
+}
+
+/// `keySetResidentBytes` once reserved for at most `capacity` keys.
+fn keySetStorageBytesBound(capacity: usize) usize {
+    return probeTableStorageBytesBound(@FieldType(KeySet, "table"), capacity);
+}
+
+/// Bytes `map` holds (allocated capacity).
+fn groupKeyMapResidentBytes(map: *const GroupKeyMap) usize {
+    return probeTableResidentBytes(&map.table);
+}
+
+/// `groupKeyMapResidentBytes` once reserved for at most `capacity` keys.
+fn groupKeyMapStorageBytesBound(capacity: usize) usize {
+    return probeTableStorageBytesBound(@FieldType(GroupKeyMap, "table"), capacity);
+}
+
+/// Bytes `cache`'s probe table, records, keys, free lists, owner logs, stripe and
+/// long-block pages, and pending moves hold (allocated capacity).
+pub fn resultCacheResidentBytes(cache: *const ResultCache) usize {
+    const Core = @FieldType(ResultCache, "core");
+    const core = &cache.core;
+    var bytes = core.slots.capacity * @sizeOf(FieldElem(Core, "slots")) + core.records.capacity * @sizeOf(FieldElem(Core, "records")) +
+        core.keys.capacity * @sizeOf(PathQueryKey) + core.free.capacity * @sizeOf(u32) + core.owner_log.capacity * @sizeOf(OwnerOp) +
+        cache.inline_pages.capacity * @sizeOf([]u32) + cache.long_pages.capacity * @sizeOf([]u32) +
+        cache.free_long_blocks.capacity * @sizeOf(u32) + cache.resize_moves.capacity * @sizeOf(ResizeMove);
+    if (core.owner_log_replacement) |replacement| bytes += replacement.capacity * @sizeOf(OwnerOp);
+    for (cache.inline_pages.items) |page| bytes += page.len * @sizeOf(u32);
+    for (cache.long_pages.items) |page| bytes += page.len * @sizeOf(u32);
+    return bytes;
+}
+
+/// `resultCacheResidentBytes` between resizes for a cache never reserved past `capacity`
+/// entries of `inline_words`-word stripes, holding at most `long_blocks` live long blocks of
+/// `long_block_words` words. Saturates.
+pub fn resultCacheStorageBytesBound(capacity: usize, inline_words: usize, long_block_words: usize, long_blocks: usize) usize {
+    const Core = @FieldType(ResultCache, "core");
+    const inline_shift = caches.pageShift(inline_words);
+    const inline_pages = caches.pageCount(capacity, inline_shift);
+    const long_shift = caches.pageShift(long_block_words);
+    const long_pages = caches.pageCount(@min(long_blocks, capacity), long_shift);
+    const core = capacity *| 2 *| @sizeOf(FieldElem(Core, "slots")) +| listBytesBound(FieldElem(Core, "records"), capacity) +|
+        listBytesBound(PathQueryKey, capacity) +| listBytesBound(u32, capacity) +| listBytesBound(OwnerOp, caches.ops_per_entry *| capacity);
+    const stripes = inline_pages *| (@as(usize, 1) << inline_shift) *| inline_words *| @sizeOf(u32) +| listBytesBound([]u32, inline_pages);
+    const long_pool = long_pages *| (@as(usize, 1) << long_shift) *| long_block_words *| @sizeOf(u32) +| listBytesBound([]u32, long_pages) +|
+        listBytesBound(u32, long_pages *| (@as(usize, 1) << long_shift));
+    return core +| stripes +| long_pool;
+}
+
+// Bytes a crossing scratch's tables and heap hold (allocated capacity).
+fn crossingScratchResidentBytes(scratch: *const CrossingScratch) usize {
+    return scratch.box_slots.len * @sizeOf(CrossingBoxSlot) + scratch.level_slots.len * @sizeOf(CrossingLevelSlot) + scratch.open.capacity * @sizeOf(OpenNode);
+}
+
+// `crossingScratchResidentBytes` once reserved for at most `box_limit` boxes. Saturates.
+fn crossingScratchStorageBytesBound(box_limit: usize) usize {
+    const slots = hashTableSlots(box_limit) catch std.math.maxInt(usize);
+    return slots *| (@sizeOf(CrossingBoxSlot) + @sizeOf(CrossingLevelSlot)) +| listBytesBound(OpenNode, types.openHeapLimit(box_limit));
+}
+
+// Bytes an abstract scratch's table, heap, corridor lists, and crossing scratch hold
+// (allocated capacity).
+fn abstractScratchResidentBytes(scratch: *const AbstractScratch) usize {
+    return scratch.slots.len * @sizeOf(AbstractSlot) + scratch.open.capacity * @sizeOf(OpenNode) +
+        scratch.corridor.capacity * @sizeOf(usize) + scratch.corridor_link.capacity * @sizeOf(bool) + crossingScratchResidentBytes(&scratch.crossing);
+}
+
+// `abstractScratchResidentBytes` once reserved for at most `max_abstract_nodes`. Saturates.
+fn abstractScratchStorageBytesBound(max_abstract_nodes: usize) usize {
+    const slots = hashTableSlots(max_abstract_nodes) catch std.math.maxInt(usize);
+    return slots *| @sizeOf(AbstractSlot) +| listBytesBound(OpenNode, types.openHeapLimit(max_abstract_nodes)) +|
+        listBytesBound(usize, max_abstract_nodes) +| listBytesBound(bool, max_abstract_nodes) +|
+        crossingScratchStorageBytesBound(types.crossingBoxBudget(max_abstract_nodes));
+}
+
+/// Bytes `scratch`'s abstract search and stitched path hold (allocated capacity).
+pub fn corridorScratchResidentBytes(scratch: *const CorridorScratch) usize {
+    return abstractScratchResidentBytes(&scratch.abstract) + scratch.stitched.capacity * @sizeOf(StitchedCell);
+}
+
+/// `corridorScratchResidentBytes` once reserved at caps no larger than `max_abstract_nodes`
+/// and `max_stitched_path_cells`. Saturates.
+pub fn corridorScratchStorageBytesBound(max_abstract_nodes: usize, max_stitched_path_cells: usize) usize {
+    return abstractScratchStorageBytesBound(max_abstract_nodes) +| listBytesBound(StitchedCell, max_stitched_path_cells +| 1);
+}
+
+/// Bytes `scratch`'s search table, heap, path scratch, and corridor scratch hold (allocated
+/// capacity).
+pub fn searchScratchResidentBytes(scratch: *const SearchScratch) usize {
+    return scratch.slots.len * @sizeOf(SearchSlot) + scratch.open.capacity * @sizeOf(OpenNode) +
+        scratch.path_scratch.capacity * @sizeOf(u32) + corridorScratchResidentBytes(&scratch.corridor);
+}
+
+/// `searchScratchResidentBytes` once reserved at budgets no larger than these. Saturates.
+pub fn searchScratchStorageBytesBound(max_explored_nodes: usize, max_abstract_nodes: usize, max_stitched_path_cells: usize) usize {
+    const slots = hashTableSlots(max_explored_nodes) catch std.math.maxInt(usize);
+    return slots *| @sizeOf(SearchSlot) +| listBytesBound(OpenNode, types.openHeapLimit(max_explored_nodes)) +|
+        listBytesBound(u32, @max(@as(usize, 1), max_explored_nodes)) +|
+        corridorScratchStorageBytesBound(max_abstract_nodes, max_stitched_path_cells);
+}
+
+/// Bytes `table`'s map, entries, and scan staging hold (allocated capacity).
+pub fn goalTableResidentBytes(table: *const GoalTable) usize {
+    return elementMapResidentBytes(&table.map) + table.refs.capacity * @sizeOf(u64) + table.live.capacity * @sizeOf(u32) +
+        table.scan_refs.capacity * @sizeOf(u64) + table.scan_tallies.capacity * @sizeOf(FieldElem(GoalTable, "scan_tallies"));
+}
+
+/// `goalTableResidentBytes` once reserved for at most `limit` intents. Saturates.
+pub fn goalTableStorageBytesBound(limit: usize) usize {
+    const ScanTally = FieldElem(GoalTable, "scan_tallies");
+    return elementMapStorageBytesBound(@FieldType(GoalTable, "map"), limit) +| @FieldType(GoalTable, "refs").growCapacity(limit) *| @sizeOf(u64) +|
+        @FieldType(GoalTable, "live").growCapacity(limit) *| @sizeOf(u32) +| @FieldType(GoalTable, "scan_refs").growCapacity(limit) *| @sizeOf(u64) +|
+        @FieldType(GoalTable, "scan_tallies").growCapacity(maxRangeCount(limit, scan_range_alignment_items)) *| @sizeOf(ScanTally);
+}
+
+/// Bytes `field`'s pool and directory hold (allocated capacity).
+pub fn groupFieldResidentBytes(field: *const GroupField) usize {
+    return @FieldType(GroupField, "blocks").capacityInBytes(field.blocks.capacity) + field.directory.len * @sizeOf(FieldElem(GroupField, "directory"));
+}
+
+/// An over-estimate of `groupFieldResidentBytes` for a field capped at `max_cells` cells on
+/// a level of `level_chunks` chunks: the pool never grows past what a build can claim, and
+/// its directory is sized to the pool. A directory too wide to build saturates.
+pub fn groupFieldStorageBytesBound(max_cells: usize, level_chunks: usize) usize {
+    const blocks = @min(@max(1, max_cells), level_chunks);
+    const rows = hashTableSlots(blocks) catch return std.math.maxInt(usize);
+    return blocks *| @FieldType(GroupField, "blocks").capacityInBytes(1) +| rows *| @sizeOf(FieldElem(GroupField, "directory"));
 }

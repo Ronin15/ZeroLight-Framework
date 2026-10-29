@@ -357,7 +357,7 @@ fn makeMinimalWorld() WorldSystem {
 
 fn spawnCrate(data: *DataSystem, x: f32, y: f32, size: f32, hp: u8) !EntityId {
     const entity = try data.createEntity();
-    errdefer _ = data.destroyEntity(entity);
+    errdefer data.destroyCreatedEntity(entity);
     try data.setMovementBody(entity, .{
         .position = .{ .x = x, .y = y },
         .previous_position = .{ .x = x, .y = y },
@@ -653,7 +653,7 @@ test "DestructibleController does not dual-write navigation or movement intents"
     defer frame.deinit();
     try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
     try frame.reserveStreams(4, 4, 4, 0, 0, 4);
-    try frame.reserveNavigationIntents(1, 1);
+    try frame.navigation_intents.reserve(1, 1);
     frame.beginStep();
     try frame.appendActionIntent(.{
         .entity = EntityId.invalid,

@@ -68,12 +68,12 @@ rest is production code, doc comments, and helpers):
 ### Architecture notes
 
 - File moves and splits only: no behavior, order, layout, or allocation change;
-  identical results, serial and threaded (`.claude/rules/simulation.md`
+  identical results, serial and threaded (`.grok/rules/simulation.md`
   § Determinism). Ownership stays in `src/game/systems/pathfinding/`
   (`docs/architecture.md` § Source Layout).
-- Tests stay beside the code they cover (`.claude/rules/tests-benchmarks.md`);
+- Tests stay beside the code they cover (`.grok/rules/tests-benchmarks.md`);
   shared fixtures stay in `test_support.zig`.
-- Imports are direct, with no bridge aliases (`.claude/rules/zig-style.md`).
+- Imports are direct, with no bridge aliases (`.grok/rules/zig-style.md`).
 - A seam is one a design pass finds in the code as landed, never a target line
   count.
 

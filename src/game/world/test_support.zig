@@ -15,6 +15,8 @@ const TileId = @import("system.zig").TileId;
 const WorldBuildConfig = @import("system.zig").WorldBuildConfig;
 const DenseCellWrite = @import("edit.zig").DenseCellWrite;
 const DenseChunkWrites = @import("edit.zig").DenseChunkWrites;
+const cellCoordOf = @import("edit.zig").cellCoordOf;
+const CellCoord = @import("system.zig").CellCoord;
 const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
 const default_chunk_size_tiles = @import("system.zig").default_chunk_size_tiles;
 const invalid_tile_id = @import("system.zig").invalid_tile_id;
@@ -82,7 +84,7 @@ pub const TestGpuStore = struct {
 /// Whether dense `layer`'s tile at (x, y) blocks movement on its own (out-of-range cells
 /// and layers block), apart from the level's composed bits.
 pub fn denseTileBlocksMovement(world: *const WorldSystem, layer: usize, x: u16, y: u16) bool {
-    if (layer >= world.denseLayerCount() or x >= world.width or y >= world.height) return true;
+    if (layer >= world.dense_layers.len or x >= world.width or y >= world.height) return true;
     const tile: usize = world.denseTile(layer, x, y);
     const flags = world.catalog_flags.items;
     return tile < flags.len and flags[tile].blocks_movement;
@@ -196,6 +198,32 @@ pub fn expectGpuStoreMatches(world: *const WorldSystem, gpu: *const TestGpuStore
     };
 }
 
+/// Tile-cell coordinate of sparse tile `index`. Valid until the next sparse tile removal.
+pub fn sparseTileCellCoord(world: *const WorldSystem, index: usize) CellCoord {
+    return cellCoordOf(world, world.sparse_tiles.items(.cell_index)[index]);
+}
+
+/// Blocks holding cells in a `DenseLayerStore` (or a pointer to one): its pool less
+/// released blocks.
+pub fn liveBlockCount(store: anytype) usize {
+    return store.fills.items.len - store.free.items.len;
+}
+
+/// Slots holding bits in a `ChunkBitsStore` (or a pointer to one).
+pub fn liveSlotCount(bits: anytype) usize {
+    return bits.bits.items.len - bits.free.items.len;
+}
+
+/// Blocked cells of `chunk` in a `ChunkBitsStore` (or a pointer to one): 0 open, every
+/// cell blocked, else its block's count.
+pub fn chunkBlockedCount(bits: anytype, geom: ChunkGeometry, chunk: u32) u32 {
+    return switch (bits.form(chunk)) {
+        .open => 0,
+        .blocked => geom.extent(chunk).cellCount(),
+        .mixed => bits.counts.items[bits.dir[chunk]],
+    };
+}
+
 /// Every sparse row is listed exactly once, in its own (level, chunk) list, linked both
 /// ways, and the lists list nothing else.
 pub fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
@@ -209,7 +237,7 @@ pub fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
             while (row != no_sparse_tile) : (row = rows.items(.chunk_next)[row]) {
                 try std.testing.expect(row < rows.len);
                 try std.testing.expectEqual(level, rows.items(.level_index)[row]);
-                const coord = world.sparseTileCellCoord(row);
+                const coord = sparseTileCellCoord(world, row);
                 try std.testing.expectEqual(chunk, geom.chunkOf(coord.x, coord.y));
                 try std.testing.expectEqual(previous, rows.items(.chunk_prev)[row]);
                 previous = row;
@@ -224,14 +252,14 @@ pub fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
 /// Brute-force composed blocked bit: OR over every dense layer on the level, then
 /// every sparse tile on the level at this cell.
 pub fn bruteForceLevelBlocked(world: *const WorldSystem, level: u16, x: u16, y: u16) bool {
-    for (0..world.denseLayerCount()) |layer| {
+    for (0..world.dense_layers.len) |layer| {
         if (world.denseLayerLevel(layer) != level) continue;
         if (world.flagsFor(world.denseTile(layer, x, y)).blocks_movement) return true;
     }
     for (world.sparse_tiles.items(.level_index), 0..) |row_level, sparse_index| {
         if (row_level != level) continue;
-        const cell = world.sparseTileCellCoord(sparse_index);
-        if (cell.x == x and cell.y == y and world.sparseTileBlocksMovement(sparse_index)) return true;
+        const cell = sparseTileCellCoord(world, sparse_index);
+        if (cell.x == x and cell.y == y and world.sparse_tiles.items(.flags)[sparse_index].blocks_movement) return true;
     }
     return false;
 }
@@ -280,15 +308,15 @@ test "the demo world paints the same tiles at every chunk edge" {
     try std.testing.expectEqual(demo.width, fixture.width);
     try std.testing.expectEqual(demo.height, fixture.height);
     try std.testing.expectEqual(demo.levelCount(), fixture.levelCount());
-    try std.testing.expectEqual(demo.denseLayerCount(), fixture.denseLayerCount());
-    for (0..demo.denseLayerCount()) |layer| {
+    try std.testing.expectEqual(demo.dense_layers.len, fixture.dense_layers.len);
+    for (0..demo.dense_layers.len) |layer| {
         for (0..demo.height) |y| for (0..demo.width) |x| {
             try std.testing.expectEqual(demo.denseTile(layer, @intCast(x), @intCast(y)), fixture.denseTile(layer, @intCast(x), @intCast(y)));
         };
     }
-    try std.testing.expectEqual(demo.sparseTileCount(), fixture.sparseTileCount());
-    for (0..demo.sparseTileCount()) |index| {
-        try std.testing.expectEqual(demo.sparseTileCellCoord(index), fixture.sparseTileCellCoord(index));
-        try std.testing.expectEqual(demo.sparseTileBlocksMovement(index), fixture.sparseTileBlocksMovement(index));
+    try std.testing.expectEqual(demo.sparse_tiles.len, fixture.sparse_tiles.len);
+    for (0..demo.sparse_tiles.len) |index| {
+        try std.testing.expectEqual(sparseTileCellCoord(&demo, index), sparseTileCellCoord(&fixture, index));
+        try std.testing.expectEqual(demo.sparse_tiles.items(.flags)[index].blocks_movement, fixture.sparse_tiles.items(.flags)[index].blocks_movement);
     }
 }

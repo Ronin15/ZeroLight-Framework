@@ -3,7 +3,6 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const sdl = @import("../platform/sdl.zig").c;
 const BatchStats = @import("thread_system.zig").BatchStats;
@@ -11,18 +10,15 @@ const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 
 const log = logging.perf;
 
-// Instrumented in Debug and ReleaseSafe; fully compiled out of
-// ReleaseFast/ReleaseSmall (zero-sized types, no StageTimer, no counters).
+// The build's `perf_counters` switch: on for Debug and ReleaseSafe games and tests and for
+// every bench build; off compiles the log out (zero-sized types, no StageTimer, no counters).
 //
 // Debug (`dev` / `run`): fix cycles — iterate code and behavior. Perf lines may
 // appear but are not the soak authority (Debug is heavily pessimistic).
 // ReleaseSafe: intentional soaks for ranking and absolute scale numbers (slow
 // compile — not every edit). Emit uses `log.debug`; both modes' `auto` log
 // level includes debug.
-pub const enabled = switch (builtin.mode) {
-    .debug, .safe => true,
-    .fast, .small => false,
-};
+pub const enabled = @import("build_options").perf_counters;
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FrameResult = enum {
@@ -54,8 +50,6 @@ pub const Metric = enum {
     sprite_draw_groups,
     sprite_command_overflow_grows,
     ai_entities,
-    ai_intents,
-    ai_navigation_intents,
     ai_separation_candidate_checks,
     ai_separation_neighbor_samples,
     perception_observers,
@@ -115,7 +109,6 @@ pub const Metric = enum {
     collision_candidate_pairs,
     collision_contacts,
     collision_broadphase_simd_groups,
-    collision_full_sorts,
     collision_response_contacts,
     collision_response_intents,
     collision_response_triggers,
@@ -204,15 +197,10 @@ pub const Timing = enum {
     pathfinding_publish,
     pathfinding_resize,
     // Steering prepare stages before the avoidance batch: wall time of selection, of the
-    // agents stage with its rekey, of directions, and of the agent grid, each inline or
-    // dispatched to workers.
+    // agents stage with its rekey, and of directions, each inline or dispatched to workers.
     steering_select,
     steering_snapshot,
     steering_directions,
-    steering_grid,
-    // Collision update breakdown before/around the broadphase batch.
-    collision_gather,
-    collision_sort,
     state_transitions,
     audio_drain,
     loading_build,
@@ -222,33 +210,130 @@ pub const Timing = enum {
     render_end_frame,
 };
 
+/// The batch stages the log records: each change path's cost-driver stage only.
+/// Every other stage's batch is bench output (`BenchBatchStage`).
 pub const BatchStage = enum {
+    // The per-step spatial index build's sort, the build's cost driver.
     spatial_index_build,
-    perception,
-    ai_separation,
-    ai_intent,
-    steering,
-    path_solve,
+    // Path requests: the request intake, and the pathfinding update's registry flush, shrinks
+    // included (not the eviction flush).
     path_intake,
-    // The pathfinding update's registry flush, shrinks included; not the eviction flush.
     path_registry_flush,
-    // The pathfinding update's resize copy: a capacity shrink's byte moves, its cost driver.
+    // Capacity resize: the pathfinding update's shrink copy, its byte moves.
     path_resize_copy,
-    movement,
-    chunk_derive,
-    collision_broadphase,
-    collision_narrowphase,
-    static_collider_splice,
+    // A static add, move, or destroy, one or many in a step: the commit seam's collider sync
+    // plan (the changed statics' reads, lanes, and decisions), the sync's largest stage.
+    static_collider_plan,
+    // A static add, move, or destroy next to stored triggers: the seam trigger patch's page
+    // rewrite.
+    collision_trigger_rewrite,
+    // A movement-row removal or allow crossing with stored triggers: the step's
+    // stored-trigger refresh.
+    collision_trigger_refresh,
+    // Dig, build, and dense terrain change: the nav reaction's chunk remask, its
+    // connectivity flood (rounds summed, the removal-shaped share), its one-way closure rows
+    // (round 0 and its rounds summed), and the path-cache eviction halo walk.
     nav_remask,
-    // The nav reaction's connectivity flood, its rounds summed: the removal-shaped share of a
-    // dig, fill, or dense terrain change.
     nav_connect,
-    // The nav reaction's one-way closure rows, round 0 and its rounds summed: the cost of a
-    // change to a one-way system.
     nav_closure,
     nav_evict,
+};
+
+/// Stages whose batch timing is bench output only. A bench that sets a `StepBatches` sink on
+/// its `Context` (`step_batches`) receives them; the log never records them.
+pub const BenchBatchStage = enum {
+    // The spatial index build's bucket and link stages around its logged sort.
+    spatial_index_bucket,
+    spatial_index_link,
+    // Perception's observer gather and its sense pass.
+    perception_gather,
+    perception,
+    // Memory's think-row translate, member order, visibility, and decay stages.
+    ai_memory_gather,
+    ai_memory_order,
+    ai_memory_visible,
+    ai_memory_decay,
+    affect,
+    // AI's think-row gather, separation, and intent passes.
+    ai_gather,
+    ai_separation,
+    ai_intent,
+    // The goal resolve's intent scan and blocked-goal projection.
+    path_goal_scan,
+    path_goal_project,
+    // Steering's prepare stages, the avoidance pass (`steering`), then the movement-intent
+    // order place and sort.
+    steering_agents,
+    steering_select_resolve,
+    steering_select_claim,
+    steering_directions,
+    steering,
+    steering_intent_order_place,
+    steering_intent_order_sort,
+    // The pathfinding update's registry flush count, a shrink's owner rename, the group-field
+    // advance and begin passes, and the publish copy, beside its logged intake and flush.
+    path_registry_flush_count,
+    path_registry_rename,
+    path_group_field_advance,
+    path_group_field_begin,
+    path_solve,
+    path_publish_copy,
+    apply_intents,
+    movement,
+    chunk_derive,
+    // The per-step scope passes: the AI halo gather, the think-set compaction, the collision
+    // gather, and the tier policy.
+    scope_ai_gather,
+    scope_cognition,
+    scope_collision_gather,
+    scope_tier_policy,
+    // The bounds clamp and solid-tile gate pass.
+    world_gate,
+    // Plane traversal's entry gather.
+    plane_entry,
+    // Collision response's contact gather and apply.
+    collision_response_gather,
+    collision_response_apply,
+    // The collision detect fill and sort, inline or on workers. An untimed batch with no
+    // workers is not a sample.
+    collision_fill,
+    collision_sort,
+    collision_broadphase,
+    collision_narrowphase,
+    // Dynamic x static overlap query.
+    collision_static_pairs,
+    // Debug stored-rect compare, when that batch ran.
+    collision_static_rect,
+    // The dynamic x static pairs' banded place and sort, when the step has any.
+    collision_static_place,
+    collision_static_sort,
+    // The stored-trigger emission's merge into the contact stream.
+    collision_trigger_emit,
+    // The commit seam's stored-trigger stages before the patch plan: the query over the
+    // changes, and the insert place and sort.
+    collision_trigger_query,
+    collision_trigger_insert_place,
+    collision_trigger_insert_sort,
     particles,
-    sprite_prep,
+    // The commit seam's collider sync stages after its plan: row claims and touch emission,
+    // the grouped touches, the row writes, the chunk-list splice, and the directory install.
+    static_collider_touch,
+    static_collider_group,
+    static_collider_apply,
+    static_collider_rewrite,
+    static_collider_install,
+};
+
+/// Top-level stage timers that are bench output only: the scope gathers, the think-set
+/// order, plane traversal, tier policy, and the action-intent consumer. A bench that sets a
+/// `StepBatches` sink on its `Context` receives them; the log never records them.
+pub const BenchTiming = enum {
+    pipeline_scope_gather,
+    pipeline_cognition_order,
+    pipeline_collision_scope,
+    pipeline_plane_traversal,
+    pipeline_tier_policy,
+    pipeline_action_react,
 };
 
 pub const FrameSample = struct {
@@ -262,11 +347,31 @@ pub const FrameSample = struct {
 const metric_count = @typeInfo(Metric).@"enum".field_names.len;
 const timing_count = @typeInfo(Timing).@"enum".field_names.len;
 const batch_stage_count = @typeInfo(BatchStage).@"enum".field_names.len;
+const bench_batch_stage_count = @typeInfo(BenchBatchStage).@"enum".field_names.len;
+const bench_timing_count = @typeInfo(BenchTiming).@"enum".field_names.len;
 
 pub const RuntimePerfLog = if (enabled) EnabledRuntimePerfLog else DisabledRuntimePerfLog;
 
+/// A bench's sink for the step's bench-only batches and stage timers, aggregated like the
+/// log's and indexed by `BenchBatchStage` and `BenchTiming`.
+pub const StepBatches = if (enabled) struct {
+    batches: [bench_batch_stage_count]BatchAggregate = @splat(.{}),
+    timings: [bench_timing_count]TimingAggregate = @splat(.{}),
+
+    fn record(self: *StepBatches, stage: BenchBatchStage, stats: BatchStats) void {
+        if (isEmptyBatch(stats)) return;
+        self.batches[@backingInt(stage)].record(stats);
+    }
+
+    fn recordTiming(self: *StepBatches, timing: BenchTiming, duration_ns: u64) void {
+        self.timings[@backingInt(timing)].record(duration_ns);
+    }
+} else struct {};
+
 pub const Context = if (enabled) struct {
     logger: ?*RuntimePerfLog = null,
+    // Set only by a bench census; the game binds the log alone.
+    step_batches: ?*StepBatches = null,
 
     pub fn bind(logger: *RuntimePerfLog) Context {
         return .{ .logger = logger };
@@ -291,6 +396,16 @@ pub const Context = if (enabled) struct {
     pub fn recordBatch(self: Context, stage: BatchStage, stats: BatchStats) void {
         if (self.logger) |logger| logger.recordBatch(stage, stats);
     }
+
+    /// Reaches only a bound `StepBatches` sink; the log never records it.
+    pub fn recordBenchBatch(self: Context, stage: BenchBatchStage, stats: BatchStats) void {
+        if (self.step_batches) |sink| sink.record(stage, stats);
+    }
+
+    /// Reaches only a bound `StepBatches` sink; the log never records it.
+    pub fn recordBenchTiming(self: Context, timing: BenchTiming, duration_ns: u64) void {
+        if (self.step_batches) |sink| sink.recordTiming(timing, duration_ns);
+    }
 } else struct {
     pub fn bind(_: *RuntimePerfLog) Context {
         return .{};
@@ -300,12 +415,16 @@ pub const Context = if (enabled) struct {
     pub fn recordMetricMax(_: Context, _: Metric, _: u64) void {}
     pub fn recordTiming(_: Context, _: Timing, _: u64) void {}
     pub fn recordBatch(_: Context, _: BatchStage, _: BatchStats) void {}
+    pub fn recordBenchBatch(_: Context, _: BenchBatchStage, _: BatchStats) void {}
+    pub fn recordBenchTiming(_: Context, _: BenchTiming, _: u64) void {}
 };
 
 comptime {
     if (!enabled) {
         std.debug.assert(@sizeOf(RuntimePerfLog) == 0);
         std.debug.assert(@sizeOf(Context) == 0);
+        std.debug.assert(@sizeOf(StepBatches) == 0);
+        std.debug.assert(@sizeOf(BenchStageTimer) == 0);
     }
 }
 
@@ -341,6 +460,28 @@ pub const StageTimer = if (enabled) struct {
         return 0;
     }
     pub fn stop(_: StageTimer, _: Context, _: Timing) void {}
+};
+
+// A `BenchTiming` stage's wall-clock timer: it reads the clock only when `perf` has a bench
+// sink bound, so a game build pays one null check per stage. Zero-sized when perf logging is
+// disabled.
+pub const BenchStageTimer = if (enabled) struct {
+    start_ns: ?u64,
+
+    pub fn start(perf: Context) BenchStageTimer {
+        return .{ .start_ns = if (perf.step_batches != null) sdl.SDL_GetTicksNS() else null };
+    }
+
+    pub fn stop(self: BenchStageTimer, perf: Context, timing: BenchTiming) void {
+        const start_ns = self.start_ns orelse return;
+        const now = sdl.SDL_GetTicksNS();
+        perf.recordBenchTiming(timing, if (now > start_ns) now - start_ns else 0);
+    }
+} else struct {
+    pub fn start(_: Context) BenchStageTimer {
+        return .{};
+    }
+    pub fn stop(_: BenchStageTimer, _: Context, _: BenchTiming) void {}
 };
 
 const DisabledRuntimePerfLog = struct {
@@ -380,7 +521,7 @@ const EnabledRuntimePerfLog = struct {
     }
 
     pub fn recordBatch(self: *EnabledRuntimePerfLog, stage: BatchStage, stats: BatchStats) void {
-        if (stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0) return;
+        if (isEmptyBatch(stats)) return;
         self.batches[@backingInt(stage)].record(stats);
     }
 
@@ -409,7 +550,6 @@ const EnabledRuntimePerfLog = struct {
         self.recordMetric(.sprite_vertices, stats.vertex_count);
         self.recordMetric(.sprite_draw_groups, stats.draw_group_count);
         self.recordMetric(.sprite_command_overflow_grows, stats.command_overflow_grows);
-        self.recordBatch(.sprite_prep, stats.batch);
     }
 
     fn reset(self: *EnabledRuntimePerfLog, now_ns: u64) void {
@@ -585,9 +725,8 @@ const EnabledRuntimePerfLog = struct {
         const steering_select_timing = self.timingValue(.steering_select);
         const steering_snapshot_timing = self.timingValue(.steering_snapshot);
         const steering_directions_timing = self.timingValue(.steering_directions);
-        const steering_grid_timing = self.timingValue(.steering_grid);
         log.debug(
-            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3} grid_avg_ms={d:.3} grid_max_ms={d:.3}",
+            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(steering_select_timing.averageNs()),
@@ -596,21 +735,6 @@ const EnabledRuntimePerfLog = struct {
                 millis(steering_snapshot_timing.max_ns),
                 millis(steering_directions_timing.averageNs()),
                 millis(steering_directions_timing.max_ns),
-                millis(steering_grid_timing.averageNs()),
-                millis(steering_grid_timing.max_ns),
-            },
-        );
-        const collision_gather_timing = self.timingValue(.collision_gather);
-        const collision_sort_timing = self.timingValue(.collision_sort);
-        log.debug(
-            "perf {d:.1}s collision_setup gather_avg_ms={d:.3} gather_max_ms={d:.3} sort_avg_ms={d:.3} sort_max_ms={d:.3} full_sorts={}",
-            .{
-                elapsed_s,
-                millis(collision_gather_timing.averageNs()),
-                millis(collision_gather_timing.max_ns),
-                millis(collision_sort_timing.averageNs()),
-                millis(collision_sort_timing.max_ns),
-                self.metricValue(.collision_full_sorts),
             },
         );
         log.debug(
@@ -653,13 +777,11 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} destructibles_destroyed={} destructibles_hit={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
+            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} destructibles_destroyed={} destructibles_hit={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
             .{
                 elapsed_s,
                 self.metricValue(.ai_entities),
                 averagePer(self.metricValue(.ai_entities), update_count),
-                self.metricValue(.ai_intents),
-                self.metricValue(.ai_navigation_intents),
                 self.metricValue(.steering_selected_intents),
                 self.metricValue(.steering_movement_intents),
                 self.metricValue(.movement_bodies),
@@ -763,7 +885,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s steering path_requests={} available={} pending={} unavailable={} replans={} unavailable_backoff={} stuck={} agent_samples={} obstacle_samples={} agent_checks={} obstacle_checks={} ai_sep_checks={} ai_sep_samples={} collision_simd_groups={} full_sorts={}",
+            "perf {d:.1}s steering path_requests={} available={} pending={} unavailable={} replans={} unavailable_backoff={} stuck={} agent_samples={} obstacle_samples={} agent_checks={} obstacle_checks={} ai_sep_checks={} ai_sep_samples={} collision_simd_groups={}",
             .{
                 elapsed_s,
                 self.metricValue(.steering_path_requests),
@@ -780,7 +902,6 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.ai_separation_candidate_checks),
                 self.metricValue(.ai_separation_neighbor_samples),
                 self.metricValue(.collision_broadphase_simd_groups),
-                self.metricValue(.collision_full_sorts),
             },
         );
 
@@ -842,6 +963,9 @@ const TimingAggregate = struct {
 const BatchAggregate = struct {
     calls: u64 = 0,
     items: u64 = 0,
+    // The fewest and most items one call carried; zero before the first call.
+    min_items: u64 = 0,
+    max_items: u64 = 0,
     ranges: u64 = 0,
     inline_calls: u64 = 0,
     threaded_calls: u64 = 0,
@@ -859,6 +983,8 @@ const BatchAggregate = struct {
     max_active_worker_threads: usize = 0,
 
     fn record(self: *BatchAggregate, stats: BatchStats) void {
+        self.min_items = if (self.calls == 0) stats.item_count else @min(self.min_items, stats.item_count);
+        self.max_items = @max(self.max_items, stats.item_count);
         self.calls += 1;
         self.items += stats.item_count;
         self.ranges += stats.range_count;
@@ -893,6 +1019,11 @@ const BatchAggregate = struct {
     }
 };
 
+// A stage that did not run this step.
+fn isEmptyBatch(stats: BatchStats) bool {
+    return stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0;
+}
+
 fn millis(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
 }
@@ -907,47 +1038,93 @@ fn averagePer(total: u64, count: u64) f64 {
 }
 
 test "runtime performance log accumulates frame samples until interval" {
-    if (!enabled) return error.SkipZigTest;
-
-    var perf = RuntimePerfLog.init(0);
-    perf.recordFrame(interval_ns / 2, .{
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    log_under_test.recordFrame(interval_ns / 2, .{
         .frame_delta_ns = 16 * std.time.ns_per_ms,
         .fixed_updates = 1,
         .hit_update_cap = false,
         .result = .submitted,
     });
 
-    try std.testing.expectEqual(@as(u64, 1), perf.frames);
-    try std.testing.expectEqual(@as(u64, 1), perf.metricValue(.submitted_frames));
-    try std.testing.expectEqual(@as(u64, 1), perf.metricValue(.fixed_updates));
-    try std.testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), perf.timingValue(.frame_interval).max_ns);
+    try std.testing.expectEqual(@as(u64, 1), log_under_test.frames);
+    try std.testing.expectEqual(@as(u64, 1), log_under_test.metricValue(.submitted_frames));
+    try std.testing.expectEqual(@as(u64, 1), log_under_test.metricValue(.fixed_updates));
+    try std.testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), log_under_test.timingValue(.frame_interval).max_ns);
 }
 
 test "runtime performance log reset clears accumulators" {
-    if (!enabled) return error.SkipZigTest;
-
-    var perf = RuntimePerfLog.init(0);
-    perf.recordMetric(.sdl_events, 3);
-    perf.recordTiming(.app_tick, 12);
-    perf.recordTiming(.gameplay_update, 8);
-    perf.recordBatch(.movement, .{
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    log_under_test.recordMetric(.sdl_events, 3);
+    log_under_test.recordTiming(.app_tick, 12);
+    log_under_test.recordTiming(.gameplay_update, 8);
+    log_under_test.recordBatch(.nav_remask, .{
         .item_count = 16,
         .range_count = 1,
         .batch_duration_ns = 100,
         .ran_inline = true,
     });
-    perf.recordFrame(interval_ns / 2, .{
+    log_under_test.recordFrame(interval_ns / 2, .{
         .frame_delta_ns = 16 * std.time.ns_per_ms,
         .fixed_updates = 1,
         .hit_update_cap = true,
         .result = .submitted,
     });
 
-    perf.reset(interval_ns);
+    log_under_test.reset(interval_ns);
 
-    try std.testing.expectEqual(@as(u64, 0), perf.frames);
-    try std.testing.expectEqual(@as(u64, 0), perf.metricValue(.sdl_events));
-    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.app_tick).count);
-    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.gameplay_update).count);
-    try std.testing.expectEqual(@as(u64, 0), perf.batchValue(.movement).calls);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.frames);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.metricValue(.sdl_events));
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.timingValue(.app_tick).count);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.timingValue(.gameplay_update).count);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.batchValue(.nav_remask).calls);
+}
+
+test "a bench-only batch reaches a bound step sink and never the log" {
+    // With the log compiled out, the sink and the context hold nothing.
+    if (comptime !enabled) {
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(StepBatches));
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(Context));
+        return;
+    }
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    var sink = StepBatches{};
+    const stats = BatchStats{ .item_count = 16, .range_count = 2, .batch_duration_ns = 100, .ran_inline = false, .active_worker_threads = 1 };
+    const unbound = Context.bind(&log_under_test);
+    try std.testing.expect(unbound.step_batches == null);
+    unbound.recordBenchBatch(.movement, stats);
+    const bound = Context{ .logger = &log_under_test, .step_batches = &sink };
+    bound.recordBenchBatch(.movement, stats);
+    bound.recordBenchBatch(.steering, .{});
+    try std.testing.expectEqual(@as(u64, 1), sink.batches[@backingInt(BenchBatchStage.movement)].calls);
+    try std.testing.expectEqual(@as(u64, 1), sink.batches[@backingInt(BenchBatchStage.movement)].threaded_calls);
+    try std.testing.expectEqual(@as(u64, 0), sink.batches[@backingInt(BenchBatchStage.steering)].calls);
+    for (log_under_test.batches) |batch| try std.testing.expectEqual(@as(u64, 0), batch.calls);
+}
+
+test "a batch aggregate keeps the fewest and most items one call carried" {
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.batchValue(.nav_remask).min_items);
+    for ([_]usize{ 48, 16, 96 }) |items| log_under_test.recordBatch(.nav_remask, .{ .item_count = items, .range_count = 1, .batch_duration_ns = 100 });
+    const batch = log_under_test.batchValue(.nav_remask);
+    try std.testing.expectEqual(@as(u64, 3), batch.calls);
+    try std.testing.expectEqual(@as(u64, 16), batch.min_items);
+    try std.testing.expectEqual(@as(u64, 96), batch.max_items);
+}
+
+test "a bench-only stage timing reaches a bound step sink and never the log" {
+    if (comptime !enabled) {
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(BenchStageTimer));
+        return;
+    }
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    var sink = StepBatches{};
+    Context.bind(&log_under_test).recordBenchTiming(.pipeline_tier_policy, 40);
+    const bound = Context{ .logger = &log_under_test, .step_batches = &sink };
+    bound.recordBenchTiming(.pipeline_tier_policy, 40);
+    try std.testing.expectEqual(@as(u64, 1), sink.timings[@backingInt(BenchTiming.pipeline_tier_policy)].count);
+    try std.testing.expectEqual(@as(u64, 40), sink.timings[@backingInt(BenchTiming.pipeline_tier_policy)].total_ns);
+    for (log_under_test.timings) |timing| try std.testing.expectEqual(@as(u64, 0), timing.count);
+    // Unbound, the timer reads no clock and records nothing.
+    const unbound_timer = BenchStageTimer.start(Context.bind(&log_under_test));
+    try std.testing.expect(unbound_timer.start_ns == null);
 }

@@ -14,6 +14,10 @@ const TextureDesc = @import("../../render/resources.zig").TextureDesc;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const runStage = @import("../../app/thread_system.zig").runStage;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const world_terrain = @import("terrain.zig");
 const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
 const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
@@ -38,11 +42,24 @@ const ProceduralTiles = struct {
     deco: TileId,
 };
 
+// The paint's range alignment in chunks: one cache line of its narrowest written
+// column (`blocked_counts`), so neighbouring ranges share at most their boundary line
+// in every column it writes.
+const paint_range_alignment_items = thread_shared_record_alignment / @sizeOf(u16);
+comptime {
+    // A chunk's cells block is at least one `TileId` (`chunk_size_tiles = 1`).
+    for ([_]usize{ @sizeOf(u16), @sizeOf(TileId), @sizeOf(world_terrain.BlockFill), @sizeOf(world_terrain.ChunkBits) }) |element_size| {
+        std.debug.assert(paint_range_alignment_items * element_size >= thread_shared_record_alignment);
+    }
+}
+
 // Threaded procedural fill of one dense layer. Each chunk owns block `chunk` of
 // `block_cells` and slot `chunk` of the level's composed bits, so workers write
 // disjoint ranges; the layer must be its level's only band and the level must
 // have no sparse tiles yet, so the composed bits follow from this layer alone.
 const ProceduralBuildContext = struct {
+    // The paint's dispatched range count, set before dispatch.
+    range_count: usize = 0,
     geom: ChunkGeometry,
     block_cells: []TileId,
     block_fills: []world_terrain.BlockFill,
@@ -199,11 +216,9 @@ fn buildProceduralGround(self: *WorldSystem, level: u16, layer_index: usize, ids
         .seed = seed,
         .ids = ids,
     };
-    _ = thread_system.parallelForWithOptions(geom.chunkCount(), &build_context, buildProceduralChunk, .{
-        .items_per_range = 1,
-        .range_alignment_items = 1,
-        .adaptive = false,
-    });
+    // A one-off under the world's fresh paint tuner (`rebuild_tuner_config`).
+    const paint_batch = runStage(Dispatch.init(thread_system, &self.ground_build_tuner, .{}), geom.chunkCount(), paint_range_alignment_items, &build_context, &build_context.range_count, buildProceduralChunk);
+    if (comptime runtime_perf_log.enabled) self.perf.last_paint_batch = paint_batch;
     store.finishChunkFill();
     terrain.blocked.finishChunkFill(geom);
     terrain.content_revision +%= 1;
@@ -245,11 +260,11 @@ fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) 
     const geom = build.geom;
     const block_cells = geom.blockCells();
     const chunk_count = geom.chunkCount();
-    // The dispatched range indexes chunks (one per range); chunk `c` writes only
-    // block `c`, fill row `c`, bits slot `c`, and count `c`.
+    // The range covers chunks; chunk `c` writes only block `c`, fill row `c`, bits
+    // slot `c`, and count `c`.
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= chunk_count);
-    std.debug.assert(range.index < chunk_count);
+    std.debug.assert(range.index < build.range_count);
     std.debug.assert(build.block_cells.len == chunk_count * block_cells);
     std.debug.assert(build.block_fills.len == chunk_count);
     std.debug.assert(build.blocked_bits.len == chunk_count);
@@ -359,7 +374,8 @@ const testWorldMeta = @import("test_support.zig").testWorldMeta;
 const testMinimalSurfaceWorld = @import("test_support.zig").testMinimalSurfaceWorld;
 const bruteForceLevelBlocked = @import("test_support.zig").bruteForceLevelBlocked;
 const TerrainTestTiles = @import("test_support.zig").TerrainTestTiles;
-const procedural_test_config = @import("test_support.zig").procedural_test_config;
+
+const liveBlockCount = @import("test_support.zig").liveBlockCount;
 
 test "demo bounds past a u16 world side fail loudly instead of converting" {
     var meta = try testWorldMeta();
@@ -406,8 +422,16 @@ test "underground demo levels are solid dirt until a cell is dug walkable" {
     try std.testing.expect(!world.levelBlocksMovement(1, 2, 2));
 }
 
+// 16x12 tiles in 2x2 chunks: 48 chunks, so the paint crosses aligned ranges and its last
+// range is partial (32 + 16).
+const procedural_range_test_config = WorldBuildConfig{
+    .width_tiles = 16,
+    .height_tiles = 12,
+    .chunk_size_tiles = 2,
+    .underground_level_count = 0,
+};
+
 test "procedural world build is identical serial and threaded" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -415,12 +439,16 @@ test "procedural world build is identical serial and threaded" {
     var worker_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
     defer worker_threads.deinit();
 
-    var serial = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, procedural_test_config, &serial_threads);
+    var serial = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, procedural_range_test_config, &serial_threads);
     defer serial.deinit();
-    var threaded = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, procedural_test_config, &worker_threads);
+    var threaded = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, procedural_range_test_config, &worker_threads);
     defer threaded.deinit();
+    // More than one aligned range, the last one partial: the fresh paint tuner's first
+    // selection is the full pool.
+    try std.testing.expect(threaded.chunkCountPerLevel() > paint_range_alignment_items);
+    try std.testing.expect(threaded.chunkCountPerLevel() % paint_range_alignment_items != 0);
 
-    try std.testing.expectEqual(serial.sparseTileCount(), threaded.sparseTileCount());
+    try std.testing.expectEqual(serial.sparse_tiles.len, threaded.sparse_tiles.len);
     for (0..serial.height) |y| for (0..serial.width) |x| {
         const xi: u16 = @intCast(x);
         const yi: u16 = @intCast(y);
@@ -436,9 +464,9 @@ test "procedural world build is identical serial and threaded" {
         try std.testing.expectEqual(serial_store.uniformTile(chunk), threaded_store.uniformTile(chunk));
         try std.testing.expectEqual(serial.levelChunkBlockedForm(0, chunk), threaded.levelChunkBlockedForm(0, chunk));
     }
-    try std.testing.expectEqual(serial_store.liveBlockCount(), threaded_store.liveBlockCount());
+    try std.testing.expectEqual(liveBlockCount(serial_store), liveBlockCount(threaded_store));
     // The procedural ground is mixed somewhere, so the threaded fill really ran.
-    try std.testing.expect(threaded_store.liveBlockCount() > 0);
+    try std.testing.expect(liveBlockCount(threaded_store) > 0);
     try expectUniformExactlyWhenOneTile(&threaded, 0);
 }
 
@@ -494,16 +522,16 @@ test "procedural ground that paints a chunk with one non-fill tile leaves it uni
     for (0..world.chunkCountPerLevel()) |chunk| {
         try std.testing.expectEqual(@as(?TileId, stone), store.uniformTile(@intCast(chunk)));
     }
-    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
 }
 
+// The range-crossing config, so each fresh world's paint dispatches on the pool.
 fn buildProceduralWorldForAllocationTest(allocator: std.mem.Allocator, meta: *const WorldTilesetMeta, threads: *ThreadSystem) !void {
-    var world = try WorldSystem.initProceduralFromMeta(allocator, meta, procedural_test_config, threads);
+    var world = try WorldSystem.initProceduralFromMeta(allocator, meta, procedural_range_test_config, threads);
     world.deinit();
 }
 
 test "procedural world build fails cleanly at every allocation on the multi-worker path (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });

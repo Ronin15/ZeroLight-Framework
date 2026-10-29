@@ -5,7 +5,10 @@
 //! Pathfinding negative-result bench groups: steady, dig, and burst unreachable load.
 //! A config whose nav storage exceeds the bench's nav-size limit fails with its
 //! figure (`nav_size.checkNavSize`), and every config checks each part of the nav's
-//! bytes against its charge (`nav_size.checkNavBytes`).
+//! bytes against its charge (`nav_size.checkNavBytes`). The tuned case settles every
+//! tuner its measured step runs before measuring (`step_tuners:`), over the whole
+//! pathfinding set (`stepTunerSettle`); the burst's dispatch variant runs only the goal scan
+//! and project, so the rest stay idle.
 
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -17,16 +20,17 @@ const PathfindingStats = @import("../../game/systems/pathfinding.zig").Pathfindi
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
 const GoalResolveStats = @import("../../game/systems/pathfinding/types.zig").GoalResolveStats;
 const goal_scan_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
+const goal_project_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").project_range_alignment_items;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
+const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("../fixtures.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
-const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
+const stepTunerSettle = @import("nav_fixtures.zig").stepTunerSettle;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const writeLevelZeroCells = @import("nav_fixtures.zig").writeLevelZeroCells;
 const toggle_batch = @import("nav_fixtures.zig").toggle_batch;
@@ -44,7 +48,7 @@ const pocketDigCell = @import("nav_fixtures.zig").pocketDigCell;
 pub const negative_steady_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-steady",
     .item_label = "unreachable path requests per step",
-    .defaultItemCounts = negativeSteadyItemCounts,
+    .item_counts = &negative_steady_item_counts,
     .runCase = runNegativeSteadyCase,
     .write_workload = writeUnavailableWorkload,
 };
@@ -59,7 +63,8 @@ pub const negative_steady_group = suite.BenchmarkGroup{
 pub const negative_dig_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-dig",
     .item_label = NegativeDigCode.label,
-    .defaultItemCounts = negativeDigItemCounts,
+    .describe_item = NegativeDigCode.describe,
+    .item_counts = &negative_dig_item_counts,
     .runCase = runNegativeDigCase,
     .write_workload = writeUnavailableWorkload,
 };
@@ -74,22 +79,27 @@ pub const negative_dig_group = suite.BenchmarkGroup{
 // untimed in variant 0 and timed in variant 1. `outputs` is the requests answered unavailable;
 // the workload adds the goal projections. Passes when the step answers every request with no
 // search and nothing pending, linear in requests, with four projections for the blocked crowd
-// at every size. `--details` prints the update stages and the goal resolve's stage shapes.
+// at every size. Variant 2 resolves one intent per distinct blocked cell, one more than a
+// scan range and a project range; a fixed case uses one item per range. Its workload counts
+// are those intents and the distinct goals, not unavailable answers. Passes when a fixed
+// threaded case runs both the scan and the project on workers. `--details` prints the update stages and the goal
+// resolve's stage shapes.
 pub const negative_burst_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-burst",
     .item_label = BurstCode.label,
-    .defaultItemCounts = negativeBurstItemCounts,
+    .describe_item = BurstCode.describe,
+    .item_counts = &negative_burst_item_counts,
     .runCase = runNegativeBurstCase,
     .write_workload = writeBurstWorkload,
 };
 
 // The case's goal resolve over `intents`, as the pipeline's `path_goal_resolve` stage.
-fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !GoalResolveStats {
-    if (!case.usesThreadSystem()) return system.resolveGoals(PathRequest, intents, null, .{});
-    return system.resolveGoals(PathRequest, intents, thread_system.?, .{
-        .items_per_range = case.itemsPerRange(goal_scan_range_alignment_items),
+fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !GoalResolveStats {
+    return system.resolveGoals(PathRequest, intents, thread_system, .{
+        .items_per_range = case.stageItemsPerRange(goal_scan_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
 }
 
@@ -105,13 +115,9 @@ const negative_dig_item_counts = [_]usize{
     NegativeDigCode.of(.{ .level_side = 2048, .requests = 64 }),
 };
 
-fn negativeSteadyItemCounts(_: suite.Profile) []const usize {
-    return &negative_steady_item_counts;
-}
-
-fn negativeDigItemCounts(_: suite.Profile) []const usize {
-    return &negative_dig_item_counts;
-}
+// One more intent than a scan range or a project range, so one item per range is more than one
+// aligned range of either stage.
+const goal_dispatch_intents: usize = @max(goal_scan_range_alignment_items, goal_project_range_alignment_items) + 1;
 
 const negative_burst_item_counts = [_]usize{
     BurstCode.of(.{ .variant = .open_goals, .requests = 1024 }),
@@ -120,17 +126,22 @@ const negative_burst_item_counts = [_]usize{
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 1024 }),
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 4096 }),
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 12288 }),
+    BurstCode.of(.{ .variant = .dispatch, .requests = goal_dispatch_intents }),
 };
-
-fn negativeBurstItemCounts(_: suite.Profile) []const usize {
-    return &negative_burst_item_counts;
-}
 
 fn writeUnavailableWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("unavailable={}", .{stats.output_count});
 }
 
+// Dispatch stores intents and distinct goals in these counters. Any other variant, or a
+// code that does not decode, keeps unavailable answers and projections.
 fn writeBurstWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (BurstCode.decode(stats.item_count) catch null) |code| {
+        if (code.variant == .dispatch) {
+            try writer.print("intents={} distinct_goals={}", .{ stats.output_count, stats.candidate_pairs });
+            return;
+        }
+    }
     try writer.print("unavailable={} projections={}", .{ stats.output_count, stats.candidate_pairs });
 }
 
@@ -167,7 +178,7 @@ fn pocketWallCells() [2 * pocket_side + 1]CellCoord {
 fn checkPocketLayout(allocator: std.mem.Allocator, side: u16, goal_count: usize, requester_count: usize) !void {
     if (goal_count > @as(usize, pocket_side) * pocket_side) return error.PocketGoalCellsTooFew;
     const columns = side -| 2 * pocket_requester_margin;
-    if (columns == 0 or pocket_requester_row + (requester_count + columns - 1) / columns > side -| pocket_dig_inset) return error.PocketRequesterRowsTooFew;
+    if (columns == 0 or pocket_requester_row + @divCeil(requester_count, columns) > side -| pocket_dig_inset) return error.PocketRequesterRowsTooFew;
     var taken = try std.DynamicBitSetUnmanaged.initEmpty(allocator, @as(usize, side) * side);
     defer taken.deinit(allocator);
     const walls = pocketWallCells();
@@ -191,7 +202,7 @@ fn checkPocketLayout(allocator: std.mem.Allocator, side: u16, goal_count: usize,
 
 // The pocket on a walkable `side`² level with one requester per request; goals are set per
 // step. Nav is world-backed, so the far dig reaches it through `changeAndReact`.
-fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, side, 1);
     errdefer open.world.deinit();
     const walls = pocketWallCells();
@@ -232,16 +243,16 @@ const PocketStep = struct {
 
 // Times one update of every request; intake must answer every one unavailable from reach,
 // with no solve and nothing cached.
-fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !PocketStep {
+fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: *ThreadSystem) !PocketStep {
     try fixtures.writeRequests(&fixture.stream, fixture.requests);
     const count = fixture.requests.len;
     const start_ns = suite.nowNs(io);
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.available_results != 0) return error.PocketGoalReached;
-    if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.PocketRequestDropped;
-    if (stats.solved_requests != 0 or stats.accepted_requests != 0 or stats.cache_hits != 0) return error.PocketSearched;
-    if (stats.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
+    if (stats.perf.available_results != 0) return error.PocketGoalReached;
+    if (stats.perf.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.PocketRequestDropped;
+    if (stats.perf.solved_requests != 0 or stats.perf.accepted_requests != 0 or stats.perf.cache_hits != 0) return error.PocketSearched;
+    if (stats.perf.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
 }
 
@@ -249,9 +260,9 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = negative_steady_side;
     try checkPocketLayout(allocator, side, item_count, item_count);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, item_count);
     try nav_size.checkNavSize(negative_steady_group.name, item_count, case, size_config);
@@ -259,17 +270,11 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     var fixture = try initPocketFixture(allocator, io, side, item_count, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
-    setPathStageTuners(&fixture.system, case);
 
-    for (0..coldWarmup(options)) |_| _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
+    var warm = suite.Warmup.custom(case, coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
+    const settle = stepTunerSettle(&fixture.system);
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -277,15 +282,18 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     for (0..coldIterations(options)) |_| {
         const step = try runPocketUpdate(io, case, &fixture, thread_ptr);
         last_stats = step.stats;
-        accumulator.record(step.elapsed_ns, last_stats.intake_batch);
+        accumulator.record(step.elapsed_ns, last_stats.perf.intake_batch);
         stage_report.add(step.elapsed_ns, last_stats);
     }
-    stage_report.print(options, negative_steady_group.name, item_count, case);
 
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
-    stats.output_count = last_stats.unavailable_results;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
+    stage_report.write(&stats.details);
+    stats.output_count = last_stats.perf.unavailable_results;
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
+    }
     return stats;
 }
 
@@ -302,17 +310,14 @@ const NegativeDigReport = struct {
         self.samples += 1;
         self.react_ns += reaction.elapsed_ns;
         self.update_ns += step.elapsed_ns;
-        self.remask.add(.{reaction.stats.remask_batch});
+        self.remask.add(.{reaction.stats.perf.remask_batch});
     }
 
-    fn print(self: NegativeDigReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.samples == 0) return;
+    fn write(self: NegativeDigReport, details: *suite.DetailLines) void {
+        if (self.samples == 0) return;
         const samples: u128 = self.samples * std.time.ns_per_us;
         var remask_buffer: [48]u8 = undefined;
-        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s}\n", .{
-            negative_dig_group.name,
-            item_count,
-            case.name,
+        details.print("react={}us update={}us remask={s}\n", .{
             @as(u64, @intCast(self.react_ns / samples)),
             @as(u64, @intCast(self.update_ns / samples)),
             self.remask.label(0, &remask_buffer),
@@ -327,7 +332,7 @@ const NegativeDig = struct {
     cell: CellCoord,
     blocked: bool = false,
 
-    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !struct { reaction: Reaction, update: PocketStep } {
+    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: *ThreadSystem) !struct { reaction: Reaction, update: PocketStep } {
         self.blocked = !self.blocked;
         const tile = if (self.blocked) fixture.open.blocking else fixture.open.walkable;
         const reaction = try fixture.changeAndReact(io, &.{self.cell}, tile, thread_system);
@@ -343,9 +348,9 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     const requester_count: usize = code.requests;
     if (requester_count == 0) return error.NegativeDigNoRequests;
     try checkPocketLayout(allocator, side, requester_count, requester_count);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, requester_count);
     try nav_size.checkNavSize(negative_dig_group.name, item_count, case, size_config);
@@ -354,7 +359,6 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     try fixture.changed.ensureTotalCapacity(allocator, 1);
-    setPathStageTuners(&fixture.system, case);
     fixtures.setNavTuners(&fixture.system, case);
 
     // Untimed first update: every request answered at intake, as every later one.
@@ -362,15 +366,11 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
 
     var dig = NegativeDig{ .cell = pocketDigCell(side) };
-    for (0..coldWarmup(options)) |_| _ = try dig.step(io, case, &fixture, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try dig.step(io, case, &fixture, thread_ptr);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
+    var warm = suite.Warmup.custom(case, coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
+    // A step is the nav reaction and the update: every tuner of the set.
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try dig.step(io, case, &fixture, thread_ptr);
+    const settle = stepTunerSettle(&fixture.system);
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The update's stages and the reaction's eviction stages, each over its own span.
@@ -378,20 +378,23 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var reaction_report = EvictReport{};
     for (0..coldIterations(options)) |_| {
         const timed = try dig.step(io, case, &fixture, thread_ptr);
-        accumulator.record(timed.reaction.elapsed_ns + timed.update.elapsed_ns, timed.update.stats.intake_batch);
+        accumulator.record(timed.reaction.elapsed_ns + timed.update.elapsed_ns, timed.update.stats.perf.intake_batch);
         stage_report.add(timed.update.elapsed_ns, timed.update.stats);
         reaction_report.add(timed.reaction);
         report.add(timed.reaction, timed.update);
     }
-    stage_report.print(options, negative_dig_group.name, item_count, case);
-    reaction_report.print(options, negative_dig_group.name, item_count, case);
-    report.print(options, item_count, case);
 
     try nav_size.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    reaction_report.write(&stats.details);
+    report.write(&stats.details);
     stats.output_count = requester_count;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
+    }
     return stats;
 }
 
@@ -425,6 +428,8 @@ const BurstVariant = enum(u8) {
     open_goals,
     // Every request of a pocket at its blocked center.
     blocked_crowd,
+    // One intent per distinct blocked cell, past a scan range and a project range.
+    dispatch,
 };
 
 const BurstConfig = struct {
@@ -499,12 +504,12 @@ fn burstBlockCells() [burst_pockets * burst_block_side * burst_block_side]CellCo
 // inside the level.
 fn checkBurstLayout(config: BurstConfig) !void {
     if (config.requests == 0) return error.NegativeBurstNoRequests;
-    if (config.variant == .open_goals and (config.requests + burst_pockets - 1) / burst_pockets > @as(usize, burst_pocket_side) * burst_pocket_side) return error.NegativeBurstGoalCellsTooFew;
-    const rows = (config.requests + burst_requester_columns - 1) / burst_requester_columns;
+    if (config.variant == .open_goals and @divCeil(config.requests, burst_pockets) > @as(usize, burst_pocket_side) * burst_pocket_side) return error.NegativeBurstGoalCellsTooFew;
+    const rows = @divCeil(config.requests, burst_requester_columns);
     if (burst_requester_row + rows > burst_side) return error.NegativeBurstRequesterRowsTooFew;
 }
 
-fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, burst_side, 1);
     errdefer open.world.deinit();
     const walls = burstWallCells();
@@ -561,18 +566,17 @@ const ResolveReport = struct {
 
     fn add(self: *ResolveReport, resolve: GoalResolveStats) void {
         self.samples += 1;
-        self.shapes.add(.{ resolve.scan_batch, resolve.project_batch });
-        self.off_main_ns += offMainNs(resolve.scan_batch) + offMainNs(resolve.project_batch);
+        const scan = resolve.perf.scan_batch;
+        const project = resolve.perf.project_batch;
+        self.shapes.add(.{ scan, project });
+        self.off_main_ns += offMainNs(scan) + offMainNs(project);
     }
 
-    fn print(self: ResolveReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.samples == 0) return;
+    fn write(self: ResolveReport, details: *suite.DetailLines) void {
+        if (self.samples == 0) return;
         var scan_buffer: [48]u8 = undefined;
         var project_buffer: [48]u8 = undefined;
-        std.debug.print("  {s} {} {s}: goal_scan={s} goal_project={s} goal_off_main={}us\n", .{
-            negative_burst_group.name,
-            item_count,
-            case.name,
+        details.print("goal_scan={s} goal_project={s} goal_off_main={}us\n", .{
             self.shapes.label(0, &scan_buffer),
             self.shapes.label(1, &project_buffer),
             @as(u64, @intCast(self.off_main_ns / self.samples / std.time.ns_per_us)),
@@ -594,7 +598,7 @@ const BurstOutcome = struct {
 // resolves every intent each step) and the step that submits them. Intake answers every
 // request unavailable from reach on that step, with no search and nothing pending, and every
 // status reads unavailable after it.
-fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !BurstOutcome {
+fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *ReactFixture, thread_system: *ThreadSystem) !BurstOutcome {
     const count = fixture.requests.len;
     fixture.system.clearRuntimeState();
     try fixtures.writeRequests(&fixture.stream, fixture.requests);
@@ -602,27 +606,141 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
     const resolve = try runResolveGoals(&fixture.system, fixture.requests, thread_system, case);
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.available_results != 0) return error.NegativeBurstGoalReached;
-    if (stats.start_invalid_dropped != 0 or stats.dropped_requests != 0) return error.NegativeBurstRequestDropped;
-    if (stats.unavailable_results != count or stats.pending_requests != 0) return error.NegativeBurstUnanswered;
-    if (stats.solved_requests != 0) return error.NegativeBurstSearched;
+    if (stats.perf.available_results != 0) return error.NegativeBurstGoalReached;
+    if (stats.perf.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.NegativeBurstRequestDropped;
+    if (stats.perf.unavailable_results != count or stats.perf.pending_requests != 0) return error.NegativeBurstUnanswered;
+    if (stats.perf.solved_requests != 0) return error.NegativeBurstSearched;
     const status_start_ns = suite.nowNs(io);
     const all_unavailable = unavailableCount(fixture) == count;
     if (variant == .blocked_crowd) elapsed_ns += suite.elapsedNs(status_start_ns, suite.nowNs(io));
     if (!all_unavailable) return error.NegativeBurstStatusNotUnavailable;
     // One projection per distinct blocked goal, shared: four for the blocked crowd.
     const expected_projections: usize = if (variant == .blocked_crowd) burst_pockets else 0;
-    if (resolve.distinct != expected_projections or stats.goal_fallbacks != 0) return error.NegativeBurstProjectionsNotShared;
-    return .{ .elapsed_ns = elapsed_ns, .unavailable = stats.unavailable_results, .projections = resolve.distinct, .stats = stats, .resolve = resolve };
+    if (resolve.distinct != expected_projections or stats.perf.goal_fallbacks != 0) return error.NegativeBurstProjectionsNotShared;
+    return .{ .elapsed_ns = elapsed_ns, .unavailable = stats.perf.unavailable_results, .projections = resolve.distinct, .stats = stats, .resolve = resolve };
+}
+
+// A square level large enough for `intents` blocked cells on row 1 and a start on row 3.
+fn dispatchSide(intents: usize) u16 {
+    const tiles: usize = default_chunk_size_tiles;
+    const chunks = (intents + 2 + tiles - 1) / tiles;
+    return @intCast(@max(chunks, 2) * tiles);
+}
+
+fn dispatchSizeConfig(side: u16, participant_count: usize, requests: usize) nav_size.NavSizeConfig {
+    return .{
+        .side = side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = requests,
+        .group_fields = 1,
+        .long_results = 0,
+        .runs_per_result = 0,
+        .batch = nav_size.NavBatch.none,
+    };
+}
+
+// One blocked cell per intent. The start sits off that row.
+fn initDispatchFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
+    const side = dispatchSide(config.requests);
+    if (config.requests == 0 or @as(usize, side) <= config.requests + 1) return error.NegativeBurstDispatchGoals;
+    var open = try buildOpenWorld(allocator, io, side, 1);
+    errdefer open.world.deinit();
+    const blocked = try allocator.alloc(CellCoord, config.requests);
+    defer allocator.free(blocked);
+    for (blocked, 0..) |*cell, index| cell.* = .{ .x = @intCast(index + 1), .y = 1 };
+    try writeLevelZeroCells(&open, blocked, open.blocking);
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, config.requests);
+    errdefer allocator.free(requests);
+    const start = open.cellCenter(.{ .x = 1, .y = 3 });
+    for (requests, blocked) |*request, cell| {
+        request.* = .{
+            .entity = try data.createEntity(),
+            .start = start,
+            .goal = open.cellCenter(cell),
+        };
+    }
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+fn checkGoalDispatch(case: suite.BenchmarkCase, thread_system: *ThreadSystem, resolve: GoalResolveStats, intents: usize) !void {
+    if (resolve.distinct != intents or resolve.blocked != intents) return error.NegativeBurstDispatchGoals;
+    if (resolve.perf.project_batch.item_count != resolve.distinct or resolve.distinct <= goal_project_range_alignment_items) return error.NegativeBurstDispatchGoals;
+    if (resolve.perf.scan_batch.item_count != intents or resolve.perf.scan_batch.item_count <= goal_scan_range_alignment_items) return error.NegativeBurstDispatchScan;
+    // One item per range: the dispatch aligns that up to the stage's own alignment.
+    try suite.checkStageDispatched(case, thread_system, 1, resolve.perf.scan_batch);
+    try suite.checkStageDispatched(case, thread_system, 1, resolve.perf.project_batch);
+}
+
+fn runDispatchResolve(io: std.Io, system: *PathfindingSystem, requests: []const PathRequest, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !struct { elapsed_ns: u64, resolve: GoalResolveStats } {
+    const start_ns = suite.nowNs(io);
+    // Fixed cases use one item per range, the shape the dispatch bound checks. Adaptive
+    // cases keep the case's own control, and the clamp its batch count; the check resolves
+    // the clamp's range from each batch.
+    const resolve = try system.resolveGoals(PathRequest, requests, thread_system, .{
+        .items_per_range = if (case.adaptive or case.stageBatchesPerParticipant() != null) case.stageItemsPerRange(goal_scan_range_alignment_items) else 1,
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
+    });
+    const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+    try checkGoalDispatch(case, thread_system, resolve, requests.len);
+    return .{ .elapsed_ns = elapsed_ns, .resolve = resolve };
+}
+
+fn runGoalDispatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: BurstConfig) !suite.RunStats {
+    if (config.requests <= goal_scan_range_alignment_items or config.requests <= goal_project_range_alignment_items) return error.NegativeBurstDispatchGoals;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
+    const side = dispatchSide(config.requests);
+    const size_config = dispatchSizeConfig(side, fixtures.participantCount(thread_ptr), config.requests);
+    try nav_size.checkNavSize(negative_burst_group.name, item_count, case, size_config);
+
+    var fixture = try initDispatchFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
+
+    // The resolve alone runs: its scan and project tuners.
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
+    const settle = stepTunerSettle(&fixture.system);
+    const scan_start = suite.TunerStart.of(&fixture.system.tuners.goal_scan, case);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var resolve_report = ResolveReport{};
+    var last: ?GoalResolveStats = null;
+    for (0..options.iterations) |_| {
+        const sample = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
+        resolve_report.add(sample.resolve);
+        accumulator.record(sample.elapsed_ns, sample.resolve.perf.scan_batch);
+        last = sample.resolve;
+    }
+
+    try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
+    var stats = accumulator.finish();
+    resolve_report.write(&stats.details);
+    if (last) |resolve| {
+        stats.output_count = resolve.intents;
+        stats.candidate_pairs = resolve.distinct;
+    }
+    stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.goal_scan, scan_start);
+    }
+    return stats;
 }
 
 fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try BurstConfig.decode(item_count);
+    if (config.variant == .dispatch) return runGoalDispatchCase(allocator, io, options, case, item_count, config);
     try checkBurstLayout(config);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = burstSizeConfig(participant_count, config.requests);
     try nav_size.checkNavSize(negative_burst_group.name, item_count, case, size_config);
@@ -630,18 +748,13 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     var fixture = try initBurstFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
-    setPathStageTuners(&fixture.system, case);
 
     // At least one untimed burst: the first grows the capacity from the reserve floor.
-    for (0..@max(1, coldWarmup(options))) |_| _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
+    var warm = suite.Warmup.custom(case, @max(1, coldWarmup(options)), suite.adaptiveSettleIterationLimit(options));
+    // A burst is the goal resolve and the update: every tuner of the set.
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
+    const settle = stepTunerSettle(&fixture.system);
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
@@ -651,20 +764,23 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         const burst = try runBurst(io, case, config.variant, &fixture, thread_ptr);
         resolve_report.add(burst.resolve);
         // The update's stages and main share; the resolve's worker time prints on its own.
-        stage_report.add(burst.elapsed_ns -| (offMainNs(burst.resolve.scan_batch) + offMainNs(burst.resolve.project_batch)), burst.stats);
-        accumulator.record(burst.elapsed_ns, burst.stats.intake_batch);
+        stage_report.add(burst.elapsed_ns -| (offMainNs(burst.resolve.perf.scan_batch) + offMainNs(burst.resolve.perf.project_batch)), burst.stats);
+        accumulator.record(burst.elapsed_ns, burst.stats.perf.intake_batch);
         last = burst;
     }
-    stage_report.print(options, negative_burst_group.name, item_count, case);
-    resolve_report.print(options, item_count, case);
 
     try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    resolve_report.write(&stats.details);
     if (last) |burst| {
         stats.output_count = burst.unavailable;
         stats.candidate_pairs = burst.projections;
     }
     stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
+    }
     return stats;
 }

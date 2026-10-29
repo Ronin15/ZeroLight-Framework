@@ -5,124 +5,86 @@
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const config = @import("../config.zig");
-const math = @import("../core/math.zig");
-const resources = @import("../render/resources.zig");
 const sprite_batch = @import("../render/sprite_batch.zig");
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
-const sprite_prep_range_alignment_items: usize = 1;
+const sprite_prep_range_alignment_items = sprite_batch.sprite_prep_range_alignment_items;
 const ordered_workload_total_parts: usize = 10;
 const ordered_workload_world_parts: usize = 8;
 const ordered_workload_ui_parts: usize = 1;
 const ordered_world_depth_buckets: usize = 16;
 const ordered_ui_depths = [_]sprite_batch.UiDepth{ .background, .panel, .highlight, .text };
 
+// `render-prep` (CPU only, no window or GPU submission): each iteration submits an ordered
+// stream of N sprites (world depth buckets, then UI depths, then the debug overlay; every
+// 23rd on a dead texture) into one `SpriteBatch`, then snapshots, emits vertices (the
+// threaded stage), and builds draw groups. Prints `vertices=`, `sprites=` (valid),
+// `skipped=` (unresolved textures), `groups=`, and the bench's own phase timers
+// (`ordered_submit`, `snapshot`, `vertex_emit`, `draw_groups`); `--details` adds `main=`,
+// the time outside a vertex emit that ran on workers, and `main_per_item=`. Pass shape:
+// time linear in commands and main per command flat; asserts check every command is emitted or skipped, the dead-texture ones
+// skipped, and a fixed threaded case dispatches the vertex emit to workers.
 pub const group = suite.BenchmarkGroup{
     .name = "render-prep",
     .item_label = "draw commands",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeRenderPrepWorkload,
-    .summary_focus = .production_adaptive,
-};
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-const TextureSlot = struct {
-    id: sprite_batch.TextureId,
-    desc: resources.TextureDesc,
-    alive: bool = true,
-};
-
-const TextureTable = struct {
-    slots: []const TextureSlot,
-
-    fn resolver(self: *const TextureTable) sprite_batch.TextureResolver {
-        return .{
-            .context = self,
-            .resolve = resolve,
-        };
-    }
-
-    fn resolve(context: *const anyopaque, id: sprite_batch.TextureId) ?resources.TextureDesc {
-        const self: *const TextureTable = @ptrCast(@alignCast(context));
-        if (!id.isValid()) return null;
-        for (self.slots) |slot| {
-            if (slot.alive and slot.id.matches(id.index, id.generation)) return slot.desc;
-        }
-        return null;
-    }
 };
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    const slots = [_]TextureSlot{
-        .{ .id = textureId(0, 1), .desc = .{ .width = 64, .height = 64 } },
-        .{ .id = textureId(1, 1), .desc = .{ .width = 128, .height = 32 } },
-        .{ .id = textureId(2, 1), .desc = .{ .width = 32, .height = 128 } },
-        .{ .id = textureId(3, 1), .desc = .{ .width = 16, .height = 16 } },
-        .{ .id = textureId(4, 1), .desc = .{ .width = 8, .height = 8 }, .alive = false },
-    };
-    const table = TextureTable{ .slots = &slots };
+    const table = &fixtures.TextureTable.bench;
 
     var batch = sprite_batch.SpriteBatch.init(allocator);
     defer batch.deinit();
     try batch.reserveStorage(item_count, item_count * 6, item_count);
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-
-    if (suite.adaptiveTunerForCase(case, sprite_prep_range_alignment_items)) |tuner| {
-        batch.adaptive_tuner = tuner;
-    }
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     // Warm up and settle through the same decomposed path used for measurement so
-    // settled_before_measurement and work_tuning reflect the path actually timed.
-    for (0..options.warmup_iterations) |_| {
-        _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
+    // the tuner's settle state and work_tuning reflect the path actually timed.
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(suite.tunerSettled(&batch.adaptive_tuner))) {
+        _ = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
-    var phase_accumulator = PhaseAccumulator{};
+    var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderPrepPhaseSummary){};
     var last_prep = sprite_batch.SpritePrepStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const measured = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
+        const measured = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        const emit_batch = measured.stats.perf.batch;
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(sprite_prep_range_alignment_items), emit_batch);
+        accumulator.record(elapsed_ns, emit_batch);
+        // Main is everything but a vertex emit that ran on workers.
+        main_total += if (emit_batch.ran_inline) elapsed_ns else elapsed_ns -| emit_batch.batch_duration_ns;
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
     }
 
+    if (options.iterations > 0) {
+        std.debug.assert(last_prep.skipped_invalid_count == @divCeil(item_count, 23));
+        std.debug.assert(last_prep.valid_sprite_count + last_prep.skipped_invalid_count == item_count);
+    }
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = last_prep.vertex_count;
     stats.output_count = last_prep.valid_sprite_count;
     stats.deferred_count = last_prep.skipped_invalid_count;
     stats.sample_count = last_prep.draw_group_count;
     stats.render_prep_phases = phase_accumulator.finish(options.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(batch.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&batch.adaptive_tuner, adaptive_tuner_start);
     }
     return stats;
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(sprite_prep_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, sprite_prep_range_alignment_items);
 }
 
 const MeasuredPrep = struct {
@@ -130,36 +92,11 @@ const MeasuredPrep = struct {
     phases: suite.RenderPrepPhaseSummary,
 };
 
-const PhaseAccumulator = struct {
-    ordered_submit_ns: u128 = 0,
-    snapshot_ns: u128 = 0,
-    vertex_emit_ns: u128 = 0,
-    draw_group_ns: u128 = 0,
-
-    fn record(self: *PhaseAccumulator, phases: suite.RenderPrepPhaseSummary) void {
-        self.ordered_submit_ns += phases.ordered_submit_ns;
-        self.snapshot_ns += phases.snapshot_ns;
-        self.vertex_emit_ns += phases.vertex_emit_ns;
-        self.draw_group_ns += phases.draw_group_ns;
-    }
-
-    fn finish(self: PhaseAccumulator, iterations: usize) suite.RenderPrepPhaseSummary {
-        if (iterations == 0) return .{};
-        const count: u128 = iterations;
-        return .{
-            .ordered_submit_ns = u128ToU64Saturated(self.ordered_submit_ns / count),
-            .snapshot_ns = u128ToU64Saturated(self.snapshot_ns / count),
-            .vertex_emit_ns = u128ToU64Saturated(self.vertex_emit_ns / count),
-            .draw_group_ns = u128ToU64Saturated(self.draw_group_ns / count),
-        };
-    }
-};
-
 fn runMeasuredOnce(
     item_count: usize,
     batch: *sprite_batch.SpriteBatch,
     resolver: sprite_batch.TextureResolver,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
     io: std.Io,
 ) !MeasuredPrep {
@@ -193,27 +130,19 @@ fn runMeasuredOnce(
 
 fn emitVertices(
     batch: *sprite_batch.SpriteBatch,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    if (!case.usesThreadSystem()) {
-        return batch.emitVerticesAssumeCapacity(null, .{ .adaptive = false });
-    }
-
-    return batch.emitVerticesAssumeCapacity(thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+    return batch.emitVerticesAssumeCapacity(thread_system, .{
+        .items_per_range = case.stageItemsPerRange(sprite_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
     });
 }
 
-fn u128ToU64Saturated(value: u128) u64 {
-    return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
-}
-
 fn submitOrderedCommandsOnce(batch: *sprite_batch.SpriteBatch, count: usize) !void {
-    batch.commands.clearRetainingCapacity();
-    batch.last_order = null;
+    batch.beginFrame();
     for (0..count) |index| {
         try batch.drawSprite(benchmarkSprite(index, orderedBenchmarkOrder(index, count)));
     }
@@ -221,9 +150,9 @@ fn submitOrderedCommandsOnce(batch: *sprite_batch.SpriteBatch, count: usize) !vo
 
 fn benchmarkSprite(index: usize, order: sprite_batch.RenderOrder) sprite_batch.Sprite {
     const texture = if (index % 23 == 0)
-        textureId(4, 1)
+        fixtures.textureId(4, 1)
     else
-        textureId(@intCast(index % 4), 1);
+        fixtures.textureId(@intCast(index % 4), 1);
     return .{
         .texture = texture,
         .source = if (index % 5 == 0)
@@ -236,7 +165,7 @@ fn benchmarkSprite(index: usize, order: sprite_batch.RenderOrder) sprite_batch.S
             .w = 12 + @as(f32, @floatFromInt(index % 11)),
             .h = 12 + @as(f32, @floatFromInt(index % 9)),
         },
-        .tint = tintFor(index),
+        .tint = fixtures.tintFor(index),
         .origin = .{
             .x = if (index % 3 == 0) 6 else 0,
             .y = if (index % 3 == 0) 6 else 0,
@@ -264,21 +193,10 @@ fn orderedBenchmarkOrder(index: usize, count: usize) sprite_batch.RenderOrder {
     return sprite_batch.RenderOrder.debug(.overlay);
 }
 
-fn tintFor(index: usize) config.Color {
-    return .{
-        .r = 0.45 + @as(f32, @floatFromInt(index % 5)) * 0.08,
-        .g = 0.55 + @as(f32, @floatFromInt(index % 7)) * 0.05,
-        .b = 0.65 + @as(f32, @floatFromInt(index % 3)) * 0.09,
-        .a = 1,
-    };
-}
-
-fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
-    return sprite_batch.TextureId.init(index, generation) catch unreachable;
-}
-
-fn writeRenderPrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+fn writeRenderPrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count });
-    const phases = stats.render_prep_phases orelse return;
-    try writer.print(" phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}", .{ suite.formatDuration(phases.ordered_submit_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns), suite.formatDuration(phases.draw_group_ns) });
+    if (stats.render_prep_phases) |phases| {
+        try writer.print(" phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}", .{ suite.formatDuration(phases.ordered_submit_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns), suite.formatDuration(phases.draw_group_ns) });
+    }
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.item_count);
 }

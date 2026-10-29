@@ -2,8 +2,29 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! - `ai`: the per-step AI decision (gather, separation, cohere, arbitration, intents) over
+//!   a fixed-density grid, with the shared index and the think set (every agent, in the
+//!   index's cell-major order, as production orders it) built untimed. Pass shape: time
+//!   linear in agents; separation checks per agent at most `max_separation_candidate_checks`
+//!   and neighbor samples at most `max_separation_neighbors`; neighbor-block fills at most
+//!   the rows' cell runs plus the ranges, per query kind; the tuned case within spread of
+//!   the best control; the main thread's time (the gather's window merge) flat per agent.
+//!   Asserts check the check, sample, and fill bounds.
+//! - `ai-cell-ordered`: the same agents created in the think set's order, so every per-row
+//!   store read and write (`ai_agent_hot` by AI index) ascends. Pass shape: `ai` within
+//!   spread of it, the scattered-write control; asserts check the think set ascends.
+//! Both print `separation_checks=`, `intents=`, `separation_fills=`, and `cohere_fills=`
+//! (neighbor-block fills per query kind); the summary adds the behavior histogram, and
+//! `--details` adds `main=` with `main_per_item=` (per intent), `gather=` and `intent=` (stage
+//! shapes over the measured steps; the separation stage is the row's batch), `tuned=` when the
+//! intent stage ran inline every measured step, and, for the tuned case, each stage tuner's
+//! state (`tuners:`); the tuned case settles all three before measuring.
+
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const AiBehavior = @import("../game/data_system.zig").AiBehavior;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -11,8 +32,12 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
+const max_separation_neighbors = @import("../game/systems/ai.zig").max_separation_neighbors;
+const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
+const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const InterestMarkerStore = @import("../game/world/interest.zig").InterestMarkerStore;
 const fixtures = @import("fixtures.zig");
@@ -21,21 +46,28 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 const intent_seed: u64 = 0x0a17_b0a7;
 
-// Fixed 5-slot archetype cycle (one slot per `AiBehavior`), so the
-// arbitration selection histogram exercises every bucket instead of
-// collapsing to a wander/pursue split. Mirrors `game_demo_state.zig`'s
-// `demoArchetypeForIndex` at bench scale, but sets hot perception columns
-// directly (no `PerceptionSystem`/`AffectSystem` run) the same way
-// `affect.zig`'s bench sets `AiPerception` hot fields straight into the
-// fixture -- this bench isolates arbitration + intent-emission cost, not the
-// upstream cognition stages.
+// One archetype per `AiBehavior`, so every selection bucket runs; perception columns are set
+// directly, so the bench times decision and intents, not the upstream cognition stages.
 const behavior_archetype_cycle_len: usize = 5;
+
+// The fixture's body grid: columns per row and the world-unit pitch.
+const grid_columns: usize = 128;
+const grid_pitch_x: f32 = 11.0;
+const grid_pitch_y: f32 = 9.0;
 
 pub const group = suite.BenchmarkGroup{
     .name = "ai",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
+    .write_workload = writeAiWorkload,
+};
+
+pub const cell_ordered_group = suite.BenchmarkGroup{
+    .name = "ai-cell-ordered",
+    .item_label = "AI agents",
+    .item_counts = &suite.event_scale_counts,
+    .runCase = runCellOrderedCase,
     .write_workload = writeAiWorkload,
 };
 
@@ -57,16 +89,18 @@ const Fixture = struct {
     }
 };
 
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
+fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+    return createFixtureInOrder(allocator, count, null);
 }
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+// The fixture's agents created in `order` (agent `order[k]` k-th), or in index order.
+fn createFixtureInOrder(allocator: std.mem.Allocator, count: usize, order: ?[]const u32) !Fixture {
+    std.debug.assert(order == null or order.?.len == count);
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.reserveStreams(suite.rangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
+    try frame.reserveStreams(maxRangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
 
     // Marker entities for flee's `nearest_threat` id and pursue's opt-in
     // `focus_target` fallback id: only their validity matters here (no
@@ -75,11 +109,12 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     const threat_marker = try data.createEntity();
     const focus_entity = try data.createEntity();
 
-    for (0..count) |index| {
+    for (0..count) |step| {
+        const index: usize = if (order) |agents| agents[step] else step;
         const entity = try data.createEntity();
         const position = math.Vec2{
-            .x = @as(f32, @floatFromInt(index % 128)) * 11.0,
-            .y = @as(f32, @floatFromInt(index / 128)) * 9.0,
+            .x = @as(f32, @floatFromInt(index % grid_columns)) * grid_pitch_x,
+            .y = @as(f32, @floatFromInt(index / grid_columns)) * grid_pitch_y,
         };
         try data.setMovementBody(entity, .{
             .position = position,
@@ -131,6 +166,12 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     return .{ .data = data, .frame = frame, .focus_entity = focus_entity, .markers = markers };
 }
 
+// The grid covering the fixture's `count` bodies, laid out `grid_columns` per row.
+fn fixtureIndexGeometry(count: usize) IndexGeometry {
+    const rows = (count + grid_columns - 1) / grid_columns;
+    return fixtures.indexGeometryCovering(@as(f32, @floatFromInt(grid_columns)) * grid_pitch_x, @as(f32, @floatFromInt(rows)) * grid_pitch_y, 1);
+}
+
 fn behaviorHistogram(behaviors: []const AiBehavior) suite.AiBehaviorHistogramSummary {
     var histogram = suite.AiBehaviorHistogramSummary{};
     for (behaviors) |behavior| {
@@ -147,86 +188,140 @@ fn behaviorHistogram(behaviors: []const AiBehavior) suite.AiBehaviorHistogramSum
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-
     var fixture = try createFixture(allocator, item_count);
     defer fixture.deinit();
+    return runFixture(allocator, io, options, case, item_count, &fixture, false);
+}
+
+pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    // The default fixture's think set is the creation order, built inline.
+    var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    defer setup_threads.deinit();
+    const order = blk: {
+        var plain = try createFixture(allocator, item_count);
+        defer plain.deinit();
+        var index = SpatialIndexSystem.init(allocator);
+        defer index.deinit();
+        _ = try index.build(&plain.data, .{ .entities = plain.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), &setup_threads, .{});
+        const view = index.view();
+        var scope = SimulationScopeSystem.init(allocator);
+        defer scope.deinit();
+        break :blk try allocator.dupe(u32, (try scope.compactCognition(&view, 0, false, &setup_threads, .{})).cognition);
+    };
+    defer allocator.free(order);
+    var fixture = try createFixtureInOrder(allocator, item_count, order);
+    defer fixture.deinit();
+    return runFixture(allocator, io, options, case, item_count, &fixture, true);
+}
+
+// `think_ascends`: the fixture was created in its think set's order.
+fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *Fixture, think_ascends: bool) !suite.RunStats {
     var system = AiSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, ai_range_alignment_items)) |tuner| {
-        system.separation_tuner = tuner;
-        system.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
-    }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
-    // This bench never runs movement, so the fixture's positions never change
-    // across iterations. Build the shared spatial index once, outside every
-    // timed/warmup/settle call, so the group's timed window measures only
-    // `system.update`/`updateSerial` (query + intent emission), not the index
-    // build — that cost has its own dedicated `spatial_index` bench group.
+    // Positions never change, so the index is built once, untimed (its own group times it).
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const movement_slice = fixture.data.movementBodySliceConst();
-    try spatial_sys.reserve(ai_slice.entities.len, .{});
-    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
+    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), &threads, .{ .adaptive = false });
     const spatial_view = spatial_sys.view();
+    var scope = SimulationScopeSystem.init(allocator);
+    defer scope.deinit();
+    const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
+    std.debug.assert(think_set.len == item_count);
+    if (think_ascends) {
+        for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
+    }
 
-    for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&system, &fixture, spatial_view, if (threads) |*thread_system| thread_system else null, case);
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.nextSettled(stageTunerSettle(&system))) {
+        _ = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!system.separation_tuner.isSettled() or !system.intent_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, &fixture, spatial_view, if (threads) |*thread_system| thread_system else null, case);
-        }
-    }
-    const separation_settled_before_measurement = if (case.adaptive) system.separation_tuner.isSettled() else false;
-    const intent_settled_before_measurement = if (case.adaptive) system.intent_tuner.isSettled() else false;
+    const settle = stageTunerSettle(&system);
+    const separation_tuner_start = suite.TunerStart.of(&system.separation_tuner, case);
+    const intent_tuner_start = suite.TunerStart.of(&system.intent_tuner, case);
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_ai_stats = AiStats{};
+    var main_total: u128 = 0;
+    var shapes = suite.StageShapes(stage_names.len){};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_ai_stats = try runOnce(&system, &fixture, spatial_view, if (threads) |*thread_system| thread_system else null, case);
+        last_ai_stats = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_ai_stats.separation_batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, last_ai_stats.perf.separation_batch);
+        shapes.add(.{ last_ai_stats.perf.gather_batch, last_ai_stats.perf.separation_batch, last_ai_stats.perf.intent_batch });
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_range_alignment_items), &.{ last_ai_stats.perf.gather_batch, last_ai_stats.perf.separation_batch, last_ai_stats.perf.intent_batch });
+        main_total += elapsed_ns -| (offMainNs(last_ai_stats.perf.gather_batch) + offMainNs(last_ai_stats.perf.separation_batch) + offMainNs(last_ai_stats.perf.intent_batch));
     }
 
     var stats = accumulator.finish();
-    stats.candidate_pairs = last_ai_stats.separation_candidate_checks;
-    stats.output_count = last_ai_stats.intent_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    std.debug.assert(last_ai_stats.perf.separation_candidate_checks <= last_ai_stats.perf.entity_count * max_separation_candidate_checks);
+    std.debug.assert(last_ai_stats.perf.separation_neighbor_samples <= last_ai_stats.perf.entity_count * max_separation_neighbors);
+    // A fill per key a range's rows change to: at most the rows' cell runs plus the ranges.
+    const ranges = last_ai_stats.perf.separation_batch.range_count;
+    std.debug.assert(last_ai_stats.perf.separation_block_fills <= cellRuns(fixture, spatial_view, think_set, false) + ranges);
+    std.debug.assert(last_ai_stats.perf.cohere_block_fills <= cellRuns(fixture, spatial_view, think_set, true) + ranges);
+    stats.neighbor_block_fills = last_ai_stats.perf.separation_block_fills;
+    stats.secondary_neighbor_block_fills = last_ai_stats.perf.cohere_block_fills;
+    stats.candidate_pairs = last_ai_stats.perf.separation_candidate_checks;
+    stats.output_count = last_ai_stats.perf.entity_count;
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
+    stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 2);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.separation_tuner.report(), separation_settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(system.intent_tuner.report(), intent_settled_before_measurement);
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&system.separation_tuner, separation_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&system.intent_tuner, intent_tuner_start);
+        tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
     }
     return stats;
 }
 
-fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AiStats {
+// The step's stages, each under its own tuner, in run order.
+const stage_names = [_][]const u8{ "gather", "separation", "intent" };
+
+fn stageTuners(system: *const AiSystem) [stage_names.len]*const AdaptiveWorkTuner {
+    return .{ &system.gather_tuner, &system.separation_tuner, &system.intent_tuner };
+}
+
+fn stageTunerSettle(system: *const AiSystem) suite.TunerSettle {
+    return suite.TunerSettle.of(AiSystem, system);
+}
+
+// The runs of consecutive think rows on one index cell, over the rows with cohere gain when
+// `cohere` (one faction, so the cell is the key).
+fn cellRuns(fixture: *const Fixture, view: SpatialIndexView, think_set: []const u32, cohere: bool) usize {
+    const ai = fixture.data.aiAgentSliceConst();
+    const movement = fixture.data.movementBodySliceConst();
+    var runs: usize = 0;
+    var previous: ?[2]u32 = null;
+    for (think_set) |row| {
+        if (cohere and ai.gain_coheres[row] <= 0) continue;
+        const body = fixture.data.movementBodyDenseIndex(ai.entities[row]).?;
+        const cell = [2]u32{ math.worldPosToCell(movement.previous_x[body], view.cell_size, view.cells_x), math.worldPosToCell(movement.previous_y[body], view.cell_size, view.cells_y) };
+        if (previous == null or !std.mem.eql(u32, &previous.?, &cell)) runs += 1;
+        previous = cell;
+    }
+    return runs;
+}
+
+fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView, think_set: []const u32, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !AiStats {
     fixture.frame.beginStep();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
-            .intent_seed = intent_seed,
-            .focus_target = benchmarkSeekTarget(),
-            .focus_entity = fixture.focus_entity,
-            .perception_slice = fixture.data.aiPerceptionSliceConst(),
-            .memory_slice = fixture.data.aiMemorySliceConst(),
-            .affect_slice = fixture.data.aiAffectSliceConst(),
-            .interest_markers = &fixture.markers,
-        });
-    }
 
-    return try system.update(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+    return try system.update(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, thread_system, delta_seconds, .{
+        .items_per_range = case.stageItemsPerRange(ai_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .batches_per_participant = case.stageBatchesPerParticipant(),
         .intent_seed = intent_seed,
         .focus_target = benchmarkSeekTarget(),
         .focus_entity = fixture.focus_entity,
@@ -234,31 +329,34 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
         .memory_slice = fixture.data.aiMemorySliceConst(),
         .affect_slice = fixture.data.aiAffectSliceConst(),
         .interest_markers = &fixture.markers,
+        .scope_dense_indices = think_set,
     });
-}
-
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(ai_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, ai_range_alignment_items);
 }
 
 fn benchmarkSeekTarget() math.Vec2 {
     return .{ .x = 480, .y = 270 };
 }
 
+// `neighbor_block_fills` holds the separation block fills, `secondary_neighbor_block_fills`
+// the cohere ones, `secondary_batch` the intent stage, `splice_batch` the gather, and `main`
+// the time outside the three stages' worker dispatches, also per intent.
 fn writeAiWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
-    try writer.print("separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count });
+    try writer.print("separation_checks={} intents={} separation_fills={} cohere_fills={}", .{ stats.candidate_pairs, stats.output_count, stats.neighbor_block_fills, stats.secondary_neighbor_block_fills });
     if (view == .summary) {
         if (stats.ai_behavior_histogram) |histogram| {
             try writer.print(" behaviors wander={} pursue={} flee={} investigate={} cohere={}", .{ histogram.wander, histogram.pursue, histogram.flee, histogram.investigate, histogram.cohere });
         }
         return;
     }
+    try suite.writeMainShare(writer, stats, stats.output_count);
+    if (stats.splice_batch) |gather| {
+        try writer.writeAll(" gather=");
+        try suite.writeStageShape(writer, gather);
+    }
     const intent = stats.secondary_batch orelse return;
     try writer.writeAll(" intent=");
     try suite.writeStageShape(writer, intent);
-    if (intent.ran_inline or intent.active_worker_threads == 0) {
+    if (intent.threaded_batches == 0) {
         if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
     }
 }

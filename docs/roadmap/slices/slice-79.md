@@ -21,9 +21,9 @@ with its invariant held in code and tested, and no unreachable branch.
   simulation.
 - Gameplay detects a press per step by comparing held state with its own
   last-step latch: `DigController.captureIntent`
-  (`src/game/dig_controller.zig:155`) for `dig_hole`/`dig_down`/`dig_ramp`,
+  (`src/game/dig_controller.zig:158`) for `dig_hole`/`dig_down`/`dig_ramp`,
   and `SimulationPipeline.captureActionIntent`
-  (`src/game/simulation_pipeline.zig:1132`) for `interact`.
+  (`src/game/simulation_pipeline.zig:1475`) for `interact`.
 - Failure scenario (derived from code, not reproduced): a press and its
   release that both arrive between two fixed steps leave `isHeld` false at
   every step, so no dig or interact intent is emitted. The window is the
@@ -50,18 +50,18 @@ with its invariant held in code and tested, and no unreachable branch.
 
 - `InputState` stays the simulation's only input; app commands stay in
   `FrameCommands`; fixed update never runs in render cadence
-  (`.claude/rules/input-state.md`).
+  (`.grok/rules/input-state.md`).
 - What the simulation reads per step is per-step input, so a pending press
   is consumed at a step, never at a frame
-  (`.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/simulation.md` § Determinism).
 - Pause, modal block, and pad disconnect clear any new per-step input state
   on the same paths that call `releaseHeldGameplay`.
 - Snapping changes only how many fixed steps run in a frame, never a step's
-  length or contents (`.claude/rules/simulation.md` § Determinism), and
+  length or contents (`.grok/rules/simulation.md` § Determinism), and
   never hides a real hitch: intervals outside the snap tolerance keep their
   measured value. The refresh interval follows the window's current display,
   including after a move between displays. Frame pacing policy stays in
-  `frame_pacer.zig` (`.claude/rules/memory-performance.md`).
+  `frame_pacer.zig` (`.grok/rules/memory-performance.md`).
 - `TimeLoop.max_updates_per_frame` stays a work budget (Slice 72 keeps it).
 
 ### Checklist

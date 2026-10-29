@@ -4,7 +4,7 @@
 
 **Status: not started.**
 
-Goal: a low-priority background lane, separate from fork-join `parallelFor`,
+Goal: a low-priority background lane, separate from the pool's fork-join batch dispatch (`parallelForWithOptions`, the stage `Dispatch`),
 runs coarse jobs off the main thread and hands each result back on a fixed
 simulation step chosen at submit, so no simulation outcome depends on how fast
 a job ran. Its consumers are 46 (save/load, app-layer), 65B (deferred nav
@@ -26,15 +26,17 @@ with tests, and its consumers land with their slices.
   commit, post-commit reactions) → `finished`.
 - `LoadingState.loadGameDemo` builds gameplay with `UpdateContext` in reach;
   `assets.validateRelativePath` is the traversal-safe path validator.
-- Needed and not landed: 49's `simulationChecksum()`; 50's foreign-thread `parallelFor` panic, thread
-  self-naming, and `-Dsanitize-thread`; 64A's FP-environment assertion.
+- Landed from 50: the foreign-thread panic (`thread_system.zig:1063`;
+  `4e62442`), worker names (test at `:4840`; `4e62442`), and
+  `-Dsanitize-thread` (`build.zig:113`; `4ae3d60`). Still needed: 49's
+  `simulationChecksum()`; 64A's FP-environment assertion.
 
 ### Architecture notes
 
 - Placement: the lane lives in `src/app/` and knows nothing of simulation
   steps; the step-keyed handoff helper lives in `src/game/`. Engine owns the lane and passes it through `UpdateContext`.
   Everything the lane thread touches is heap-allocated, so a moved `Engine`
-  stays valid (`.claude/rules/engine-design.md` § Ownership boundaries).
+  stays valid (`.grok/rules/engine-design.md` § Ownership boundaries).
 - Thread policy (decided): one dedicated lane thread, not taken from the
   pool; jobs never run on pool workers, where a long job would stall every
   fork-join batch. 65A lowers the lane's OS priority and fixes the pool rule.
@@ -43,7 +45,7 @@ with tests, and its consumers land with their slices.
   or world size) and applies the result at the start of `s + k` in the
   main-thread input phase, stealing a queued job or waiting on a running one.
   Result and step are identical with a fast, slow, full, or absent lane
-  (`.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/simulation.md` § Determinism).
 - Polling: simulation consumers observe a job only at its due step. A
   readiness query exists only for app-layer consumers whose result never
   enters a running simulation (46 save status, load staging, 65C at load).
@@ -52,10 +54,10 @@ with tests, and its consumers land with their slices.
   borrow 65B and 65C use); it writes only its own outputs and reaches no
   `ThreadSystem`, renderer, SDL handle, or live `DataSystem`/`WorldSystem`.
   Work on the lane is serial; work that scales with population, terrain
-  change, or world size stays on the pool (`.claude/rules/threading.md`).
+  change, or world size stays on the pool (`.grok/rules/threading.md`).
 - No allocation per submit. A full lane never changes a result: the consumer
   runs the job inline and still applies it at `s + k`
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Pause: due steps do not advance while paused; app-layer work that must
   progress while paused uses the app-layer surface, never the step handoff.
 - Lifetime: each consumer completes or cancels its jobs in its own teardown;
@@ -91,7 +93,7 @@ with tests, and its consumers land with their slices.
       `docs/development-workflow.md` TSan group.
 - [ ] Add the background-lane rule (polling, step handoff, job inputs with
       the frozen borrow, refusal fallback, pause, ticket lifetime) to
-      `.claude/rules/threading.md` when this lands.
+      `.grok/rules/threading.md` when this lands.
 
 ### Acceptance checks
 
@@ -102,6 +104,6 @@ with tests, and its consumers land with their slices.
       gameplay code (grep).
 - [ ] `background-lane` and `movement` numbers recorded in the landing
       commit; 65A's lowered-priority gate closes the interference question.
-      `zig build bench -Dsanitize-thread=true -- --profile quick --group
+      `zig build bench -Dsanitize-thread=true -- --group
       background-lane` is clean.
 - [ ] `zig build verify` passes.

@@ -36,9 +36,9 @@ its first weapon); player death drops (the player is downed, Slice 56).
 ### Architecture notes
 
 - Kill outcomes never depend on queue capacity
-  (`.claude/rules/budgets-capacities.md`): the drop queue is persistent
+  (`.grok/rules/budgets-capacities.md`): the drop queue is persistent
   `DataSystem` state that starts at content-derived size and grows at the
-  commit seam (`.claude/rules/memory-performance.md`); only the per-step
+  commit seam (`.grok/rules/memory-performance.md`); only the per-step
   spawn budget is fixed.
 - The queue's only writer is `inventory_update`; entries are pushed in a
   fixed order per victim (equipment slots, then inventory slots, then the
@@ -55,7 +55,7 @@ its first weapon); player death drops (the player is downed, Slice 56).
 - The AI emitter picks ranged or fallback reach from ammo presence, read
   only; combat resolve rechecks against this step's queued transfers.
 - Work is bounded per step by fixed counts and runs serial only where the
-  cost model allows (`.claude/rules/threading.md`).
+  cost model allows (`.grok/rules/threading.md`).
 - VoidLight reference: port required-ammo matching (first compatible stack,
   one per shot) and the AI ranged gate; change the out-of-ammo path from
   equipping a melee weapon to a fixed-reach fallback; not string ammo types,

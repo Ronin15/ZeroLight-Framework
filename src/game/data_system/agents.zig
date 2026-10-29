@@ -55,6 +55,7 @@ pub fn validateSteeringAgent(agent: SteeringAgent) !void {
         agent.avoidance_radius > max_steering_radius or
         agent.avoidance_weight > max_steering_weight or
         agent.max_neighbor_samples > max_steering_neighbor_samples or
+        agent.stuck_step_threshold > max_steering_cooldown_steps or
         agent.replan_cooldown_steps > max_steering_cooldown_steps or
         agent.unavailable_backoff_steps > max_steering_cooldown_steps)
     {
@@ -99,7 +100,8 @@ pub const AiAgentStore = struct {
     }
 
     pub fn append(self: *AiAgentStore, allocator: std.mem.Allocator, entity: EntityId, agent: AiAgent) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAiAgentRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -217,7 +219,8 @@ pub const SteeringAgentStore = struct {
     }
 
     pub fn append(self: *SteeringAgentStore, allocator: std.mem.Allocator, entity: EntityId, agent: SteeringAgent) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -409,4 +412,14 @@ test "AiAgentStore.slice exposes a mutable hot-column view aligned with sliceCon
 
     const const_slice = store.sliceConst();
     try std.testing.expectEqual(AiBehavior.flee, const_slice.behaviors[1]);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "AiAgentStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(AiAgentStore, AiAgent{});
+}
+
+test "SteeringAgentStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(SteeringAgentStore, SteeringAgent{});
 }

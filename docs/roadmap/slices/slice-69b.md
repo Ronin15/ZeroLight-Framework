@@ -33,7 +33,7 @@ new persists. A single-region world is identical to Slice 59.
 - Region 0 is the default and reproduces Slice 59 exactly; authored regions
   map from biomes in the 58 spec. The region count is content with a
   load-time format bound; per-step cost is O(regions) and independent of
-  world size (`.claude/rules/budgets-capacities.md`).
+  world size (`.grok/rules/budgets-capacities.md`).
 - Calendar, season, and day phase stay one per world (umbrella non-goal);
   regions differ in weather only, phase-staggered so borders do not flip
   together.

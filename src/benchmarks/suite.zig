@@ -9,38 +9,34 @@
 
 const std = @import("std");
 const AdaptiveWorkPhase = @import("../app/thread_system.zig").AdaptiveWorkPhase;
-const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkReport;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
-const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const rangeCount = @import("../app/thread_system.zig").rangeCount;
+const max_batch_multiplier = @import("../app/thread_system.zig").max_batch_multiplier;
+const defaultWorkerThreadCount = @import("../app/thread_system.zig").defaultWorkerThreadCount;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
+const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
+const PerfBenchBatchStage = @import("../app/runtime_perf_log.zig").BenchBatchStage;
+const PerfMetric = @import("../app/runtime_perf_log.zig").Metric;
+const PerfBenchTiming = @import("../app/runtime_perf_log.zig").BenchTiming;
+const PerfTiming = @import("../app/runtime_perf_log.zig").Timing;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
+const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
+const forEachTunerIn = @import("../game/simulation_pipeline_test_support.zig").forEachTunerIn;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
+/// The fixed partition of a chunk-partitioned stage: one chunk per range.
+pub const chunk_partition_items: usize = 1;
 
-pub const Profile = enum {
-    quick,
-    standard,
-    stress,
-};
-
-const event_scale_quick_counts = [_]usize{ 1_024, 4_096, 10_000 };
-const event_scale_standard_counts = [_]usize{ 1_024, 4_096, 10_000, 25_000, 50_000 };
-const event_scale_stress_counts = [_]usize{ 10_000, 25_000, 50_000 };
-
-pub fn eventScaleCounts(profile: Profile) []const usize {
-    return switch (profile) {
-        .quick => &event_scale_quick_counts,
-        .standard => &event_scale_standard_counts,
-        .stress => &event_scale_stress_counts,
-    };
-}
+/// The population counts of a group that scales one entity count.
+pub const event_scale_counts = [_]usize{ 1_024, 4_096, 10_000 };
 
 pub const Options = struct {
-    profile: Profile = .quick,
     warmup_iterations: usize = 5,
     iterations: usize = 30,
     case_filter: ?[]const u8 = null,
@@ -50,6 +46,8 @@ pub const Options = struct {
     item_count_filter: ?usize = null,
     fallback_budget: ?usize = null,
     details: bool = false,
+    /// Print each selected group's items and cases, and do not run them.
+    list_groups: bool = false,
 };
 
 pub const BenchmarkGroup = struct {
@@ -57,13 +55,32 @@ pub const BenchmarkGroup = struct {
     /// What one item count names: the unit counted, or an item code's layout
     /// (`ItemCode(...).label`).
     item_label: []const u8,
-    defaultItemCounts: *const fn (Profile) []const usize,
+    /// A coded group's decoder (`ItemCode(...).describe`): the report header prints the run
+    /// code's fields after its label. Null for a group whose item count is a plain count.
+    describe_item: ?ItemDescriber = null,
+    /// The item counts (or item codes) the group runs; `--items` runs one instead.
+    item_counts: []const usize,
     runCase: *const fn (std.mem.Allocator, std.Io, Options, BenchmarkCase, usize) anyerror!RunStats,
     /// Writes a case's workload: its counters in the group's own terms, and under
     /// `--details` its stage shapes too. Writing nothing prints no workload.
     write_workload: WorkloadWriter,
-    /// The case the summary leads with.
-    summary_focus: SummaryFocus = .fastest,
+    /// Set only when every fixed-control stage of the group resolves its range from this
+    /// one shape. A fixed case that resolves to an earlier case's configuration is then
+    /// reported as that case's duplicate and not timed again; a case whose range follows
+    /// the item count, and every case under null, stays timed. Requires the default case
+    /// list.
+    fixed_range_shape: ?FixedRangeShape = null,
+    /// The cases the group's workload runs (`casesNamed`), in default-case order and
+    /// holding `serial-direct`; a case the workload has no path for is left out, never
+    /// skipped.
+    cases: []const BenchmarkCase = &default_cases,
+};
+
+/// The partition a group's fixed stages scale their range modes from, and the alignment
+/// they share.
+pub const FixedRangeShape = struct {
+    partition_items: usize,
+    range_alignment_items: usize,
 };
 
 /// Where a workload is printed: the one-line summary or the `--details` table.
@@ -71,12 +88,8 @@ pub const WorkloadView = enum { summary, details };
 
 pub const WorkloadWriter = *const fn (*std.Io.Writer, RunStats, WorkloadView) std.Io.Writer.Error!void;
 
-pub const SummaryFocus = enum {
-    // The fastest measured case.
-    fastest,
-    // The production tuner's case, beside the fastest control.
-    production_adaptive,
-};
+/// Writes an item code's decoded fields (`ItemCode(...).describe`).
+pub const ItemDescriber = *const fn (*std.Io.Writer, usize) std.Io.Writer.Error!void;
 
 /// A group with no workload counters.
 pub fn writeNoWorkload(_: *std.Io.Writer, _: RunStats, _: WorkloadView) std.Io.Writer.Error!void {}
@@ -87,7 +100,6 @@ pub const BenchmarkCase = struct {
     name: []const u8,
     worker_mode: WorkerMode,
     adaptive: bool = false,
-    adaptive_range_mode: AdaptiveRangeMode = .none,
     range_mode: RangeMode = .default,
     required_worker_count: usize = 0,
 
@@ -104,13 +116,52 @@ pub const BenchmarkCase = struct {
         return self.worker_mode != .serial_direct;
     }
 
-    pub fn itemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
-        const base = default_items_per_range;
-        return switch (self.range_mode) {
-            .default => null,
-            .small => std.mem.alignForwardAnyAlign(usize, @max(base / 2, @as(usize, 1)), range_alignment_items),
-            .large => std.mem.alignForwardAnyAlign(usize, base * 4, range_alignment_items),
+    // The range size a fixed control runs: this case's range mode, or the default size
+    // aligned to the stage's range alignment; null for the clamp.
+    fn fixedItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
+        return self.fixedItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
+    }
+
+    /// A stage's `items_per_range` control: null for adaptive cases so the stage's tuner
+    /// picks the range, and for the clamp, whose stages shape from their item counts
+    /// (`stageBatchesPerParticipant`); otherwise `fixedItemsPerRange`. The serial case's
+    /// thread system has no workers, so its stages run one inline range whatever the control.
+    pub fn stageItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
+        return self.stageItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
+    }
+
+    /// `stageItemsPerRange` for a group whose fixed partition is `partition_items` (one
+    /// chunk for chunk-partitioned stages) instead of the element default: the range modes
+    /// scale from that partition. The clamp has no range size.
+    pub fn stageItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
+        if (self.adaptive) return null;
+        return self.fixedItemsPerRangeForPartition(partition_items, range_alignment_items);
+    }
+
+    /// A stage's `batches_per_participant` control: the tuner's top batch count per
+    /// participant (`max_batch_multiplier`) for the fixed clamp case, so `ThreadSystem`
+    /// shapes each dispatch from its own item count as the tuner shapes its 4x pool batches;
+    /// null for every other case.
+    pub fn stageBatchesPerParticipant(self: BenchmarkCase) ?f64 {
+        return if (!self.adaptive and self.rangeFollowsItemCount()) max_batch_multiplier else null;
+    }
+
+    // Whether the resolved range depends on the stage's item count rather than only on the
+    // partition and alignment.
+    fn rangeFollowsItemCount(self: BenchmarkCase) bool {
+        return self.range_mode == .clamp;
+    }
+
+    // The partition in the default range mode, half of it in small and four times it in
+    // large, aligned to the stage's alignment; null for the clamp, which has no range size.
+    fn fixedItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
+        const items = switch (self.range_mode) {
+            .default => partition_items,
+            .small => @max(partition_items / 2, @as(usize, 1)),
+            .large => partition_items * 4,
+            .clamp => return null,
         };
+        return std.mem.alignForwardAnyAlign(usize, items, range_alignment_items);
     }
 };
 
@@ -121,16 +172,14 @@ pub const WorkerMode = enum {
     fixed_auto,
 };
 
+/// The default partition; small halves it, large quadruples it; clamp sets
+/// `batches_per_participant` to `max_batch_multiplier`, the tuner's top batch count over the
+/// case's participants, and no range size.
 pub const RangeMode = enum {
     default,
     small,
     large,
-};
-
-pub const AdaptiveRangeMode = enum {
-    none,
-    fixed,
-    tuned,
+    clamp,
 };
 
 pub const default_cases = [_]BenchmarkCase{
@@ -166,24 +215,75 @@ pub const default_cases = [_]BenchmarkCase{
         .required_worker_count = 1,
     },
     .{
-        .name = "thread-adaptive-fixed-range",
+        .name = "thread-clamp-range",
         .worker_mode = .fixed_auto,
-        .adaptive = true,
-        .adaptive_range_mode = .fixed,
+        .range_mode = .clamp,
         .required_worker_count = 1,
     },
     .{
         .name = "thread-adaptive-tuned-range",
         .worker_mode = .fixed_auto,
         .adaptive = true,
-        .adaptive_range_mode = .tuned,
         .required_worker_count = 1,
     },
 };
 
+/// The default cases named by `names`, in default-case order; a name that is no default
+/// case fails the build.
+pub fn casesNamed(comptime names: []const []const u8) [names.len]BenchmarkCase {
+    return comptime blk: {
+        var cases: [names.len]BenchmarkCase = undefined;
+        var count: usize = 0;
+        for (default_cases) |case| {
+            for (names) |name| {
+                if (std.mem.eql(u8, name, case.name)) {
+                    cases[count] = case;
+                    count += 1;
+                }
+            }
+        }
+        if (count != names.len) @compileError("a case name names no default case, or repeats");
+        break :blk cases;
+    };
+}
+
+/// The serial case alone: a workload with only a main-thread path.
+pub const serial_cases = casesNamed(&.{"serial-direct"});
+/// The serial case and the production tuner's case: a workload whose stages run their own
+/// tuners, with no fixed-control path of its own.
+pub const serial_and_tuned_cases = casesNamed(&.{ "serial-direct", "thread-adaptive-tuned-range" });
+
 pub const RunStatus = enum {
     measured,
     skipped,
+    // Resolves to an earlier case's configuration under the group's `fixed_range_shape`;
+    // not timed.
+    duplicate,
+};
+
+// Per default case, the status text of a later case that duplicates it.
+const same_shape_notes = blk: {
+    var notes: [default_cases.len][]const u8 = undefined;
+    for (default_cases, &notes) |case, *note| note.* = "same shape as " ++ case.name;
+    break :blk notes;
+};
+
+/// A case's report lines past its workload (a group's stage or memory report), written when
+/// the case ends and printed under its row by `--details`. Text past the buffer is cut.
+pub const DetailLines = struct {
+    buffer: [4096]u8 = undefined,
+    len: usize = 0,
+
+    pub fn print(self: *DetailLines, comptime format: []const u8, args: anytype) void {
+        var writer: std.Io.Writer = .fixed(self.buffer[self.len..]);
+        // A full buffer cuts the report; it is diagnostic text only.
+        writer.print(format, args) catch {};
+        self.len += writer.buffered().len;
+    }
+
+    pub fn text(self: *const DetailLines) []const u8 {
+        return self.buffer[0..self.len];
+    }
 };
 
 pub const RunStats = struct {
@@ -191,6 +291,7 @@ pub const RunStats = struct {
     // `write_workload` names what its counters hold.
     status: RunStatus = .measured,
     skip_reason: []const u8 = "",
+    duplicate_note: []const u8 = "",
     item_count: usize = 0,
     candidate_pairs: usize = 0,
     sample_count: usize = 0,
@@ -198,16 +299,25 @@ pub const RunStats = struct {
     deferred_count: usize = 0,
     fallback_deferred_count: usize = 0,
     cache_evictions: usize = 0,
+    // Neighbor-block fills of a group whose queries share `NeighborBlock`s, and of its second
+    // query kind when it has two.
+    neighbor_block_fills: usize = 0,
+    secondary_neighbor_block_fills: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
     min_ns: u64 = 0,
     max_ns: u64 = 0,
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
+    /// False when a sample spans many stages and `batch` holds none of them: the worker
+    /// and range cells print `-` and the summary names no worker use.
+    batch_carried: bool = true,
     secondary_batch: ?BatchSummary = null,
-    // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
+    // Nav groups: the mark stage (null when the workload marks no events), the key plan, and
+    // the remask when the headline `batch` is another stage.
     nav_mark_batch: ?BatchSummary = null,
     nav_plan_batch: ?BatchSummary = null,
+    nav_remask_batch: ?BatchSummary = null,
     // Static-collider groups: the chunk lists' and the query lists' splice stages.
     splice_batch: ?BatchSummary = null,
     query_splice_batch: ?BatchSummary = null,
@@ -215,6 +325,12 @@ pub const RunStats = struct {
     steering_stages: ?SteeringStageSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
+    /// The tuners the case's measured steps ran, judged by their state before measurement
+    /// (`TunerSettle.measured`).
+    tuner_settle: ?SettleReport = null,
+    /// A case with neither a headline tuner nor a census whose every tuner production starts
+    /// fresh at each run (a pipeline built per measured iteration): it is `fresh` and judged.
+    tuners_fresh: bool = false,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
@@ -227,6 +343,17 @@ pub const RunStats = struct {
     render_game_prep_static_groups: usize = 0,
     render_game_prep_merged_tilemap_groups: usize = 0,
     ai_behavior_histogram: ?AiBehaviorHistogramSummary = null,
+    /// Mean main-thread time per iteration: wall time minus the dispatch time of the
+    /// stages that ran on workers.
+    main_ns: ?u64 = null,
+    /// Mean time of a group's one ordered merge on main inside the sample (the response
+    /// place); part of `main_ns`.
+    main_merge_ns: ?u64 = null,
+    collision_stages: ?CollisionStageSummary = null,
+    render_capacities: ?RenderCapacitySummary = null,
+    production_step: ?ProductionStepSummary = null,
+    world_create: ?WorldCreateSummary = null,
+    details: DetailLines = .{},
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -243,11 +370,11 @@ pub const RunStats = struct {
 /// its share on workers, the flood tuner's policy after the case (null when the case runs no
 /// adaptive tuner; zero workers is inline), the chunks and records patched, and a toggle's
 /// reopen flood nodes (null without a reopen). Then the one-way
-/// closure's stage shapes (candidates, resolve, mask, plan, rows with round 0 and its rounds
-/// folded, landing) and counters: components touched, links resolved, terminals new and left,
-/// rows recomputed, rounds, words written, blocks narrowed, blocks allocated and freed, words
-/// landed, landings deferred, the live block words, the batch tail's capacity, and the rows
-/// stage's time on workers; and the
+/// closure's stage shapes (candidates, resolve, mask, plan, the relocated-span copy, rows with
+/// its rounds folded, landing) and counters: components touched, links resolved, terminals new
+/// and left, rows recomputed, rounds, words written, blocks narrowed, blocks allocated and
+/// freed, words landed, landings deferred, the live block words, the batch tail's capacity,
+/// and the closure write's time on workers (the copy and the rows); and the
 /// reserve of its busiest batch: the tail words its bound reserved and its blocks took, its
 /// candidates' block words, and the terminals it could number.
 pub const NavConnSummary = struct {
@@ -272,6 +399,7 @@ pub const NavConnSummary = struct {
     closure_resolve: BatchSummary = .{},
     closure_mask: BatchSummary = .{},
     closure_plan: BatchSummary = .{},
+    closure_copy: BatchSummary = .{},
     closure_rows: BatchSummary = .{},
     closure_land: BatchSummary = .{},
     closure_touched: usize = 0,
@@ -307,8 +435,8 @@ pub const NavMainSummary = struct {
     /// Adds one reaction: its main time and its stats' inline stage time and sections.
     pub fn add(self: *NavMainSummary, main_ns: u64, stats: NavUpdateStats) void {
         self.main_ns += main_ns;
-        self.inline_ns += stats.inline_stage_ns;
-        addSections(&self.sections, stats.main);
+        self.inline_ns += stats.perf.inline_stage_ns;
+        addSections(&self.sections, stats.perf.main);
     }
 
     /// Adds `other`'s reactions, its samples not counted.
@@ -328,7 +456,7 @@ pub const NavMainSummary = struct {
     }
 };
 
-pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
+fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
     return .{
         .item_count = batch.item_count,
         .range_count = batch.range_count,
@@ -342,7 +470,18 @@ pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
         .batch_duration_ns = batch.batch_duration_ns,
         .main_thread_wait_ns = batch.main_thread_wait_ns,
         .ran_inline = batch.ran_inline,
+        .threaded_batches = @intFromBool(batch.item_count != 0 and !batch.ran_inline and batch.active_worker_threads != 0),
+        .dispatched_batches = @intFromBool(batch.item_count != 0),
     };
+}
+
+/// Stage `index` of `shapes` (a `*const StageShapes(n)`): its busiest batch's shape, and its
+/// threaded over non-empty batches across the samples added.
+pub fn batchSummaryFromShapes(shapes: anytype, index: usize) BatchSummary {
+    var summary = batchSummaryFromBatch(shapes.busiest[index]);
+    summary.threaded_batches = shapes.threaded[index];
+    summary.dispatched_batches = shapes.dispatched[index];
+    return summary;
 }
 
 const CaseResult = struct {
@@ -365,6 +504,9 @@ pub const BatchSummary = struct {
     batch_duration_ns: u64 = 0,
     main_thread_wait_ns: u64 = 0,
     ran_inline: bool = true,
+    // Of the batches summarized, those that ran on workers and those with items.
+    threaded_batches: usize = 0,
+    dispatched_batches: usize = 0,
 };
 
 pub const RenderPrepPhaseSummary = struct {
@@ -380,10 +522,6 @@ pub const SteeringStageSummary = struct {
     select_resolve: BatchSummary = .{},
     select_claim: BatchSummary = .{},
     directions: BatchSummary = .{},
-    grid_bucket: BatchSummary = .{},
-    grid_sort: BatchSummary = .{},
-    // Entries in the agent grid's largest band after the last step.
-    band_max: usize = 0,
 };
 
 /// Mean per-iteration time of a batched terrain edit's plan and write stages, its nav
@@ -416,6 +554,78 @@ pub const AiBehaviorHistogramSummary = struct {
     cohere: usize = 0,
 };
 
+/// A collision step's fill and sort batches (the last measured step) and their tuners at the
+/// measurement boundary (null without an adaptive case), its sweep entries, and the
+/// candidates its sweep tested.
+pub const CollisionStageSummary = struct {
+    fill: BatchSummary = .{},
+    sort: BatchSummary = .{},
+    fill_tuning: ?WorkTuningSummary = null,
+    sort_tuning: ?WorkTuningSummary = null,
+    entries: usize = 0,
+    visits: usize = 0,
+    // The sweep's lane groups.
+    simd_groups: usize = 0,
+};
+
+/// Render-prep capacities after a collect: the dynamic record reserve and the sprite
+/// command reserve the scene asks for.
+pub const RenderCapacitySummary = struct {
+    record_capacity: usize = 0,
+    command_capacity: usize = 0,
+};
+
+/// One production fixed step's census, means per measured step. `main_ns` is the step's
+/// wall time minus the off-main time of every perf-log and bench-only batch stage that ran
+/// on workers: an upper bound, since batches neither carries count as main. `untimed_ns` is the
+/// wall time no top-level stage timer holds. Stage wall times are every perf-log timer the
+/// step records, nested ones included; batch off-main time counts a step only when every
+/// call of the stage that step ran on workers.
+pub const ProductionStepSummary = struct {
+    population: usize = 0,
+    measured_steps: usize = 0,
+    main_ns: u64 = 0,
+    untimed_ns: u64 = 0,
+    stage_wall_ns: std.enums.EnumArray(PerfTiming, u64) = .initFill(0),
+    // The bench-only top-level stage timers' wall times the step hands the census's sink.
+    bench_stage_wall_ns: std.enums.EnumArray(PerfBenchTiming, u64) = .initFill(0),
+    batch_off_main_ns: std.enums.EnumArray(PerfBatchStage, u64) = .initFill(0),
+    batch_threaded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
+    batch_recorded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
+    // The same for the bench-only stages the step hands the census's sink.
+    bench_batch_off_main_ns: std.enums.EnumArray(PerfBenchBatchStage, u64) = .initFill(0),
+    bench_batch_threaded_steps: std.enums.EnumArray(PerfBenchBatchStage, usize) = .initFill(0),
+    bench_batch_recorded_steps: std.enums.EnumArray(PerfBenchBatchStage, usize) = .initFill(0),
+    metrics: std.enums.EnumArray(PerfMetric, u64) = .initFill(0),
+    // A per-level shape's separation check bound per query and the most cells any row
+    // crossed on one axis over the steps it covers.
+    separation_check_bound: ?usize = null,
+    max_cell_drift: u32 = 0,
+};
+
+/// One world's create and destroy: each phase's mean time, the live bytes after each
+/// create phase, and the live bytes left after destroy (from one counted pass).
+pub const WorldCreateSummary = struct {
+    surface_ns: u64 = 0,
+    stack_ns: u64 = 0,
+    nav_ns: u64 = 0,
+    destroy_ns: u64 = 0,
+    // The `surface` phase less the paint's worker time.
+    surface_main_ns: u64 = 0,
+    // The `nav` phase less its stages' worker time.
+    nav_main_ns: u64 = 0,
+    surface_bytes: usize = 0,
+    stack_bytes: usize = 0,
+    nav_bytes: usize = 0,
+    destroyed_bytes: usize = 0,
+};
+
+/// Whether a case's tuners had settled when its measurement started: `fresh` is a one-off
+/// stage whose production tuner starts fresh each run (a world, level, or store rebuild),
+/// measured fresh and judged; `idle` is a tuner that recorded no batch in the measured
+/// window, so its state shaped nothing measured, and is judged.
+pub const Settle = enum { no, yes, fresh, idle };
+
 pub const WorkTuningSummary = struct {
     // Captures tuner state at the measurement boundary. Unsettled adaptive
     // results stay visible instead of being treated as final policy.
@@ -424,22 +634,17 @@ pub const WorkTuningSummary = struct {
     initial_range_items: usize = 0,
     final_worker_threads: usize = 0,
     final_items_per_range: usize = 0,
-    best_worker_threads: usize = 0,
-    best_items_per_range: usize = 0,
+    batch_multiplier: f64 = 1,
     candidate_worker_threads: ?usize = null,
     candidate_items_per_range: ?usize = null,
     sample_count: usize = 0,
     sample_window: usize = 0,
-    failed_profile_count: usize = 0,
-    settled_window_count: usize = 0,
-    retune_after_settled_windows: usize = 0,
-    settled_before_measurement: bool = false,
-    best_mean_batch_duration_ns: u64 = 0,
+    settle: Settle = .no,
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
-    probe_window_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
-    demotion_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+    /// The tuner's counts over the measured window only.
+    measured_counts: TunerCounts = .{},
 };
 
 pub const StatsAccumulator = struct {
@@ -455,7 +660,9 @@ pub const StatsAccumulator = struct {
     total_main_thread_ranges: u128 = 0,
     total_worker_thread_ranges: u128 = 0,
     total_worker_utilization: f64 = 0,
-    last_batch: BatchStats = .{},
+    // The headline batch over every measured step: its busiest shape and threaded over
+    // non-empty batches.
+    shapes: StageShapes(1) = .{},
 
     pub fn init(item_count: usize) StatsAccumulator {
         return .{ .item_count = item_count };
@@ -471,9 +678,11 @@ pub const StatsAccumulator = struct {
         self.total_main_thread_ranges += batch.main_thread_ranges;
         self.total_worker_thread_ranges += batch.worker_thread_ranges;
         self.total_worker_utilization += batch.worker_utilization;
-        self.last_batch = batch;
+        self.shapes.add(.{batch});
     }
 
+    /// The measured steps' means; `batch` carries the headline's busiest shape and its
+    /// threaded over non-empty batches.
     pub fn finish(self: StatsAccumulator) RunStats {
         if (self.iterations == 0) return .{};
 
@@ -483,6 +692,12 @@ pub const StatsAccumulator = struct {
             @as(u64, 0)
         else
             std.math.lossyCast(u64, (total_items * std.time.ns_per_s) / self.total_ns);
+        var batch = batchSummaryFromShapes(&self.shapes, 0);
+        batch.main_thread_ranges = std.math.lossyCast(usize, self.total_main_thread_ranges / iteration_count);
+        batch.worker_thread_ranges = std.math.lossyCast(usize, self.total_worker_thread_ranges / iteration_count);
+        batch.worker_utilization_percent = @intFromFloat((self.total_worker_utilization / @as(f64, @floatFromInt(self.iterations))) * 100.0);
+        batch.batch_duration_ns = std.math.lossyCast(u64, self.total_batch_duration_ns / iteration_count);
+        batch.main_thread_wait_ns = std.math.lossyCast(u64, self.total_main_thread_wait_ns / iteration_count);
 
         return .{
             .item_count = self.item_count,
@@ -491,86 +706,396 @@ pub const StatsAccumulator = struct {
             .min_ns = self.min_ns,
             .max_ns = self.max_ns,
             .items_per_second = items_per_second,
-            .batch = .{
-                .item_count = self.last_batch.item_count,
-                .range_count = self.last_batch.range_count,
-                .items_per_range = self.last_batch.items_per_range,
-                .range_alignment_items = self.last_batch.range_alignment_items,
-                .available_worker_threads = self.last_batch.available_worker_threads,
-                .active_worker_threads = self.last_batch.active_worker_threads,
-                .main_thread_ranges = std.math.lossyCast(usize, self.total_main_thread_ranges / iteration_count),
-                .worker_thread_ranges = std.math.lossyCast(usize, self.total_worker_thread_ranges / iteration_count),
-                .worker_utilization_percent = @intFromFloat((self.total_worker_utilization / @as(f64, @floatFromInt(self.iterations))) * 100.0),
-                .batch_duration_ns = std.math.lossyCast(u64, self.total_batch_duration_ns / iteration_count),
-                .main_thread_wait_ns = std.math.lossyCast(u64, self.total_main_thread_wait_ns / iteration_count),
-                .ran_inline = self.last_batch.ran_inline,
-            },
+            .batch = batch,
         };
     }
 };
 
-pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement: bool) WorkTuningSummary {
+/// A tuner's diagnostic counts: its probe windows, settled demotions, restores, records
+/// skipped on an unsustained item-count shift, and batches recorded. The tuner's are
+/// cumulative over its life, so a measured window reports `since` its start. `records` says
+/// whether the tuner ran, not how it tuned, so `any` and `write` leave it out.
+pub const TunerCounts = struct {
+    probes: u64 = 0,
+    demotes: u64 = 0,
+    restores: u64 = 0,
+    shift_skips: u64 = 0,
+    records: u64 = 0,
+
+    pub fn of(tuner: *const AdaptiveWorkTuner) TunerCounts {
+        if (comptime !diagnostics_enabled) return .{};
+        return .{ .probes = tuner.probe_window_count, .demotes = tuner.demotion_count, .restores = tuner.restore_count, .shift_skips = tuner.shift_skip_count, .records = tuner.record_count };
+    }
+
+    pub fn since(self: TunerCounts, before: TunerCounts) TunerCounts {
+        return .{ .probes = self.probes - before.probes, .demotes = self.demotes - before.demotes, .restores = self.restores - before.restores, .shift_skips = self.shift_skips - before.shift_skips, .records = self.records - before.records };
+    }
+
+    pub fn any(self: TunerCounts) bool {
+        return self.probes != 0 or self.demotes != 0 or self.restores != 0 or self.shift_skips != 0;
+    }
+
+    /// `probes=<n> demotes=<n> restores=<n> shift_skips=<n>`.
+    pub fn write(self: TunerCounts, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("probes={} demotes={} restores={} shift_skips={}", .{ self.probes, self.demotes, self.restores, self.shift_skips });
+    }
+};
+
+/// A tuner when its case's measurement starts: whether the case counts it settled, and its
+/// counts, which `workTuningSummary` subtracts so the summary reports the measured window.
+pub const TunerStart = struct {
+    settle: Settle = .no,
+    counts: TunerCounts = .{},
+
+    /// A one-off stage's tuner that production constructs fresh each run, whose counts
+    /// start at zero.
+    pub const fresh: TunerStart = .{ .settle = .fresh };
+
+    /// `tuner` now: settled when `case` is tuned and the tuner itself is settled.
+    pub fn of(tuner: *const AdaptiveWorkTuner, case: BenchmarkCase) TunerStart {
+        return .{ .settle = if (case.adaptive and tunerSettled(tuner)) .yes else .no, .counts = .of(tuner) };
+    }
+};
+
+/// `tuner`'s state after measurement, its settle state at `start`, and its counts since then.
+pub fn workTuningSummary(tuner: *const AdaptiveWorkTuner, start: TunerStart) WorkTuningSummary {
+    return workTuningSummaryAt(tuner, .of(tuner), start);
+}
+
+/// `workTuningSummary` with the tuner's counts at measurement end given as `end`: the summary
+/// reports `end` less `start`'s counts, and `idle` for a tuner (not `fresh`) that recorded no
+/// batch in the measured window.
+fn workTuningSummaryAt(tuner: *const AdaptiveWorkTuner, end: TunerCounts, start: TunerStart) WorkTuningSummary {
+    const idle = start.settle != .fresh and end.records == start.counts.records;
     return .{
-        .phase = report.phase,
-        .initial_worker_threads = report.initial_profile.worker_threads,
-        .initial_range_items = report.initial_profile.items_per_range,
-        .final_worker_threads = report.current_profile.worker_threads,
-        .final_items_per_range = report.current_profile.items_per_range,
-        .best_worker_threads = report.best_profile.worker_threads,
-        .best_items_per_range = report.best_profile.items_per_range,
-        .candidate_worker_threads = if (report.candidate_profile) |profile| profile.worker_threads else null,
-        .candidate_items_per_range = if (report.candidate_profile) |profile| profile.items_per_range else null,
-        .sample_count = report.sample_count,
-        .sample_window = report.sample_window,
-        .failed_profile_count = report.failed_profile_count,
-        .settled_window_count = report.settled_window_count,
-        .retune_after_settled_windows = report.retune_after_settled_windows,
-        .settled_before_measurement = settled_before_measurement,
-        .best_mean_batch_duration_ns = report.best_mean_batch_duration_ns,
-        .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
-        .has_threaded_profile = report.has_threaded_profile,
-        .probing = report.probing,
-        .probe_window_count = report.probe_window_count,
-        .demotion_count = report.demotion_count,
+        .phase = tuner.phase,
+        .initial_worker_threads = tuner.initial_profile.worker_threads,
+        .initial_range_items = tuner.initial_profile.items_per_range,
+        .final_worker_threads = tuner.current_profile.worker_threads,
+        .final_items_per_range = tuner.current_profile.items_per_range,
+        .batch_multiplier = tuner.batch_multiplier,
+        .candidate_worker_threads = if (tuner.candidate_profile) |profile| profile.worker_threads else null,
+        .candidate_items_per_range = if (tuner.candidate_profile) |profile| profile.items_per_range else null,
+        .sample_count = tuner.sample_count,
+        .sample_window = tuner.config.sample_window,
+        .settle = if (idle) .idle else start.settle,
+        .baseline_mean_batch_duration_ns = tuner.baseline_mean_batch_duration_ns,
+        .has_threaded_profile = tuner.has_threaded_profile,
+        .probing = tuner.phase == .probing,
+        .measured_counts = end.since(start.counts),
     };
 }
 
-pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?AdaptiveWorkTuner {
-    // Fixed-adaptive cases reuse tuner reporting but clamp range probing so they
-    // can act as a stable control against fully adaptive policy.
-    if (!case.adaptive) return null;
-    return switch (case.adaptive_range_mode) {
-        .none, .tuned => null,
-        .fixed => fixed: {
-            const fixed_range = std.mem.alignForwardAnyAlign(usize, default_items_per_range, range_alignment_items);
-            break :fixed AdaptiveWorkTuner.init(.{
-                .initial_range_items = fixed_range,
-                .smallest_range_items = fixed_range,
-                .largest_range_items = fixed_range,
-            });
-        },
-    };
-}
-
+/// The settle limit: 16 sample windows for the inline/threaded decision, then 16 nudge
+/// comparisons for the batch count to reach a hold.
 pub fn adaptiveSettleIterationLimit(options: Options) usize {
     const default_tuner_config = AdaptiveWorkTunerConfig{};
     const settle_windows: usize = 16;
-    const settle_iterations = default_tuner_config.sample_window * settle_windows;
+    const settle_nudges: usize = 16;
+    const settle_iterations = default_tuner_config.sample_window * settle_windows + default_tuner_config.nudge_samples * settle_nudges;
     return @max(options.iterations, settle_iterations);
 }
+
+/// A tuner the bench may stop warming: settled with no settled demotion awaiting its judging
+/// window and no item-count retune pending, and, when threaded, its batch-count nudge
+/// holding.
+pub fn tunerSettled(tuner: *const AdaptiveWorkTuner) bool {
+    return tuner.phase == .settled and tuner.restore_threaded_profile == null and !tuner.retune_pending and
+        (!tuner.has_threaded_profile or tuner.nudge_state == .holding);
+}
+
+/// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), used or not: a named
+/// tuner list's completeness check.
+pub fn tunerCount(comptime T: type, value: *const T) usize {
+    const Counter = struct {
+        count: usize = 0,
+        pub fn visit(self: *@This(), comptime _: []const u8, _: *AdaptiveWorkTuner) void {
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    // The walk takes mutable pointers; `visit` reads nothing.
+    forEachTunerIn(T, @constCast(value), "", &counter);
+    return counter.count;
+}
+
+/// A snapshot of the tuners a case's step can run: each one's record count and settle state
+/// when the snapshot was taken. A tuner counts as used by a later window only when it
+/// recorded a batch since the snapshot, so tuners only setup or a one-off step ran stay idle
+/// and never hold the census. Built per tuner with `add`, or over every tuner a fixture holds
+/// by value with `of`. The entries point at the live tuners, which must stay in place and
+/// keep their counts until the snapshot's last use.
+pub const TunerSettle = struct {
+    pub const capacity = 256;
+
+    const Entry = struct {
+        name: []const u8,
+        tuner: *const AdaptiveWorkTuner,
+        records: u64,
+        settled: bool,
+        // A tuner production starts fresh at every run of its one-off pass (`addFresh`).
+        fresh: bool = false,
+    };
+
+    entries: [capacity]Entry = undefined,
+    len: usize = 0,
+
+    /// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), named by path.
+    pub fn of(comptime T: type, value: *const T) TunerSettle {
+        var census = TunerSettle{};
+        census.addAll(T, value, "");
+        return census;
+    }
+
+    /// `of`'s walk added to this census, its paths under `root`.
+    pub fn addAll(self: *TunerSettle, comptime T: type, value: *const T, comptime root: []const u8) void {
+        // The walk takes mutable pointers; `visit` only reads the tuner.
+        forEachTunerIn(T, @constCast(value), root, self);
+    }
+
+    /// A census over a named tuner list: `tuners[i]` named `names[i]`.
+    pub fn ofNamed(names: []const []const u8, tuners: []const *const AdaptiveWorkTuner) TunerSettle {
+        var census = TunerSettle{};
+        census.addNamed(names, tuners);
+        return census;
+    }
+
+    /// `add` over a named tuner list: `tuners[i]` named `names[i]`.
+    pub fn addNamed(self: *TunerSettle, names: []const []const u8, tuners: []const *const AdaptiveWorkTuner) void {
+        for (names, tuners) |name, tuner| self.add(name, tuner);
+    }
+
+    /// `tuner` and its record count and settle state now. A tuner the census already holds
+    /// keeps its first entry, so builders over overlapping sets count it once. A census past
+    /// `capacity` is a harness bug, failed loudly in every mode.
+    pub fn add(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
+        self.addEntry(.{ .name = name, .tuner = tuner, .records = TunerCounts.of(tuner).records, .settled = tunerSettled(tuner) });
+    }
+
+    /// A one-off pass's `tuner` that production starts fresh at every run (a level build's
+    /// stage set): it never settles and never holds the census or a warm loop; one the last
+    /// run selected (`last_request`) is reported `fresh` and judged.
+    pub fn addFresh(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
+        self.addEntry(.{ .name = name, .tuner = tuner, .records = 0, .settled = false, .fresh = true });
+    }
+
+    fn addEntry(self: *TunerSettle, entry: Entry) void {
+        for (self.entries[0..self.len]) |held| {
+            if (held.tuner == entry.tuner) return;
+        }
+        if (self.len == capacity) std.debug.panic("tuner census holds more than {} tuners", .{capacity});
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+
+    pub fn visit(self: *TunerSettle, comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
+        self.add(path, tuner);
+    }
+
+    /// The census over the window since the snapshot, read from the live tuners: each tuner
+    /// that recorded since is judged by its state at the snapshot.
+    pub fn measured(self: *const TunerSettle) SettleReport {
+        var records_now: [capacity]u64 = undefined;
+        for (self.entries[0..self.len], records_now[0..self.len]) |entry, *records| records.* = TunerCounts.of(entry.tuner).records;
+        return self.reportOf(records_now[0..self.len]);
+    }
+
+    /// Whether a warm loop may stop, read from the live tuners: some tuner recorded since the
+    /// snapshot and every one that did is settled now.
+    pub fn settledSince(self: *const TunerSettle) bool {
+        var records_now: [capacity]u64 = undefined;
+        var settled_now: [capacity]bool = undefined;
+        for (self.entries[0..self.len], records_now[0..self.len], settled_now[0..self.len]) |entry, *records, *settled| {
+            records.* = TunerCounts.of(entry.tuner).records;
+            settled.* = tunerSettled(entry.tuner);
+        }
+        return self.settledSinceOf(records_now[0..self.len], settled_now[0..self.len]);
+    }
+
+    /// `measured` over each entry's record count now, `records_now[i]` for entry `i`.
+    fn reportOf(self: *const TunerSettle, records_now: []const u64) SettleReport {
+        std.debug.assert(records_now.len == self.len);
+        var report = SettleReport{};
+        for (self.entries[0..self.len], records_now) |entry, records| {
+            if (entry.fresh) {
+                if (entry.tuner.last_request != null) report.fresh += 1 else report.idle += 1;
+                continue;
+            }
+            if (records == entry.records) {
+                report.idle += 1;
+                continue;
+            }
+            report.used += 1;
+            if (entry.settled) {
+                report.settled += 1;
+                continue;
+            }
+            if (report.unsettled_listed == SettleReport.listed_max) continue;
+            report.unsettled_names[report.unsettled_listed] = entry.name;
+            report.unsettled_listed += 1;
+        }
+        return report;
+    }
+
+    /// `settledSince` over each entry's record count and settle state now.
+    fn settledSinceOf(self: *const TunerSettle, records_now: []const u64, settled_now: []const bool) bool {
+        std.debug.assert(records_now.len == self.len and settled_now.len == self.len);
+        var any_recorded = false;
+        for (self.entries[0..self.len], records_now, settled_now) |entry, records, settled| {
+            if (entry.fresh or records == entry.records) continue;
+            if (!settled) return false;
+            any_recorded = true;
+        }
+        return any_recorded;
+    }
+};
+
+/// A tuner census over a measured window (`TunerSettle.measured`): `settled` of the `used`
+/// tuners (those that recorded in the window, judged by their state at its start), the `idle`
+/// ones that did not record, the `fresh` one-off tuners the last run selected
+/// (`TunerSettle.addFresh`), and the first unsettled ones' names.
+pub const SettleReport = struct {
+    const listed_max = 4;
+
+    used: usize = 0,
+    settled: usize = 0,
+    idle: usize = 0,
+    fresh: usize = 0,
+    unsettled_names: [listed_max][]const u8 = undefined,
+    unsettled_listed: usize = 0,
+
+    pub fn all(self: SettleReport) bool {
+        return self.settled == self.used;
+    }
+
+    /// `settled=<k>/<n> idle=<m>`, `fresh=<f>` when a fresh one-off tuner ran, then the first
+    /// unsettled names.
+    pub fn write(self: *const SettleReport, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("settled={}/{} idle={}", .{ self.settled, self.used, self.idle });
+        if (self.fresh != 0) try writer.print(" fresh={}", .{self.fresh});
+        if (self.all()) return;
+        try writer.writeAll(" unsettled=");
+        for (self.unsettled_names[0..self.unsettled_listed], 0..) |name, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll(name);
+        }
+        if (self.used - self.settled > self.unsettled_listed) try writer.writeAll(",...");
+    }
+};
+
+/// Per named tuner, its counts when a case's measurement starts; `printTuning` writes each
+/// one's state and its counts over the measured window.
+pub fn TunerWindow(comptime n: usize) type {
+    return struct {
+        const Self = @This();
+
+        start: [n]TunerCounts = @splat(.{}),
+
+        pub fn begin(tuners: [n]*const AdaptiveWorkTuner) Self {
+            var window = Self{};
+            for (tuners, &window.start) |tuner, *start| start.* = .of(tuner);
+            return window;
+        }
+
+        /// `tuners: <name>=<phase>,<final workers/range or inline>,x=<batch multiplier>,<probes>/
+        /// <demotes>/<restores>/<shift skips> ...` (counts over the measured window), one line.
+        pub fn printTuning(self: *const Self, details: *DetailLines, names: [n][]const u8, tuners: [n]*const AdaptiveWorkTuner) void {
+            details.print("tuners:", .{});
+            for (names, tuners, self.start) |name, tuner, start| {
+                var state: [64]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&state);
+                writeTunerState(&writer, tuner) catch {};
+                details.print(" {s}={s}", .{ name, writer.buffered() });
+                if (comptime diagnostics_enabled) {
+                    const counts = TunerCounts.of(tuner).since(start);
+                    details.print(",{}/{}/{}/{}", .{ counts.probes, counts.demotes, counts.restores, counts.shift_skips });
+                }
+            }
+            details.print("\n", .{});
+        }
+    };
+}
+
+/// `<phase>,<final workers>/<items per range>,x=<batch multiplier>`, or `<phase>,inline` for
+/// a tuner with no threaded profile.
+pub fn writeTunerState(writer: *std.Io.Writer, tuner: *const AdaptiveWorkTuner) std.Io.Writer.Error!void {
+    try writer.print("{s},", .{@tagName(tuner.phase)});
+    if (!tuner.has_threaded_profile) return writer.writeAll("inline");
+    try writer.print("{}/{},x={d:.2}", .{ tuner.current_profile.worker_threads, tuner.current_profile.items_per_range, tuner.batch_multiplier });
+}
+
+/// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`
+/// or, over a tuner census, `while (warm.nextSettled(census)) step();`: the warmup steps,
+/// then, for an adaptive case only, steps until the case's tuners settle or the settle limit
+/// runs out.
+pub const Warmup = struct {
+    warmup_left: usize,
+    settle_left: usize,
+    // `nextSettled`'s census at its first settle step.
+    settle_start: ?TunerSettle = null,
+
+    /// `options`' warmup (at least `min_warmup` steps) and the default settle limit.
+    pub fn init(options: Options, case: BenchmarkCase, min_warmup: usize) Warmup {
+        return custom(case, @max(min_warmup, options.warmup_iterations), adaptiveSettleIterationLimit(options));
+    }
+
+    pub fn custom(case: BenchmarkCase, warmup_steps: usize, settle_limit: usize) Warmup {
+        return .{ .warmup_left = warmup_steps, .settle_left = if (case.adaptive) settle_limit else 0 };
+    }
+
+    /// Whether to run one more step; `tuners_settled` is the case's tuners' state now.
+    pub fn next(self: *Warmup, tuners_settled: bool) bool {
+        if (self.warmup_left != 0) {
+            self.warmup_left -= 1;
+            return true;
+        }
+        if (tuners_settled or self.settle_left == 0) return false;
+        self.settle_left -= 1;
+        return true;
+    }
+
+    /// Whether `nextSettled`'s settle phase ended with every tuner that recorded since its
+    /// snapshot settled (false for a case with no settle phase).
+    pub fn settled(self: *const Warmup) bool {
+        const start = if (self.settle_start) |*start| start else return false;
+        return start.settledSince();
+    }
+
+    /// Whether to run one more step, for a case judged by a tuner census; `current` is the
+    /// census now. The first settle step keeps `current` as the settle phase's snapshot, so
+    /// tuners only setup or the warmup steps ran never hold the loop; it then stops when
+    /// every tuner that recorded since is settled (`TunerSettle.settledSince`), or when the
+    /// settle limit runs out.
+    pub fn nextSettled(self: *Warmup, current: TunerSettle) bool {
+        const since_settled: ?bool = if (self.settle_start) |*start| start.settledSince() else null;
+        return self.nextSettledOf(current, since_settled);
+    }
+
+    /// `nextSettled` given whether the snapshot's tuners settled since it was taken
+    /// (`TunerSettle.settledSince`), null before the snapshot.
+    fn nextSettledOf(self: *Warmup, current: TunerSettle, since_settled: ?bool) bool {
+        std.debug.assert((since_settled == null) == (self.settle_start == null));
+        if (self.warmup_left != 0) {
+            self.warmup_left -= 1;
+            return true;
+        }
+        if (self.settle_left == 0) return false;
+        if (since_settled) |settled_now| {
+            if (settled_now) return false;
+        } else {
+            self.settle_start = current;
+        }
+        self.settle_left -= 1;
+        return true;
+    }
+};
 
 pub fn parseOptions(args: []const []const u8) !Options {
     var options = Options{};
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--profile")) {
-            index += 1;
-            if (index >= args.len) return error.MissingArgument;
-            options.profile = try parseProfile(args[index]);
-        } else if (stripPrefix(arg, "--profile=")) |value| {
-            options.profile = try parseProfile(value);
-        } else if (std.mem.eql(u8, arg, "--warmup")) {
+        if (std.mem.eql(u8, arg, "--warmup")) {
             index += 1;
             if (index >= args.len) return error.MissingArgument;
             options.warmup_iterations = try parsePositiveUsize(args[index]);
@@ -614,6 +1139,8 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.fallback_budget = try parsePositiveUsize(value);
         } else if (std.mem.eql(u8, arg, "--details")) {
             options.details = true;
+        } else if (std.mem.eql(u8, arg, "--list")) {
+            options.list_groups = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.HelpRequested;
         } else {
@@ -641,11 +1168,16 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
             var results: [default_cases.len]CaseResult = undefined;
             var result_count: usize = 0;
 
-            for (default_cases) |case| {
+            std.debug.assert(group.fixed_range_shape == null or group.cases.len == default_cases.len);
+            for (group.cases, 0..) |case, case_index| {
                 if (options.case_filter) |filter| {
                     if (!std.mem.eql(u8, filter, case.name) and !shouldIncludeBaselineForFilter(filter, case)) continue;
                 }
-                const stats = try group.runCase(allocator, io, options, case, item_count);
+                const duplicate_of = if (group.fixed_range_shape) |shape| sameShapeCaseIndex(shape, case_index) else null;
+                const stats: RunStats = if (duplicate_of) |earlier|
+                    .{ .status = .duplicate, .duplicate_note = same_shape_notes[earlier] }
+                else
+                    try group.runCase(allocator, io, options, case, item_count);
                 results[result_count] = .{ .case = case, .stats = stats };
                 result_count += 1;
             }
@@ -657,6 +1189,21 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
         std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter orelse options.group_prefix.?});
         return error.InvalidArgument;
     }
+}
+
+// The earliest default case that `default_cases[case_index]` runs the same configuration as
+// under `shape`: the same fixed (non-adaptive) threaded worker mode and the same resolved range.
+// A range that follows the stage's item count resolves per stage at dispatch, so a case with
+// one is never matched either way.
+fn sameShapeCaseIndex(shape: FixedRangeShape, case_index: usize) ?usize {
+    const case = default_cases[case_index];
+    if (case.adaptive or !case.usesThreadSystem()) return null;
+    const range = case.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items) orelse return null;
+    for (default_cases[0..case_index], 0..) |earlier, earlier_index| {
+        if (earlier.adaptive or earlier.worker_mode != case.worker_mode) continue;
+        if (earlier.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items) == range) return earlier_index;
+    }
+    return null;
 }
 
 /// A group runs when it equals `--group` (if given) and starts with `--group-prefix` (if given).
@@ -675,7 +1222,33 @@ fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_c
         explicit_item_count[0] = item_count;
         return explicit_item_count[0..1];
     }
-    return group.defaultItemCounts(options.profile);
+    return group.item_counts;
+}
+
+/// One group per block: its name, what an item counts, the `--items` values it
+/// accepts, and the cases it runs. `--group` and `--group-prefix` narrow it.
+pub fn printGroupList(groups: []const BenchmarkGroup, options: Options) !void {
+    const filtered = options.group_filter != null or options.group_prefix != null;
+    var matched = false;
+    for (groups) |group| {
+        if (filtered and !groupSelected(options, group.name)) continue;
+        matched = true;
+        std.debug.print("group={s}\nlabel={s}\nitems=", .{ group.name, group.item_label });
+        for (group.item_counts, 0..) |count, index| {
+            if (index != 0) std.debug.print(" ", .{});
+            std.debug.print("{d}", .{count});
+        }
+        std.debug.print("\ncases=", .{});
+        for (group.cases, 0..) |case, index| {
+            if (index != 0) std.debug.print(",", .{});
+            std.debug.print("{s}", .{case.name});
+        }
+        std.debug.print("\n", .{});
+    }
+    if (filtered and !matched) {
+        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter orelse options.group_prefix.?});
+        return error.InvalidArgument;
+    }
 }
 
 pub fn printUsage() void {
@@ -683,7 +1256,6 @@ pub fn printUsage() void {
         \\Usage: zig build bench -- [options]
         \\
         \\Options:
-        \\  --profile quick|standard|stress   (count groups; item-code groups run fixed configs)
         \\  --warmup N
         \\  --iterations N
         \\  --case name
@@ -692,20 +1264,125 @@ pub fn printUsage() void {
         \\  --items N
         \\  --fallback-budget N
         \\  --details
+        \\  --list
         \\
         \\Default runs every benchmark case for every registered workload.
         \\
     , .{});
 }
 
-pub fn availableWorkerThreads() usize {
-    const cpu_count = std.Thread.getCpuCount() catch return 0;
-    return if (cpu_count > 1) cpu_count - 1 else 0;
+/// The aligned range a fixed threaded case's control dispatched a single `batch` at. Under the
+/// clamp it is production's resolution of the batch's own item count
+/// (`ThreadSystem.fixedBatchesItemsPerRange`), and the control `items_per_range` (null there)
+/// is ignored; otherwise it is `items_per_range` aligned to the batch's alignment, or null.
+pub fn controlItemsPerRange(case: BenchmarkCase, threads: *const ThreadSystem, items_per_range: ?usize, batch: BatchStats) ?usize {
+    const alignment = @max(batch.range_alignment_items, 1);
+    if (case.stageBatchesPerParticipant()) |batches| return threads.fixedBatchesItemsPerRange(batch.item_count, case.maxWorkerThreads(), alignment, batches);
+    const range = items_per_range orelse return null;
+    return std.mem.alignForwardAnyAlign(usize, @max(range, 1), alignment);
+}
+
+/// Fails when a fixed threaded case ran a single-dispatch stage off its control on a thread
+/// system with workers: inline over more than one range at its control
+/// (`controlItemsPerRange`), or, under the clamp, split into other than one range per control
+/// range of its items (`checkFixedRangeCount`). Adaptive and serial cases, and a null control,
+/// pass. A batch folded from several dispatches is checked by `checkFoldedStageDispatched`, a
+/// round-folded one by `checkRoundsDispatched`.
+pub fn checkStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{ BenchStageRanInline, BenchStageRangeShape }!void {
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0) return;
+    const range = controlItemsPerRange(case, threads, items_per_range, batch) orelse return;
+    if (batch.ran_inline and batch.item_count > range) return error.BenchStageRanInline;
+    if (case.stageBatchesPerParticipant() != null) try checkFixedRangeCount(case, thread_system, items_per_range, batch);
+}
+
+// Fails when a fixed threaded case ran every dispatch folded into `batch`
+// (`accumulateBatch`) inline although one of them held more than one range at its control,
+// on a thread system with workers. Outside the clamp that is a folded batch past one control
+// range. Under the clamp a dispatch runs inline only when it fits one aligned unit
+// (`ThreadSystem.fixedBatchesItemsPerRange`), so an inline fold fails when it holds more
+// items than one aligned unit per range, or a dispatch ran forced inline. Adaptive and serial
+// cases, and a null control, pass.
+fn checkFoldedStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRanInline}!void {
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0 or !batch.ran_inline) return;
+    const alignment = @max(batch.range_alignment_items, 1);
+    if (case.stageBatchesPerParticipant() != null) {
+        if (batch.forced_inline or batch.item_count > batch.range_count * alignment) return error.BenchStageRanInline;
+        return;
+    }
+    const range = items_per_range orelse return;
+    if (batch.item_count > std.mem.alignForwardAnyAlign(usize, @max(range, 1), alignment)) return error.BenchStageRanInline;
+}
+
+/// Fails when a fixed threaded case split a stage into other than one range per control
+/// range (`controlItemsPerRange`) of its items, on a thread system with workers. Adaptive and
+/// serial cases, an empty batch, and a null control pass.
+pub fn checkFixedRangeCount(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRangeShape}!void {
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0 or batch.item_count == 0) return;
+    const range = controlItemsPerRange(case, threads, items_per_range, batch) orelse return;
+    if (batch.range_count != rangeCount(batch.item_count, range)) return error.BenchStageRangeShape;
+}
+
+/// Fails when a fixed threaded case ran a round-folded stage (`RoundDispatch`, alignment 1)
+/// off its range on a thread system with workers: every round inline although its widest
+/// round (`round_items_max`) spanned more than one range, or an inline round past one range.
+/// Rounds that each ran unforced inline were one range apiece, so the inline fold proves a
+/// round inline past one range only when its mean round passes one range, or a round ran
+/// forced inline. Under the clamp the range is production's resolution of the widest step's
+/// item count (`step_items_max`, what `RoundDispatch.begin` sized the rounds from), and every
+/// round reports it: the folded batch's range must equal it (the resolved range does not
+/// shrink as the item count grows, so the widest step's range is the widest of every step's).
+/// Adaptive and serial cases, a null control, and a batch with no round pass.
+pub fn checkRoundsDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats, round_items_max: usize, step_items_max: usize) error{ BenchStageRanInline, BenchStageRangeShape }!void {
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0 or batch.item_count == 0) return;
+    const range = if (case.stageBatchesPerParticipant()) |batches| clamp: {
+        const step_range = threads.fixedBatchesItemsPerRange(step_items_max, case.maxWorkerThreads(), 1, batches);
+        if (batch.items_per_range != step_range) return error.BenchStageRangeShape;
+        break :clamp step_range;
+    } else @max(items_per_range orelse return, 1);
+    if (round_items_max > range and batch.worker_thread_ranges == 0) return error.BenchStageRanInline;
+    if (roundsRanInline(range, batch)) return error.BenchStageRanInline;
+}
+
+// Whether the inline rounds folded into `batch` held a round of more than one `range`: a
+// forced-inline round past one range, or a mean round past one range.
+fn roundsRanInline(range: usize, batch: BatchStats) bool {
+    if (!batch.ran_inline or batch.item_count <= range) return false;
+    return batch.forced_inline or @divCeil(batch.item_count, @max(batch.range_count, 1)) > range;
+}
+
+/// `checkStageDispatched` over each of `batches`.
+pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batches: []const BatchStats) error{ BenchStageRanInline, BenchStageRangeShape }!void {
+    for (batches) |batch| try checkStageDispatched(case, thread_system, items_per_range, batch);
+}
+
+/// Fails when the tuned case on a thread system with workers ran a rebuild stage inline over
+/// more than one aligned range: a fresh rebuild tuner's first selection is the full pool
+/// (`rebuild_tuner_config`). Other cases pass.
+pub fn checkRebuildOnWorkers(case: BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildStageRanInline}!void {
+    if (!case.adaptive or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
+    if (rangeCount(batch.item_count, batch.range_alignment_items) > 1 and batch.ran_inline) return error.RebuildStageRanInline;
+}
+
+/// A static collider rebuild's pass-shape counts, its batch records in `RebuildStage` order,
+/// on a fixture of one-tile statics: every entity slot selected, every static planned and
+/// touched, one footprint chunk and no coarse cell per static, at least one fill unit per
+/// span and per query record, and one installed block per occupied chunk.
+pub fn checkRebuildWork(batches: [std.enums.values(RebuildStage).len]BatchStats, slot_count: usize, static_count: usize, chunk_count: usize) !void {
+    const select, const plan, const touch, const group_batch, const rewrite, const install = batches;
+    if (select.item_count != slot_count) return error.RebuildSelectMissedSlots;
+    if (plan.item_count != static_count or touch.item_count != static_count) return error.RebuildPlanMissedStatics;
+    if (group_batch.item_count != static_count) return error.RebuildGroupMissedTouches;
+    if (rewrite.item_count < 2 * static_count) return error.RebuildFillMissedStatics;
+    if (install.item_count != chunk_count) return error.RebuildInstallMissedChunks;
 }
 
 pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {
     if (case.required_worker_count == 0) return null;
-    if (availableWorkerThreads() >= case.required_worker_count) return null;
+    if (defaultWorkerThreadCount() >= case.required_worker_count) return null;
     return RunStats.skipped("not enough worker threads available");
 }
 
@@ -715,20 +1392,6 @@ pub fn nowNs(io: std.Io) i96 {
 
 pub fn elapsedNs(start_ns: i96, end_ns: i96) u64 {
     return if (end_ns > start_ns) @intCast(end_ns - start_ns) else 0;
-}
-
-/// Ceiling division of `item_count` into ranges of `items_per_range`, shared by
-/// the benchmark fixtures so each does not re-roll its own ceil-division.
-pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
-    if (items_per_range == 0) return 0;
-    return std.math.divCeil(usize, item_count, items_per_range) catch unreachable; // lint:allow catch-unreachable: divisor guarded non-zero above
-}
-
-fn parseProfile(value: []const u8) !Profile {
-    if (std.mem.eql(u8, value, "quick")) return .quick;
-    if (std.mem.eql(u8, value, "standard")) return .standard;
-    if (std.mem.eql(u8, value, "stress")) return .stress;
-    return error.InvalidArgument;
 }
 
 fn parsePositiveUsize(value: []const u8) !usize {
@@ -755,10 +1418,10 @@ fn shouldIncludeBaselineForFilter(filter: []const u8, case: BenchmarkCase) bool 
 
 fn printHeader(options: Options) void {
     std.debug.print(
-        "\nbenchmark profile={s} warmup={} iterations={} default_cases={}\n",
-        .{ @tagName(options.profile), options.warmup_iterations, options.iterations, default_cases.len },
+        "\nbenchmark warmup={} iterations={} default_cases={}\n",
+        .{ options.warmup_iterations, options.iterations, default_cases.len },
     );
-    std.debug.print("worker_threads_available={}\n", .{availableWorkerThreads()});
+    std.debug.print("worker_threads_available={}\n", .{defaultWorkerThreadCount()});
     std.debug.print("purpose: exercise benchmark flows, prove adaptive behavior, and catch regressions\n", .{});
     std.debug.print("case roles: serial-direct is baseline; thread-fixed-* rows are forced scheduler controls\n", .{});
     std.debug.print("case roles: thread-adaptive-* rows reflect production-style measured scheduling policy\n", .{});
@@ -780,10 +1443,11 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
         return;
     }
 
-    std.debug.print("\n{s}  {} {s}\n\n", .{ group.name, baseline.stats.item_count, group.item_label });
+    var item_buffer: [256]u8 = undefined;
+    std.debug.print("\n{s}  {} {s}{s}\n\n", .{ group.name, baseline.stats.item_count, group.item_label, formatItemInto(&item_buffer, group, baseline.stats.item_count) });
     const best = bestMeasured(results) orelse baseline;
     const fixed_auto = measured(findResult(results, "thread-fixed-auto"));
-    const adaptive = measured(findResult(results, "thread-adaptive-tuned-range")) orelse measured(findResult(results, "thread-adaptive-fixed-range"));
+    const adaptive = measured(findResult(results, "thread-adaptive-tuned-range"));
 
     printCompactTable(results, baseline);
     if (options.details) {
@@ -809,9 +1473,10 @@ fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
         var throughput_buffer: [32]u8 = undefined;
         var worker_buffer: [24]u8 = undefined;
 
-        const mean = if (result.stats.status == .measured) formatDurationInto(&mean_buffer, result.stats.mean_ns) else "skipped";
-        const speedup = if (result.stats.status == .measured) formatSpeedupInto(&speedup_buffer, speedupBasisPoints(baseline.stats, result.stats)) else "skipped";
-        const throughput = if (result.stats.status == .measured) formatThroughputInto(&throughput_buffer, result.stats.items_per_second) else "skipped";
+        const unmeasured = @tagName(result.stats.status);
+        const mean = if (result.stats.status == .measured) formatDurationInto(&mean_buffer, result.stats.mean_ns) else unmeasured;
+        const speedup = if (result.stats.status == .measured) formatSpeedupInto(&speedup_buffer, speedupBasisPoints(baseline.stats, result.stats)) else unmeasured;
+        const throughput = if (result.stats.status == .measured) formatThroughputInto(&throughput_buffer, result.stats.items_per_second) else unmeasured;
         const workers = if (result.stats.status == .measured) formatWorkerThreadsInto(&worker_buffer, result.stats) else "-";
 
         printCell(result.case.name, 30);
@@ -823,6 +1488,10 @@ fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
     }
 }
 
+// The details table's work-tuning column: fits a cell with a candidate profile and the
+// diagnostic counts (Debug/ReleaseSafe).
+const work_tuning_width = 108;
+
 fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
     printCell("case", 30);
     printCell("min", 11);
@@ -831,20 +1500,20 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
     printCell("worker_ranges", 14);
     printCell("wait", 11);
     printCell("items_per_range", 16);
-    printCell("work_tuning", 72);
+    printCell("work_tuning", work_tuning_width);
     std.debug.print("workload\n", .{});
 
     for (results) |result| {
-        if (result.stats.status == .skipped) {
+        if (result.stats.status != .measured) {
             printCell(result.case.name, 30);
-            printCell("skipped", 11);
-            printCell("skipped", 11);
+            printCell(@tagName(result.stats.status), 11);
+            printCell(@tagName(result.stats.status), 11);
             printCell("-", 12);
             printCell("-", 14);
             printCell("-", 11);
             printCell("-", 16);
-            printCell("-", 72);
-            std.debug.print("{s}\n", .{result.stats.skip_reason});
+            printCell("-", work_tuning_width);
+            std.debug.print("{s}\n", .{statusText(result.stats)});
             continue;
         }
 
@@ -854,21 +1523,50 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
         var main_ranges_buffer: [24]u8 = undefined;
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
-        var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [4096]u8 = undefined;
+        var tuning_buffer: [192]u8 = undefined;
+        var workload_buffer: [8192]u8 = undefined;
 
         const batch = result.stats.batch;
+        const carried = result.stats.batch_carried;
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
         printCell(formatDurationInto(&max_buffer, result.stats.max_ns), 11);
-        printCell(formatRangeCellInto(&main_ranges_buffer, batch, batch.main_thread_ranges), 12);
-        printCell(formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges), 14);
-        printCell(formatDurationInto(&wait_buffer, batch.main_thread_wait_ns), 11);
-        printCell(formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range), 16);
-        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 72);
+        printCell(if (carried) formatRangeCellInto(&main_ranges_buffer, batch, batch.main_thread_ranges) else "-", 12);
+        printCell(if (carried) formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges) else "-", 14);
+        printCell(if (carried) formatDurationInto(&wait_buffer, batch.main_thread_wait_ns) else "-", 11);
+        printCell(if (carried) formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range) else "-", 16);
+        // A case whose tuners all start fresh and that names no headline tuner shows its
+        // settle state in the tuning cell.
+        const tuning_cell = if (result.stats.work_tuning == null and result.stats.tuners_fresh) "settled=fresh" else formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning);
+        printCell(tuning_cell, work_tuning_width);
         const workload = formatWorkloadInto(&workload_buffer, group, result.stats, .details);
         std.debug.print("{s}\n", .{if (workload.len == 0) "-" else workload});
+        if (result.stats.secondary_work_tuning) |secondary| {
+            std.debug.print("    secondary_tuning: {s}\n", .{formatWorkTuningInto(&tuning_buffer, secondary)});
+        }
+        if (result.stats.tuner_settle) |census| {
+            var settle_buffer: [256]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&settle_buffer);
+            census.write(&writer) catch {};
+            std.debug.print("    step_tuners: {s}\n", .{writer.buffered()});
+        }
+        printDetailLines(result.stats.details.text());
     }
+}
+
+// A case's report lines, each indented under its row.
+fn printDetailLines(text: []const u8) void {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| std.debug.print("    {s}\n", .{line});
+}
+
+// A coded `group`'s decoded fields for `item_count`, after a `: `; empty for a plain count.
+fn formatItemInto(buffer: []u8, group: BenchmarkGroup, item_count: usize) []const u8 {
+    const describe = group.describe_item orelse return "";
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.writeAll(": ") catch return "";
+    describe(&writer, item_count) catch return ": item fields";
+    return writer.buffered();
 }
 
 // `group`'s workload text for `stats`; empty when it writes none.
@@ -889,11 +1587,10 @@ fn printValidationSummary(
     // Keep the summary terse and action-oriented: it should call out unusual
     // scheduler behavior or workload counters without pretending to choose
     // runtime tuning policy from one benchmark run.
-    const focus = switch (group.summary_focus) {
-        .fastest => best,
-        .production_adaptive => adaptive orelse best,
-    };
-    const focus_label = if (group.summary_focus == .production_adaptive and adaptive != null) "production_adaptive" else "best";
+    // The summary leads with the production tuner's case, beside the fastest control; a
+    // group with no adaptive case leads with its fastest.
+    const focus = adaptive orelse best;
+    const focus_label = if (adaptive != null) "production_adaptive" else "best";
     const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
     std.debug.print(
         "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",
@@ -908,26 +1605,28 @@ fn printValidationSummary(
     }
 
     if (adaptive) |adaptive_result| {
+        var settle_buffer: [256]u8 = undefined;
+        if (formatSettleInto(&settle_buffer, adaptive_result.stats)) |settle| std.debug.print("adaptive {s}. ", .{settle});
         if (adaptive_result.stats.work_tuning) |summary| {
             if (summary.has_threaded_profile) {
                 std.debug.print(
-                    "adaptive phase={s} best_profile={}/{} final={}/{}. ",
-                    .{ @tagName(summary.phase), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+                    "adaptive phase={s} final={}/{} x={d:.2}. ",
+                    .{ @tagName(summary.phase), summary.final_worker_threads, summary.final_items_per_range, summary.batch_multiplier },
                 );
             } else {
                 std.debug.print("adaptive phase={s} threaded_profile=none. ", .{@tagName(summary.phase)});
             }
         }
-        if (adaptive_result.stats.batch.active_worker_threads == 0) {
-            std.debug.print(
-                "adaptive stayed inline with {}/{} worker_threads. ",
-                .{ adaptive_result.stats.batch.active_worker_threads, adaptive_result.stats.batch.available_worker_threads },
-            );
-        } else {
-            std.debug.print(
-                "adaptive used {}/{} worker_threads. ",
-                .{ adaptive_result.stats.batch.active_worker_threads, adaptive_result.stats.batch.available_worker_threads },
-            );
+        // A sample that carries no batch has no one stage to name worker use from. The
+        // brackets are the headline's threaded over non-empty batches across the measured
+        // steps.
+        if (adaptive_result.stats.batch_carried) {
+            const batch = adaptive_result.stats.batch;
+            if (batch.threaded_batches == 0) {
+                std.debug.print("adaptive stayed inline [0/{}] with {} worker_threads available. ", .{ batch.dispatched_batches, batch.available_worker_threads });
+            } else {
+                std.debug.print("adaptive used {}/{} worker_threads [{}/{}]. ", .{ batch.active_worker_threads, batch.available_worker_threads, batch.threaded_batches, batch.dispatched_batches });
+            }
         }
     } else {
         std.debug.print("adaptive flow not selected in this run. ", .{});
@@ -952,21 +1651,27 @@ fn bestFixedThreadedResult(results: []const CaseResult) ?CaseResult {
         findResult(results, "thread-fixed-auto"),
         findResult(results, "thread-small-range"),
         findResult(results, "thread-large-range"),
+        findResult(results, "thread-clamp-range"),
     });
 }
 
 fn printFlowCoverage(results: []const CaseResult) void {
     var measured_count: usize = 0;
     var skipped_count: usize = 0;
+    var duplicate_count: usize = 0;
     for (results) |result| {
         switch (result.stats.status) {
             .measured => measured_count += 1,
             .skipped => skipped_count += 1,
+            .duplicate => duplicate_count += 1,
         }
     }
     std.debug.print("flow coverage {}/{} measured", .{ measured_count, results.len });
     if (skipped_count != 0) {
         std.debug.print(", {} skipped", .{skipped_count});
+    }
+    if (duplicate_count != 0) {
+        std.debug.print(", {} duplicate", .{duplicate_count});
     }
     std.debug.print(".", .{});
 }
@@ -975,12 +1680,14 @@ fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_
     // Attention messages flag suspicious policy gaps against fixed controls. The
     // benchmark still exits successfully so timing noise can be reviewed.
     if (adaptive) |adaptive_result| {
+        // An unsettled tuned case is never judged against the controls.
+        if (caseSettle(adaptive_result.stats) == .no) return "adaptive did not settle before measurement (settled=no): not judged, rerun with more warmup";
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
                 return "adaptive is more than 25% slower than fixed-auto";
             }
         }
-        if (adaptive_result.stats.batch.active_worker_threads > 0) {
+        if (adaptive_result.stats.batch.threaded_batches > 0) {
             if (threaded_control) |fixed| {
                 if (percentDelta(adaptive_result.stats.mean_ns, fixed.stats.mean_ns) > 25) {
                     return "adaptive is more than 25% slower than best fixed threaded control";
@@ -1006,15 +1713,16 @@ fn statusText(stats: RunStats) []const u8 {
     return switch (stats.status) {
         .measured => "measured",
         .skipped => stats.skip_reason,
+        .duplicate => stats.duplicate_note,
     };
 }
 
 fn formatDurationInto(buffer: []u8, ns: u64) []const u8 {
-    return std.fmt.bufPrint(buffer, "{f}", .{formatDuration(ns)}) catch "duration";
+    return std.mem.print(buffer, "{f}", .{formatDuration(ns)}) catch "duration";
 }
 
 fn formatSpeedupInto(buffer: []u8, basis_points: u64) []const u8 {
-    return std.fmt.bufPrint(buffer, "{d}.{d:0>2}x", .{ basis_points / 100, basis_points % 100 }) catch "speedup";
+    return std.mem.print(buffer, "{d}.{d:0>2}x", .{ basis_points / 100, basis_points % 100 }) catch "speedup";
 }
 
 fn formatThroughputInto(buffer: []u8, items_per_second: u64) []const u8 {
@@ -1032,16 +1740,46 @@ fn formatThroughputInto(buffer: []u8, items_per_second: u64) []const u8 {
         FormatUnit{ .scale = 1, .suffix = "/s" };
 
     if (unit.scale == 1) {
-        return std.fmt.bufPrint(buffer, "{}{s}", .{ items_per_second, unit.suffix }) catch "throughput";
+        return std.mem.print(buffer, "{}{s}", .{ items_per_second, unit.suffix }) catch "throughput";
     }
 
     const whole = items_per_second / unit.scale;
     const fraction = (items_per_second % unit.scale) / (unit.scale / 100);
-    return std.fmt.bufPrint(buffer, "{}.{d:0>2}{s}", .{ whole, fraction, unit.suffix }) catch "throughput";
+    return std.mem.print(buffer, "{}.{d:0>2}{s}", .{ whole, fraction, unit.suffix }) catch "throughput";
 }
 
+// The headline's busiest batch's workers over those available, then its threaded over
+// non-empty batches across the measured steps.
 fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
-    return std.fmt.bufPrint(buffer, "{}/{}", .{ stats.batch.active_worker_threads, stats.batch.available_worker_threads }) catch "workers";
+    if (!stats.batch_carried) return "-";
+    const batch = stats.batch;
+    return std.mem.print(buffer, "{}/{}[{}/{}]", .{ batch.active_worker_threads, batch.available_worker_threads, batch.threaded_batches, batch.dispatched_batches }) catch "workers";
+}
+
+// A case's settle state before measurement: `no` when any tuner its measured steps ran, or
+// its headline tuner, had not settled; `fresh` for a case whose tuners all start fresh
+// (`tuners_fresh`); null when it reports none of them.
+fn caseSettle(stats: RunStats) ?Settle {
+    if (stats.tuner_settle) |census| {
+        if (!census.all()) return .no;
+        if (stats.work_tuning) |summary| return summary.settle;
+        return .yes;
+    }
+    if (stats.work_tuning) |summary| return summary.settle;
+    return if (stats.tuners_fresh) .fresh else null;
+}
+
+// `settled=<yes|no|fresh|idle>`, or the step's tuner census `settled=<k>/<n> idle=<m>` when
+// the case took one; null when the case reports no settle state (`caseSettle`).
+fn formatSettleInto(buffer: []u8, stats: RunStats) ?[]const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    if (stats.tuner_settle) |census| {
+        census.write(&writer) catch return "settled";
+        if (stats.work_tuning) |summary| if (summary.settle == .no and census.all()) writer.writeAll(" headline=no") catch return "settled";
+        return writer.buffered();
+    }
+    const settle = caseSettle(stats) orelse return null;
+    return std.mem.print(buffer, "settled={s}", .{@tagName(settle)}) catch "settled";
 }
 
 // A range column of `batch`: `inline` when it ran inline (no range split), else `value`.
@@ -1051,7 +1789,7 @@ fn formatRangeCellInto(buffer: []u8, batch: BatchSummary, value: usize) []const 
 }
 
 fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
-    return std.fmt.bufPrint(buffer, "{}", .{value}) catch "value";
+    return std.mem.print(buffer, "{}", .{value}) catch "value";
 }
 
 fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const u8 {
@@ -1063,12 +1801,14 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
     return writer.buffered();
 }
 
-fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
-    try writer.print("{s} settled={s}", .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) });
+/// A tuner's phase, whether it settled before measurement (or ran `fresh`), its final
+/// profile, its batch multiplier, and its counts over the measured window.
+pub fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
+    try writer.print("{s} settled={s}", .{ @tagName(summary.phase), @tagName(summary.settle) });
     if (summary.has_threaded_profile) {
         try writer.print(
-            " best={}/{} final={}/{}",
-            .{ summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+            " final={}/{} x={d:.2}",
+            .{ summary.final_worker_threads, summary.final_items_per_range, summary.batch_multiplier },
         );
     } else {
         try writer.writeAll(" threaded=none");
@@ -1077,7 +1817,8 @@ fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Wr
         try writer.print(" cand={}/{}", .{ summary.candidate_worker_threads orelse 0, candidate });
     }
     if (comptime diagnostics_enabled) {
-        try writer.print(" probes={} demotes={}", .{ summary.probe_window_count, summary.demotion_count });
+        try writer.writeByte(' ');
+        try summary.measured_counts.write(writer);
     }
 }
 
@@ -1087,10 +1828,22 @@ pub fn writeShare(writer: *std.Io.Writer, label: []const u8, part_ns: u64, mean_
     try writer.print(" {s}={f} ({}%)", .{ label, formatDuration(part_ns), percent });
 }
 
-/// A stage's batch shape: `inline`, or active workers and ranges.
+/// The main thread's share of the mean (`main_ns`, when set) and its time per one of `items`.
+pub fn writeMainShare(writer: *std.Io.Writer, stats: RunStats, items: usize) std.Io.Writer.Error!void {
+    const main_ns = stats.main_ns orelse return;
+    try writeShare(writer, "main", main_ns, stats.mean_ns);
+    try writer.print(" main_per_item={f}", .{formatDuration(main_ns / @max(items, 1))});
+}
+
+/// A stage's batch shape: `inline`, or active workers and ranges; then, for a summary over
+/// samples (`batchSummaryFromShapes`), `[threaded/non-empty]` batches.
 pub fn writeStageShape(writer: *std.Io.Writer, batch: BatchSummary) std.Io.Writer.Error!void {
-    if (batch.ran_inline or batch.active_worker_threads == 0) return writer.writeAll("inline");
-    try writer.print("{}w/{}r", .{ batch.active_worker_threads, batch.range_count });
+    if (batch.ran_inline or batch.active_worker_threads == 0) {
+        try writer.writeAll("inline");
+    } else {
+        try writer.print("{}w/{}r", .{ batch.active_worker_threads, batch.range_count });
+    }
+    if (batch.dispatched_batches != 0) try writer.print("[{}/{}]", .{ batch.threaded_batches, batch.dispatched_batches });
 }
 
 // `writeStageShape`, or `-` for a stage that covered no items.
@@ -1100,8 +1853,8 @@ fn writeRunStageShape(writer: *std.Io.Writer, batch: BatchSummary) std.Io.Writer
 }
 
 /// A nav reaction's stage shapes: `mark=` (when the workload marks events), `plan=`, then
-/// `remask=` (the primary batch) and `patch=` (the secondary batch), then the connectivity
-/// block and main-thread split when the group reports them.
+/// `remask=` (`nav_remask_batch`, else the primary batch) and `patch=` (the secondary batch),
+/// then the connectivity block and main-thread split when the group reports them.
 pub fn writeNavStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Error!void {
     if (stats.nav_mark_batch) |mark| {
         try writer.writeAll("mark=");
@@ -1111,7 +1864,7 @@ pub fn writeNavStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Err
     try writer.writeAll("plan=");
     try writeStageShape(writer, stats.nav_plan_batch orelse .{});
     try writer.writeAll(" remask=");
-    try writeStageShape(writer, stats.batch);
+    try writeStageShape(writer, stats.nav_remask_batch orelse stats.batch);
     try writer.writeAll(" patch=");
     try writeStageShape(writer, stats.secondary_batch orelse .{});
     try writeNavConn(writer, stats.nav_conn);
@@ -1177,6 +1930,7 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
         .{ " closure_resolve=", conn.closure_resolve },
         .{ " closure_mask=", conn.closure_mask },
         .{ " closure_plan=", conn.closure_plan },
+        .{ " closure_copy=", conn.closure_copy },
         .{ " closure_rows=", conn.closure_rows },
         .{ " closure_land=", conn.closure_land },
     };
@@ -1209,56 +1963,151 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
     });
 }
 
-/// One nav reaction's connectivity and closure summary from its stats, with the flood
-/// tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
-pub fn navConnSummary(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
-    return .{
-        .seed = batchSummaryFromBatch(stats.conn_seed_batch),
-        .gather = batchSummaryFromBatch(stats.conn_gather_batch),
-        .flood = batchSummaryFromBatch(stats.conn_flood_batch),
-        .families = stats.conn_families,
-        .rounds = stats.conn_rounds,
-        .round_items_min = stats.conn_round_items_min,
-        .round_items_max = stats.conn_round_items_max,
-        .build_visits = stats.conn_build_visits,
-        .flood_nodes = stats.conn_flood_nodes,
-        .groups = stats.conn_groups,
-        .splits = stats.conn_splits,
-        .merges = stats.conn_merges,
-        .flood_off_main_ns = stats.conn_flood_off_main_ns,
+/// A nav reaction's stage batches over the reactions added (`StageShapes`): the mark, plan,
+/// remask, and patch, the connectivity seed, gather, and flood, and the closure candidates,
+/// resolve, mask, plan, copy, rows, and landing; and the last reaction, for the counters.
+pub const NavReactionShapes = struct {
+    // A stage after the mark: its name, its `NavUpdateStats.perf` batch field, and for a
+    // round-folded stage its widest round's and widest step's fields
+    // (`checkNavReactionDispatched`).
+    const PerfStage = struct { name: []const u8, batch: []const u8, rounds: ?RoundFields = null };
+    const RoundFields = struct { items_max: []const u8, step_items_max: []const u8 };
+    // The one stage-to-field table `add` and `checkNavReactionDispatched` read, in stage order.
+    const perf_stages = [_]PerfStage{
+        .{ .name = "plan", .batch = "plan_batch" },
+        .{ .name = "remask", .batch = "remask_batch" },
+        .{ .name = "patch", .batch = "patch_batch" },
+        .{ .name = "conn_seed", .batch = "conn_seed_batch" },
+        .{ .name = "conn_gather", .batch = "conn_gather_batch" },
+        .{ .name = "conn_flood", .batch = "conn_flood_batch", .rounds = .{ .items_max = "conn_round_items_max", .step_items_max = "conn_flood_step_items_max" } },
+        .{ .name = "closure_candidates", .batch = "conn_closure_candidates_batch" },
+        .{ .name = "closure_resolve", .batch = "conn_closure_resolve_batch" },
+        .{ .name = "closure_mask", .batch = "conn_closure_mask_batch" },
+        .{ .name = "closure_plan", .batch = "conn_closure_plan_batch" },
+        .{ .name = "closure_copy", .batch = "conn_closure_copy_batch" },
+        .{ .name = "closure_rows", .batch = "conn_closure_rows_batch", .rounds = .{ .items_max = "closure_rows_round_items_max", .step_items_max = "closure_rows_step_items_max" } },
+        .{ .name = "closure_land", .batch = "conn_closure_land_batch" },
+    };
+    comptime {
+        // Each stage reads the batch field its name names.
+        for (perf_stages) |stage| std.debug.assert(std.mem.endsWith(u8, stage.batch, stage.name ++ "_batch"));
+    }
+    pub const stage_names = blk: {
+        var names: [1 + perf_stages.len][]const u8 = undefined;
+        names[0] = "mark";
+        for (perf_stages, 1..) |stage, index| names[index] = stage.name;
+        break :blk names;
+    };
+    pub const stage_count = stage_names.len;
+    const mark_stage = 0;
+    const plan_stage = 1;
+    const remask_stage = 2;
+    const patch_stage = 3;
+    comptime {
+        std.debug.assert(std.mem.eql(u8, stage_names[plan_stage], "plan") and std.mem.eql(u8, stage_names[remask_stage], "remask") and std.mem.eql(u8, stage_names[patch_stage], "patch"));
+    }
+
+    shapes: StageShapes(stage_count) = .{},
+    last: NavUpdateStats = .{},
+
+    /// One reaction: `mark` is the mark dispatch that fed it (empty when none did).
+    pub fn add(self: *NavReactionShapes, mark: BatchStats, stats: NavUpdateStats) void {
+        // The counters `connSummary` reads outside the perf log (`chunks_patched`,
+        // `records_patched`) are kept in every build.
+        self.last = stats;
+        if (comptime !diagnostics_enabled) return;
+        var batches: [stage_count]BatchStats = undefined;
+        batches[mark_stage] = mark;
+        inline for (perf_stages, 1..) |stage, index| batches[index] = @field(stats.perf, stage.batch);
+        self.shapes.add(batches);
+    }
+
+    /// `<prefix>: <stage>=<label> ...` over every stage (`StageShapes.print`).
+    pub fn print(self: *const NavReactionShapes, details: *DetailLines, prefix: []const u8) void {
+        self.shapes.print(details, prefix, stage_names);
+    }
+
+    /// Into `stats`: the mark (when a reaction marked), plan, remask, and patch over the
+    /// reactions added, and the connectivity summary (`connSummary`).
+    pub fn summarize(self: *const NavReactionShapes, stats: *RunStats, flood_tuner_workers: ?usize) void {
+        if (self.shapes.dispatched[mark_stage] != 0) stats.nav_mark_batch = batchSummaryFromShapes(&self.shapes, mark_stage);
+        stats.nav_plan_batch = batchSummaryFromShapes(&self.shapes, plan_stage);
+        stats.nav_remask_batch = batchSummaryFromShapes(&self.shapes, remask_stage);
+        stats.secondary_batch = batchSummaryFromShapes(&self.shapes, patch_stage);
+        stats.nav_conn = self.connSummary(flood_tuner_workers);
+    }
+
+    /// The last reaction's connectivity and closure counters (`navConnCounters`), every stage
+    /// shape over the reactions added.
+    pub fn connSummary(self: *const NavReactionShapes, flood_tuner_workers: ?usize) NavConnSummary {
+        var conn = navConnCounters(self.last, flood_tuner_workers);
+        const stage_summaries = [_]*BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_copy, &conn.closure_rows, &conn.closure_land };
+        comptime std.debug.assert(patch_stage + 1 + stage_summaries.len == stage_count);
+        for (stage_summaries, patch_stage + 1..) |summary, stage| summary.* = batchSummaryFromShapes(&self.shapes, stage);
+        return conn;
+    }
+};
+
+/// Fails when a fixed threaded case ran a nav reaction stage off its control: `mark`, one
+/// dispatch (`checkStageDispatched`); the chunk-partitioned stages, which `NavUpdateStats`
+/// folds over the update's batches (`checkFoldedStageDispatched`); the flood and closure rows
+/// (`checkRoundsDispatched`); every stage of `NavReactionShapes`. The nav stages share one
+/// control, from one item per range (`chunk_partition_items`).
+pub fn checkNavReactionDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, mark: BatchStats, stats: NavUpdateStats) error{ BenchStageRanInline, BenchStageRangeShape }!void {
+    if (comptime !diagnostics_enabled) return;
+    const range = case.stageItemsPerRangeForPartition(chunk_partition_items, 1);
+    try checkStageDispatched(case, thread_system, range, mark);
+    inline for (NavReactionShapes.perf_stages) |stage| {
+        const batch = @field(stats.perf, stage.batch);
+        if (comptime stage.rounds) |rounds| {
+            try checkRoundsDispatched(case, thread_system, range, batch, @field(stats.perf, rounds.items_max), @field(stats.perf, rounds.step_items_max));
+        } else try checkFoldedStageDispatched(case, thread_system, range, batch);
+    }
+}
+
+// One nav reaction's connectivity and closure counters from its stats (no stage shapes), with
+// the flood tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
+fn navConnCounters(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
+    var summary = NavConnSummary{
         .flood_tuner_workers = flood_tuner_workers,
         .chunks_patched = stats.chunks_patched,
         .records_patched = stats.records_patched,
-        .candidates = batchSummaryFromBatch(stats.conn_closure_candidates_batch),
-        .closure_resolve = batchSummaryFromBatch(stats.conn_closure_resolve_batch),
-        .closure_mask = batchSummaryFromBatch(stats.conn_closure_mask_batch),
-        .closure_plan = batchSummaryFromBatch(stats.conn_closure_plan_batch),
-        .closure_rows = batchSummaryFromBatch(stats.conn_closure_rows_batch),
-        .closure_land = batchSummaryFromBatch(stats.conn_closure_land_batch),
-        .closure_touched = stats.closure_touched,
-        .closure_links = stats.closure_links,
-        .closure_terms_new = stats.closure_terms_new,
-        .closure_terms_left = stats.closure_terms_left,
-        .closure_a_rows = stats.closure_a_rows,
-        .closure_rounds = stats.closure_rounds,
-        .closure_words_written = stats.closure_words_written,
-        .closure_shrinks = stats.closure_shrinks,
-        .closure_block_allocs = stats.closure_block_allocs,
-        .closure_block_frees = stats.closure_block_frees,
-        .closure_landed_words = stats.closure_landed_words,
-        .closure_land_deferrals = stats.closure_land_deferrals,
-        .closure_live_words = stats.closure_live_words,
-        .closure_tail_capacity = stats.closure_tail_capacity,
-        .closure_rows_off_main_ns = if (stats.conn_closure_rows_batch.ran_inline) 0 else stats.conn_closure_rows_batch.batch_duration_ns,
-        .closure_tail_bound = stats.closure_tail_bound,
-        .closure_tail_used = stats.closure_tail_used,
-        .closure_candidate_words = stats.closure_candidate_words,
-        .closure_kb = stats.closure_kb,
     };
+    if (comptime diagnostics_enabled) {
+        summary.closure_rows_off_main_ns = offMainNs(stats.perf.conn_closure_copy_batch) + offMainNs(stats.perf.conn_closure_rows_batch);
+        summary.families = stats.perf.conn_families;
+        summary.rounds = stats.perf.conn_rounds;
+        summary.round_items_min = stats.perf.conn_round_items_min;
+        summary.round_items_max = stats.perf.conn_round_items_max;
+        summary.build_visits = stats.perf.conn_build_visits;
+        summary.flood_nodes = stats.perf.conn_flood_nodes;
+        summary.groups = stats.perf.conn_groups;
+        summary.splits = stats.perf.conn_splits;
+        summary.merges = stats.perf.conn_merges;
+        summary.flood_off_main_ns = stats.perf.conn_flood_off_main_ns;
+        summary.closure_touched = stats.perf.closure_touched;
+        summary.closure_links = stats.perf.closure_links;
+        summary.closure_terms_new = stats.perf.closure_terms_new;
+        summary.closure_terms_left = stats.perf.closure_terms_left;
+        summary.closure_a_rows = stats.perf.closure_a_rows;
+        summary.closure_rounds = stats.perf.closure_rounds;
+        summary.closure_words_written = stats.perf.closure_words_written;
+        summary.closure_shrinks = stats.perf.closure_shrinks;
+        summary.closure_block_allocs = stats.perf.closure_block_allocs;
+        summary.closure_block_frees = stats.perf.closure_block_frees;
+        summary.closure_landed_words = stats.perf.closure_landed_words;
+        summary.closure_land_deferrals = stats.perf.closure_land_deferrals;
+        summary.closure_live_words = stats.perf.closure_live_words;
+        summary.closure_tail_capacity = stats.perf.closure_tail_capacity;
+        summary.closure_tail_bound = stats.perf.closure_tail_bound;
+        summary.closure_tail_used = stats.perf.closure_tail_used;
+        summary.closure_candidate_words = stats.perf.closure_candidate_words;
+        summary.closure_kb = stats.perf.closure_kb;
+    }
+    return summary;
 }
 
-/// Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the
-/// claim and the grid sort on the serial path).
+/// Steering's prepare stage shapes, in stage order; `-` for a stage whose summary is empty.
 pub fn writeSteeringStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Error!void {
     const stages = stats.steering_stages orelse SteeringStageSummary{};
     const shapes = [_]struct { []const u8, BatchSummary }{
@@ -1266,17 +2115,11 @@ pub fn writeSteeringStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Write
         .{ " resolve=", stages.select_resolve },
         .{ " claim=", stages.select_claim },
         .{ " dir=", stages.directions },
-        .{ " bucket=", stages.grid_bucket },
-        .{ " sort=", stages.grid_sort },
     };
     for (shapes) |shape| {
         try writer.writeAll(shape[0]);
         try writeRunStageShape(writer, shape[1]);
     }
-}
-
-fn yesNo(value: bool) []const u8 {
-    return if (value) "yes" else "no";
 }
 
 fn findResult(results: []const CaseResult, name: []const u8) ?CaseResult {
@@ -1349,6 +2192,12 @@ pub const Duration = struct {
     }
 };
 
+/// The smallest grid side, at least 1, whose square holds `count` cells.
+pub fn ceilSqrt(count: usize) usize {
+    const floor_side: usize = std.math.sqrt(count);
+    return @max(if (floor_side * floor_side < count) floor_side + 1 else floor_side, 1);
+}
+
 /// Items per second over one mean duration, for a group whose throughput numerator is not
 /// its item count (items serviced, cells written, an item code).
 pub fn itemsPerSecond(items: usize, mean_ns: u64) u64 {
@@ -1377,14 +2226,22 @@ pub fn StageShapes(comptime n: usize) type {
             }
         }
 
+        /// `<prefix>: <name>=<label> ...`, one line over every stage.
+        pub fn print(self: *const Self, details: *DetailLines, prefix: []const u8, names: [n][]const u8) void {
+            var buffer: [48]u8 = undefined;
+            details.print("{s}:", .{prefix});
+            for (names, 0..) |name, index| details.print(" {s}={s}", .{ name, self.label(index, &buffer) });
+            details.print("\n", .{});
+        }
+
         /// Stage `index`'s shape: `inline(items)` or `Ww/Rr(items)`, then threaded/non-empty
         /// batches.
         pub fn label(self: *const Self, index: usize, buffer: []u8) []const u8 {
             const batch = self.busiest[index];
             if (batch.ran_inline or batch.active_worker_threads == 0) {
-                return std.fmt.bufPrint(buffer, "inline({})[{}/{}]", .{ batch.item_count, self.threaded[index], self.dispatched[index] }) catch "inline";
+                return std.mem.print(buffer, "inline({})[{}/{}]", .{ batch.item_count, self.threaded[index], self.dispatched[index] }) catch "inline";
             }
-            return std.fmt.bufPrint(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, self.threaded[index], self.dispatched[index] }) catch "stage";
+            return std.mem.print(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, self.threaded[index], self.dispatched[index] }) catch "stage";
         }
     };
 }
@@ -1471,6 +2328,20 @@ pub fn ItemCode(comptime Fields: type, comptime digits: []const usize) type {
             }
             return fields;
         }
+
+        /// Writes `code`'s fields as `name=value` (an enum by its tag) for the report
+        /// header, or `undecodable` when `decode` fails.
+        pub fn describe(writer: *std.Io.Writer, code: usize) std.Io.Writer.Error!void {
+            const fields = decode(code) catch return writer.writeAll("undecodable");
+            inline for (names, 0..) |name, index| {
+                if (index != 0) try writer.writeByte(' ');
+                const value = @field(fields, name);
+                switch (@typeInfo(@TypeOf(value))) {
+                    .@"enum" => try writer.print("{s}={s}", .{ name, @tagName(value) }),
+                    else => try writer.print("{s}={}", .{ name, value }),
+                }
+            }
+        }
     };
 }
 
@@ -1482,14 +2353,27 @@ test "default benchmark cases cover required thread modes" {
     try std.testing.expectEqualStrings("thread-fixed-auto", default_cases[3].name);
     try std.testing.expectEqualStrings("thread-small-range", default_cases[4].name);
     try std.testing.expectEqualStrings("thread-large-range", default_cases[5].name);
-    try std.testing.expectEqualStrings("thread-adaptive-fixed-range", default_cases[6].name);
+    try std.testing.expectEqualStrings("thread-clamp-range", default_cases[6].name);
     try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[7].name);
+}
+
+test "a group's named cases keep default-case order, and the default list is every case" {
+    const named = casesNamed(&.{ "thread-adaptive-tuned-range", "serial-direct" });
+    try std.testing.expectEqual(@as(usize, 2), named.len);
+    try std.testing.expectEqualStrings("serial-direct", named[0].name);
+    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", named[1].name);
+    try std.testing.expect(named[1].adaptive);
+    const group = BenchmarkGroup{ .name = "test", .item_label = "items", .item_counts = &test_item_counts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    try std.testing.expectEqual(default_cases.len, group.cases.len);
+}
+
+test "a grid side covers its count with the fewest cells" {
+    const cases = [_][2]usize{ .{ 0, 1 }, .{ 1, 1 }, .{ 2, 2 }, .{ 4, 2 }, .{ 5, 3 }, .{ 16_384, 128 }, .{ 16_385, 129 } };
+    for (cases) |case| try std.testing.expectEqual(case[1], ceilSqrt(case[0]));
 }
 
 test "benchmark options parse scaling and filtering arguments" {
     const args = [_][]const u8{
-        "--profile",
-        "standard",
         "--warmup=2",
         "--iterations",
         "9",
@@ -1502,7 +2386,6 @@ test "benchmark options parse scaling and filtering arguments" {
         "--details",
     };
     const options = try parseOptions(&args);
-    try std.testing.expectEqual(Profile.standard, options.profile);
     try std.testing.expectEqual(@as(usize, 2), options.warmup_iterations);
     try std.testing.expectEqual(@as(usize, 9), options.iterations);
     try std.testing.expectEqualStrings("thread-fixed-1", options.case_filter.?);
@@ -1510,6 +2393,10 @@ test "benchmark options parse scaling and filtering arguments" {
     try std.testing.expectEqual(@as(usize, 65_536), options.item_count_filter.?);
     try std.testing.expectEqual(@as(usize, 64), options.fallback_budget.?);
     try std.testing.expect(options.details);
+
+    const listed = try parseOptions(&.{"--list"});
+    try std.testing.expect(listed.list_groups);
+    try std.testing.expect(listed.group_filter == null);
 }
 
 test "benchmark group prefix selects a family and combines with an exact group" {
@@ -1541,65 +2428,453 @@ test "benchmark options reject unknown case filter" {
 test "benchmark case filter includes serial baseline for non-serial cases" {
     try std.testing.expect(shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[0]));
     try std.testing.expect(!shouldIncludeBaselineForFilter("serial-direct", default_cases[0]));
-    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[7]));
+    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[default_cases.len - 1]));
 }
 
-test "work tuning summary preserves settled phase" {
-    const summary = workTuningSummary(.{
-        .phase = .settled,
-        .initial_profile = .{ .worker_threads = 0, .items_per_range = 64 },
-        .current_profile = .{ .worker_threads = 4, .items_per_range = 256 },
-        .best_profile = .{ .worker_threads = 4, .items_per_range = 256 },
-        .sample_window = 2,
-        .failed_profile_count = 0,
-        .settled_window_count = 4,
-        .retune_after_settled_windows = 10_000,
-        .best_mean_batch_duration_ns = 42,
-        .has_threaded_profile = true,
-        .probe_window_count = if (diagnostics_enabled) 7 else {},
-        .demotion_count = if (diagnostics_enabled) 2 else {},
-    }, true);
+// A tuner settled on a threaded profile with its nudge holding.
+fn testSettledThreadedTuner() AdaptiveWorkTuner {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    tuner.phase = .settled;
+    tuner.has_threaded_profile = true;
+    tuner.current_profile = .{ .worker_threads = 4, .items_per_range = 256 };
+    tuner.batch_multiplier = 1.21;
+    tuner.nudge_state = .holding;
+    tuner.learned_item_count = 1024;
+    return tuner;
+}
+
+test "work tuning summary preserves settled phase, or fresh" {
+    const tuner = testSettledThreadedTuner();
+    // The tuner recorded in the measured window: its start state is the summary's settle.
+    const start = TunerStart.of(&tuner, findBenchmarkCase("thread-adaptive-tuned-range").?);
+    const summary = workTuningSummaryAt(&tuner, .{ .records = start.counts.records + 1 }, start);
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
-    try std.testing.expect(summary.settled_before_measurement);
-    try std.testing.expectEqual(@as(usize, 4), summary.best_worker_threads);
-    try std.testing.expectEqual(@as(usize, 256), summary.best_items_per_range);
-    if (comptime diagnostics_enabled) {
-        try std.testing.expectEqual(@as(u64, 7), summary.probe_window_count);
-        try std.testing.expectEqual(@as(u64, 2), summary.demotion_count);
-        var tuning_buffer: [96]u8 = undefined;
-        try std.testing.expectEqualStrings(
-            "settled settled=yes best=4/256 final=4/256 probes=7 demotes=2",
-            formatWorkTuningInto(&tuning_buffer, summary),
-        );
+    try std.testing.expectEqual(Settle.yes, summary.settle);
+    try std.testing.expectEqual(@as(usize, 4), summary.final_worker_threads);
+    try std.testing.expectEqual(@as(usize, 256), summary.final_items_per_range);
+    try std.testing.expectEqual(@as(f64, 1.21), summary.batch_multiplier);
+    var tuning_buffer: [192]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, summary), "settled settled=yes final=4/256 x=1.21"));
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, workTuningSummary(&tuner, .fresh)), "settled settled=fresh"));
+}
+
+test "tuner counts over a measured window are the counts since its start" {
+    const start = TunerCounts{ .probes = 3, .demotes = 1, .restores = 0, .shift_skips = 5, .records = 40 };
+    const end = TunerCounts{ .probes = 5, .demotes = 2, .restores = 1, .shift_skips = 5, .records = 52 };
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try end.since(start).write(&writer);
+    try std.testing.expectEqualStrings("probes=2 demotes=1 restores=1 shift_skips=0", writer.buffered());
+    try std.testing.expect(!end.since(end).any());
+    // A record is not a tuning event.
+    try std.testing.expect(!(TunerCounts{ .records = 3 }).any());
+
+    // The summary stores the window, not the tuner's lifetime counts.
+    const tuner = testSettledThreadedTuner();
+    const summary = workTuningSummaryAt(&tuner, end, .{ .settle = .yes, .counts = start });
+    try std.testing.expectEqual(end.since(start), summary.measured_counts);
+    try std.testing.expectEqual(end, workTuningSummaryAt(&tuner, end, .fresh).measured_counts);
+}
+
+test "a work tuning summary reports a tuner that did not record as idle" {
+    const tuner = testSettledThreadedTuner();
+    const counts = TunerCounts{ .records = 7 };
+    // No batch recorded in the window: idle, whatever its start state, and judged.
+    const unsettled_idle = workTuningSummaryAt(&tuner, counts, .{ .settle = .no, .counts = counts });
+    try std.testing.expectEqual(Settle.idle, unsettled_idle.settle);
+    try std.testing.expectEqual(@as(?Settle, .idle), caseSettle(.{ .work_tuning = unsettled_idle }));
+    var buffer: [192]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&buffer, unsettled_idle), "settled settled=idle"));
+    const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
+    const adaptive = CaseResult{ .case = findBenchmarkCase("thread-adaptive-tuned-range").?, .stats = .{ .mean_ns = 1, .work_tuning = unsettled_idle } };
+    try std.testing.expectEqual(@as(?[]const u8, null), validationAttention(fixed, adaptive, fixed));
+    // A fresh tuner is never idle, and one that recorded keeps its start state.
+    try std.testing.expectEqual(Settle.fresh, workTuningSummaryAt(&tuner, .{}, .fresh).settle);
+    try std.testing.expectEqual(Settle.no, workTuningSummaryAt(&tuner, .{ .records = 8 }, .{ .settle = .no, .counts = counts }).settle);
+}
+
+test "the details table's work-tuning column fits a cell with a candidate and its counts" {
+    var tuner = testSettledThreadedTuner();
+    tuner.phase = .learning;
+    tuner.current_profile = .{ .worker_threads = 23, .items_per_range = 1024 };
+    tuner.candidate_profile = .{ .worker_threads = 23, .items_per_range = 1024 };
+    const counts = TunerCounts{ .probes = 999, .demotes = 99, .restores = 99, .shift_skips = 999 };
+    var buffer: [192]u8 = undefined;
+    const cell = formatWorkTuningInto(&buffer, workTuningSummaryAt(&tuner, counts, .fresh));
+    try std.testing.expect(std.mem.indexOf(u8, cell, "cand=23/1024") != null);
+    try std.testing.expect(cell.len <= work_tuning_width);
+}
+
+test "a tuner with a demotion awaiting judgment or a pending retune is not settled" {
+    var tuner = testSettledThreadedTuner();
+    try std.testing.expect(tunerSettled(&tuner));
+    tuner.retune_pending = true;
+    try std.testing.expect(!tunerSettled(&tuner));
+    tuner.retune_pending = false;
+    tuner.has_threaded_profile = false;
+    tuner.restore_threaded_profile = .{ .worker_threads = 4, .items_per_range = 256 };
+    try std.testing.expect(!tunerSettled(&tuner));
+    tuner.restore_threaded_profile = null;
+    try std.testing.expect(tunerSettled(&tuner));
+    tuner.has_threaded_profile = true;
+    tuner.nudge_state = .stepped;
+    try std.testing.expect(!tunerSettled(&tuner));
+}
+
+test "a tuner census judges only the tuners that recorded since its snapshot, by their state then" {
+    const Fixture = struct {
+        settled: AdaptiveWorkTuner,
+        idle: AdaptiveWorkTuner,
+        pair: [2]AdaptiveWorkTuner,
+    };
+    var fixture = Fixture{ .settled = testSettledThreadedTuner(), .idle = .init(.{}), .pair = .{ testSettledThreadedTuner(), testSettledThreadedTuner() } };
+    fixture.pair[1].phase = .learning;
+    const census = TunerSettle.of(Fixture, &fixture);
+    try std.testing.expectEqual(@as(usize, 4), census.len);
+    try std.testing.expectEqualStrings(".pair[1]", census.entries[3].name);
+    try std.testing.expect(!census.entries[1].settled and !census.entries[3].settled);
+    // `settled` and `pair[1]` recorded since the snapshot; `idle` and `pair[0]` did not.
+    var records_now: [4]u64 = undefined;
+    for (census.entries[0..census.len], &records_now) |entry, *records| records.* = entry.records;
+    records_now[0] += 3;
+    records_now[3] += 1;
+    // Settling after the snapshot changes nothing: the entry keeps its state then.
+    fixture.pair[1].phase = .settled;
+    const report = census.reportOf(&records_now);
+    try std.testing.expectEqual(@as(usize, 2), report.used);
+    try std.testing.expectEqual(@as(usize, 1), report.settled);
+    try std.testing.expectEqual(@as(usize, 2), report.idle);
+    try std.testing.expect(!report.all());
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try report.write(&writer);
+    try std.testing.expectEqualStrings("settled=1/2 idle=2 unsettled=.pair[1]", writer.buffered());
+
+    // The census is judged before the headline: an unsettled step never reaches the controls.
+    const headline = workTuningSummaryAt(&fixture.settled, .{ .records = 1 }, .{ .settle = .yes });
+    const unsettled: RunStats = .{ .tuner_settle = report, .work_tuning = headline };
+    try std.testing.expectEqual(@as(?Settle, .no), caseSettle(unsettled));
+    const adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = unsettled };
+    const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
+    try std.testing.expect(std.mem.endsWith(u8, validationAttention(fixed, adaptive, fixed).?, "rerun with more warmup"));
+    // Every tuner that ran settled at the snapshot: judged, idle ones never hold it.
+    const settled_report = census.reportOf(&.{ records_now[0], census.entries[1].records, census.entries[2].records + 1, census.entries[3].records });
+    try std.testing.expect(settled_report.all());
+    try std.testing.expectEqualStrings("settled=2/2 idle=2", formatSettleInto(&buffer, .{ .tuner_settle = settled_report, .work_tuning = headline }).?);
+    const fresh: RunStats = .{ .work_tuning = workTuningSummary(&fixture.settled, .fresh) };
+    try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(fresh));
+    try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, fresh).?);
+    // A case with no headline tuner or census whose tuners all start fresh: judged as `fresh`.
+    const all_fresh: RunStats = .{ .tuners_fresh = true };
+    try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(all_fresh));
+    try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, all_fresh).?);
+    try std.testing.expectEqual(@as(?Settle, null), caseSettle(.{}));
+    try std.testing.expectEqual(@as(?[]const u8, null), formatSettleInto(&buffer, .{}));
+    const fresh_adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = .{ .mean_ns = 1, .tuners_fresh = true } };
+    try std.testing.expect(validationAttention(fixed, fresh_adaptive, fixed) == null);
+}
+
+test "a tuner census settles when every tuner that recorded since its snapshot is settled" {
+    const Fixture = struct { a: AdaptiveWorkTuner, b: AdaptiveWorkTuner };
+    const fixture = Fixture{ .a = .init(.{}), .b = .init(.{}) };
+    const census = TunerSettle.of(Fixture, &fixture);
+    const before = [2]u64{ census.entries[0].records, census.entries[1].records };
+    // Nothing recorded since the snapshot: no evidence the step's tuners settled.
+    try std.testing.expect(!census.settledSinceOf(&before, &.{ true, true }));
+    // A tuner that recorded is judged by its state now.
+    try std.testing.expect(!census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ false, true }));
+    try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, true }));
+    // An unsettled tuner that did not record never holds the loop.
+    try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, false }));
+}
+
+test "a tuner census reports a fresh one-off tuner the last run selected as fresh, never holding the census or a warm loop" {
+    const Fixture = struct { in_play: AdaptiveWorkTuner, ran: AdaptiveWorkTuner, unused: AdaptiveWorkTuner };
+    var fixture = Fixture{ .in_play = testSettledThreadedTuner(), .ran = .init(.{}), .unused = .init(.{}) };
+    var census = TunerSettle{};
+    census.add("in_play", &fixture.in_play);
+    census.addFresh("ran", &fixture.ran);
+    census.addFresh("unused", &fixture.unused);
+    // The run selected `ran` and left it unsettled; `unused` never ran since its reset.
+    _ = fixture.ran.selectProfile(.{ .item_count = 64, .available_worker_threads = 2, .max_worker_threads = 2, .fallback_items_per_range = 8, .range_alignment_items = 1, .calibration = .fromFloors(20_000, 10_000, 2) });
+    const records_now = [3]u64{ census.entries[0].records + 1, 7, 0 };
+    const report = census.reportOf(&records_now);
+    try std.testing.expectEqual(@as(usize, 1), report.used);
+    try std.testing.expectEqual(@as(usize, 1), report.fresh);
+    try std.testing.expectEqual(@as(usize, 1), report.idle);
+    try std.testing.expect(report.all());
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try report.write(&writer);
+    try std.testing.expectEqualStrings("settled=1/1 idle=1 fresh=1", writer.buffered());
+    // An unsettled fresh tuner that recorded never holds the warm loop.
+    try std.testing.expect(census.settledSinceOf(&records_now, &.{ true, false, false }));
+}
+
+test "a tuner census holds each tuner once, under the first name it was added by" {
+    const Fixture = struct { a: AdaptiveWorkTuner, b: AdaptiveWorkTuner };
+    const fixture = Fixture{ .a = .init(.{}), .b = .init(.{}) };
+    var census = TunerSettle.of(Fixture, &fixture);
+    // A second builder over an overlapping set adds only the tuners not already held.
+    census.addNamed(&.{ "other.b", "other.a" }, &.{ &fixture.b, &fixture.a });
+    census.add("other.b", &fixture.b);
+    try std.testing.expectEqual(@as(usize, 2), census.len);
+    try std.testing.expectEqualStrings(".a", census.entries[0].name);
+    try std.testing.expectEqualStrings(".b", census.entries[1].name);
+}
+
+test "the headline batch reports its busiest shape and threaded over non-empty batches across steps" {
+    var accumulator = StatsAccumulator.init(64);
+    accumulator.record(10, .{ .item_count = 64, .range_count = 4, .available_worker_threads = 3, .active_worker_threads = 3, .ran_inline = false });
+    accumulator.record(10, .{ .item_count = 32, .available_worker_threads = 3 });
+    accumulator.record(10, .{});
+    const stats = accumulator.finish();
+    try std.testing.expectEqual(@as(usize, 1), stats.batch.threaded_batches);
+    try std.testing.expectEqual(@as(usize, 2), stats.batch.dispatched_batches);
+    try std.testing.expectEqual(@as(usize, 3), stats.batch.active_worker_threads);
+    try std.testing.expect(!stats.batch.ran_inline);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("3/3[1/2]", formatWorkerThreadsInto(&buffer, stats));
+
+    // A stage of a multi-stage shape set reports the same busiest batch and counts.
+    const shapes_summary = batchSummaryFromShapes(&accumulator.shapes, 0);
+    try std.testing.expectEqual(@as(usize, 64), shapes_summary.item_count);
+    try std.testing.expectEqual(@as(usize, 1), shapes_summary.threaded_batches);
+    try std.testing.expectEqual(@as(usize, 2), shapes_summary.dispatched_batches);
+}
+
+test "benchmark fixed and stage range sizes align the range and null out adaptive cases" {
+    const cases = struct {
+        fn named(name: []const u8) BenchmarkCase {
+            for (default_cases) |case| {
+                if (std.mem.eql(u8, case.name, name)) return case;
+            }
+            std.debug.panic("no default benchmark case named {s}", .{name});
+        }
+    };
+    // An alignment above the default size moves the default up to it.
+    const wide_alignment = default_items_per_range + 1;
+
+    const fixed_auto = cases.named("thread-fixed-auto");
+    try std.testing.expectEqual(@as(?usize, wide_alignment), fixed_auto.fixedItemsPerRange(wide_alignment));
+    try std.testing.expectEqual(@as(?usize, wide_alignment), fixed_auto.stageItemsPerRange(wide_alignment));
+
+    const small = cases.named("thread-small-range");
+    try std.testing.expectEqual(small.fixedItemsPerRange(16), small.stageItemsPerRange(16));
+
+    const adaptive = cases.named("thread-adaptive-tuned-range");
+    try std.testing.expect(adaptive.adaptive);
+    try std.testing.expectEqual(@as(?usize, null), adaptive.stageItemsPerRange(16));
+    try std.testing.expectEqual(@as(?usize, wide_alignment), adaptive.fixedItemsPerRange(wide_alignment));
+}
+
+test "benchmark range modes scale from the group's partition" {
+    const RangeCase = struct { name: []const u8, element: ?usize, chunk: ?usize, chunk_aligned: ?usize };
+    // Element partition (the default) at alignment 16; one-chunk partition at alignment 1
+    // and at an alignment above the partition.
+    const expected = [_]RangeCase{
+        .{ .name = "thread-fixed-auto", .element = 64, .chunk = 1, .chunk_aligned = 16 },
+        .{ .name = "thread-small-range", .element = 32, .chunk = 1, .chunk_aligned = 16 },
+        .{ .name = "thread-large-range", .element = 256, .chunk = 4, .chunk_aligned = 16 },
+        .{ .name = "thread-adaptive-tuned-range", .element = null, .chunk = null, .chunk_aligned = null },
+    };
+    for (expected) |row| {
+        const case = findBenchmarkCase(row.name).?;
+        try std.testing.expectEqual(row.element, case.stageItemsPerRange(16));
+        try std.testing.expectEqual(row.element, case.stageItemsPerRangeForPartition(default_items_per_range, 16));
+        try std.testing.expectEqual(row.chunk, case.stageItemsPerRangeForPartition(1, 1));
+        try std.testing.expectEqual(row.chunk_aligned, case.stageItemsPerRangeForPartition(1, 16));
+        try std.testing.expect(!case.rangeFollowsItemCount());
     }
+
+    try std.testing.expect(findBenchmarkCase("thread-adaptive-tuned-range").?.adaptive);
+    try std.testing.expect(!findBenchmarkCase("thread-fixed-auto").?.adaptive);
 }
 
-test "fixed adaptive benchmark case disables range probing" {
-    const tuner = adaptiveTunerForCase(default_cases[6], 16).?;
-    const report = tuner.report();
-
-    try std.testing.expectEqual(@as(usize, 64), report.initial_profile.items_per_range);
-    try std.testing.expectEqual(@as(usize, 64), report.current_profile.items_per_range);
-    try std.testing.expect(adaptiveTunerForCase(default_cases[7], 16) == null);
+test "a fixed control's dispatch checks fail an inline batch past one range, folded or in rounds" {
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    const fixed = findBenchmarkCase("thread-fixed-auto").?;
+    // One inline batch of more items than the aligned range; the alignment widens the range.
+    try std.testing.expectError(error.BenchStageRanInline, checkStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .range_alignment_items = 1, .ran_inline = true }));
+    try checkStageDispatched(fixed, &threads, 8, .{ .item_count = 8, .range_count = 1, .range_alignment_items = 1, .ran_inline = true });
+    try checkStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 1, .range_alignment_items = 8, .ran_inline = true });
+    try checkStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .range_alignment_items = 1, .ran_inline = false });
+    // Two plain dispatches of four folded inline: past one range, so one of them ran inline.
+    try std.testing.expectError(error.BenchStageRanInline, checkFoldedStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .range_alignment_items = 1, .ran_inline = true }));
+    try checkFoldedStageDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 3, .range_alignment_items = 1, .ran_inline = false });
+    // Two rounds of four, each one inline range, pass; a mean round past one range, a widest
+    // round past one range with no worker range, and a forced-inline round fail.
+    try checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .ran_inline = true }, 4, 8);
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 12, .range_count = 2, .ran_inline = true }, 4, 8));
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 3, .ran_inline = true }, 6, 8));
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(fixed, &threads, 4, .{ .item_count = 8, .range_count = 2, .ran_inline = true, .forced_inline = true }, 4, 8));
+    // The adaptive case and a thread system with no worker pass.
+    try checkStageDispatched(findBenchmarkCase("thread-adaptive-tuned-range").?, &threads, 4, .{ .item_count = 8, .range_count = 1, .ran_inline = true });
+    var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial.deinit();
+    try checkStageDispatched(fixed, &serial, 4, .{ .item_count = 8, .range_count = 1, .ran_inline = true });
 }
 
-test "adaptive settle budget covers multiple tuner windows" {
-    try std.testing.expectEqual(@as(usize, 48), adaptiveSettleIterationLimit(.{}));
-    try std.testing.expectEqual(@as(usize, 100), adaptiveSettleIterationLimit(.{ .iterations = 100 }));
+test "the clamp control sets the tuner's top batch count per participant and no range size" {
+    for (default_cases) |case| {
+        const expected: ?f64 = if (std.mem.eql(u8, case.name, "thread-clamp-range")) max_batch_multiplier else null;
+        try std.testing.expectEqual(expected, case.stageBatchesPerParticipant());
+    }
+    const clamp = findBenchmarkCase("thread-clamp-range").?;
+    try std.testing.expect(clamp.rangeFollowsItemCount());
+    try std.testing.expectEqual(@as(?usize, null), clamp.maxWorkerThreads());
+    try std.testing.expectEqual(@as(?usize, null), clamp.fixedItemsPerRange(16));
+    try std.testing.expectEqual(@as(?usize, null), clamp.stageItemsPerRange(16));
+    try std.testing.expectEqual(@as(?usize, null), clamp.stageItemsPerRangeForPartition(chunk_partition_items, 1));
 }
 
-test "event scale profiles cover low through high signal counts" {
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1_024, 4_096, 10_000 }, eventScaleCounts(.quick));
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1_024, 4_096, 10_000, 25_000, 50_000 }, eventScaleCounts(.standard));
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 10_000, 25_000, 50_000 }, eventScaleCounts(.stress));
+test "the clamp control's dispatch checks hold each batch to production's shape for its item count" {
+    if (@import("builtin").single_threaded) return;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    const clamp = findBenchmarkCase("thread-clamp-range").?;
+    // Three workers and main: 16 batches of 1,000 items, aligned to 16, at the production
+    // shape; the control `items_per_range` is ignored.
+    const wide = BatchStats{ .item_count = 1_000, .range_count = 16, .range_alignment_items = 16, .ran_inline = false };
+    const range = controlItemsPerRange(clamp, &threads, 1, wide).?;
+    try std.testing.expectEqual(@as(usize, 64), range);
+    try std.testing.expectEqual(threads.fixedBatchesItemsPerRange(wide.item_count, null, 16, max_batch_multiplier), range);
+    try checkStageDispatched(clamp, &threads, null, wide);
+    // Inline at the clamp's range count, and dispatched at another shape (the fixed default's
+    // 64-item ranges over 1,008 aligned items would be 16, so a 32-item one), fail.
+    var inline_wide = wide;
+    inline_wide.ran_inline = true;
+    try std.testing.expectError(error.BenchStageRanInline, checkStageDispatched(clamp, &threads, null, inline_wide));
+    var reshaped = wide;
+    reshaped.range_count = rangeCount(wide.item_count, 32);
+    try std.testing.expectError(error.BenchStageRangeShape, checkStageDispatched(clamp, &threads, null, reshaped));
+    // One aligned unit is one range: inline is its correct shape.
+    try checkStageDispatched(clamp, &threads, null, .{ .item_count = 16, .range_count = 1, .range_alignment_items = 16, .ran_inline = true });
+    // Ten one-unit dispatches folded inline pass; a fold holding an inline 1,000-item dispatch
+    // at its 64-item ranges, or a forced-inline dispatch, fails.
+    try checkFoldedStageDispatched(clamp, &threads, null, .{ .item_count = 160, .range_count = 10, .range_alignment_items = 16, .ran_inline = true });
+    try std.testing.expectError(error.BenchStageRanInline, checkFoldedStageDispatched(clamp, &threads, null, .{ .item_count = 1_160, .range_count = 26, .range_alignment_items = 16, .ran_inline = true }));
+    try std.testing.expectError(error.BenchStageRanInline, checkFoldedStageDispatched(clamp, &threads, null, .{ .item_count = 16, .range_count = 1, .range_alignment_items = 16, .ran_inline = true, .forced_inline = true }));
+    // Rounds resolve from their step's items: 1,600 on three workers and main is 16 ranges
+    // of 100. Ten rounds of 4 items under it correctly ran inline, though 40 items alone would
+    // resolve to one-item ranges.
+    const step_range = threads.fixedBatchesItemsPerRange(1_600, null, 1, max_batch_multiplier);
+    try std.testing.expectEqual(@as(usize, 100), step_range);
+    try checkRoundsDispatched(clamp, &threads, null, .{ .item_count = 40, .range_count = 10, .items_per_range = 100, .ran_inline = true }, 4, 1_600);
+    // A widest round past the step range that ran inline fails, and so do rounds at a range
+    // other than the step's (a clamp that never reached the stage runs the default 64).
+    try std.testing.expectError(error.BenchStageRanInline, checkRoundsDispatched(clamp, &threads, null, .{ .item_count = 400, .range_count = 2, .items_per_range = 100, .ran_inline = true }, 200, 1_600));
+    try std.testing.expectError(error.BenchStageRangeShape, checkRoundsDispatched(clamp, &threads, null, .{ .item_count = 400, .range_count = 7, .items_per_range = 64, .ran_inline = false, .worker_thread_ranges = 3 }, 200, 1_600));
+    // No round: nothing to check.
+    try checkRoundsDispatched(clamp, &threads, null, .{}, 0, 0);
+}
+
+test "benchmark fixed case resolving to an earlier case's configuration is reported as its duplicate" {
+    const lookup = struct {
+        fn index(name: []const u8) usize {
+            for (default_cases, 0..) |case, case_index| {
+                if (std.mem.eql(u8, case.name, name)) return case_index;
+            }
+            std.debug.panic("no default benchmark case named {s}", .{name});
+        }
+    };
+    const DuplicateCase = struct { name: []const u8, chunk: ?[]const u8, chunk_aligned: ?[]const u8 };
+    // One-chunk partition at alignment 1 (small collapses onto the default) and at an
+    // alignment above the partition (large collapses too).
+    const expected = [_]DuplicateCase{
+        .{ .name = "serial-direct", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-fixed-1", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-fixed-2", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-fixed-auto", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-small-range", .chunk = "thread-fixed-auto", .chunk_aligned = "thread-fixed-auto" },
+        .{ .name = "thread-large-range", .chunk = null, .chunk_aligned = "thread-fixed-auto" },
+        .{ .name = "thread-clamp-range", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-adaptive-tuned-range", .chunk = null, .chunk_aligned = null },
+    };
+    try std.testing.expectEqual(default_cases.len, expected.len);
+    const element: FixedRangeShape = .{ .partition_items = default_items_per_range, .range_alignment_items = 16 };
+    const chunk: FixedRangeShape = .{ .partition_items = chunk_partition_items, .range_alignment_items = 1 };
+    const chunk_aligned: FixedRangeShape = .{ .partition_items = chunk_partition_items, .range_alignment_items = 16 };
+    for (expected) |row| {
+        const case_index = lookup.index(row.name);
+        try std.testing.expectEqual(@as(?usize, null), sameShapeCaseIndex(element, case_index));
+        try std.testing.expectEqual(if (row.chunk) |name| lookup.index(name) else null, sameShapeCaseIndex(chunk, case_index));
+        try std.testing.expectEqual(if (row.chunk_aligned) |name| lookup.index(name) else null, sameShapeCaseIndex(chunk_aligned, case_index));
+    }
+
+    const duplicate: RunStats = .{ .status = .duplicate, .duplicate_note = same_shape_notes[lookup.index("thread-fixed-auto")] };
+    try std.testing.expectEqualStrings("same shape as thread-fixed-auto", statusText(duplicate));
+    // An untimed duplicate (mean 0) never wins the best-control pick.
+    const results = [_]CaseResult{
+        .{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 100 } },
+        .{ .case = findBenchmarkCase("thread-small-range").?, .stats = duplicate },
+    };
+    try std.testing.expectEqualStrings("thread-fixed-auto", bestFixedThreadedResult(&results).?.case.name);
+    try std.testing.expectEqualStrings("thread-fixed-auto", bestMeasured(&results).?.case.name);
+    // The clamp control competes for the best-control pick.
+    const with_clamp = results ++ [_]CaseResult{.{ .case = findBenchmarkCase("thread-clamp-range").?, .stats = .{ .mean_ns = 90 } }};
+    try std.testing.expectEqualStrings("thread-clamp-range", bestFixedThreadedResult(&with_clamp).?.case.name);
+}
+
+test "a warmup runs its steps, then settles an adaptive case until its tuners settle or the limit" {
+    const fixed = default_cases[0];
+    const adaptive = default_cases[default_cases.len - 1];
+    var warm = Warmup.custom(fixed, 2, 5);
+    try std.testing.expect(warm.next(false) and warm.next(false) and !warm.next(false));
+    warm = Warmup.custom(adaptive, 1, 3);
+    try std.testing.expect(warm.next(true) and warm.next(false) and warm.next(false) and !warm.next(true));
+    warm = Warmup.custom(adaptive, 0, 2);
+    try std.testing.expect(warm.next(false) and warm.next(false) and !warm.next(false));
+}
+
+test "a census warmup snapshots at its first settle step and stops when the snapshot's tuners settle or the limit" {
+    const fixed = default_cases[0];
+    const adaptive = default_cases[default_cases.len - 1];
+    // Tuners that never record: `settledSince` is false in every perf mode, so only the limit
+    // ends the settle phase.
+    const idle_tuner = AdaptiveWorkTuner.init(.{});
+    var censuses: [6]TunerSettle = @splat(.{});
+    for (&censuses, 1..) |*census, len| {
+        for (0..len) |_| census.add("idle", &idle_tuner);
+    }
+
+    // Two warmup steps, then the three-step settle limit; the snapshot is call 3's census.
+    var warm = Warmup.custom(adaptive, 2, 3);
+    var steps: usize = 0;
+    while (warm.nextSettled(censuses[steps])) steps += 1;
+    try std.testing.expectEqual(@as(usize, 5), steps);
+    try std.testing.expectEqual(censuses[2].len, warm.settle_start.?.len);
+    try std.testing.expect(!warm.settled());
+
+    // A serial case stops after its warmup and has no settle phase.
+    warm = Warmup.custom(fixed, 2, 3);
+    steps = 0;
+    while (warm.nextSettled(censuses[steps])) steps += 1;
+    try std.testing.expectEqual(@as(usize, 2), steps);
+    try std.testing.expect(warm.settle_start == null);
+    try std.testing.expect(!warm.settled());
+
+    // The first settle step always runs and takes the snapshot; the next stops once the
+    // snapshot's tuners settled since.
+    warm = Warmup.custom(adaptive, 1, 3);
+    try std.testing.expect(warm.nextSettledOf(censuses[0], null));
+    try std.testing.expect(warm.settle_start == null);
+    try std.testing.expect(warm.nextSettledOf(censuses[1], null));
+    try std.testing.expectEqual(censuses[1].len, warm.settle_start.?.len);
+    try std.testing.expect(warm.nextSettledOf(censuses[2], false));
+    try std.testing.expect(!warm.nextSettledOf(censuses[3], true));
+    try std.testing.expectEqual(censuses[1].len, warm.settle_start.?.len);
+}
+
+test "adaptive settle budget covers multiple tuner windows and nudge comparisons" {
+    try std.testing.expectEqual(@as(usize, 160), adaptiveSettleIterationLimit(.{}));
+    try std.testing.expectEqual(@as(usize, 1000), adaptiveSettleIterationLimit(.{ .iterations = 1000 }));
 }
 
 const test_item_counts = [_]usize{ 4, 8 };
-
-fn testItemCounts(_: Profile) []const usize {
-    return &test_item_counts;
-}
 
 fn testRunCase(_: std.mem.Allocator, _: std.Io, _: Options, _: BenchmarkCase, _: usize) anyerror!RunStats {
     return .{};
@@ -1614,7 +2889,7 @@ test "benchmark items option overrides registered counts" {
     const group = BenchmarkGroup{
         .name = "test",
         .item_label = "test items",
-        .defaultItemCounts = testItemCounts,
+        .item_counts = &test_item_counts,
         .runCase = testRunCase,
         .write_workload = writeNoWorkload,
     };
@@ -1640,36 +2915,37 @@ test "benchmark table formatters keep compact text" {
 
     try std.testing.expectEqualStrings("1.23M/s", formatThroughputInto(&throughput_buffer, 1_234_567));
     try std.testing.expectEqualStrings("3.25x", formatSpeedupInto(&speedup_buffer, 325));
-    try std.testing.expectEqualStrings("4/10", formatWorkerThreadsInto(&worker_buffer, .{
+    try std.testing.expectEqualStrings("-", formatWorkerThreadsInto(&worker_buffer, .{ .batch_carried = false }));
+    try std.testing.expectEqualStrings("4/10[3/5]", formatWorkerThreadsInto(&worker_buffer, .{
         .batch = .{
             .active_worker_threads = 4,
             .available_worker_threads = 10,
+            .threaded_batches = 3,
+            .dispatched_batches = 5,
         },
     }));
-    const counters_text = if (diagnostics_enabled) " probes=0 demotes=0" else "";
-    try std.testing.expectEqualStrings(
-        "settled settled=yes best=4/256 final=4/256" ++ counters_text,
+    try std.testing.expect(std.mem.startsWith(
+        u8,
         formatWorkTuningInto(&range_buffer, .{
             .phase = .settled,
-            .best_worker_threads = 4,
-            .best_items_per_range = 256,
             .final_worker_threads = 4,
             .final_items_per_range = 256,
-            .settled_before_measurement = true,
+            .settle = .yes,
             .has_threaded_profile = true,
         }),
-    );
+        "settled settled=yes final=4/256 x=1.00",
+    ));
     const group = BenchmarkGroup{
         .name = "test",
         .item_label = "test items",
-        .defaultItemCounts = testItemCounts,
+        .item_counts = &test_item_counts,
         .runCase = testRunCase,
         .write_workload = writeTestWorkload,
     };
     var workload_buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings("hits=4", formatWorkloadInto(&workload_buffer, group, .{ .output_count = 4 }, .summary));
     try std.testing.expectEqualStrings("hits=4 main=250 ns (25%)", formatWorkloadInto(&workload_buffer, group, .{ .output_count = 4 }, .details));
-    const silent = BenchmarkGroup{ .name = "silent", .item_label = "items", .defaultItemCounts = testItemCounts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    const silent = BenchmarkGroup{ .name = "silent", .item_label = "items", .item_counts = &test_item_counts, .runCase = testRunCase, .write_workload = writeNoWorkload };
     try std.testing.expectEqualStrings("", formatWorkloadInto(&workload_buffer, silent, .{ .output_count = 4 }, .details));
 }
 
@@ -1684,38 +2960,6 @@ test "the details table's range columns read inline for an inline batch, never a
     const threaded = BatchSummary{ .item_count = 64, .range_count = 4, .items_per_range = 16, .active_worker_threads = 3, .worker_thread_ranges = 3, .ran_inline = false };
     try std.testing.expectEqualStrings("16", formatRangeCellInto(&buffer, threaded, threaded.items_per_range));
     try std.testing.expectEqualStrings("3", formatRangeCellInto(&buffer, threaded, threaded.worker_thread_ranges));
-}
-
-test "nav main split prints each section, the inline stage time, and the rest per sample" {
-    var buffer: [320]u8 = undefined;
-    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, null));
-    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, NavMainSummary{}));
-    const stats = NavUpdateStats{
-        .inline_stage_ns = 20_000,
-        .main = .{
-            .mark_ns = 1_000,
-            .plan_ns = 2_000,
-            .reserve_ns = 3_000,
-            .commit_ns = 4_000,
-            .conn_merge_ns = 5_000,
-            .conn_layout_ns = 6_000,
-            .flood_ns = 7_000,
-            .closure_ns = 8_000,
-            .evict_ns = 9_000,
-        },
-    };
-    // Two samples: one reaction, then an iteration of a reaction merged from another summary.
-    var summary = NavMainSummary{};
-    summary.add(70_000, stats);
-    summary.endSample();
-    var other = NavMainSummary{};
-    other.add(70_000, stats);
-    summary.merge(other);
-    summary.endSample();
-    try std.testing.expectEqualStrings(
-        " main_split=mark:1.00 us plan:2.00 us reserve:3.00 us commit:4.00 us conn_merge:5.00 us conn_layout:6.00 us flood:7.00 us closure:8.00 us evict:9.00 us inline:20.00 us rest:5.00 us",
-        formatNavMainInto(&buffer, summary),
-    );
 }
 
 const TestVariant = enum(u8) { plain, packed_pads };
@@ -1734,6 +2978,26 @@ test "an item code packs its fields in decimal, round-trips them, and names its 
     const Plain = ItemCode(struct { level_side: u16, levels: u16 }, &.{3});
     try std.testing.expectEqualStrings("(level side * 1000 + levels)", Plain.label);
     try std.testing.expectEqual(@as(usize, 256_008), Plain.of(.{ .level_side = 256, .levels = 8 }));
+}
+
+test "a coded group's header names the run code's fields, and a code no config decodes from says so" {
+    const group = BenchmarkGroup{
+        .name = "test",
+        .item_label = TestCode.label,
+        .describe_item = TestCode.describe,
+        .item_counts = &test_item_counts,
+        .runCase = testRunCase,
+        .write_workload = writeNoWorkload,
+    };
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(": variant=packed_pads edge_chunks=8 level_side=1024 levels=1", formatItemInto(&buffer, group, 10_081_024_001));
+    try std.testing.expectEqualStrings(": undecodable", formatItemInto(&buffer, group, 20_081_024_001));
+    const Flag = ItemCode(struct { dormant: bool, pairs: u32 }, &.{6});
+    var flag_writer: std.Io.Writer = .fixed(&buffer);
+    try Flag.describe(&flag_writer, 1_000_064);
+    try std.testing.expectEqualStrings("dormant=true pairs=64", flag_writer.buffered());
+    const plain = BenchmarkGroup{ .name = "plain", .item_label = "items", .item_counts = &test_item_counts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    try std.testing.expectEqualStrings("", formatItemInto(&buffer, plain, 64));
 }
 
 test "an item code rejects a field past its digits, its type, or its enum's tags" {
@@ -1755,6 +3019,89 @@ test "the stage-shape accumulator keeps each stage's busiest batch, preferring o
     try std.testing.expectEqualStrings("inline(2)[0/1]", shapes.label(1, &buffer));
 }
 
+test "a stage line names each stage's shape over the samples, and a summarized stage prints its threaded count" {
+    var shapes = StageShapes(2){};
+    shapes.add(.{ .{ .item_count = 8, .range_count = 4, .active_worker_threads = 3, .ran_inline = false }, .{ .item_count = 2, .range_count = 1, .ran_inline = true } });
+    shapes.add(.{ .{ .item_count = 8, .range_count = 1, .ran_inline = true }, .{} });
+    var details = DetailLines{};
+    shapes.print(&details, "stages", .{ "plan", "write" });
+    try std.testing.expectEqualStrings("stages: plan=3w/4r(8)[1/2] write=inline(2)[0/1]\n", details.text());
+
+    var buffer: [48]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeStageShape(&writer, batchSummaryFromShapes(&shapes, 0));
+    try std.testing.expectEqualStrings("3w/4r[1/2]", writer.buffered());
+    // A summary of no samples (a shape set by hand) prints no count.
+    writer = .fixed(&buffer);
+    try writeStageShape(&writer, .{ .item_count = 2, .ran_inline = true });
+    try std.testing.expectEqualStrings("inline", writer.buffered());
+}
+
+test "a nav reaction's stage shapes land on their named summaries and stage line" {
+    // Each stage's batch carries its stage index plus one as its item count.
+    var batches: [NavReactionShapes.stage_count]BatchStats = undefined;
+    for (&batches, 1..) |*batch, count| batch.* = .{ .item_count = count, .range_count = 1 };
+    var shapes = NavReactionShapes{};
+    shapes.shapes.add(batches);
+    var run = RunStats{};
+    shapes.summarize(&run, null);
+    try std.testing.expectEqual(@as(usize, 1), run.nav_mark_batch.?.item_count);
+    try std.testing.expectEqual(@as(usize, 2), run.nav_plan_batch.?.item_count);
+    try std.testing.expectEqual(@as(usize, 3), run.nav_remask_batch.?.item_count);
+    try std.testing.expectEqual(@as(usize, 4), run.secondary_batch.?.item_count);
+    const conn = run.nav_conn.?;
+    const conn_stages = [_]BatchSummary{ conn.seed, conn.gather, conn.flood, conn.candidates, conn.closure_resolve, conn.closure_mask, conn.closure_plan, conn.closure_copy, conn.closure_rows, conn.closure_land };
+    for (conn_stages, 5..) |stage, count| try std.testing.expectEqual(count, stage.item_count);
+    var details = DetailLines{};
+    shapes.print(&details, "reaction");
+    try std.testing.expectEqualStrings("reaction: mark=inline(1)[0/1] plan=inline(2)[0/1] remask=inline(3)[0/1] patch=inline(4)[0/1] conn_seed=inline(5)[0/1] conn_gather=inline(6)[0/1] conn_flood=inline(7)[0/1] closure_candidates=inline(8)[0/1] closure_resolve=inline(9)[0/1] closure_mask=inline(10)[0/1] closure_plan=inline(11)[0/1] closure_copy=inline(12)[0/1] closure_rows=inline(13)[0/1] closure_land=inline(14)[0/1]\n", details.text());
+
+    // No reaction marked: no mark shape.
+    var unmarked = NavReactionShapes{};
+    batches[0] = .{};
+    unmarked.shapes.add(batches);
+    run = .{};
+    unmarked.summarize(&run, null);
+    try std.testing.expectEqual(@as(?BatchSummary, null), run.nav_mark_batch);
+}
+
+test "a tuner count walks every tuner a value holds, used or not" {
+    const Nested = struct { inner: [1]AdaptiveWorkTuner };
+    const Fixture = struct {
+        step: AdaptiveWorkTuner,
+        rebuild_tuners: [2]AdaptiveWorkTuner,
+        nested: Nested,
+        unused: AdaptiveWorkTuner,
+    };
+    var learning = testSettledThreadedTuner();
+    learning.phase = .learning;
+    const fixture = Fixture{
+        .step = testSettledThreadedTuner(),
+        .rebuild_tuners = .{ learning, learning },
+        .nested = .{ .inner = .{learning} },
+        .unused = .init(.{}),
+    };
+    // A const value walks too; a census snapshots every tuner, under `root`.
+    var census = TunerSettle{};
+    census.addAll(Fixture, &fixture, "state");
+    try std.testing.expectEqual(@as(usize, 5), census.len);
+    try std.testing.expectEqualStrings("state.nested.inner[0]", census.entries[3].name);
+    try std.testing.expectEqual(@as(usize, 5), tunerCount(Fixture, &fixture));
+}
+
+test "a tuner state names its phase and final shape, or inline" {
+    var tuner = testSettledThreadedTuner();
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeTunerState(&writer, &tuner);
+    try std.testing.expectEqualStrings("settled,4/256,x=1.21", writer.buffered());
+    tuner.has_threaded_profile = false;
+    tuner.phase = .learning;
+    writer = .fixed(&buffer);
+    try writeTunerState(&writer, &tuner);
+    try std.testing.expectEqualStrings("learning,inline", writer.buffered());
+}
+
 fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
     writeSteeringStages(&writer, stats) catch return "stages";
@@ -1763,24 +3110,21 @@ fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {
 
 test "steering stage label tells a stage that did not run from an inline one" {
     var buffer: [160]u8 = undefined;
-    // The serial path: the claim and the grid sort never ran.
-    try std.testing.expectEqualStrings("agents=inline resolve=inline claim=- dir=inline bucket=inline sort=-", formatSteeringStagesInto(&buffer, .{
+    // An empty claim summary prints `-`. A serial step records an inline claim batch.
+    try std.testing.expectEqualStrings("agents=inline resolve=inline claim=- dir=inline", formatSteeringStagesInto(&buffer, .{
         .steering_stages = .{
             .agents = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
             .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
             .directions = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
-            .grid_bucket = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
         },
     }));
-    // Threaded: the claim inline by its tuner, the grid sort on workers.
-    try std.testing.expectEqualStrings("agents=2w/4r resolve=inline claim=inline dir=2w/3r bucket=2w/4r sort=3w/64r", formatSteeringStagesInto(&buffer, .{
+    // Threaded: the claim inline by its tuner.
+    try std.testing.expectEqualStrings("agents=2w/4r resolve=inline claim=inline dir=2w/3r", formatSteeringStagesInto(&buffer, .{
         .steering_stages = .{
             .agents = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
             .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
             .select_claim = .{ .item_count = 4, .range_count = 1, .ran_inline = true },
             .directions = .{ .item_count = 48, .range_count = 3, .active_worker_threads = 2, .ran_inline = false },
-            .grid_bucket = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
-            .grid_sort = .{ .item_count = 64, .range_count = 64, .active_worker_threads = 3, .ran_inline = false },
         },
     }));
 }
@@ -1796,10 +3140,10 @@ test "benchmark validation attention flags adaptive regressions against controls
         .stats = .{ .mean_ns = 100 },
     };
     const adaptive = CaseResult{
-        .case = default_cases[6],
+        .case = default_cases[default_cases.len - 1],
         .stats = .{
             .mean_ns = 130,
-            .batch = .{ .active_worker_threads = 1 },
+            .batch = .{ .active_worker_threads = 1, .threaded_batches = 1, .dispatched_batches = 1 },
         },
     };
     const threaded_control = CaseResult{
@@ -1816,14 +3160,7 @@ test "benchmark validation attention flags adaptive regressions against controls
         validationAttention(null, adaptive, threaded_control).?,
     );
     try std.testing.expect(validationAttention(fixed_auto, .{
-        .case = default_cases[6],
+        .case = default_cases[default_cases.len - 1],
         .stats = .{ .mean_ns = 110 },
     }, threaded_control) == null);
-}
-
-test "batch modes align to cache-line item boundaries" {
-    const small = default_cases[4].itemsPerRange(16).?;
-    const large = default_cases[5].itemsPerRange(16).?;
-    try std.testing.expectEqual(@as(usize, 32), small);
-    try std.testing.expectEqual(@as(usize, 256), large);
 }

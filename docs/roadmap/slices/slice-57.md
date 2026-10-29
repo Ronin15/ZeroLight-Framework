@@ -1,6 +1,6 @@
 ## Slice 57: Items, Inventory, And Equipment
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 56](slice-56.md), [Slice 49](slice-49.md), [Slice 59](slice-59.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 56](slice-56.md), [Slice 49](slice-49.md), [Slice 59](slice-59.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started.** Needs 56 (health, combat stats, kill events), 49
 (seed domains), and 59 (sky exposure for outdoor decay). The player UI is
@@ -11,7 +11,7 @@ that modifies combat, currency, consumable use, loot drops, and world items
 that can be picked up, plus the one inventory-transfer substrate (grants,
 trades, gifts) every later producer uses. Items at rest in the world are
 dormant: they cost nothing per step, persist wherever they lie, and decay
-slowly only outdoors (`.claude/rules/engine-design.md` § Target scale). All of
+slowly only outdoors (`.grok/rules/engine-design.md` § Target scale). All of
 it is deterministic and allocation-free after reserve.
 
 ### Current foundation
@@ -19,8 +19,12 @@ it is deterministic and allocation-free after reserve.
 - Strict JSON-to-table authoring precedent: `ai_archetypes.zig` and the
   tileset and sprite metadata loaders.
 - `assets/sprites/grim_items.json` holds item icons (weapons, armor, potions,
-  coins, keys, gems, tools); `RuntimeAssets.spriteAtlasMeta(.grim_items)` and
-  `SpriteAtlasMeta.spriteByName` resolve them; `AssetReference { sprite,
+  coins, keys, gems, tools); `RuntimeAssets.spriteAtlasMeta(.grim_items)`
+  (`assets/runtime_assets.zig:130`) and `SpriteAtlasMeta.sourceRectForId`
+  (`assets/sprite_atlas_meta.zig:94`) resolve an icon id; the name-to-id map
+  (`name_to_id`) has no public lookup since `spriteByName` was removed
+  callerless (`c1313b1`), so the catalog loader adds its production name
+  lookup; `AssetReference { sprite,
   atlas_entry_id }` (`data_system/types.zig`) carries them in sim data.
 - `ActionKind.use` exists in `simulation.zig` with no consumer.
 - The collision-trigger stream (`systems/collision_response.zig`) emits one
@@ -36,12 +40,12 @@ it is deterministic and allocation-free after reserve.
   change slowly (outdoor decay). Nothing about an item at rest depends on
   distance from the observer.
 - Item and loot-table identity is the authored numeric key, never load order;
-  names resolve once at load (`.claude/rules/assets-audio.md`). Catalog and
+  names resolve once at load (`.grok/rules/assets-audio.md`). Catalog and
   loot-table fingerprints feed Slice 46's content fingerprint.
 - Three appended components (inventory, equipment, world item) follow the
-  component-store pattern (`.claude/rules/simulation.md` § Persistent data).
+  component-store pattern (`.grok/rules/simulation.md` § Persistent data).
   Inventory slot storage grows at the structural-commit seam; only the index
-  width is a fixed ceiling (`.claude/rules/budgets-capacities.md`).
+  width is a fixed ceiling (`.grok/rules/budgets-capacities.md`).
 - The checksum hashes logical inventory contents, never allocation layout, so
   saves made after slot reuse load to the same checksum.
 - World items are created by every producer (loot, 57B drops, 58 dig yields,
@@ -60,7 +64,7 @@ it is deterministic and allocation-free after reserve.
   state; it lands here with tests, and Slice 61 wires its first producer and
   pipeline resource (no dead resource tags ship).
 - One new pipeline stage for inventory work, placed by its real reads
-  (`.claude/rules/simulation.md` § Pipeline); equipment changes take effect
+  (`.grok/rules/simulation.md` § Pipeline); equipment changes take effect
   next step.
 - Persistent: inventories, equipment, and world items are hashed and saved in
   the same change (Slices 49 / 46); unknown item keys reject a load.
@@ -85,6 +89,10 @@ it is deterministic and allocation-free after reserve.
 - [ ] Transfer substrate: batches, preflight queries, all-or-nothing apply.
 - [ ] Equipment modifiers in action selection and combat.
 - [ ] Events, stats, structural share, and audio for pickups.
+- [ ] Pickup and transfer commands past the structural share defer through
+      [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
+      pickup burst defers and the step succeeds
+      (`.grok/rules/budgets-capacities.md`).
 - [ ] `use_item` player action.
 - [ ] The use-item latch is hashed (64B) and saved in
       Slice 46's `pipeline_history`.

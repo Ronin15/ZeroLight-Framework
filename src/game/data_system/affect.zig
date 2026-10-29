@@ -76,7 +76,8 @@ pub const AiAffectStore = struct {
     }
 
     pub fn append(self: *AiAffectStore, allocator: std.mem.Allocator, entity: EntityId, affect: AiAffect) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAiAffectRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -357,4 +358,10 @@ test "AiAffectStore sliceConst and mutable slice expose aligned columns" {
     mutable_slice.curiosity[1] = 0.24;
     try std.testing.expectEqual(@as(f32, 0.42), store.get(1).fear);
     try std.testing.expectEqual(@as(f32, 0.24), store.get(1).curiosity);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "AiAffectStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(AiAffectStore, AiAffect{});
 }

@@ -14,19 +14,20 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 const benchmark_particle_depths = [_]WorldDepth{ .actor, .effect, .marker };
 
+// `particles`: one `ParticleSystem` update over N particles across three render depths,
+// each living past the run so every row stays live. `--details` prints `main=`, the time
+// outside an update batch that ran on workers, and `main_per_item=`. Pass shape: time
+// linear in rows and main per row flat; asserts check every row stays live and each step
+// covers them all, and a fixed threaded case dispatches the update to workers.
 pub const group = suite.BenchmarkGroup{
     .name = "particles",
     .item_label = "particle rows",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
-    .write_workload = suite.writeNoWorkload,
+    .write_workload = writeParticleWorkload,
 };
 
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem {
     var particles = try ParticleSystem.init(allocator, .{ .capacity = count });
     errdefer particles.deinit();
 
@@ -58,59 +59,53 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem
     return particles;
 }
 
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var particles = try createFixture(allocator, item_count);
     defer particles.deinit();
-    if (suite.adaptiveTunerForCase(case, particle_range_alignment_items)) |tuner| {
-        particles.adaptive_tuner = tuner;
-    }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
-    for (0..options.warmup_iterations) |_| {
-        _ = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(suite.tunerSettled(&particles.adaptive_tuner))) {
+        _ = runOnce(&particles, &threads, case);
     }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!particles.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) particles.adaptive_tuner.isSettled() else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&particles.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
+        const batch = runOnce(&particles, &threads, case);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        std.debug.assert(batch.item_count == item_count);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(particle_range_alignment_items), batch);
+        accumulator.record(elapsed_ns, batch);
+        // Main is everything but an update batch that ran on workers.
+        main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
     }
+    std.debug.assert(particles.activeCount() == item_count);
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(particles.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&particles.adaptive_tuner, adaptive_tuner_start);
     }
     return stats;
 }
 
-fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) BatchStats {
-    if (!case.usesThreadSystem()) {
-        return particles.updateSerial(delta_seconds).batch;
-    }
-
-    return particles.update(thread_system.?, delta_seconds, .{
-        .items_per_range = benchmarkItemsPerRange(case),
+fn runOnce(particles: *ParticleSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) BatchStats {
+    return particles.update(thread_system, delta_seconds, .{
+        .items_per_range = case.stageItemsPerRange(particle_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
-    }).batch;
+        .batches_per_participant = case.stageBatchesPerParticipant(),
+    }).perf.batch;
 }
 
-fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.adaptive) return null;
-    return case.itemsPerRange(particle_range_alignment_items) orelse
-        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, particle_range_alignment_items);
+fn writeParticleWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }

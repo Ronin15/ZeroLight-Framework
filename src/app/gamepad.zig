@@ -34,10 +34,6 @@ pub const GamepadManager = struct {
         return if (self.active) |active| active.id else null;
     }
 
-    pub fn activeHandle(self: *const GamepadManager) ?*c.SDL_Gamepad {
-        return if (self.active) |active| active.handle else null;
-    }
-
     /// Enumerates already-connected devices at startup and adopts the first one
     /// found, if any. One-time cold-path `SDL_GetGamepads` allocation is fine
     /// here; this is not a hot path.

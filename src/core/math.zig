@@ -59,6 +59,16 @@ pub fn lastCellOfSpan(min_pos: f32, max_pos: f32, cell_size: f32, max_cells: u32
     return @max(first, worldPosToCell(end_cells - 1, 1, max_cells));
 }
 
+/// `value`'s bits as a key whose unsigned order is the float order: negatives reversed below
+/// positives, `-0` canonicalized to `+0` so equal floats share a key. NaNs sort past the
+/// infinity of their sign. Scalar counterpart of `simd.orderedBitsFloat4`.
+pub fn orderedBits(value: f32) u32 {
+    // Adding +0 turns -0 into +0 and leaves every other value as it is.
+    const bits: u32 = @bitCast(value + 0.0);
+    const sign_fill: u32 = @bitCast(@as(i32, @bitCast(bits)) >> 31);
+    return bits ^ (sign_fill | 0x8000_0000);
+}
+
 /// Linearly interpolates between `start` and `end` by `amount`. Scalar
 /// counterpart of `simd.lerpFloat4`.
 pub fn lerp(start: f32, end: f32, amount: f32) f32 {
@@ -153,15 +163,6 @@ pub fn sinCos(angle: f32) SinCos {
     return .{ .sin = @sin(angle), .cos = @cos(angle) };
 }
 
-/// Rotates `v` counter-clockwise by a precomputed sin/cos pair:
-/// `(x*cos - y*sin, x*sin + y*cos)`.
-pub fn rotate2D(v: Vec2, angle: SinCos) Vec2 {
-    return .{
-        .x = v.x * angle.cos - v.y * angle.sin,
-        .y = v.x * angle.sin + v.y * angle.cos,
-    };
-}
-
 /// Angle (radians, `[-pi, pi]`) of the vector `(x, y)` measured from +x. The
 /// single project chokepoint for direction -> angle conversion (e.g. baking a
 /// facing vector into a `Sprite.rotation`), so callers never inline the trig.
@@ -237,6 +238,20 @@ test "lastCellOfSpan excludes the cell a max edge lands on, at every f32 magnitu
     try std.testing.expectEqual(cells - 1, lastCellOfSpan(0, 1.0e9, 32, cells));
     try std.testing.expectEqual(cells - 1, lastCellOfSpan(0, std.math.inf(f32), 32, cells));
     try std.testing.expectEqual(@as(u32, 0), lastCellOfSpan(0, 100, 32, 0));
+}
+
+test "orderedBits orders like the floats and gives -0 and +0 one key" {
+    const inf = std.math.inf(f32);
+    const subnormal = std.math.floatTrueMin(f32);
+    // Ascending, each strictly above the last as a float.
+    const ascending = [_]f32{ -inf, -std.math.floatMax(f32), -1.5, -subnormal, 0, subnormal, std.math.floatMin(f32), 1, 1.5, std.math.floatMax(f32), inf };
+    for (ascending[0 .. ascending.len - 1], ascending[1..]) |lower, upper| {
+        try std.testing.expect(orderedBits(lower) < orderedBits(upper));
+    }
+    try std.testing.expectEqual(orderedBits(0.0), orderedBits(-0.0));
+    // NaNs sort past the infinity of their sign.
+    try std.testing.expect(orderedBits(std.math.nan(f32)) > orderedBits(inf));
+    try std.testing.expect(orderedBits(-std.math.nan(f32)) < orderedBits(-inf));
 }
 
 test "lerpVec2 interpolates between points" {
@@ -336,36 +351,10 @@ test "normalizeOrDefaultFinite falls back on degenerate inputs" {
     try std.testing.expectEqual(default, normalizeOrDefaultFinite(std.math.floatMax(f32), std.math.floatMax(f32), 1.0e-4, default));
 }
 
-test "rotate2D rotates points by a precomputed sin/cos pair" {
-    const quarter = sinCos(std.math.pi / 2.0);
-    const rotated = rotate2D(.{ .x = 1, .y = 0 }, quarter);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), rotated.x, 1.0e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), rotated.y, 1.0e-6);
-
-    const identity = sinCos(0);
-    const unchanged = rotate2D(.{ .x = 3, .y = -4 }, identity);
-    try std.testing.expectApproxEqAbs(@as(f32, 3), unchanged.x, 1.0e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -4), unchanged.y, 1.0e-6);
-
-    // Matches the inline formula the sprite quad emitter previously hand-rolled.
-    const angle = sinCos(0.7);
-    const point = Vec2{ .x = 2, .y = 5 };
-    try std.testing.expectApproxEqAbs(
-        point.x * angle.cos - point.y * angle.sin,
-        rotate2D(point, angle).x,
-        1.0e-6,
-    );
-    try std.testing.expectApproxEqAbs(
-        point.x * angle.sin + point.y * angle.cos,
-        rotate2D(point, angle).y,
-        1.0e-6,
-    );
-}
-
-test "atan2 recovers the angle sinCos rotated a +x unit vector by" {
+test "atan2 recovers the angle of a sinCos unit vector" {
     for ([_]f32{ 0, 0.5, 1.2, -0.8, std.math.pi / 2.0, -std.math.pi / 2.0 }) |angle| {
-        const dir = rotate2D(.{ .x = 1, .y = 0 }, sinCos(angle));
-        try std.testing.expectApproxEqAbs(angle, atan2(dir.y, dir.x), 1.0e-6);
+        const dir = sinCos(angle);
+        try std.testing.expectApproxEqAbs(angle, atan2(dir.sin, dir.cos), 1.0e-6);
     }
     try std.testing.expectApproxEqAbs(std.math.pi / 2.0, atan2(1, 0), 1.0e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0), atan2(0, 1), 1.0e-6);

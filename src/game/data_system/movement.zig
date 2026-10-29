@@ -12,6 +12,7 @@ const types = @import("types.zig");
 const EntityId = types.EntityId;
 const MovementBody = types.MovementBody;
 const MovementBodyPtr = types.MovementBodyPtr;
+const CollisionBounds = types.CollisionBounds;
 const MovementBodySlice = types.MovementBodySlice;
 const ConstMovementBodySlice = types.ConstMovementBodySlice;
 const ScopeColumnsSlice = types.ScopeColumnsSlice;
@@ -40,6 +41,14 @@ const MovementBodyRow = struct {
     velocity_y: f32,
     speed: f32,
     has_primitive_visual: bool = false,
+    // Mirror of the entity's `CollisionBounds` (zero without one) and its AI membership,
+    // written only by `DataSystem` at the commit seam.
+    bounds_offset_x: f32 = 0,
+    bounds_offset_y: f32 = 0,
+    bounds_size_x: f32 = 0,
+    bounds_size_y: f32 = 0,
+    has_collision_bounds: bool = false,
+    has_ai_agent: bool = false,
     tier: SimulationTier,
     chunk_x: i32,
     chunk_y: i32,
@@ -56,7 +65,8 @@ pub const MovementBodyStore = struct {
     }
 
     pub fn append(self: *MovementBodyStore, allocator: std.mem.Allocator, entity: EntityId, body: MovementBody) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -124,6 +134,20 @@ pub const MovementBodyStore = struct {
         self.rows.slice().items(.has_primitive_visual)[index] = has_visual;
     }
 
+    /// Mirrors `bounds` onto row `index` and marks it bounded.
+    pub fn setCollisionBounds(self: *MovementBodyStore, index: usize, bounds: CollisionBounds) void {
+        const s = self.rows.slice();
+        s.items(.bounds_offset_x)[index] = bounds.offset.x;
+        s.items(.bounds_offset_y)[index] = bounds.offset.y;
+        s.items(.bounds_size_x)[index] = bounds.size.x;
+        s.items(.bounds_size_y)[index] = bounds.size.y;
+        s.items(.has_collision_bounds)[index] = true;
+    }
+
+    pub fn setHasAiAgent(self: *MovementBodyStore, index: usize, has_agent: bool) void {
+        self.rows.slice().items(.has_ai_agent)[index] = has_agent;
+    }
+
     pub fn scopeMetadataAt(self: *const MovementBodyStore, index: usize) EntitySimulationMetadata {
         const s = self.rows.slice();
         return .{
@@ -140,7 +164,8 @@ pub const MovementBodyStore = struct {
         s.items(.tier)[index] = metadata.tier;
         s.items(.chunk_x)[index] = metadata.chunk.x;
         s.items(.chunk_y)[index] = metadata.chunk.y;
-        s.items(.level)[index] = metadata.level;
+        // Resolved by the caller: a scope row always holds a level.
+        s.items(.level)[index] = metadata.level.?;
         s.items(.stagger_phase)[index] = metadata.stagger_phase;
         s.items(.always_active)[index] = metadata.always_active;
     }
@@ -182,6 +207,12 @@ pub const MovementBodyStore = struct {
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
             .has_primitive_visual = s.items(.has_primitive_visual),
+            .bounds_offset_x = s.items(.bounds_offset_x),
+            .bounds_offset_y = s.items(.bounds_offset_y),
+            .bounds_size_x = s.items(.bounds_size_x),
+            .bounds_size_y = s.items(.bounds_size_y),
+            .has_collision_bounds = s.items(.has_collision_bounds),
+            .has_ai_agent = s.items(.has_ai_agent),
         };
     }
 
@@ -198,6 +229,12 @@ pub const MovementBodyStore = struct {
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
             .has_primitive_visual = s.items(.has_primitive_visual),
+            .bounds_offset_x = s.items(.bounds_offset_x),
+            .bounds_offset_y = s.items(.bounds_offset_y),
+            .bounds_size_x = s.items(.bounds_size_x),
+            .bounds_size_y = s.items(.bounds_size_y),
+            .has_collision_bounds = s.items(.has_collision_bounds),
+            .has_ai_agent = s.items(.has_ai_agent),
         };
     }
 
@@ -247,13 +284,9 @@ pub const MovementBodyStore = struct {
 
 test "simd range helpers cover movement body vector and scalar tail counts" {
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(@as(usize, 0)));
-    try std.testing.expectEqual(@as(usize, 0), simd.tailLen(@as(usize, 0)));
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(simd.lane_count - 1));
-    try std.testing.expectEqual(@as(usize, simd.lane_count - 1), simd.tailLen(simd.lane_count - 1));
     try std.testing.expectEqual(@as(usize, simd.lane_count), simd.vectorizedEnd(simd.lane_count));
-    try std.testing.expectEqual(@as(usize, 0), simd.tailLen(simd.lane_count));
     try std.testing.expectEqual(@as(usize, simd.lane_count * 2), simd.vectorizedEnd(simd.lane_count * 2 + 1));
-    try std.testing.expectEqual(@as(usize, 1), simd.tailLen(simd.lane_count * 2 + 1));
 }
 
 test "MovementBodyStore append is allocation-free after ensureCapacity reserves" {
@@ -273,4 +306,10 @@ test "MovementBodyStore append is allocation-free after ensureCapacity reserves"
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "MovementBodyStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(MovementBodyStore, MovementBody{});
 }

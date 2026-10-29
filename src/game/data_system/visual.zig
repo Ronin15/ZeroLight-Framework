@@ -76,7 +76,8 @@ pub const FacingStore = struct {
     }
 
     pub fn append(self: *FacingStore, allocator: std.mem.Allocator, entity: EntityId, facing: FacingData) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyFacingRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -177,7 +178,8 @@ pub const PrimitiveVisualStore = struct {
     }
 
     pub fn append(self: *PrimitiveVisualStore, allocator: std.mem.Allocator, entity: EntityId, visual: PrimitiveVisual) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(visualToRow(entity, visual));
@@ -308,7 +310,8 @@ pub const AssetReferenceStore = struct {
     }
 
     pub fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, asset_ref: AssetReference) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -387,4 +390,18 @@ test "AssetReferenceStore append is allocation-free after ensureCapacity reserve
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "FacingStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(FacingStore, FacingData{});
+}
+
+test "PrimitiveVisualStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(PrimitiveVisualStore, std.mem.zeroes(PrimitiveVisual));
+}
+
+test "AssetReferenceStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(AssetReferenceStore, std.mem.zeroes(AssetReference));
 }

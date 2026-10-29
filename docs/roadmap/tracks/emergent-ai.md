@@ -7,7 +7,7 @@ Goal: emergent NPC behavior (perception, memory, feelings, and utility
 arbitration) on top of the navigation substrate, with many emotions and
 decisions defined as content. Cognition runs for every agent in every world;
 distance from the observer lowers its tick rate, never stops it (Slice 75,
-`.claude/rules/engine-design.md` § Target scale). Hot paths stay
+`.grok/rules/engine-design.md` § Target scale). Hot paths stay
 allocation-free and deterministic (serial == threaded, scalar == SIMD).
 
 **Track status (code-authoritative):**
@@ -44,7 +44,7 @@ The owner's cognition redesign (2026-10-08) is
 [Slice 73](../slices/slice-73.md): drives and behaviors defined by data
 with counts from content, no per-drive or per-behavior code, sparse
 couplings and per-archetype behavior sets, a data-driven task layer under
-utility selection, and the `.claude/rules/simulation.md` § AI and affect
+utility selection, and the `.grok/rules/simulation.md` § AI and affect
 edit, keeping utility scoring, sticky selection, and hysteresis drives.
 Slices 42, 55, 56, 61, 63, 68B, 71A, 71C, and 71D add their drives and
 behaviors on it.
@@ -61,13 +61,13 @@ behaviors on it.
 | `AiSystem` | `systems/ai.zig` | Gathers `Signals`, runs arbitration, emits `NavigationIntent` at `ai_decide` |
 | Archetypes | `ai_archetypes.zig`, `assets/ai/archetypes.json` | Strict load-time personalities |
 
-Stage order `perception → ai_memory → affect → ai_decide → steering →
-pathfinding` (`simulation_pipeline.zig` `stage_order`). Pursue/flee prefer
+Stage order `spatial_index_build → ai_cognition_order → perception →
+ai_memory → affect → ai_decide → steering → pathfinding` (`simulation_pipeline.zig` `stage_order`). Pursue/flee prefer
 perception's faction-generic `nearest_threat`, then fresh memory, then the
 opt-in focus fallback; investigate prefers heard stimuli, then interest
 markers, then memory-ring contacts; cohere reads the shared spatial index.
 
 Track-wide contracts (component stores, SIMD-first processors, scalar
 events, utility + sticky selection, optional signal components) are rules
-in `.claude/rules/simulation.md`, `.claude/rules/threading.md`, and
-`.claude/rules/memory-performance.md`.
+in `.grok/rules/simulation.md`, `.grok/rules/threading.md`, and
+`.grok/rules/memory-performance.md`.

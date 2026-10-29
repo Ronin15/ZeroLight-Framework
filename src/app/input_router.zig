@@ -60,17 +60,6 @@ pub const InputRoutingPolicy = struct {
     }
 };
 
-/// Keyboard-oriented entry point. Gamepad button/axis events are dropped
-/// (no active pad). Prefer `routeEventWithGamepad` from the engine path.
-pub fn routeEvent(
-    policy: InputRoutingPolicy,
-    event: *const c.SDL_Event,
-    input: *InputState,
-    commands: *FrameCommands,
-) void {
-    routeEventWithGamepad(policy, event, input, commands, null);
-}
-
 /// Routes a raw SDL event through `policy` into held gameplay input or
 /// one-frame commands. `active_gamepad_id` filters GAMEPAD_BUTTON_* and
 /// GAMEPAD_AXIS_MOTION to the single open pad: when `null`, all pad input is
@@ -317,14 +306,14 @@ test "routed gameplay events mutate held input only when gameplay is allowed" {
     var down_event = keyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
     var up_event = keyEvent(c.SDL_EVENT_KEY_UP, c.SDLK_A, false);
 
-    routeEvent(InputRoutingPolicy.modalUi(), &down_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.modalUi(), &down_event, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.move_left));
 
-    routeEvent(InputRoutingPolicy.gameplay(), &down_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &down_event, &input, &commands, null);
     try std.testing.expect(input.isHeld(.move_left));
 
     // UP clears held gameplay even under modalUi so dig/move cannot trap.
-    routeEvent(InputRoutingPolicy.modalUi(), &up_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.modalUi(), &up_event, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.move_left));
 }
 
@@ -335,17 +324,17 @@ test "held dig DOWN under modal is ignored; dig UP under modal clears if held" {
     var dig_up = keyEvent(c.SDL_EVENT_KEY_UP, c.SDLK_E, false);
 
     // DOWN under modal must not latch dig.
-    routeEvent(InputRoutingPolicy.modalUi(), &dig_down, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.modalUi(), &dig_down, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.dig_hole));
 
     // Latch dig under gameplay, then modal blocks further DOWN.
-    routeEvent(InputRoutingPolicy.gameplay(), &dig_down, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &dig_down, &input, &commands, null);
     try std.testing.expect(input.isHeld(.dig_hole));
-    routeEvent(InputRoutingPolicy.modalUi(), &dig_down, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.modalUi(), &dig_down, &input, &commands, null);
     try std.testing.expect(input.isHeld(.dig_hole));
 
     // UP under modal clears the prior hold.
-    routeEvent(InputRoutingPolicy.modalUi(), &dig_up, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.modalUi(), &dig_up, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.dig_hole));
 }
 
@@ -354,7 +343,7 @@ test "releaseHeldGameplay after dig hold leaves dig not held under modal" {
     var commands = FrameCommands{};
     var dig_down = keyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_E, false);
 
-    routeEvent(InputRoutingPolicy.gameplay(), &dig_down, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &dig_down, &input, &commands, null);
     try std.testing.expect(input.isHeld(.dig_hole));
 
     // Simulate pause/gameplay-block release path.
@@ -362,7 +351,7 @@ test "releaseHeldGameplay after dig hold leaves dig not held under modal" {
     try std.testing.expect(!input.isHeld(.dig_hole));
 
     // Subsequent DOWN under modal still ignored.
-    routeEvent(InputRoutingPolicy.modalUi(), &dig_down, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.modalUi(), &dig_down, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.dig_hole));
 }
 
@@ -373,17 +362,17 @@ test "routed app and debug commands honor context and key repeat" {
     var repeated_pause_event = keyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_P, true);
     var debug_event = keyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_F2, false);
 
-    routeEvent(InputRoutingPolicy.gameplay(), &pause_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &pause_event, &input, &commands, null);
     try std.testing.expect(commands.wasPressed(.pause));
 
     commands.beginFrame();
-    routeEvent(InputRoutingPolicy.gameplay(), &repeated_pause_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &repeated_pause_event, &input, &commands, null);
     try std.testing.expect(!commands.wasPressed(.pause));
 
-    routeEvent(InputRoutingPolicy.gameplay().withContext(.debug, false), &debug_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay().withContext(.debug, false), &debug_event, &input, &commands, null);
     try std.testing.expect(!commands.wasPressed(.toggle_debug_overlay));
 
-    routeEvent(InputRoutingPolicy.gameplay(), &debug_event, &input, &commands);
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &debug_event, &input, &commands, null);
     try std.testing.expect(commands.wasPressed(.toggle_debug_overlay));
 }
 
@@ -502,8 +491,8 @@ test "gamepad button and axis events are dropped when no active pad is open" {
     routeEventWithGamepad(InputRoutingPolicy.gameplay(), &pause, &input, &commands, null);
     try std.testing.expect(!commands.wasPressed(.pause));
 
-    // Four-arg routeEvent is the no-active-pad convenience path.
-    routeEvent(InputRoutingPolicy.gameplay(), &button, &input, &commands);
+    // A null active pad drops gamepad input.
+    routeEventWithGamepad(InputRoutingPolicy.gameplay(), &button, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.dig_hole));
 }
 

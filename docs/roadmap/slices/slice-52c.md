@@ -3,14 +3,15 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 52A](slice-52a.md), [Slice 49](slice-49.md), [Slice 50](slice-50.md) (TSan job), [Slice 52B](slice-52b.md) (tag job) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started.** The verify, gpu-smoke, shader, and soak workflows need
-52A; the `frame-battle` digest needs 49's checksum; the TSan job needs 50; the
+52A; the `production-step` digest needs 49's checksum; the TSan job needs 50; the
 tag packaging job needs 52B.
 
 Goal: every push to `main` and every PR runs the full gate on Linux x86_64,
 Windows x86_64 (native and cross from Linux), and macOS arm64; a display-gated
 gpu-smoke runs under Xvfb with Mesa lavapipe; tags produce downloadable per-OS
 packages with symbols; a ReleaseSafe soak and release bench run archives its
-outputs. `frame-battle` measures how the full fixed step plus CPU render prep
+outputs. `production-step` (extended here with CPU render prep, a state digest, and
+a NaN count) measures how the full fixed step plus CPU render prep
 scales with population and world size, and proves serial == threaded state
 digests at every size.
 
@@ -25,13 +26,16 @@ digests at every size.
   run `test` / `bench` / `run` / `gpu-smoke` with the PATH prepend.
 - `gpu-smoke` needs a display.
 - Benches: groups register in `src/benchmarks/runner.zig`; the suite accepts
-  `--group`, `--case`, `--items`, `--profile`, `--iterations`, `--details`;
-  outputs are gitignored. `tools/bench_run.py` always runs Debug and calls
-  `os.uname()`, which Windows lacks.
-- No bench drives the full fixed step; groups are per system, and
-  `render-game-prep` covers CPU render prep on synthetic fixtures. The only
-  full-frame reference is manual ReleaseSafe perf-log dumps at one demo
-  population, which reproduce across neither machines nor commits.
+  `--group`, `--group-prefix`, `--case`, `--items`, `--warmup`, `--iterations`,
+  `--fallback-budget`, `--details` (`suite.zig:1074-1116`); outputs are
+  gitignored. `tools/bench_ab.py` runs Debug by default, warmup 1, iterations
+  3 (`bench_ab.py:53`).
+- `production-step` (`src/benchmarks/production_step.zig`, registered in
+  `runner.zig`) drives the production fixed step (`GameDemoState.update`
+  through the structural-commit seam) on a directly built population ladder
+  with a fixed pre-measure and a tuner-settled check, but no CPU render prep,
+  no state digest, and no NaN count; `render-game-prep` covers CPU render prep
+  on synthetic fixtures.
 - `GameDemoState` builds headless: `update(UpdateContext)` runs input, the
   pipeline, audio queueing, particles, camera, and the structural commit;
   `RuntimeAssets` can be seeded with metadata only; a serial `ThreadSystem` is
@@ -41,9 +45,9 @@ digests at every size.
 
 - Owner direction: benches measure scaling shape, never a target count; the
   demo's population and world size are never bench sizes or thresholds
-  (`.claude/rules/engine-design.md` § Target scale,
-  `.claude/rules/tests-benchmarks.md`).
-- `frame-battle` runs at least three points each along population and world
+  (`.grok/rules/engine-design.md` § Target scale,
+  `.grok/rules/tests-benchmarks.md`).
+- `production-step` runs at least three points each along population and world
   extent (level size, depth), building its fixture directly rather than from
   the demo config, with a fixed settle step count (never scaled) so every case
   runs identical steps. Once [Slice 74](slice-74.md) and
@@ -56,7 +60,7 @@ digests at every size.
   job, never as archived references. A mismatch fails the job and is fixed at
   its cause (**zig-debug-specialist**), never by relaxing exact equality.
 - Bench-fixture correctness relies on internal asserts in real runs; no test
-  calls the bench (`.claude/rules/tests-benchmarks.md`).
+  calls the bench (`.grok/rules/tests-benchmarks.md`).
 - Workflows: `ci.yml` (Linux, Linux TSan, Linux gpu-smoke, Windows, macOS),
   `shader-artifacts.yml` (regenerate on Windows with pinned Vulkan SDK and a
   hash-checked DXC, then require no diff), `release.yml` (sniper-container
@@ -70,11 +74,11 @@ digests at every size.
 - Soak fails only on test, assert, safety panic, digest mismatch, or nonzero
   NaN count, never on timing; hosted-runner numbers are trend data, and
   authoritative release numbers come from the reference machine. The soak's
-  full `--profile stress` sweep is the one full-suite run this slice names.
+  full `zig build bench` sweep is the one full-suite run this slice names.
 - Pinning: Zig from zon in one step; GitHub-owned actions by major tag;
   third-party actions and container images by full SHA or digest.
 - Owners: `.github/workflows/`, a `-Dpython` build option routing every Python
-  step, `tools/bench_run.py`, and `src/benchmarks/frame.zig`; no production
+  step, `tools/bench_ab.py`, and `src/benchmarks/production_step.zig`; no production
   API change.
 - VoidLight: no CI to port; its manual ReleaseSafe soak model becomes this
   reproducible soak, which supplements DW's multi-hour soak gate; do not port
@@ -84,12 +88,14 @@ digests at every size.
 
 - [ ] `-Dpython=<exe>` with a host-dependent default, used by every Python
       build step.
-- [ ] `tools/bench_run.py` `--optimize` and `--cpu-baseline` recorded in the
-      header, `platform.node()`; `tools/README.md`.
-- [ ] `frame-battle` bench (`src/benchmarks/frame.zig`): direct-built fixture
-      ladder over population and world extent, fixed settle, split sim and
+- [ ] The soak and release bench runs record optimize mode and CPU baseline
+      in their archived output; `tools/README.md`.
+- [ ] `production-step` (`src/benchmarks/production_step.zig`) extended, not a
+      new group (shared harness pieces live once, `.grok/rules/tests-benchmarks.md`
+      § Benchmarks): ladder over population and world extent, split sim and
       render-prep timers, serial and threaded cases, `state_digest`, and
-      internal asserts; registered.
+      internal asserts; it already runs the full fixed step with a fixed
+      pre-measure and a tuner-settled check.
 - [ ] `state_nan_values` beside `state_digest`; the soak
       fails on any nonzero value.
 - [ ] `ci.yml` jobs as above, including the `x86_64_v2` header grep, the
@@ -101,7 +107,7 @@ digests at every size.
       failing on no files, and tag-only publish.
 - [ ] (added by Slice 66) macOS release job uploads its `package-symbols` dir
       as `symbols-macos` (66A later renames both per OS and arch).
-- [ ] `soak-bench.yml`: ReleaseSafe tests and long `frame-battle` run, stress
+- [ ] `soak-bench.yml`: ReleaseSafe tests and long `production-step` run, stress
       sweep, serial-vs-threaded digest checks at every ladder point, ReleaseFast baseline, artifact upload; cron after a
       recorded duration.
 - [ ] Docs: DW "Continuous Integration" (what gates, artifacts, shader
@@ -109,7 +115,7 @@ digests at every size.
       changelog's Windows `test`/`bench` residual (`run` and `gpu-smoke` stay
       manual).
 - [ ] Add the determinism-mismatch handling rule to
-      `.claude/rules/simulation.md` when this lands.
+      `.grok/rules/simulation.md` when this lands.
 
 ### Acceptance checks
 
@@ -121,7 +127,7 @@ digests at every size.
       binary runs on the reference Arch host (manual, display).
 - [ ] A manual `soak-bench` run completes and uploads its outputs; its duration
       sets the timeout before the cron is enabled.
-- [ ] `frame-battle` digests are equal serial vs threaded at every ladder
+- [ ] `production-step` digests are equal serial vs threaded at every ladder
       point; its scaling shape across the ladder is
       recorded on the reference machine in ReleaseFast and ReleaseSafe, and the
       `compat`/`ship` A/B completes 52A's baseline evidence.

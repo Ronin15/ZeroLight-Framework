@@ -8,6 +8,7 @@
 //! NavGraph's grids and chunk records; they stay free functions to keep that wiring flat.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const simd = @import("../../../core/simd.zig");
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -231,8 +232,10 @@ fn solveAbstract(
     var least_expanded: LeastExpanded = undefined;
     const least: ?*LeastExpanded = if (request.tier == 0) null else &least_expanded;
     const searched = abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap, &heuristic, least);
-    scratch.crossing_boxes_settled += abstract.crossing.settles;
-    scratch.crossing_budget_frozen += @intFromBool(abstract.crossing.frozen);
+    if (comptime runtime_perf_log.enabled) {
+        scratch.perf.crossing_boxes_settled += abstract.crossing.settles;
+        scratch.perf.crossing_budget_frozen += @intFromBool(abstract.crossing.frozen);
+    }
     const to_goal = searched == .found;
     const corridor = switch (searched) {
         .found, .toward => |c| c,
@@ -351,11 +354,11 @@ fn stitchCorridor(
 }
 
 // Counts one segment search against `segment_cap`, recording the participant's per-step
-// high-water; false when the cap is spent.
+// high-water with perf counters; false when the cap is spent.
 fn countSegment(scratch: *SearchScratch, segments_used: *usize, segment_cap: usize) bool {
     if (segments_used.* >= segment_cap) return false;
     segments_used.* += 1;
-    scratch.max_stitch_segments_used = @max(scratch.max_stitch_segments_used, segments_used.*);
+    if (comptime runtime_perf_log.enabled) scratch.perf.max_stitch_segments_used = @max(scratch.perf.max_stitch_segments_used, segments_used.*);
     return true;
 }
 
@@ -637,7 +640,7 @@ const CrossLevelHeuristic = struct {
         if (gap == 0) return .{ .add = 0, .floor = 0 };
         // No short link crosses levels: only a long link reaches the goal level.
         if (self.short_span == 0) return .{ .add = unreachable_cost, .floor = unreachable_cost };
-        const crossings = (gap + self.short_span - 1) / self.short_span;
+        const crossings = @divCeil(gap, self.short_span);
         return .{ .add = crossings *| self.short_excess, .floor = crossings *| self.short_cost };
     }
 
@@ -1160,7 +1163,7 @@ fn reconstructLocalPath(scratch: *SearchScratch, goal_slot: u32) void {
 // Writes a plain path whole into this request's output stripe at its solve ordinal,
 // with its registry runs. The local solve bounds a path at one cell per explored node,
 // which the stripe holds.
-fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16, goal_cell: u32) void {
+pub fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16, goal_cell: u32) void {
     const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(path.len <= stripe_words);
@@ -1182,7 +1185,7 @@ fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, pat
 // is the start level and `goal_cell` the live goal it was solved toward. stitchCorridor's cap
 // (at most max_stitched_path_cells) bounds it at the stripe, asserted so a drift fails loud
 // instead of truncating the corridor.
-fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16, goal_cell: u32) void {
+pub fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16, goal_cell: u32) void {
     const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(types.stitchedWords(stitched.len) <= stripe_words);
@@ -1689,7 +1692,7 @@ const ReferenceAbstract = struct {
         const allocator = self.nodes.allocator;
         const width = graph.geometry.width;
         const tiles: u32 = graph.geometry.chunk_tiles;
-        const chunks_x = (width + tiles - 1) / tiles;
+        const chunks_x = @divCeil(width, tiles);
         const goal: u32 = @intCast(goal_index);
         const goal_x = goal % width;
         const goal_y = goal / width;
@@ -1942,6 +1945,7 @@ test "abstract expansion visits only same-label peers, border mirrors, and live 
 
 const LevelLink = @import("../../world/system.zig").LevelLink;
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 
 // 16x16 cells in 4-tile chunks over `levels` levels, each with random walls.
@@ -2033,7 +2037,7 @@ fn pushDistance(allocator: std.mem.Allocator, distances: *std.AutoHashMap(usize,
 fn exhaustiveAbstractObjective(allocator: std.mem.Allocator, graph: *const NavGraph, start_grid: *const NavGrid, goal_grid: *const NavGrid, start_level: u16, goal_level: u16, start_index: usize, goal_index: usize) !?u32 {
     const width = graph.geometry.width;
     const tiles: u32 = graph.geometry.chunk_tiles;
-    const chunks_x = (width + tiles - 1) / tiles;
+    const chunks_x = @divCeil(width, tiles);
     const goal: u32 = @intCast(goal_index);
     const goal_x = goal % width;
     const goal_y = goal / width;
@@ -2265,6 +2269,8 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
 }
 
 test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract graph, links built whole or through marks" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const allocator = std.testing.allocator;
     const DataSystem = @import("../../data_system.zig").DataSystem;
     var meta = try test_support.loadTestWorldMeta(allocator);
@@ -2307,9 +2313,9 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
         try marked.reserve(capacity);
         try marked.rebuildStaticNavGridWithWorld(&data, &marked_world, null);
         for (links[0..first_apply]) |link| try marked_world.addLevelLink(link);
-        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
+        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, &serial_threads);
         for (links[first_apply..]) |link| try marked_world.addLevelLink(link);
-        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
+        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, &serial_threads);
         try std.testing.expect(std.meta.eql(whole.graph.link_bounds, marked.graph.link_bounds));
         for (whole.graph.level_crossings.items, marked.graph.level_crossings.items) |a, b| try std.testing.expect(std.meta.eql(a, b));
 
@@ -2373,7 +2379,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
     try marked.reserve(capacity);
     try marked.rebuildStaticNavGridWithWorld(&data, &marked_world, null);
     try marked_world.addLevelLink(pocket_teleport);
-    _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
+    _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, &serial_threads);
     var abstract = AbstractScratch{};
     defer abstract.deinit(allocator);
     try abstract.reserve(allocator, 4096);
