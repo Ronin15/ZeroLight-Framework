@@ -1075,8 +1075,9 @@ narrowphase, each under its own tuner, and the same functions inline when the
 tuner or a zero-worker pool stays on the caller. The sweep key is level, strip,
 ordered min, and entity. Statics are not sweep entries. Dynamic×static pairs
 come from `ColliderView`. Solid static×static pairs are dropped. A static
-trigger over a static is stored until the collider revision changes; that
-refresh runs at the collider sync (`syncStaticColliders`).
+trigger over a static is stored across steps and updated when the collider
+revision changes; `syncStaticColliders` patches or rebuilds the store at that
+sync.
 
 The stored pairs live in `TriggerStore` (`collision_triggers.zig`): per level a
 B+-tree of sorted 64-pair pages (the leaves, pooled `PayloadSlabs` slots) under
@@ -1089,12 +1090,26 @@ pass, and never reads a filtered pair. A patch buckets its edits on main, plans
 every tree height from counts, writes the fresh pages in one leaf dispatch
 (each range finds its run once), and writes the nodes on main as an
 O(1)-per-output merge with advancing run and segment cursors (not a stage).
-`refresh` (allow epoch) ranges own pages at 1,024-pair alignment: a range
-holding every page of a height-1 node writes its prefixes and totals, a node
-split at a range edge gets raw per-page counts, and main prefixes only the
-split nodes and folds heights 2 and up, the level counts, and the rank. Perf
-carries the node merge's work proof (`last_node_merge`, `last_rebuild_node_merge`
-{outputs, ns}) and `last_refresh_fold` {entries, ns}.
+`collision_allow_epoch` moves when a tier crosses `allowsCollision`
+(`noteCollisionAllow` records that entity) and when a movement row is removed
+(`removeMovementBodyAt` records the removed id and any swapped tail).
+`TriggerStore.refresh` re-resolves the stored pairs that name those entities:
+it gathers their pair refs, the refresh place and sort stages order them with
+the banded sort, and the refresh dispatch writes each dirty page's rows and
+emit bits. The range that holds a page's first affected item writes that page's
+affected slots, including ones past the range's end. Untouched slots are
+not read. Main point-adds each dirty page's valid and allowed deltas into
+the later prefix entries of those counts, the node, level, and store totals,
+and `LevelRank`. Pair-start prefixes are not rewritten, and pair totals do
+not move. The fold is those dirty pages, flat in stored pairs for one
+recorded entity. `planHeights` reserves the refresh scratch to the published
+pairs before install, so a later refresh allocates nothing. A failure before the epoch stamp leaves the record list and the
+epoch; a rebuild stamps the epoch after writing current rows, and records
+from before that stamp are dropped without a dispatch. A list a drop emptied,
+still empty after the patch's inserts, leaves the pair index
+(`retireEmptyRefs`); a list that still has capacity is spared. Perf carries
+the node merge's work proof (`last_node_merge`, `last_rebuild_node_merge`
+{outputs, ns}), `last_refresh_sort`, and `last_refresh_fold` {entries, ns}.
 
 Range slots follow each dispatch's selection (`RangeSlots`, § Thread System):
 the spill, broadphase, and static-query sets, the trigger patch and rebuild
@@ -1122,17 +1137,18 @@ static contacts merge in key order. Broadphase and narrowphase keep separate
 tuners and batch stats.
 
 After the static query, one pass writes movement index, generation, an allow
-word (0 or 1), and velocity onto the hit row. The contact loop streams those
-columns with the same overlap lanes. A shared edge stays a query hit and is
-not a contact. Stored static-trigger pairs keep that allow word in pair order.
-It is packed when a dormant or kinematic body exists and the column is stale
-(`collision_allow_epoch` moves when a tier crosses `allowsCollision` and when
-a movement row is removed), on the trigger-allow stage or inline below its
-gate. The append reserves once and does not re-read tiers. In Debug the query
-records the static ids it walked; after the ranges join, one compare checks
-each distinct static's stored bounds against the live rect and returns
-`StaticMovedOutsideCommit` on a mismatch. ReleaseFast does not record, stamp,
-or compare.
+word (0 or 1), and velocity onto the hit row. Hit rows are per static-query
+slot, floored at that slot's reserve window (the pairs reserved for its
+range, capped at `reserved_query_hits`). A query whose live count fits in
+the window releases the slot to it. A wider count keeps one geometric step
+above the live count, and a one-row shrink keeps the block until capacity
+is a step above that bound. A slot the partition drops frees its hit
+storage. The contact loop streams those columns with the same overlap
+lanes. A shared edge stays a query hit and is not a contact. In Debug the
+query records the static ids it walked; after the ranges join, one compare
+checks each distinct static's stored bounds against the live rect and
+returns `StaticMovedOutsideCommit` on a mismatch. ReleaseFast does not
+record, stamp, or compare.
 
 Contacts are transient `SimulationFrame` data. `CollisionResponseSystem`
 consumes that stream through explicit response-policy components. `gather`

@@ -13,9 +13,9 @@ slots sized from the selection (`42192b2`), the stored-trigger store
 (`a8e0a33`, `de8d308`), and response place merged on main (`faa3200`). The
 owner closed the ReleaseFast gaps as inside the spread. Gather and sort are
 off main on the `collision` group, and the tall, stacked, and thin shapes
-meet their pass. Still open: tier-toggle trigger refresh, static query hit
-rows, tuned slot trim, and rows at rest (after slice 88, index merged order
-9b). `zig build verify` passed.
+meet their pass. Tier-toggle trigger refresh and static query hit rows
+landed in `f027f48`. Still open: tuned slot trim, and rows at rest (after
+slice 88, index merged order 9b). `zig build verify` passed.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -35,7 +35,8 @@ the current bench.
   `StaticColliderSystem` query columns. Solid static×static pairs are
   dropped. Stored triggers live in per-level page trees (`TriggerStore`,
   `collision_triggers.zig`; `4b44ca6`, `a8e0a33`), patched at the commit seam
-  and refreshed when the allow epoch moves (`refresh`, `:1672`); emission is
+  and refreshed from the entities recorded with the allow epoch
+  (`TriggerStore.refresh`, `collision_triggers.zig:2050`; `f027f48`); emission is
   one dispatch by emitted cursor with no count pass (`de8d308`).
 - `CollisionResponseSystem.gatherRange` stays scalar. `computeIntentMath`
   streams the intent columns in lanes, and the remainder is that multiply
@@ -125,16 +126,32 @@ the current bench.
       --details` the main share is the ordered merge only; serial == threaded
       across range sizes and worker counts; `FailingAllocator` proof on a
       multi-worker step; a pipeline test proves the stages ran on workers.
-- [ ] A tier toggle refreshes only the trigger pairs it changes. Failure: any
+- [x] A tier toggle refreshes only the trigger pairs it changes. Landed in
+      `f027f48`. A tier cross records the entity (`noteCollisionAllow`,
+      `data_system/system.zig:322`); a movement-row removal records the
+      removed id and any swapped tail (`removeMovementBodyAt`, `:1014`).
+      `TriggerStore.refresh` (`collision_triggers.zig:2050`) gathers those
+      entities' pair refs, `sortAffected` (`:1228`) orders them on the
+      banded-sort stage, and rank is a point-add on `LevelRank`
+      (`applyCountDelta`, `:2139`). Failure: any
       `collision_allow_epoch` move (`data_system/system.zig:306`, `:995`)
       makes `TriggerStore.refresh` (`collision_triggers.zig:1672`)
       re-resolve every stored pair's rows and emit bits, so one entity
       crossing `allowsCollision` costs O(T) in stored pairs (local change at
       world cost, `.grok/rules/engine-design.md` § Cost model). Pass: a
       toggle's refresh work follows the toggled entities' pairs;
-      `collision-static-triggers` refresh work flat in T for a one-entity
-      toggle; serial == threaded.
-- [ ] Static query hit rows are O(1) per slot. Failure: each static query
+      `collision-static-triggers` asserts each measured step refreshes
+      `flipped_pairs`, not every stored pair, and its pass shape is refresh
+      work flat in stored pairs for a one-entity toggle; serial == threaded
+      (0 and 2 workers).
+- [x] Static query hit rows are O(1) per slot. Landed in `f027f48`. Each
+      `StaticPairBuffer` (`collision.zig:574`) keeps its own hit rows.
+      `staticQueryHitBound` (`:1406`) is that slot's reserve window when the
+      live count fits, otherwise one geometric step above the live count. A
+      slot whose queries fit releases to that bound once capacity is past
+      `staticQueryHitLimit` (`:1414`, `grow` `:623`). A slot the partition
+      drops frees its hit storage (`releaseDroppedStaticHits`, `:1533`).
+      Failure: each static query
       slot holds the high-water rows of the widest query it ever ran
       (`StaticPairBuffer.reserve`, `collision.zig:579-599`, `sizing.hit_rows`),
       never lowered; measured 66.6 KB at 65,536 statics and 226-438 KB at
@@ -142,7 +159,10 @@ the current bench.
       10,000-static query. Memory then follows the widest past query, not what
       exists (`.grok/rules/engine-design.md` § Cost model). Pass: rows are a
       fixed window or a decaying high water; `static_hit_rows=` in
-      `collision-static-triggers` follows the live query; serial == threaded.
+      `collision-static-triggers` follows the live query
+      (`checkSlotRecords` fails past `staticQueryHitLimit` of that slot's
+      live count against one alignment window); serial == threaded (0 and
+      2 workers).
 - [ ] Tuned range slots stay within the per-item bound's trim. Failure:
       `slot_records` over `b * items` (`RangeSlots.recountHeld`,
       `thread_system.zig:1654`) reads 4.02 tuned at `collision` 1,024 and

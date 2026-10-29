@@ -300,6 +300,9 @@ labelled.
   spread. Tuners are not merged or removed for it. The `production-step` 4,096
   run stays not judged. macOS stays the `375c7c3` record. Windows was not run
   and is not a close condition.
+- `f027f48`: collision refresh follows the entities recorded with the allow
+  epoch, and each static-query slot's hit rows follow that slot's live query
+  (`docs/architecture.md` § Collision).
 
 ## Other Changes
 
