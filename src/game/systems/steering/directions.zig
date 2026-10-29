@@ -255,8 +255,6 @@ fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         job.selected[slot] = .{ .entity = intent.entity, .intent = intent };
         job.work.start_x[slot] = start.x;
         job.work.start_y[slot] = start.y;
-        job.work.final_dir_x[slot] = 0;
-        job.work.final_dir_y[slot] = 0;
         job.work.selected_agent_radii[slot] = agent.agent_radius;
         job.work.selected_avoidance_radii[slot] = agent.avoidance_radius;
         job.work.selected_avoidance_weights[slot] = agent.avoidance_weight;

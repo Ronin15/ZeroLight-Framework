@@ -6,10 +6,10 @@ Range: `main..core_systems`
 
 Base: `5673672` (`Merge pull request #12 from Ronin15/module_layout`)
 
-Tip: in progress. Slice 85 landed (archived). Slice 50's ReleaseFast
-`zig build test` and the owner's Windows and Mac runs stay open in that
-slice. The measuring landing is the branch baseline. Slices 83, 84, 86, and
-90 are archived.
+Tip: in progress. Slice 85 landed (archived). Reviewed from `37b9796`
+(2026-10-18) through slice 85. Slice 50's ReleaseFast `zig build test` and
+the owner's Windows run stay open in that slice. The measuring landing is
+the branch baseline. Slices 83, 84, 86, 90, and 85 are archived.
 
 ## Summary
 
@@ -333,6 +333,26 @@ are Debug unless labelled.
   1024 612.1 to 524.2 µs; `steering-shuffled` 4096 1.52 to 1.58 ms, within
   noise. `production-step` `1024008016384` for the index switch was not judged:
   both sides stayed unsettled at warmup 484 on tuners that change does not own.
+
+## Branch review from `37b9796`
+
+Four reviews of `37b9796..HEAD` (thread system, pathfinding and world,
+collision, steering and pipeline). Pathfinding and collision had no findings.
+SIMD lane shapes were kept.
+
+- A full-pool one-off (`first_selection = .full_pool`) stayed on that shape
+  only for its first select. The next select ran the whole batch inline on
+  main and discarded the threaded sample, so a per-level rebuild threaded
+  level 0 and ran later levels on main. The opening window now stays on the
+  full pool until it adopts. A later relearn selects normally.
+- The warmed multi-worker sprite-prep test asserts the emit batch did not run
+  inline and that workers took ranges. An inline emit fails it.
+- `final_dir` was written by avoidance and read by nothing. The columns are
+  gone. The movement intent already carries the direction.
+
+ThreadSanitizer on `full-pool first selection`: 3/3 passed. The full
+`zig build test -Dsanitize-thread=true` is still the merge gate for this
+`ThreadSystem` change.
 
 ## Other Changes
 

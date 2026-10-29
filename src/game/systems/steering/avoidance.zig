@@ -217,8 +217,6 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
             const index = job.windows[window].start + (logical - job.windows[window].logical_base);
             std.debug.assert(index < job.selected.len and index < job.work.len());
             const result = computeAvoidance(job, index, &obstacle_hits, &neighbors);
-            job.work.final_dir_x[index] = result.direction.x;
-            job.work.final_dir_y[index] = result.direction.y;
             if (comptime runtime_perf_log.enabled) {
                 tally.agent_samples += result.perf.agent_samples;
                 tally.obstacle_samples += result.perf.obstacle_samples;

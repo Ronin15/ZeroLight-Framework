@@ -281,7 +281,10 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    slice's tuned cases are judged, `.grok/rules/tests-benchmarks.md` § Benchmarks) →
    [90](roadmap/archive/slice-90.md) wake protocol and startup calibration (landed) →
    [86](roadmap/archive/slice-86.md) collision (landed) →
-   [85](roadmap/archive/slice-85.md) steering (landed) → tile gate
+   [85](roadmap/archive/slice-85.md) steering (landed). Reviewed `37b9796..HEAD`:
+   pathfinding and collision clean; the full-pool opening window, the sprite-prep
+   worker proof, and the unread `final_dir` columns are fixed in the review
+   commit, then tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items, next) →
    [87](roadmap/slices/slice-87.md) render prep →
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →

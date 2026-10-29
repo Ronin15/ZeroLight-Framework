@@ -639,9 +639,10 @@ sets neither (`.grok/rules/threading.md`).
   elapsed windows (`.grok/rules/threading.md`).
 - One-off first selection: a tuner built with `first_selection = .full_pool`
   (`rebuild_tuner_config`: a world-create or static-collider rebuild whose first
-  batch is too large for main) dispatches its first batch on the full pool at 2
-  batches per participant (measured against 1 and 4 on the rebuild and
-  world-create benches); no nudge follows a one-off. The `rebuild_tuner_config`
+  batch is too large for main) keeps that full-pool shape for the whole opening
+  window, at 2 batches per participant (measured against 1 and 4 on the rebuild
+  and world-create benches), until the window adopts. A later relearn selects
+  normally. No nudge follows a one-off. The `rebuild_tuner_config`
   users: the world's procedural paint (`ground_build_tuner`, at 32-chunk range
   alignment), the static-collider rebuild, pathfinding's level build set
   (`nav_build`, fresh at every nav build: it samples each stage once per level,

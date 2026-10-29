@@ -1402,22 +1402,29 @@ test "warmed multi-worker sprite prep does not allocate" {
 
     // Reserved-then-build SUCCESS branch under a hard-failing allocator: proves
     // the multi-worker emit path is allocation-free after reserve (not only the
-    // serial inline branch).
+    // serial inline branch). Snapshot, emit, and draw groups are `buildAssumeCapacity`;
+    // the emit batch is the fixed-shape dispatch. An inline emit has no worker ranges.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     batch.allocator = failing.allocator();
     defer batch.allocator = allocator;
 
-    const stats = batch.buildAssumeCapacity(table.resolver(), &threads, .{
+    _ = batch.snapshotCommandsAssumeCapacity(table.resolver());
+    const emit = batch.emitVerticesAssumeCapacity(&threads, .{
         .items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     });
+    batch.buildDrawGroupsAssumeCapacity();
+    const stats = batch.finishPrepStats(emit);
 
     try std.testing.expectEqual(command_capacity, stats.valid_sprite_count);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);
     try std.testing.expectEqual(command_capacity * 6, batch.positions.items.len);
+    try std.testing.expect(!emit.ran_inline);
+    try std.testing.expect(emit.active_worker_threads > 0);
+    try std.testing.expect(emit.worker_thread_ranges > 0);
 }
 
 fn addParallelParityCommands(batch: *SpriteBatch) !void {

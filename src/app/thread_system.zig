@@ -130,13 +130,14 @@ pub const AdaptiveWorkTunerConfig = struct {
     /// Settled inline windows at or above the gate that pass before an inline stage
     /// probes again, after its first threaded probe lost or after a demotion.
     inline_probe_cooldown_windows: usize = 120,
-    /// A fresh tuner's first selection; every later selection and record is unchanged.
+    /// A fresh tuner's opening learning window. Cleared when that window finishes or
+    /// learning resets, so every later selection is unchanged.
     first_selection: AdaptiveFirstSelection = .learn_inline,
 };
 
-/// `learn_inline` runs a fresh tuner's first batch inline to measure its baseline;
-/// `full_pool` dispatches it on every allowed worker, shaped by the cost model, for a
-/// stage whose first batch is a one-off too large for main (a world-create build).
+/// `learn_inline` runs a fresh tuner's opening window inline to measure its baseline;
+/// `full_pool` dispatches that window on every allowed worker, shaped by the cost model,
+/// for a stage whose first batches are a one-off too large for main (a world-create build).
 pub const AdaptiveFirstSelection = enum {
     learn_inline,
     full_pool,
@@ -394,7 +395,6 @@ pub const AdaptiveWorkTuner = struct {
         const normalized_request = self.normalizeRequest(request);
         self.last_request = normalized_request;
         self.skip_next_record = false;
-        const fresh_full_pool = self.learned_item_count == 0 and self.config.first_selection == .full_pool;
         if (self.learned_item_count == 0) {
             self.learned_item_count = normalized_request.item_count;
         } else if (outsideBand(self.learned_item_count, normalized_request.item_count, self.config.item_count_reset_percent)) {
@@ -419,7 +419,11 @@ pub const AdaptiveWorkTuner = struct {
             self.shifted_batch_count = 0;
         }
 
-        if (fresh_full_pool) return self.poolProfile(normalized_request, @floatFromInt(full_pool_batches_per_participant));
+        // A full-pool opening stays on that shape until its window adopts, so the records
+        // stay one window instead of flipping inline and resetting.
+        if (self.config.first_selection == .full_pool and !self.has_threaded_profile) {
+            return self.poolProfile(normalized_request, @floatFromInt(full_pool_batches_per_participant));
+        }
         // An unsustained jump up on a tuner without a threaded profile runs at the shape the
         // per-item model predicts for the new count, not inline; its record trains nothing,
         // it judges the held shape (`judgeJump`). A tuner with a threaded profile
@@ -486,6 +490,9 @@ pub const AdaptiveWorkTuner = struct {
     // Whether the selection took the unsustained-jump branch. None of its inputs change
     // between a select and its record, so `record` reads the same answer.
     fn jumpSelected(self: *const AdaptiveWorkTuner) bool {
+        // The opening full-pool window is that shape, not a jump. Its skipped out-of-band
+        // record must not judge a jump profile the select never set.
+        if (self.config.first_selection == .full_pool and !self.has_threaded_profile) return false;
         return self.skip_next_record and self.shifted_up and !self.has_threaded_profile and self.model_work_ns_per_item > 0;
     }
 
@@ -572,6 +579,8 @@ pub const AdaptiveWorkTuner = struct {
     // Learning establishes the baseline for the sampled profile. Cheap inline work
     // settles at once; a threaded window (a full-pool first selection) is adopted.
     fn finishLearningWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
+        // This window is the opening selection. A later relearn or demotion selects normally.
+        self.config.first_selection = .learn_inline;
         const profile = self.sampled_profile orelse self.current_profile;
         self.baseline_mean_batch_duration_ns = sample_mean_ns;
         if (profile.worker_threads == 0 and sample_mean_ns < self.gateNs()) {
@@ -1093,6 +1102,8 @@ pub const AdaptiveWorkTuner = struct {
     // inline learning against the new item-count regime, at a multiplier of one.
     fn resetForLearning(self: *AdaptiveWorkTuner) void {
         self.phase = .learning;
+        // A full-pool opening does not carry into a relearn.
+        self.config.first_selection = .learn_inline;
         self.current_profile = self.initial_profile;
         self.candidate_profile = null;
         self.restore_threaded_profile = null;
@@ -4799,6 +4810,15 @@ test "adaptive work tuner a full-pool first selection dispatches workers and a d
     const first = opted.selectProfile(request);
     try std.testing.expectEqual(@as(usize, 4), shapeBatch(4096, first, 4, 16, true).worker_threads);
     try std.testing.expectEqual(5 * full_pool_batches_per_participant, rangeCount(4096, first.items_per_range));
+
+    // One recorded full-pool batch, still inside the default sample window. The next
+    // select stays on workers; an inline second select never fills the window.
+    try std.testing.expect(opted.config.sample_window > 1);
+    opted.record(tunerTestBatchWithProfile(4096, first, 1_000_000));
+    try std.testing.expectEqual(@as(usize, 1), opted.sample_count);
+    const second = opted.selectProfile(request);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(shapeBatch(4096, second, 4, 16, true).worker_threads > 0);
 
     var default = AdaptiveWorkTuner.init(.{});
     try std.testing.expectEqual(@as(usize, 0), shapeBatch(4096, default.selectProfile(request), 4, 16, true).worker_threads);

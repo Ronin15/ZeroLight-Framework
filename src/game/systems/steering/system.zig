@@ -164,7 +164,7 @@ pub const SteeringSystem = struct {
     claim_stamp: u32 = 0,
     // `directions` writes each steering-row range's selected intents into that range's window
     // of `selected` and `selected_work_rows`; `selected_windows` maps the windows onto the
-    // selected order the avoidance pass walks. The avoidance pass writes `final_dir`.
+    // selected order the avoidance pass walks.
     selected: SelectedList = .empty,
     selected_work_rows: std.MultiArrayList(SelectedWorkRow) = .{},
     selected_windows: std.ArrayList(SelectedWindow) = .empty,
@@ -377,8 +377,6 @@ pub fn selectedWorkSlice(self: *SteeringSystem) SelectedWorkSlice {
         .start_y = s.items(.start_y),
         .base_dir_x = s.items(.base_dir_x),
         .base_dir_y = s.items(.base_dir_y),
-        .final_dir_x = s.items(.final_dir_x),
-        .final_dir_y = s.items(.final_dir_y),
         .selected_agent_radii = s.items(.selected_agent_radii),
         .selected_avoidance_radii = s.items(.selected_avoidance_radii),
         .selected_avoidance_weights = s.items(.selected_avoidance_weights),
@@ -397,8 +395,6 @@ pub fn selectedWorkSliceConst(self: *const SteeringSystem) ConstSelectedWorkSlic
         .start_y = s.items(.start_y),
         .base_dir_x = s.items(.base_dir_x),
         .base_dir_y = s.items(.base_dir_y),
-        .final_dir_x = s.items(.final_dir_x),
-        .final_dir_y = s.items(.final_dir_y),
         .selected_agent_radii = s.items(.selected_agent_radii),
         .selected_avoidance_radii = s.items(.selected_avoidance_radii),
         .selected_avoidance_weights = s.items(.selected_avoidance_weights),
@@ -445,8 +441,6 @@ pub const SelectedWorkRow = struct {
     start_y: f32,
     base_dir_x: f32,
     base_dir_y: f32,
-    final_dir_x: f32,
-    final_dir_y: f32,
     selected_agent_radii: f32,
     selected_avoidance_radii: f32,
     selected_avoidance_weights: f32,
@@ -504,8 +498,6 @@ pub const SelectedWorkSlice = struct {
     start_y: HotF32Slice,
     base_dir_x: HotF32Slice,
     base_dir_y: HotF32Slice,
-    final_dir_x: HotF32Slice,
-    final_dir_y: HotF32Slice,
     selected_agent_radii: HotF32Slice,
     selected_avoidance_radii: HotF32Slice,
     selected_avoidance_weights: HotF32Slice,
@@ -525,8 +517,6 @@ const ConstSelectedWorkSlice = struct {
     start_y: ConstHotF32Slice,
     base_dir_x: ConstHotF32Slice,
     base_dir_y: ConstHotF32Slice,
-    final_dir_x: ConstHotF32Slice,
-    final_dir_y: ConstHotF32Slice,
     selected_agent_radii: ConstHotF32Slice,
     selected_avoidance_radii: ConstHotF32Slice,
     selected_avoidance_weights: ConstHotF32Slice,
