@@ -1047,14 +1047,22 @@ test "steering runtime state follows its entity across swap-removes" {
         try runRekeyScenario(thread_system, threaded_config, .destroy_and_create, &churned);
 
         // Surviving agents request exactly as without the churn (their cooldowns came
-        // along, the row taken from past the steering count ticked once), then the new
-        // agent from its fresh row.
+        // along). Path requests are in steering-row order, which churn changes, so
+        // the match is the set. The new agent requests from its fresh row and is
+        // the last steering row.
         try std.testing.expect(control.requesters.items.len > 0);
         try std.testing.expectEqual(control.requesters.items.len + 1, churned.requesters.items.len);
-        for (control.requesters.items, churned.requesters.items[0..control.requesters.items.len]) |expected, actual| {
-            try std.testing.expect(expected.eql(actual));
+        var matched: usize = 0;
+        for (control.requesters.items) |expected| {
+            for (churned.requesters.items) |actual| {
+                if (expected.eql(actual)) {
+                    matched += 1;
+                    break;
+                }
+            }
         }
-        try std.testing.expect(churned.requesters.items[control.requesters.items.len].eql(churned.newcomer));
+        try std.testing.expectEqual(control.requesters.items.len, matched);
+        try std.testing.expect(churned.requesters.items[churned.requesters.items.len - 1].eql(churned.newcomer));
         // Every surviving agent steers exactly as without the churn: its smoothing state
         // came along.
         var survivors: usize = 0;
