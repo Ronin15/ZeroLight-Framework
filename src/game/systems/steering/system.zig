@@ -21,7 +21,6 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
-const band_tuner_config = @import("../../../app/thread_system.zig").band_tuner_config;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
@@ -79,8 +78,6 @@ pub const max_bands: usize = 64;
 pub const SteeringConfig = struct {
     items_per_range: ?usize = null,
     batches_per_participant: ?f64 = null,
-    // The claim stage's range size, in bands; null lets its tuner pick it.
-    band_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -155,7 +152,7 @@ pub const SteeringSystem = struct {
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     agents_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     select_resolve_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
-    select_claim_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(band_tuner_config),
+    select_claim_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     directions_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
 
     pub fn init(allocator: std.mem.Allocator) SteeringSystem {
@@ -619,7 +616,6 @@ test "steering serial and real threaded workers produce identical movement inten
     defer index.deinit();
     _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, index.view(), .{
         .items_per_range = steering_range_alignment_items,
-        .band_items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     });
@@ -710,7 +706,6 @@ test "steering serial matches threaded intents across multiple range splits and 
         try threaded_system.reserve(128);
         _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, index.view(), .{
             .items_per_range = split.items_per_range,
-            .band_items_per_range = 1,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
@@ -845,7 +840,6 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
 
     const cfg: SteeringConfig = .{
         .items_per_range = steering_range_alignment_items,
-        .band_items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     };
@@ -934,17 +928,11 @@ test "steering runtime rows go with destroyed entities within a one-agent reserv
 test "steering production stage tuners use the central gate and their stage's range alignment" {
     var system = SteeringSystem.init(std.testing.allocator);
     defer system.deinit();
-    const agent_and_intent_tuners = [_]*const AdaptiveWorkTuner{ &system.adaptive_tuner, &system.agents_tuner, &system.select_resolve_tuner, &system.directions_tuner };
+    const agent_and_intent_tuners = [_]*const AdaptiveWorkTuner{ &system.adaptive_tuner, &system.agents_tuner, &system.select_resolve_tuner, &system.select_claim_tuner, &system.directions_tuner };
     for (agent_and_intent_tuners) |tuner| {
         try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, tuner.config.threaded_batch_ns);
         try std.testing.expectEqual(steering_range_alignment_items, tuner.config.initial_range_items);
         try std.testing.expectEqual(steering_range_alignment_items, tuner.config.smallest_range_items);
-    }
-    // The claim dispatches bands, one item each.
-    for ([_]*const AdaptiveWorkTuner{&system.select_claim_tuner}) |tuner| {
-        try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, tuner.config.threaded_batch_ns);
-        try std.testing.expectEqual(@as(usize, 1), tuner.config.initial_range_items);
-        try std.testing.expectEqual(@as(usize, 1), tuner.config.smallest_range_items);
     }
 }
 
@@ -967,7 +955,7 @@ test "steering threaded prepare equals serial across range splits and worker cou
         for ([_]usize{ 1, 2, 3 }) |workers| {
             var threaded = ParityTrace{};
             defer threaded.deinit();
-            try runParityScenario(&threads, .{ .items_per_range = items_per_range, .band_items_per_range = 1, .max_worker_threads = workers, .adaptive = false }, &threaded);
+            try runParityScenario(&threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false }, &threaded);
             try expectTracesEqual(&serial, &threaded);
         }
     }
@@ -981,7 +969,7 @@ test "steering with no worker to give matches serial" {
     var no_workers = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer no_workers.deinit();
     try std.testing.expectEqual(@as(usize, 0), no_workers.workerThreadCount());
-    for ([_]SteeringConfig{ .{ .adaptive = true }, .{ .items_per_range = 32, .band_items_per_range = 1, .adaptive = false } }) |config| {
+    for ([_]SteeringConfig{ .{ .adaptive = true }, .{ .items_per_range = 32, .adaptive = false } }) |config| {
         var trace = ParityTrace{};
         defer trace.deinit();
         try runParityScenario(&no_workers, config, &trace);
@@ -992,14 +980,14 @@ test "steering with no worker to give matches serial" {
     defer threads.deinit();
     var capped = ParityTrace{};
     defer capped.deinit();
-    try runParityScenario(&threads, .{ .items_per_range = 32, .band_items_per_range = 1, .max_worker_threads = 0, .adaptive = false }, &capped);
+    try runParityScenario(&threads, .{ .items_per_range = 32, .max_worker_threads = 0, .adaptive = false }, &capped);
     try expectTracesEqual(&serial, &capped);
 }
 
 test "steering runtime state follows its entity across swap-removes" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    const threaded_config: SteeringConfig = .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false };
+    const threaded_config: SteeringConfig = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
     for ([_]bool{ false, true }) |threaded| {
         const thread_system: ?*ThreadSystem = if (threaded) &threads else null;
         var control = RekeyOutcome{};
@@ -1048,7 +1036,6 @@ test "steering with fresh adaptive tuners matches serial" {
     // Fresh adaptive tuners learn inline for a whole sample window, so every tuned stage
     // stays on the main thread for a scenario no longer than one window.
     try std.testing.expect(parity_step_count <= steering_adaptive_tuner_config.sample_window);
-    try std.testing.expect(parity_step_count <= band_tuner_config.sample_window);
     var tuned = ParityTrace{};
     defer tuned.deinit();
     try runParityScenario(&threads, .{ .max_worker_threads = 3, .adaptive = true }, &tuned);

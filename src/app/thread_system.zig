@@ -2189,12 +2189,6 @@ pub fn BandPartition(comptime block_rows: usize, comptime max_bands: usize) type
     };
 }
 
-/// Tuner config of a stage that dispatches one item per band.
-pub const band_tuner_config = AdaptiveWorkTunerConfig{
-    .initial_range_items = 1,
-    .smallest_range_items = 1,
-};
-
 /// Tuner config of a world-create rebuild stage: the rebuild is a one-off, so a fresh
 /// tuner's first rebuild dispatches on the full pool instead of inline on main.
 pub const rebuild_tuner_config = AdaptiveWorkTunerConfig{ .first_selection = .full_pool };
@@ -3104,12 +3098,6 @@ test "band partition covers every row with whole blocks in band order" {
             for (first..end) |row| try std.testing.expectEqual(band, bands.bandOfRow(row));
         }
     }
-}
-
-test "band tuner config starts at, and never shrinks below, one band per range" {
-    const tuner = AdaptiveWorkTuner.init(band_tuner_config);
-    try std.testing.expectEqual(@as(usize, 1), tuner.initial_profile.items_per_range);
-    try std.testing.expectEqual(@as(usize, 1), tuner.config.smallest_range_items);
 }
 
 // A stage job that counts its items and ranges and checks its range index against the

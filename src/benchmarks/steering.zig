@@ -24,10 +24,11 @@
 //! judged against its controls; `steering-static-change` flat in statics;
 //! `steering-static-dense` linear in statics per chunk, and the `interleaved` and `churned`
 //! layouts' time per agent within spread of `chunk_ordered` at the same count. Asserts
-//! check that every agent writes a movement intent, that the agent groups' avoidance checks
-//! stay within each agent's candidate budget, that the static groups sample statics,
-//! and that `steering-static-dense` repeats its first step's obstacle visits and samples
-//! and, when churned, that every destroy and recreate commits and syncs.
+//! check that every agent writes a movement intent, that `select_claim`'s item count equals
+//! the navigation intent count, that the agent groups' avoidance checks stay within each
+//! agent's candidate budget, that the static groups sample statics, and that
+//! `steering-static-dense` repeats its first step's obstacle visits and samples and, when
+//! churned, that every destroy and recreate commits and syncs.
 //!
 //! The agent groups print `avoidance_checks=`, `samples=`, and `intents=`;
 //! `steering-static-change` prints `obstacle_checks=` and `obstacle_samples=`;
@@ -40,9 +41,8 @@
 //! (`seam:`), and its main share subtracts every seam stage on workers. The tuned case
 //! settles every tuner its measured step runs (`step_tuners:`: the five steering stages, and
 //! the seam's for `steering-static-change`) and prints each steering tuner's state
-//! (`tuners:`). A fixed threaded case runs every stage of more than one range on workers;
-//! the claim runs at the case's band range (`bandItemsPerRange`), and each fixed threaded
-//! case checks its range count against it.
+//! (`tuners:`). A fixed threaded case runs every stage of more than one range on workers
+//! at the intent alignment and checks the claim's range count against it.
 //!
 //! `steering-levels` times one steering step over 1, 4, and 16 levels with the check cap
 //! of agents at one xy on each level (one under the cap as the others), every agent
@@ -371,7 +371,6 @@ fn prepareLevels(fixture: *LevelsFixture) !void {
 fn levelsOnce(system: *SteeringSystem, fixture: *LevelsFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const stats = try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, fixture.index.view(), .{
         .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
-        .band_items_per_range = bandItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .batches_per_participant = case.stageBatchesPerParticipant(),
@@ -485,7 +484,6 @@ fn measureCase(
     var shapes = suite.StageShapes(stage_names.len){};
     var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
     const element_range = case.stageItemsPerRange(steering_range_alignment_items);
-    const band_range = bandItemsPerRange(case);
     for (0..options.iterations) |_| {
         try prepare(context);
         const start_ns = suite.nowNs(io);
@@ -498,10 +496,10 @@ fn measureCase(
         shapes.add(stageBatches(last_stats));
         if (seam) |fixture| seam_shapes.add(fixtures.seamBatches(&fixture.seam.pipeline));
         try suite.checkStagesDispatched(case, thread_ptr, element_range, &.{
-            last_stats.perf.agents_batch, last_stats.perf.select_resolve_batch, last_stats.perf.directions_batch, last_stats.perf.batch,
+            last_stats.perf.agents_batch, last_stats.perf.select_resolve_batch, last_stats.perf.select_claim_batch, last_stats.perf.directions_batch, last_stats.perf.batch,
         });
-        try suite.checkStagesDispatched(case, thread_ptr, band_range, &.{last_stats.perf.select_claim_batch});
-        try suite.checkFixedRangeCount(case, thread_ptr, band_range, last_stats.perf.select_claim_batch);
+        try suite.checkFixedRangeCount(case, thread_ptr, element_range, last_stats.perf.select_claim_batch);
+        if (last_stats.perf.select_claim_batch.item_count != last_stats.navigation_intent_count) return error.ClaimItemsNotIntentCount;
     }
 
     var stats = accumulator.finish();
@@ -543,19 +541,10 @@ fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSys
     return stats;
 }
 
-// The claim stage's fixed partition: one band per range.
-const band_partition_items: usize = 1;
-
-// The band stages' range control for `case`: the range modes scale from one band.
-fn bandItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    return case.stageItemsPerRangeForPartition(band_partition_items, 1);
-}
-
 // The steering update for `case` over the step's navigation intents.
 fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     return try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, fixture.index.view(), .{
         .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
-        .band_items_per_range = bandItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .batches_per_participant = case.stageBatchesPerParticipant(),
@@ -713,7 +702,6 @@ const SeamFixture = struct {
         const pipeline = &self.seam.pipeline;
         return try pipeline.steering.update(&self.data, &self.seam.frame, thread_system, &pipeline.pathfinding, &pipeline.static_colliders, pipeline.spatial_index.view(), .{
             .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
-            .band_items_per_range = bandItemsPerRange(case),
             .max_worker_threads = case.maxWorkerThreads(),
             .adaptive = case.adaptive,
             .batches_per_participant = case.stageBatchesPerParticipant(),

@@ -16,12 +16,18 @@ const setRowCount = @import("../../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
+const OwnedBands = @import("../banded_sort.zig").OwnedBands;
 const steering_range_alignment_items = @import("system.zig").steering_range_alignment_items;
 const max_bands = @import("system.zig").max_bands;
 const StageThreads = @import("system.zig").StageThreads;
 const SteeringStats = @import("system.zig").SteeringStats;
 const SteeringSystem = @import("system.zig").SteeringSystem;
 const BandRow = @import("system.zig").BandRow;
+
+// `OwnedBands` indexes `starts` at `band_count`, so the widths match.
+comptime {
+    std.debug.assert(max_bands == @import("../banded_sort.zig").band_count);
+}
 
 // An intent with no steering row, or a claim field not yet written this step.
 pub const no_row: u32 = std.math.maxInt(u32);
@@ -31,10 +37,11 @@ const band_block_rows: usize = steering_range_alignment_items;
 
 /// `select_resolve`, then `select_claim`. Each stage runs inline or on workers as its tuner
 /// selects, including when no worker is available: ranges resolve their intents and place
-/// them by steering band in their window; then each band claims, for the steering rows it
-/// owns, every range's band segment in range order. The bands follow the steering rows
-/// only, never the resolve partition. Each steering row gets its first intent in source
-/// order and its best by priority, ties to the earlier.
+/// them by steering band in their window; a claim range is a span of the placed intents and
+/// owns every nonempty band whose start lies in the span, claiming that band's steering rows
+/// from every resolve range's segment in range order. A band is never split. The bands follow
+/// the steering rows only, never the resolve partition. Each steering row gets its first
+/// intent in source order and its best by priority, ties to the earlier.
 pub fn selectIntents(
     self: *SteeringSystem,
     data: *const DataSystem,
@@ -66,12 +73,11 @@ pub fn selectIntents(
     const resolve_batch = resolve_stage.run(selection, intent_count, steering_range_alignment_items, &resolve, resolveJob);
     if (comptime runtime_perf_log.enabled) stats.perf.select_resolve_batch = resolve_batch;
 
-    // Bands, not intents: the claim range size is the config's band size, and its batch
-    // count stays the shared one.
-    var claim_stage = threads.stage(&self.select_claim_tuner);
-    claim_stage.items_per_range = threads.config.band_items_per_range;
-    claim_stage.batches_per_participant = threads.config.batches_per_participant;
-    const claim_selection = claim_stage.select(bands.band_count, 1);
+    const starts = placedBandStarts(self.band_rows.items, bands.band_count);
+    // Placed intents are a u32 count, at most the intent count.
+    const placed: usize = @intCast(starts[max_bands]);
+    const claim_stage = threads.stage(&self.select_claim_tuner);
+    const claim_selection = claim_stage.select(placed, steering_range_alignment_items);
     var claim = ClaimJob{
         .intents = intents,
         .intent_steering = intent_rows.items(.steering),
@@ -79,11 +85,12 @@ pub fn selectIntents(
         .band_rows = self.band_rows.items,
         .resolve_items_per_range = selection.items_per_range,
         .bands = bands,
+        .starts = starts,
         .claims = claims,
         .stamp = self.claim_stamp,
         .range_count = claim_selection.range_count,
     };
-    const claim_batch = claim_stage.run(claim_selection, bands.band_count, 1, &claim, claimJob);
+    const claim_batch = claim_stage.run(claim_selection, placed, steering_range_alignment_items, &claim, claimJob);
     if (comptime runtime_perf_log.enabled) stats.perf.select_claim_batch = claim_batch;
 }
 
@@ -179,7 +186,23 @@ fn resolveJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-// `select_claim`: one range of bands.
+// Band b's start among placed intents, over every resolve range. `offsets[b]` counts the
+// placed intents of earlier bands, so the sum is that start; entries past `band_count`
+// equal the placed total.
+fn placedBandStarts(band_rows: []const PaddedSlot(BandRow), band_count: usize) [max_bands + 1]u32 {
+    std.debug.assert(band_count <= max_bands);
+    var starts: [max_bands + 1]u32 = @splat(0);
+    for (band_rows) |slot| {
+        for (starts[0 .. band_count + 1], slot.value.offsets[0 .. band_count + 1]) |*start, offset| {
+            start.* += offset;
+        }
+    }
+    const placed = starts[band_count];
+    for (starts[band_count + 1 ..]) |*tail| tail.* = placed;
+    return starts;
+}
+
+// `select_claim`: one range of placed intents.
 const ClaimJob = struct {
     intents: []const NavigationIntent,
     intent_steering: []const u32,
@@ -187,24 +210,28 @@ const ClaimJob = struct {
     band_rows: []const PaddedSlot(BandRow),
     resolve_items_per_range: usize,
     bands: AgentBands,
+    // Band starts among the placed intents; `starts[max_bands]` is the placed count.
+    starts: [max_bands + 1]u32,
     claims: ClaimColumns,
     stamp: u32,
     range_count: usize,
 };
 
-// Each band claims its own steering rows from every resolve range's band segment in range
-// order, which is source order.
+// The range owns each nonempty band whose placed start lies in it. That band claims its
+// steering rows from every resolve range's band segment in range order, which is source order.
 fn claimJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *ClaimJob = @ptrCast(@alignCast(context));
+    const placed = job.starts[max_bands];
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= job.bands.band_count);
-    // The range's bands own the claim rows below `firstRow(range.end)`.
+    std.debug.assert(range.start <= range.end and range.end <= placed);
     const claim_rows = job.claims.stamp.len;
     std.debug.assert(job.claims.first.len == claim_rows and job.claims.best.len == claim_rows);
-    std.debug.assert(job.bands.firstRow(range.end) <= claim_rows);
-    for (range.start..range.end) |band| {
+    var owned = OwnedBands.init(&job.starts, range.start, range.end);
+    while (owned.next()) |band| {
+        std.debug.assert(band < job.bands.band_count);
         const first_row = job.bands.firstRow(band);
         const end_row = job.bands.firstRow(band + 1);
+        std.debug.assert(end_row <= claim_rows);
         for (job.band_rows, 0..) |slot, resolve_range| {
             const window = job.buckets[resolve_range * job.resolve_items_per_range ..];
             for (window[slot.value.offsets[band]..slot.value.offsets[band + 1]]) |intent_index| {
@@ -320,7 +347,7 @@ test "steering threaded arbitration keeps the first appearance and the best inte
         const stats = if (run == 0)
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)
         else
-            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false });
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
         // First appearance order, each agent steering along its best intent.
         for (output, frame.intents.mergedItems(), agents, best) |*slot, merged, agent, best_index| {
@@ -427,7 +454,7 @@ test "steering claims and intents match serial across resolve partitions" {
         frame.beginStep();
         try appendNavigationIntents(&frame, &intents);
         const stats = if (items_per_range) |range_items|
-            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = range_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false })
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = range_items, .max_worker_threads = 2, .adaptive = false })
         else
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
