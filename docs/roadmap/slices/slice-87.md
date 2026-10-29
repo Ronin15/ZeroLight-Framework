@@ -3,7 +3,8 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: collect walk landed.** The visible-chunk runs, the two capacities,
-and the off-view capacity asserts are in. The flat-time measure is not run.
+and the off-view measure are in. Collect time and both capacities stay flat
+as the off-view rows grow.
 Routed by the 64G combined review (area C). The render backend pass closes
 the core branch and comes after the collect moves, so the same files are
 touched once; 88 follows the collect items, before the backend pass (index,
@@ -48,8 +49,13 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
 
 ### Checklist
 
-- [ ] Collect walks the visible chunks' rows. The walk and the capacity
-      asserts landed. The flat-time measure has not been run. Failure scenario: off-view
+- [x] Collect walks the visible chunks' rows. Debug, `437c8a1` against
+      `6902aa9`, serial. Collect time 555.6 us, 533.8 us, and 511.5 us at
+      4,096, 32,768, and 262,144 off-view rows. The base grows 308.5 us,
+      1.21 ms, 8.09 ms. Record capacity stays 1,089 and command capacity
+      stays 1,121. In view stays 1,024 and collected stays 1,088. At 4,096
+      the window walk is slower than the old scan (555.6 us against 308.5
+      us); from 32,768 it is faster. Failure scenario: off-view
       population raises frame cost and reserved vertex memory with nothing
       more drawn. The visible rows are scattered over the movement store
       (append and swap-remove order, `data_system/movement.zig:67`, `removeAt` `:189`), and
