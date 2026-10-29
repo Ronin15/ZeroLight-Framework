@@ -35,7 +35,7 @@ pub fn selectionIntent(agent: EntityId, agent_index: usize, variant: usize, prio
 
 pub fn addSteeredEntity(data: *DataSystem, position: math.Vec2) !EntityId {
     const entity = try data.createEntity();
-    errdefer _ = data.destroyEntity(entity);
+    errdefer data.destroyCreatedEntity(entity);
     try data.setMovementBody(entity, .{
         .position = position,
         .previous_position = position,
@@ -57,7 +57,7 @@ pub fn addSteeredEntity(data: *DataSystem, position: math.Vec2) !EntityId {
 
 pub fn addStaticObstacle(data: *DataSystem, position: math.Vec2, size: math.Vec2) !EntityId {
     const entity = try data.createEntity();
-    errdefer _ = data.destroyEntity(entity);
+    errdefer data.destroyCreatedEntity(entity);
     try data.setMovementBody(entity, .{
         .position = position,
         .previous_position = position,

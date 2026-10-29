@@ -125,6 +125,9 @@ pub const DataSystem = struct {
     /// unpacked marker. It moves when a tier crosses `allowsCollision`, and when a
     /// movement row is removed, because `swapRemove` can retarget that index.
     collision_allow_epoch: u64 = 0,
+    /// Entities recorded with the epoch bump, generation included. Trigger refresh
+    /// drains it. Step scratch: it starts empty and is not saved.
+    collision_allow_records: std.ArrayList(EntityId) = .empty,
     movement_bodies: MovementBodyStore = .{},
     facings: FacingStore = .{},
     primitive_visuals: PrimitiveVisualStore = .{},
@@ -159,6 +162,7 @@ pub const DataSystem = struct {
         self.primitive_visuals.deinit(self.allocator);
         self.facings.deinit(self.allocator);
         self.movement_bodies.deinit(self.allocator);
+        self.collision_allow_records.deinit(self.allocator);
         self.slots.deinit(self.allocator);
         self.* = init(self.allocator);
     }
@@ -198,13 +202,13 @@ pub const DataSystem = struct {
         return EntityId.init(index, 1) catch unreachable;
     }
 
-    pub fn destroyEntity(self: *DataSystem, id: EntityId) bool {
+    pub fn destroyEntity(self: *DataSystem, id: EntityId) error{OutOfMemory}!bool {
         const slot = self.resolveSlot(id) orelse return false;
         const index = id.index;
 
         // Component stores stay dense. Removing an entity may swap the tail row
         // into this entity's dense index and patch that moved entity's slot.
-        if (slot.movement_body_index) |dense_index| self.removeMovementBodyAt(@intCast(dense_index));
+        if (slot.movement_body_index) |dense_index| try self.removeMovementBodyAt(@intCast(dense_index));
         if (slot.facing_index) |dense_index| self.removeFacingAt(@intCast(dense_index));
         if (slot.primitive_visual_index) |dense_index| self.removePrimitiveVisualAt(@intCast(dense_index));
         if (slot.asset_ref_index) |dense_index| self.removeAssetReferenceAt(@intCast(dense_index));
@@ -245,6 +249,16 @@ pub const DataSystem = struct {
         return true;
     }
 
+    /// `errdefer` cleanup of an entity this call created. `OutOfMemory` leaves it
+    /// alive; the caller's error stands.
+    pub fn destroyCreatedEntity(self: *DataSystem, id: EntityId) void {
+        const destroyed = self.destroyEntity(id) catch |err| {
+            std.debug.assert(err == error.OutOfMemory);
+            return;
+        };
+        _ = destroyed;
+    }
+
     pub fn isAlive(self: *const DataSystem, id: EntityId) bool {
         return self.resolveSlotConst(id) != null;
     }
@@ -278,10 +292,11 @@ pub const DataSystem = struct {
             if (metadata.level) |level| std.debug.assert(level == world_level);
             resolved.level = world_level;
         } else if (resolved.level == null) resolved.level = stored.level;
+        // The record lands before the tier, so a failed append leaves the row.
+        try self.noteCollisionAllow(id, stored.tier, metadata.tier);
         self.tier_counts[@backingInt(stored.tier)] -= 1;
         self.tier_counts[@backingInt(metadata.tier)] += 1;
         self.movement_bodies.setScopeMetadata(di, resolved);
-        self.noteCollisionAllow(stored.tier, metadata.tier);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
 
@@ -292,18 +307,22 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
         const old_tier = self.movement_bodies.tierAt(di);
+        // The record lands before the tier, so a failed append leaves the row.
+        try self.noteCollisionAllow(id, old_tier, tier);
         self.tier_counts[@backingInt(old_tier)] -= 1;
         self.tier_counts[@backingInt(tier)] += 1;
         self.movement_bodies.setTier(di, tier);
-        self.noteCollisionAllow(old_tier, tier);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
     }
 
     // Dormant and kinematic are the tiers that do not allow collision. Locomotion
-    // and cognition cross neither each other nor this stamp.
-    fn noteCollisionAllow(self: *DataSystem, old_tier: SimulationTier, new_tier: SimulationTier) void {
-        if (old_tier.allowsCollision() != new_tier.allowsCollision()) self.collision_allow_epoch +%= 1;
+    // and cognition cross neither each other nor this stamp. The entity is recorded
+    // before the bump; a failed append leaves the epoch and the tier alone.
+    fn noteCollisionAllow(self: *DataSystem, id: EntityId, old_tier: SimulationTier, new_tier: SimulationTier) error{OutOfMemory}!void {
+        if (old_tier.allowsCollision() == new_tier.allowsCollision()) return;
+        try self.collision_allow_records.append(self.allocator, id);
+        self.collision_allow_epoch +%= 1;
     }
 
     /// When an entity enters a non-moving tier, snap previous=position so render
@@ -430,6 +449,7 @@ pub const DataSystem = struct {
         self.primitive_visuals.clearRetainingCapacity();
         self.facings.clearRetainingCapacity();
         self.movement_bodies.clearRetainingCapacity();
+        self.collision_allow_records.clearRetainingCapacity();
 
         self.first_free_slot = null;
         self.free_slot_count = self.slots.items.len;
@@ -471,6 +491,9 @@ pub const DataSystem = struct {
             return;
         }
 
+        // Removal records this id and, when the row is not the tail, the id swapRemove
+        // moves. Reserved before the append so that cleanup cannot allocate.
+        try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + 2);
         const dense_index = try self.movement_bodies.append(self.allocator, id, body);
         slot.movement_body_index = dense_index;
         slot.addComponent(.movement_body);
@@ -988,13 +1011,21 @@ pub const DataSystem = struct {
         return slot;
     }
 
-    fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
+    fn removeMovementBodyAt(self: *DataSystem, index: usize) error{OutOfMemory}!void {
         // The scope tier row leaves with the movement body, so drop its tier count
         // before the swap overwrites it. The moved tail row keeps its own tier.
         // A later row may land on this index; stored trigger pairs re-read it.
+        // Both ids are recorded before the bump and the removal; a failed reserve
+        // leaves the epoch, the list, and the row.
+        const entities = self.movement_bodies.sliceConst().entities;
+        const removed = entities[index];
+        const last = entities.len - 1;
+        const tail: ?EntityId = if (index == last) null else entities[last];
+        try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + if (tail != null) @as(usize, 2) else 1);
+        self.collision_allow_records.appendAssumeCapacity(removed);
+        if (tail) |tail_id| self.collision_allow_records.appendAssumeCapacity(tail_id);
         self.collision_allow_epoch +%= 1;
         self.tier_counts[@backingInt(self.movement_bodies.tierAt(index))] -= 1;
-        const removed = self.movement_bodies.sliceConst().entities[index];
         const bounds_index = self.slots.items[@intCast(removed.index)].collision_bounds_index;
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
@@ -1351,7 +1382,7 @@ test "a hinted movement row is kept only while its row still names the entity" {
     const bodiless = try data.createEntity();
     try std.testing.expectEqual(@as(?usize, 1), data.movementBodyDenseIndexHinted(data.movementBodySliceConst().entities, second, 1));
     // A stale hint: the destroy swaps `second` onto row 0, and row 1 is past the column end.
-    try std.testing.expect(data.destroyEntity(first));
+    try std.testing.expect(try data.destroyEntity(first));
     const entities = data.movementBodySliceConst().entities;
     try std.testing.expectEqual(@as(?usize, 0), data.movementBodyDenseIndexHinted(entities, second, 1));
     // A hint naming another entity's row, and a destroyed id on its old row, resolve.
@@ -1369,14 +1400,14 @@ test "entity generations reject stale ids after removal and reuse" {
 
     const first = try data.createEntity();
     try std.testing.expect(data.isAlive(first));
-    try std.testing.expect(data.destroyEntity(first));
+    try std.testing.expect(try data.destroyEntity(first));
     try std.testing.expect(!data.isAlive(first));
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(first.index, reused.index);
     try std.testing.expect(reused.generation != first.generation);
     try std.testing.expect(data.isAlive(reused));
-    try std.testing.expect(!data.destroyEntity(first));
+    try std.testing.expect(!(try data.destroyEntity(first)));
 }
 
 test "entity simulation metadata defaults and rejects stale ids" {
@@ -1403,7 +1434,7 @@ test "entity simulation metadata defaults and rejects stale ids" {
     // The scope columns view exposes the same level the metadata round-tripped.
     try std.testing.expectEqual(@as(u16, 3), data.scopeColumnsSliceConst().level[0]);
 
-    try std.testing.expect(data.destroyEntity(entity));
+    try std.testing.expect(try data.destroyEntity(entity));
     try std.testing.expect(data_test_support.simulationMetadata(&data, entity) == null);
     try std.testing.expectError(error.InvalidEntity, data.setSimulationMetadata(entity, .{}));
 
@@ -1539,8 +1570,8 @@ test "entity free slot count tracks destroy reuse and reset" {
     const second = try data.createEntity();
     try std.testing.expectEqual(@as(usize, 0), data.free_slot_count);
 
-    try std.testing.expect(data.destroyEntity(first));
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(first));
+    try std.testing.expect(try data.destroyEntity(second));
     try std.testing.expectEqual(@as(usize, 2), data.free_slot_count);
 
     _ = try data.createEntity();
@@ -1561,7 +1592,7 @@ test "movement body store is row aligned and compact after removal" {
     try data.setMovementBody(second, testBody(2));
     try data.setMovementBody(third, testBody(3));
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const slice = data.movementBodySliceConst();
     try expectMovementBodyColumnsAligned(slice);
@@ -1641,7 +1672,7 @@ test "component masks track entity membership for system queries" {
         data.componentMaskFor(entity),
     );
 
-    try std.testing.expect(data.destroyEntity(entity));
+    try std.testing.expect(try data.destroyEntity(entity));
     try std.testing.expectEqual(@as(ComponentMask, 0), data.componentMaskFor(entity));
     try std.testing.expect(!data.hasComponents(entity, component_masks.movement_body));
 }
@@ -1661,7 +1692,7 @@ test "bodyLevelFaction matches movementBodyDenseIndex, worldLevelConst, and fact
     try data.setFaction(bodiless, .ally);
     const stale = try data.createEntity();
     try data.setMovementBody(stale, testBody(3));
-    try std.testing.expect(data.destroyEntity(stale));
+    try std.testing.expect(try data.destroyEntity(stale));
 
     for ([_]EntityId{ bare, tagged }) |entity| {
         const found = data.bodyLevelFaction(entity).?;
@@ -1709,7 +1740,7 @@ test "a static obstacle resolves only for a live slot with body, bounds, and a s
     try data.setMovementBody(destroyed, testBody(6));
     try data.setCollisionBounds(destroyed, bounds);
     try data.setCollisionResponse(destroyed, static_response);
-    try std.testing.expect(data.destroyEntity(destroyed));
+    try std.testing.expect(try data.destroyEntity(destroyed));
 
     const columns = data.staticObstacleColumns();
     for ([_]EntityId{ surface, leveled }) |entity| {
@@ -1815,7 +1846,7 @@ test "render collect indices resolve drawable rows from movement dense index" {
         data.primitiveVisualSliceConst().entities.len,
     ) == null);
 
-    _ = data.destroyEntity(entity);
+    _ = try data.destroyEntity(entity);
     try std.testing.expect(data.renderCollectIndicesForMovement(
         data.movementBodySliceConst(),
         0,
@@ -1865,10 +1896,10 @@ test "movement rows mirror collision bounds and AI membership through bounds set
     try expectBoundsAndAiMirrored(&data, plain);
 
     // Destroying the first row swaps the tail row in with its mirrored columns.
-    try std.testing.expect(data.destroyEntity(early));
+    try std.testing.expect(try data.destroyEntity(early));
     try expectBoundsAndAiMirrored(&data, late);
     try expectBoundsAndAiMirrored(&data, plain);
-    try std.testing.expect(data.destroyEntity(late));
+    try std.testing.expect(try data.destroyEntity(late));
     try expectBoundsAndAiMirrored(&data, plain);
     try expectMovementBodyColumnsAligned(data.movementBodySliceConst());
 }
@@ -1945,7 +1976,7 @@ test "destroying an entity removes every attached data row" {
     try data.setCollisionResponse(entity, testResponse(.bounce, .dynamic, 0.75));
     try data.setSteeringAgent(entity, testSteeringAgent(1));
 
-    try std.testing.expect(data.destroyEntity(entity));
+    try std.testing.expect(try data.destroyEntity(entity));
     try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.facingSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.primitiveVisualSliceConst().entities.len);
@@ -1966,7 +1997,7 @@ test "primitive visual store is columnar and compact after removal" {
     try data.setPrimitiveVisual(second, testVisualWithSize(24));
     try data.setPrimitiveVisual(third, testVisualWithSize(32));
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const slice = data.primitiveVisualSliceConst();
     try expectPrimitiveVisualColumnsAligned(slice);
@@ -2072,7 +2103,7 @@ test "collision bounds store is columnar compact and rejects invalid bounds" {
     try std.testing.expectError(error.InvalidCollisionBounds, data.setCollisionBounds(first, .{ .size = .{ .x = std.math.inf(f32), .y = 1 } }));
     try std.testing.expectError(error.InvalidCollisionBounds, data.setCollisionBounds(first, .{ .size = .{ .x = std.math.nan(f32), .y = 1 } }));
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
     const slice = data.collisionBoundsSliceConst();
     try expectCollisionBoundsColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
@@ -2106,7 +2137,7 @@ test "collision response store is columnar compact and rejects invalid response 
     try std.testing.expectError(error.InvalidCollisionResponse, data.setCollisionResponse(first, testResponse(.bounce, .dynamic, std.math.inf(f32))));
     try std.testing.expectError(error.InvalidCollisionResponse, data.setCollisionResponse(first, testResponse(.bounce, .dynamic, std.math.nan(f32))));
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
     const slice = data.collisionResponseSliceConst();
     try expectCollisionResponseColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
@@ -2176,7 +2207,7 @@ test "structural commands skip stale entities and preserve deterministic command
     const entity = try data.createEntity();
     try data.setMovementBody(entity, testBody(1));
     const stale = entity;
-    try std.testing.expect(data.destroyEntity(entity));
+    try std.testing.expect(try data.destroyEntity(entity));
     const replacement = try data.createEntity();
 
     const commands = [_]StructuralCommand{
@@ -2223,7 +2254,7 @@ test "ai agent component stores dense columns, supports template create and set/
     try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .sticky_bonus = -0.1 }));
     try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .sticky_bonus = std.math.nan(f32) }));
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
     const slice = data.aiAgentSliceConst();
     try expectAiAgentColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
@@ -2268,7 +2299,7 @@ test "steering agent component stores dense columns, supports set/get, rejects i
     try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .avoidance_radius = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .max_neighbor_samples = max_steering_neighbor_samples + 1 }));
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
     const slice = data.steeringAgentSliceConst();
     try expectSteeringAgentColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
@@ -2482,7 +2513,7 @@ test "structural command preflight counts duplicate component sets once" {
     const target = try data.createEntity();
     const seed = try data.createEntity();
     try data.setPrimitiveVisual(seed, testVisualWithSize(8));
-    try std.testing.expect(data.destroyEntity(seed));
+    try std.testing.expect(try data.destroyEntity(seed));
 
     const commands = [_]StructuralCommand{
         .{ .set_primitive_visual = .{ .entity = target, .visual = testVisualWithSize(16) } },
@@ -2541,7 +2572,7 @@ test "structural command preflight returns before projection for empty command b
 
     for (0..8) |_| {
         const entity = try data.createEntity();
-        try std.testing.expect(data.destroyEntity(entity));
+        try std.testing.expect(try data.destroyEntity(entity));
     }
 
     var scratch = StructuralPlanScratch.init(std.testing.allocator);
@@ -2597,7 +2628,7 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
     try data.setMovementBody(e2, .{});
     try data.setSimulationMetadata(e1, .{ .tier = .dormant });
     try data.setSimulationMetadata(e2, .{ .tier = .kinematic });
-    _ = data.destroyEntity(e0); // was cognition (default)
+    _ = try data.destroyEntity(e0); // was cognition (default)
     const e3 = try data.createEntity(); // reuses e0's slot at cognition
     try data.setMovementBody(e3, .{});
     try data.setSimulationMetadata(e3, .{ .tier = .locomotion });
@@ -2644,7 +2675,7 @@ test "structural command set_simulation_tier commits and skips stale entities" {
     const alive = try data.createEntity();
     try data.setMovementBody(alive, .{});
     const dead = try data.createEntity();
-    _ = data.destroyEntity(dead);
+    _ = try data.destroyEntity(dead);
     // Live entity with no movement body — tier has no row to land on. Must skip
     // like a stale ID, not abort the batch (would drop the trailing command).
     const bodiless = try data.createEntity();
@@ -2688,6 +2719,41 @@ test "entering a non-moving tier snaps interpolation history to position" {
     slice.previous_x[di] = 10;
     try data.setSimulationTier(entity, .cognition);
     try std.testing.expectEqual(@as(f32, 10), data.movementBodySliceConst().previous_x[di]);
+}
+
+test "a movement body append then a failed set leaves the entity not alive" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 1, .y = 1 } });
+    try std.testing.expect(data.isAlive(entity));
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    data.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, data.setWorldLevel(entity, 3));
+    data.destroyCreatedEntity(entity);
+    try std.testing.expect(!data.isAlive(entity));
+    try std.testing.expectEqual(@as(?usize, null), data.movementBodyDenseIndex(entity));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "destroying a non-tail movement row allocates nothing once two allow records are reserved" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    try data.setMovementBody(first, .{ .position = .{ .x = 1, .y = 0 } });
+    try data.setMovementBody(second, .{ .position = .{ .x = 2, .y = 0 } });
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(first).?);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodyDenseIndex(second).?);
+    try data.collision_allow_records.ensureTotalCapacity(std.testing.allocator, data.collision_allow_records.items.len + 2);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    data.allocator = failing.allocator();
+    try std.testing.expect(try data.destroyEntity(first));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!data.isAlive(first));
+    try std.testing.expect(data.isAlive(second));
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(second).?);
+    try std.testing.expectEqual(@as(usize, 2), data.collision_allow_records.items.len);
 }
 
 test "faction round-trips through set get ptr and dense slice" {
@@ -2748,7 +2814,7 @@ test "faction store is columnar and compact after removal" {
     try data.setFaction(second, .ally);
     try data.setFaction(third, .hostile);
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const rows = data.factions.rows.slice();
     try std.testing.expectEqual(@as(usize, 2), rows.len);
@@ -2769,7 +2835,7 @@ test "faction survives entity destruction and reuse with generational correctnes
 
     const original = try data.createEntity();
     try data.setFaction(original, .hostile);
-    try std.testing.expect(data.destroyEntity(original));
+    try std.testing.expect(try data.destroyEntity(original));
 
     // Stale ID no longer resolves once the slot's generation advances.
     try std.testing.expectEqual(@as(?Faction, null), data.factionConst(original));
@@ -2900,7 +2966,7 @@ test "ai perception store is columnar and compact after removal" {
     try data.setAiPerception(second, .{ .vision_range = 200 });
     try data.setAiPerception(third, .{ .vision_range = 300 });
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const slice = data.aiPerceptionSliceConst();
     try std.testing.expectEqual(slice.entities.len, slice.vision_range.len);
@@ -2918,7 +2984,7 @@ test "ai perception survives entity destruction and reuse with generational corr
 
     const original = try data.createEntity();
     try data.setAiPerception(original, .{ .vision_range = 111 });
-    try std.testing.expect(data.destroyEntity(original));
+    try std.testing.expect(try data.destroyEntity(original));
 
     try std.testing.expectEqual(@as(?AiPerception, null), data_test_support.aiPerception(&data, original));
 
@@ -2964,7 +3030,7 @@ test "ai memory store is columnar and compact after removal" {
     try data.setAiMemory(second, .{ .staleness = 200 });
     try data.setAiMemory(third, .{ .staleness = 300 });
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const slice = data.aiMemorySliceConst();
     try std.testing.expectEqual(slice.entities.len, slice.staleness.len);
@@ -2982,7 +3048,7 @@ test "ai memory survives entity destruction and reuse with generational correctn
 
     const original = try data.createEntity();
     try data.setAiMemory(original, .{ .staleness = 111 });
-    try std.testing.expect(data.destroyEntity(original));
+    try std.testing.expect(try data.destroyEntity(original));
 
     try std.testing.expectEqual(@as(?AiMemory, null), data_test_support.aiMemory(&data, original));
 
@@ -3010,7 +3076,7 @@ test "destructible round-trips through set/get and clears on destroy" {
     try std.testing.expectEqual(@as(u8, 1), data.destructibleConst(first).?.hit_points);
     try std.testing.expect(data.destructibleConst(first).?.destroy_on_interact);
 
-    try std.testing.expect(data.destroyEntity(first));
+    try std.testing.expect(try data.destroyEntity(first));
     try std.testing.expectEqual(@as(?Destructible, null), data.destructibleConst(first));
 }
 
@@ -3025,7 +3091,7 @@ test "destructible store is columnar and compact after removal" {
     try data.setDestructible(second, .{ .hit_points = 2 });
     try data.setDestructible(third, .{ .hit_points = 3 });
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const slice = data.destructibleSliceConst();
     try std.testing.expectEqual(slice.entities.len, slice.hit_points.len);
@@ -3076,7 +3142,7 @@ test "ai affect store is columnar and compact after removal" {
     try data.setAiAffect(second, .{ .baseline_fear = 0.2 });
     try data.setAiAffect(third, .{ .baseline_fear = 0.3 });
 
-    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expect(try data.destroyEntity(second));
 
     const slice = data.aiAffectSliceConst();
     try std.testing.expectEqual(slice.entities.len, slice.baseline_fear.len);
@@ -3094,7 +3160,7 @@ test "ai affect survives entity destruction and reuse with generational correctn
 
     const original = try data.createEntity();
     try data.setAiAffect(original, .{ .baseline_fear = 0.4 });
-    try std.testing.expect(data.destroyEntity(original));
+    try std.testing.expect(try data.destroyEntity(original));
 
     try std.testing.expectEqual(@as(?AiAffect, null), data_test_support.aiAffect(&data, original));
 

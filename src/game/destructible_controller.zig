@@ -357,7 +357,7 @@ fn makeMinimalWorld() WorldSystem {
 
 fn spawnCrate(data: *DataSystem, x: f32, y: f32, size: f32, hp: u8) !EntityId {
     const entity = try data.createEntity();
-    errdefer _ = data.destroyEntity(entity);
+    errdefer data.destroyCreatedEntity(entity);
     try data.setMovementBody(entity, .{
         .position = .{ .x = x, .y = y },
         .previous_position = .{ .x = x, .y = y },

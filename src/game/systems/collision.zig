@@ -556,14 +556,32 @@ fn ensureHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocator
     setRowCount(HitRow, hits, n);
 }
 
+// `target` rows when the block is larger. `len == 0` so `setCapacity` does not copy.
+// A failed alloc restores `len` and keeps the wide block. A warm block at or under
+// `target` does not allocate.
+fn releaseHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocator, target: usize) error{OutOfMemory}!void {
+    if (hits.capacity <= target) return;
+    const kept = hits.len;
+    setRowCount(HitRow, hits, 0);
+    errdefer setRowCount(HitRow, hits, kept);
+    try hits.setCapacity(allocator, target);
+    setRowCount(HitRow, hits, target);
+}
+
 // A range's static query output. `pairs` accumulates over the range's queries; `hits` is
-// one query's scratch, so it is sized to the largest single query, not the range's pairs.
+// one query's scratch, sized to this slot's widest query, not the range's pairs and not
+// another slot's query.
 const StaticPairBuffer = struct {
     pub const Context = *StaticSlotSizing;
     pub const max_passes = 2;
 
     pairs: std.ArrayList(KeyedContact) = .empty,
     hits: std.MultiArrayList(HitRow) = .{},
+    // Max overlap count this pass. Zero after `clear` and on a slot the partition dropped.
+    live_hits: usize = 0,
+    // Rows `reserve` keeps for one query: the pair records capped at `reserved_query_hits`.
+    // Survives `clear`; the next `reserve` overwrites it.
+    hit_window: usize = 0,
     // The pair count the range needed past `pairs.capacity`; 0 when it fit.
     required: usize = 0,
     // The largest single query's hit count past `hits.len`; 0 when every query fit.
@@ -576,14 +594,15 @@ const StaticPairBuffer = struct {
     ids: std.ArrayList(u32) = .empty,
     ids_required: usize = 0,
 
-    // Pairs and Debug ids for `records`; one query's hit rows: `reserved_query_hits` up to
-    // the pairs, or the widest query any slot of the set grew to.
+    // Pairs and Debug ids for `records`. One query's hit rows: the pairs capped at
+    // `reserved_query_hits`. `sizing` is the run's growth; this slot does not read it.
     pub fn reserve(self: *StaticPairBuffer, allocator: std.mem.Allocator, records: usize, sizing: *StaticSlotSizing) error{OutOfMemory}!bool {
+        _ = sizing;
         var grew = try reserveRecords(KeyedContact, &self.pairs, allocator, records);
-        const hit_rows = @max(@min(records, reserved_query_hits), sizing.hit_rows);
-        if (self.hits.len < hit_rows) {
-            grew = grew or self.hits.capacity < hit_rows;
-            try ensureHitRows(&self.hits, allocator, hit_rows);
+        self.hit_window = @min(records, reserved_query_hits);
+        if (self.hits.len < self.hit_window) {
+            grew = grew or self.hits.capacity < self.hit_window;
+            try ensureHitRows(&self.hits, allocator, self.hit_window);
         }
         // Same bound as the pairs: the range's walks read ids across all its queries.
         if (comptime builtin.mode == .debug) grew = try reserveRecords(u32, &self.ids, allocator, records) or grew;
@@ -592,14 +611,17 @@ const StaticPairBuffer = struct {
 
     // Grows what the last pass outgrew, before its replay: hit rows geometrically past the
     // largest query, pairs and Debug ids past the range's need. Merges the need into `sizing`.
+    // A slot whose queries fit releases hit rows to its bound when the block is above the
+    // limit; that release does not replay.
     pub fn grow(self: *StaticPairBuffer, allocator: std.mem.Allocator, sizing: *StaticSlotSizing) error{OutOfMemory}!bool {
         var growth = StaticSlotGrowth{};
         if (self.hits_required > self.hits.len) {
             // std's growth past the need, so a query that widens a little does not grow
             // and replay again.
             try ensureHitRows(&self.hits, allocator, std.MultiArrayList(HitRow).growCapacity(self.hits_required));
-            sizing.hit_rows = @max(sizing.hit_rows, self.hits.len);
             growth.hits = self.hits_required;
+        } else if (self.hits.capacity > CollisionSystem.staticQueryHitLimit(self.live_hits, self.hit_window)) {
+            try releaseHitRows(&self.hits, allocator, CollisionSystem.staticQueryHitBound(self.live_hits, self.hit_window));
         }
         if (self.required > self.pairs.capacity) {
             try self.pairs.ensureTotalCapacity(allocator, self.required);
@@ -625,6 +647,7 @@ const StaticPairBuffer = struct {
         self.pairs.clearRetainingCapacity();
         self.required = 0;
         self.hits_required = 0;
+        self.live_hits = 0;
         self.overflowed = false;
         self.pending = 0;
         if (comptime builtin.mode == .debug) {
@@ -670,11 +693,8 @@ const StaticSlotGrowth = struct {
     }
 };
 
-// The static query set's sizing: the widest single query's hit rows any slot grew to, which
-// every prepared slot then holds, so a retune that moves that query to another range does
-// not replay; and the largest need one run's grows showed.
+// The largest need one static-query run's grows showed.
 const StaticSlotSizing = struct {
-    hit_rows: usize = 0,
     growth: StaticSlotGrowth = .{},
 };
 
@@ -1090,9 +1110,10 @@ pub const CollisionSystem = struct {
     /// the key-ordered emission of stored and dynamic contacts, each on workers under its
     /// own tuner or inline as it selects. With no worker the same functions run inline.
     /// Allocates only past `reserve`'s bounds, on the calling thread between dispatches.
+    /// The trigger refresh scratch grows to the recorded pairs before its dispatch.
     pub fn update(
         self: *CollisionSystem,
-        data: *const DataSystem,
+        data: *DataSystem,
         contacts: *RangeOutputStream(CollisionContact),
         thread_system: *ThreadSystem,
         config: CollisionConfig,
@@ -1380,6 +1401,22 @@ pub const CollisionSystem = struct {
         return broadphasePairBound(body_capacity);
     }
 
+    /// Hit rows a static-query slot keeps: the reserve window when `live` fits in it,
+    /// otherwise one geometric step above `live`.
+    fn staticQueryHitBound(live: usize, window: usize) usize {
+        if (live <= window) return window;
+        return std.MultiArrayList(HitRow).growCapacity(live);
+    }
+
+    /// Capacity above which that slot releases back to `staticQueryHitBound`. The window
+    /// when `live` fits; one geometric step above the bound when it does not, so a
+    /// one-row shrink keeps the block and the next one-row widen does not grow.
+    pub fn staticQueryHitLimit(live: usize, window: usize) usize {
+        const bound = staticQueryHitBound(live, window);
+        if (live <= window) return bound;
+        return std.MultiArrayList(HitRow).growCapacity(bound);
+    }
+
     /// Counts, once, a reserved step whose `pair_count` (`what`: the candidate pairs after
     /// the broadphase merge, or the static pairs after the static query) exceeds
     /// `reserved_pair_bound`. Main thread.
@@ -1491,21 +1528,37 @@ pub const CollisionSystem = struct {
         return result;
     }
 
+    // Slots past the prepared ranges, or every slot when this step runs no static query,
+    // drop hit scratch. A slot already empty does not call the allocator.
+    fn releaseDroppedStaticHits(self: *CollisionSystem, from: usize) void {
+        for (self.static_slots.list.items[from..]) |*slot| {
+            slot.value.live_hits = 0;
+            if (slot.value.hits.capacity == 0) continue;
+            slot.value.hits.shrinkAndFree(self.allocator, 0);
+        }
+    }
+
     // The trigger store brought to `view` (the seam's retry) and refreshed to the allow
     // epoch, then one query over the filled dynamics. `static_pairs` is the dynamic x static
     // contacts. Returns the Debug out-of-band flag.
-    fn gatherStaticPairs(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, exclude_tiers: bool, stats: *CollisionStats) !bool {
+    fn gatherStaticPairs(self: *CollisionSystem, data: *DataSystem, view: ColliderView, threads: Threads, exclude_tiers: bool, stats: *CollisionStats) !bool {
         self.static_pairs.clearRetainingCapacity();
-        if (view.geometry == null) return false;
-        try self.syncTriggers(data, view, threads);
-        if (self.trigger_store.refresh(storeThreads(threads), data)) {
+        // Null geometry has no static query. Refresh still drains the allow records;
+        // an empty store has nothing to dispatch.
+        if (view.geometry != null) try self.syncTriggers(data, view, threads);
+        if (try self.trigger_store.refresh(storeThreads(threads), data)) {
             if (comptime runtime_perf_log.enabled) stats.perf.trigger_refresh_batch = self.trigger_store.perf.last_batches.get(.refresh);
+        }
+        if (view.geometry == null) {
+            self.releaseDroppedStaticHits(0);
+            return false;
         }
         const input_count = self.proxies.len;
         if (input_count != 0) {
             const stage = threads.stage(&self.static_pair_tuner);
             const shape = StageShape.select(stage, input_count, collision_range_alignment_items);
             const grew = try self.static_slots.prepare(self.allocator, shape, input_count, broadphase_pairs_per_item, &self.static_sizing);
+            self.releaseDroppedStaticHits(self.static_slots.range_count);
             const slots = self.static_slots.slots();
             var job = StaticQueryJob{
                 .data = data,
@@ -1535,7 +1588,7 @@ pub const CollisionSystem = struct {
                 try self.compactDistinctIds(view, slots);
                 if (try self.dispatchRectCompare(data, view, threads, stats)) return true;
             }
-        }
+        } else self.releaseDroppedStaticHits(0);
         return false;
     }
 
@@ -2155,6 +2208,8 @@ fn staticQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             var span_ids = SpanIds{ .ids = &slot.ids, .required = &slot.ids_required };
             break :blk job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, &span_ids);
         } else job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, {});
+        // This range's widest query. `grow` reads it on the main thread after the join.
+        slot.live_hits = @max(slot.live_hits, full);
         if (!slot.admit(full)) continue;
         packStaticHits(job.view, job.data, hits, full, entity, bodies, scope, job.exclude_tiers);
         writeStaticHitContacts(&slot.pairs, hits, full, entity, proxies.movement_index[slot_index], box, proxies.velocity_x[slot_index], proxies.velocity_y[slot_index], proxies.level[slot_index], job.strips);
@@ -3477,13 +3532,13 @@ fn fillReferenceLayout(data: *DataSystem) !void {
 
 // `CollisionSystem.update` over the scoped bodies (null = all), inline: a thread system with
 // no workers.
-fn updateScopedInline(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), scope_dense_indices: ?[]const u32) !CollisionStats {
+fn updateScopedInline(system: *CollisionSystem, data: *DataSystem, contacts: *RangeOutputStream(CollisionContact), scope_dense_indices: ?[]const u32) !CollisionStats {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.update(data, contacts, &threads, .{ .scope_dense_indices = scope_dense_indices });
 }
 
-fn updateInline(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact)) !CollisionStats {
+fn updateInline(system: *CollisionSystem, data: *DataSystem, contacts: *RangeOutputStream(CollisionContact)) !CollisionStats {
     return updateScopedInline(system, data, contacts, null);
 }
 
@@ -5064,7 +5119,7 @@ fn filteredReference(data: *const DataSystem, strips: CollisionStrips) ![]Collis
     return try kept.toOwnedSlice(std.testing.allocator);
 }
 
-fn updateView(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), view: ColliderView, workers: usize, items_per_range: ?usize) !CollisionStats {
+fn updateView(system: *CollisionSystem, data: *DataSystem, contacts: *RangeOutputStream(CollisionContact), view: ColliderView, workers: usize, items_per_range: ?usize) !CollisionStats {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers });
     defer threads.deinit();
     return system.update(data, contacts, &threads, .{
@@ -5324,6 +5379,26 @@ test "collision stored trigger allow follows allowsCollision without a collider 
     try expectStoredTriggerAllowFollowsTier(2);
 }
 
+test "collision stored trigger allow records drain when static geometry is null" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 1, .y = 1 } });
+    try data.setSimulationTier(entity, .kinematic);
+    try std.testing.expect(data.collision_allow_records.items.len != 0);
+    const epoch = data.collision_allow_epoch;
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    _ = try updateView(&system, &data, &contacts, .{}, 0, null);
+    try std.testing.expectEqual(@as(usize, 0), data.collision_allow_records.items.len);
+    try std.testing.expectEqual(epoch, system.trigger_store.refreshed_epoch.?);
+    try std.testing.expectEqual(@as(u32, 0), system.trigger_store.pair_count);
+    try std.testing.expectEqual(@as(usize, 0), contacts.mergedItems().len);
+}
+
 fn expectStoredTriggerAllowFollowsMovedRow(workers: usize) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -5352,7 +5427,7 @@ fn expectStoredTriggerAllowFollowsMovedRow(workers: usize) !void {
     // Removing the dynamic walker swaps right onto row 0; no static changed, so the store
     // holds right's row 2 until the removal's allow epoch refreshes it. A kinematic body
     // then takes row 2 and turns exclusion on.
-    try std.testing.expect(data.destroyEntity(walker));
+    try std.testing.expect(try data.destroyEntity(walker));
     const parked = try addObstacle(&data, .{ .x = 2000, .y = 2000, .w = 8, .h = 8 }, .dynamic, .solid);
     try data.setSimulationTier(parked, .kinematic);
     try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(right).?);
@@ -5404,7 +5479,7 @@ fn expectStoredTriggerAllowPastColumnEnd(workers: usize) !void {
     try expectSameContactPairs(trigger_pair, contacts.mergedItems());
 
     // Right swaps from row 3 to row 1; the stored pair's row 3 is now past the column end.
-    try std.testing.expect(data.destroyEntity(walker));
+    try std.testing.expect(try data.destroyEntity(walker));
     try std.testing.expectEqual(@as(usize, 1), data.movementBodyDenseIndex(right).?);
     try std.testing.expectEqual(@as(usize, 3), data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(view.revision, colliders.view().revision);
@@ -5473,9 +5548,13 @@ test "collision stored trigger refresh and emission over several ranges match se
     setTestAllocator(&system, failing.allocator());
     defer setTestAllocator(&system, std.testing.allocator);
     try data.setSimulationTier(smalls[1], .kinematic);
+    // Both stores refresh this cross. The first refresh drains the shared record list.
+    const recorded = try std.testing.allocator.dupe(EntityId, data.collision_allow_records.items);
+    defer std.testing.allocator.free(recorded);
     _ = try updateView(&system, &data, &contacts, view, 2, collision_range_alignment_items);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     setTestAllocator(&system, std.testing.allocator);
+    try data.collision_allow_records.appendSlice(std.testing.allocator, recorded);
     _ = try updateView(&serial, &data, &serial_contacts, view, 0, collision_range_alignment_items);
     try expectSameContacts(serial_contacts.mergedItems(), contacts.mergedItems());
     for (contacts.mergedItems()) |contact| {
@@ -5760,7 +5839,7 @@ test "dynamic bounds index tracks static membership through removal" {
     try data.setCollisionResponse(wall, .{ .mobility = .static, .mode = .solid });
     try expectDynamicIndex(&data, &.{ dynamic_index, other_index });
 
-    try std.testing.expect(data.destroyEntity(dynamic));
+    try std.testing.expect(try data.destroyEntity(dynamic));
     const other_now = data.resolveSlotConst(other).?.collision_bounds_index.?;
     try expectDynamicIndex(&data, &.{other_now});
 }
@@ -6023,7 +6102,7 @@ fn expectSameTriggerPairs(expected: *const CollisionSystem, actual: *const Colli
     try std.testing.expectEqual(expected.trigger_store.allowed_count, actual.trigger_store.allowed_count);
 }
 
-fn updateOn(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), view: ColliderView, threads: *ThreadSystem, workers: usize) !void {
+fn updateOn(system: *CollisionSystem, data: *DataSystem, contacts: *RangeOutputStream(CollisionContact), view: ColliderView, threads: *ThreadSystem, workers: usize) !void {
     _ = try system.update(data, contacts, threads, .{
         .static_colliders = view,
         .max_worker_threads = workers,
@@ -6163,7 +6242,7 @@ const TriggerPatchFixture = struct {
     contacts: RangeOutputStream(CollisionContact),
     workers: usize,
 
-    fn init(self: *TriggerPatchFixture, data: *const DataSystem, workers: usize) !void {
+    fn init(self: *TriggerPatchFixture, data: *DataSystem, workers: usize) !void {
         self.workers = workers;
         self.colliders = StaticColliderSystem.init(std.testing.allocator);
         errdefer self.colliders.deinit();
@@ -6822,7 +6901,70 @@ test "a static query past its reserved hit rows grows its slot and replays to th
     try expectWideQueryReplays(2);
 }
 
-test "a static query retune gives every selected range the widest query's hit rows" {
+fn expectNarrowStaticQueryReleases(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Same wide query as the replay fixture: more overlaps than a slot's reserve window.
+    const columns: usize = 16;
+    const rows: usize = 6;
+    for (0..columns * rows) |index| {
+        _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index % columns)) * 32, .y = @as(f32, @floatFromInt(index / columns)) * 32, .w = 32, .h = 32 }, .static, .solid);
+    }
+    const wide = try addObstacle(&data, .{ .x = 1, .y = 1, .w = @as(f32, @floatFromInt(columns)) * 32 - 2, .h = @as(f32, @floatFromInt(rows - 1)) * 32 - 2 }, .dynamic, .solid);
+    _ = try addObstacle(&data, .{ .x = 1500, .y = 1500, .w = 8, .h = 8 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry(), null);
+    const expected = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(expected.len > reserved_query_hits);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(256);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    _ = try updateView(&system, &data, &contacts, colliders.view(), workers, null);
+    try expectSameContacts(expected, contacts.mergedItems());
+    var above_window = false;
+    for (system.static_slots.slots()) |slot| {
+        if (slot.value.hits.capacity > reserved_query_hits) above_window = true;
+    }
+    try std.testing.expect(above_window);
+
+    // Off the statics, and small enough that every query fits the reserve window.
+    const body = data.movementBodyDenseIndex(wide).?;
+    const movement = data.movementBodySlice();
+    movement.position_x[body] = 8000;
+    movement.position_y[body] = 8000;
+    movement.previous_x[body] = 8000;
+    movement.previous_y[body] = 8000;
+    try data.setCollisionBounds(wide, .{ .size = .{ .x = 8, .y = 8 } });
+    const narrowed = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(narrowed);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), workers, null);
+    try expectSameContacts(narrowed, contacts.mergedItems());
+    for (system.static_slots.slots()) |slot| {
+        try std.testing.expect(slot.value.hits.capacity <= reserved_query_hits);
+        try std.testing.expect(slot.value.hits.len <= reserved_query_hits);
+    }
+
+    // The shrink may allocate. The same query again must not.
+    const allocator = system.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing.allocator();
+    defer system.allocator = allocator;
+    _ = try updateView(&system, &data, &contacts, colliders.view(), workers, null);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try expectSameContacts(narrowed, contacts.mergedItems());
+}
+
+test "collision static query releases wide hit rows once every query fits the window" {
+    try expectNarrowStaticQueryReleases(0);
+    try expectNarrowStaticQueryReleases(2);
+}
+
+test "collision static query retune keeps wide hit rows only on the slot that ran them" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const columns: usize = 16;
@@ -6847,17 +6989,23 @@ test "a static query retune gives every selected range the widest query's hit ro
     try system.reserve(256);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    var widest: usize = 0;
-    for ([_]usize{ 1, 2, 3 }, 0..) |windows, step| {
+    for ([_]usize{ 1, 2, 3 }) |windows| {
         _ = try updateView(&system, &data, &contacts, colliders.view(), 2, windows * collision_range_alignment_items);
         try expectSameContacts(expected, contacts.mergedItems());
         const slots = system.static_slots.slots();
         try std.testing.expect(slots.len > 1);
-        // From the first step's growth on, every prepared range holds the widest query.
+        var held_wide = false;
         for (slots) |slot| {
-            if (step != 0) try std.testing.expect(slot.value.hits.len >= widest);
-            widest = @max(widest, slot.value.hits.len);
+            if (slot.value.live_hits <= reserved_query_hits) {
+                try std.testing.expect(slot.value.hits.capacity <= reserved_query_hits);
+            } else {
+                try std.testing.expect(slot.value.hits.len >= slot.value.live_hits);
+                held_wide = true;
+            }
         }
-        try std.testing.expect(widest >= expected.len);
+        try std.testing.expect(held_wide);
+        for (system.static_slots.list.items[system.static_slots.range_count..]) |slot| {
+            try std.testing.expectEqual(@as(usize, 0), slot.value.hits.capacity);
+        }
     }
 }

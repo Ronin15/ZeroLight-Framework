@@ -339,7 +339,7 @@ fn commitStructuralCommands(
         switch (command) {
             .create_entity => |template| {
                 const entity = try self.createEntity();
-                errdefer _ = self.destroyEntity(entity);
+                errdefer self.destroyCreatedEntity(entity);
                 stats.components_set += try applyTemplateComponents(self, entity, template);
                 stats.created += 1;
                 change_sink.record(.{ .entity_created = entity });
@@ -350,7 +350,7 @@ fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
                 // Capture plane before destroy: world_level row is removed with the entity.
                 const level = self.worldLevelConst(entity) orelse 0;
-                if (self.destroyEntity(entity)) {
+                if (try self.destroyEntity(entity)) {
                     stats.destroyed += 1;
                     change_sink.record(.{ .entity_destroyed = .{
                         .entity = entity,
@@ -574,6 +574,10 @@ pub fn preflightStructuralCommands(
     }
 
     try projection.required.validateLimits();
+    // Each command records at most two allow ids (a removal and its landed tail,
+    // or a create's errdefer removal). Tier changes record one. Commit then appends
+    // without allocating.
+    try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + commands.len * 2);
     const plan = StructuralCommitPlan{
         .command_count = commands.len,
         .capacity_needs = projection.required,

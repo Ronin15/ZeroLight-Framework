@@ -1079,7 +1079,7 @@ test "steering update is allocation-free after reserves from the first step" {
 
     // A churn step within the reserve: the first agent goes (its steering row takes the
     // last one's) and a new agent comes, so the rekey both moves and defaults rows.
-    try std.testing.expect(data.destroyEntity(agent));
+    try std.testing.expect(try data.destroyEntity(agent));
     const newcomer = try addSteeredEntity(&data, .{ .x = 64, .y = 0 });
     steering.invalidateSteeringMovementIndexCache();
     frame.beginStep();
@@ -1178,7 +1178,7 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
     // A churn step within the reserve: one agent goes (its steering row takes the last
     // one's) and a new agent takes its place in the intents, so the rekey moves and
     // defaults rows.
-    try std.testing.expect(data.destroyEntity(agents[5]));
+    try std.testing.expect(try data.destroyEntity(agents[5]));
     agents[5] = try addSteeredEntity(&data, .{ .x = 8, .y = 200 });
     step_intents[5].entity = agents[5];
     steering.invalidateSteeringMovementIndexCache();
@@ -1215,7 +1215,7 @@ test "steering runtime rows go with destroyed entities within a one-agent reserv
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), steering.runtime_rows.len);
 
-    try std.testing.expect(data.destroyEntity(agent));
+    try std.testing.expect(try data.destroyEntity(agent));
     frame.beginStep();
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), steering.runtime_rows.len);
@@ -1521,7 +1521,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
             const removals: []const usize = if (step_index == 1) &.{ 40, 3 } else &.{0};
             for (removals) |index| {
                 stale = agents.orderedRemove(index);
-                try std.testing.expect(data.destroyEntity(stale));
+                try std.testing.expect(try data.destroyEntity(stale));
             }
             try agents.append(std.testing.allocator, try addSteeredEntity(&data, parityAgentPosition(parity_crowd_count + step_index)));
             system.invalidateSteeringMovementIndexCache();
@@ -1605,7 +1605,7 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
     switch (churn) {
         .none => {},
         .destroy_and_create => {
-            for ([_]usize{ 10, 3 }) |index| try std.testing.expect(data.destroyEntity(agents.orderedRemove(index)));
+            for ([_]usize{ 10, 3 }) |index| try std.testing.expect(try data.destroyEntity(agents.orderedRemove(index)));
             outcome.newcomer = try addSteeredEntity(&data, .{ .x = 1650, .y = 1050 });
             try agents.append(std.testing.allocator, outcome.newcomer);
             system.invalidateSteeringMovementIndexCache();

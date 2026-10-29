@@ -30,6 +30,7 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const changedCapacities = @import("../../app/thread_system.zig").changedCapacities;
 const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
@@ -59,6 +60,75 @@ const node_min: u32 = node_capacity / 2;
 const max_tree_height = 7;
 // A stored row whose entity has no movement body.
 const no_row: u32 = std.math.maxInt(u32);
+
+/// One stored pair an entity names: the level tree, the page, and the slot in that page.
+const PairRef = struct {
+    level: u32,
+    page: u32,
+    slot: u8,
+};
+
+// The two list indices of a pair's endpoints. `a == b` is two indices of one list.
+const SlotEnds = struct {
+    a: u32,
+    b: u32,
+};
+
+// One pair the leaf write added or moved. Padded so each output page's ops start on a
+// cache line: neighbouring leaf ranges do not share the line they write.
+const IndexOp = struct {
+    kind: enum(u8) { insert, move },
+    new_slot: u8,
+    old_slot: u8,
+    _pad: u8 = 0,
+    level: u32,
+    new_page: u32,
+    old_page: u32,
+
+    comptime {
+        std.debug.assert(@sizeOf(IndexOp) == 16);
+        std.debug.assert(thread_shared_record_alignment % @sizeOf(IndexOp) == 0);
+    }
+};
+
+const IndexOpList = std.array_list.Aligned(IndexOp, .fromByteUnits(thread_shared_record_alignment));
+
+// One dirty page's valid and allowed count change. Pair totals do not move.
+const RefreshDelta = struct {
+    level: u32,
+    page: u32,
+    valid_delta: i32,
+    allowed_delta: i32,
+};
+
+// One refresh range's delta count. Padded: neighbouring ranges write neighbouring records.
+const RefreshRangeCount = struct {
+    count: u32 align(thread_shared_record_alignment) = 0,
+    _pad: [thread_shared_record_alignment - @sizeOf(u32)]u8 = undefined,
+
+    comptime {
+        std.debug.assert(@sizeOf(RefreshRangeCount) == thread_shared_record_alignment);
+        std.debug.assert(@alignOf(RefreshRangeCount) == thread_shared_record_alignment);
+    }
+};
+
+// Page ids are u32, so `(page << 6) | slot` does not fit a u32.
+fn slotKey(page: u32, slot: u8) u64 {
+    std.debug.assert(slot < page_capacity);
+    return (@as(u64, page) << 6) | slot;
+}
+
+fn entityIdBits(id: EntityId) u64 {
+    return @as(u64, id.index) | (@as(u64, id.generation) << 32);
+}
+
+fn entityIdLess(_: void, lhs: EntityId, rhs: EntityId) bool {
+    return entityIdBits(lhs) < entityIdBits(rhs);
+}
+
+fn pairRefKey(ref: PairRef) u64 {
+    return (@as(u64, ref.page) << 8) | ref.slot;
+}
 // `emit` bit 0: both rows resolve. Bit 1: both tiers allow collision.
 const emit_valid: u8 = 1;
 const emit_allowed: u8 = 2;
@@ -96,9 +166,17 @@ fn countsAs(emit: u8, kind: PairCount) bool {
 // Insert place and sort ranges start on cache-line boundaries of the staging and destination
 // windows and span at least one line, as the static pair sort's ranges do.
 const insert_range_alignment_items: usize = 16;
-// A refresh range owns the pages that start in it and writes each one's counts or prefix into
-// its parent's entry: a cache line of u32 entries is 16 pages, 16 full pages' pairs.
+// A refresh range owns the page whose first affected item it holds, and writes that page's
+// columns and one delta.
 const refresh_range_alignment_items: usize = page_capacity * (thread_shared_record_alignment / @sizeOf(u32));
+// `PairRef` is 12 bytes, so 16 items (192 B) put each refresh-sort range on a cache line
+// and span one. The place is a scalar scatter and the sort is `pdq`; neither is a float kernel.
+const refresh_sort_range_alignment_items: usize = 16;
+
+comptime {
+    std.debug.assert(@sizeOf(PairRef) == 12);
+    std.debug.assert(refresh_sort_range_alignment_items * @sizeOf(PairRef) % 64 == 0);
+}
 // Leaf items are whole output pages, each at least a 2.5 KB slot, and each also writes its
 // `LevelOutput` record, under a cache line: two items make a range span a line of those
 // records.
@@ -444,6 +522,9 @@ const TriggerRebuildStage = enum { insert_place, insert_sort, leaf };
 pub const StoreThreads = StageThreads(StageControls);
 
 const InsertSort = banded_sort.BandedSort(InsertEdit, insertKeyOf);
+const RefreshSort = banded_sort.BandedSort(PairRef, pairRefKey);
+// Place and sort of one refresh. A patch never runs them, so they are not patch stages.
+const RefreshSortStage = enum { place, sort };
 
 fn insertKeyOf(edit: InsertEdit) u256 {
     return edit.key;
@@ -568,8 +649,8 @@ pub const NodeMerge = struct {
     ns: u64 = 0,
 };
 
-/// A refresh's fold on main after its join: the range edges, split-node and higher-node
-/// entries, and levels it visited, and its time.
+/// A refresh's fold on main after its join: the dirty pages' prefix entries and level
+/// totals, and its time. Flat in stored pairs for one recorded entity.
 pub const RefreshFold = struct {
     entries: usize = 0,
     ns: u64 = 0,
@@ -583,9 +664,9 @@ pub const TriggerStore = struct {
     /// Kept only with `runtime_perf_log.enabled`. Growth counts: pool slabs the pages and
     /// nodes grew by, level table growths, and patch plan scratch lists a patch grew (each
     /// list once per patch, on error too). Each patch or step stage's last batch shape
-    /// (`last_batches`), the last patch's node merge (`last_node_merge`) and the last
-    /// refresh's fold (`last_refresh_fold`), reset by every patch and rebuild, so after a
-    /// rebuild the patch and step records hold none; each rebuild
+    /// (`last_batches`), the last patch's node merge (`last_node_merge`), the last
+    /// refresh's sort (`last_refresh_sort`) and its fold (`last_refresh_fold`), reset by
+    /// every patch and rebuild, so after a rebuild the patch and step records hold none; each rebuild
     /// stage's (`last_rebuild_batches`) and the rebuild's node merge
     /// (`last_rebuild_node_merge`), reset by every rebuild.
     pub const Perf = if (runtime_perf_log.enabled) struct {
@@ -597,6 +678,7 @@ pub const TriggerStore = struct {
         last_rebuild_batches: std.EnumArray(TriggerRebuildStage, BatchStats) = .initFill(.{}),
         last_rebuild_node_merge: NodeMerge = .{},
         last_refresh_fold: RefreshFold = .{},
+        last_refresh_sort: banded_sort.SortBatches = .{},
     } else struct {};
 
     allocator: std.mem.Allocator,
@@ -615,10 +697,31 @@ pub const TriggerStore = struct {
     allowed_count: u32 = 0,
     /// The allow epoch stored rows and emit bits are current at.
     refreshed_epoch: ?u64 = null,
+    // Both endpoints of every stored pair. An entity with no pairs has no entry.
+    // Unmanaged: tests replace `allocator`, and the managed map would keep the one from init.
+    pair_refs: std.AutoHashMapUnmanaged(EntityId, std.ArrayList(PairRef)) = .empty,
+    // `(page << 6) | slot` → the two list indices. std has no pair map.
+    slot_refs: std.AutoHashMapUnmanaged(u64, SlotEnds) = .empty,
+    // Empty lists with their capacity, so a drop and a later insert of the same entities
+    // does not allocate. Not map entries.
+    spare_ref_lists: std.ArrayList(std.ArrayList(PairRef)) = .empty,
+    ref_counts: std.AutoHashMapUnmanaged(EntityId, u32) = .empty,
+    // Entities whose lists this patch created, so a failed reserve removes the empty
+    // entries, and entities a drop emptied. After the inserts, a still-empty list retires.
+    index_created: std.ArrayList(EntityId) = .empty,
+    index_ops: IndexOpList = .empty,
+    index_op_bases: std.ArrayList(u32) = .empty,
+    // The pairs a refresh re-resolves, and one delta per dirty page in range order.
+    affected: std.ArrayList(PairRef) = .empty,
+    refresh_staging: std.ArrayList(PairRef) = .empty,
+    refresh_band_offsets: SlotList(BandOffsets) = .empty,
+    refresh_deltas: std.ArrayList(RefreshDelta) = .empty,
+    refresh_ranges: std.ArrayList(RefreshRangeCount) = .empty,
     /// The collider revision the store was last patched or rebuilt to.
     seen_revision: u64 = 0,
     ready: bool = false,
     tuners: std.EnumArray(TriggerStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
+    refresh_sort_tuners: std.EnumArray(RefreshSortStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
     rebuild_tuners: std.EnumArray(TriggerRebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(rebuild_tuner_config)),
     perf: Perf = .{},
     page_growth_logged: bool = false,
@@ -672,6 +775,19 @@ pub const TriggerStore = struct {
         self.insert_segments.deinit(allocator);
         self.insert_segment_starts.deinit(allocator);
         self.band_offsets.deinit(allocator);
+        self.clearPairIndex();
+        self.pair_refs.deinit(allocator);
+        self.slot_refs.deinit(allocator);
+        self.ref_counts.deinit(allocator);
+        self.spare_ref_lists.deinit(allocator);
+        self.index_created.deinit(allocator);
+        self.index_ops.deinit(allocator);
+        self.index_op_bases.deinit(allocator);
+        self.affected.deinit(allocator);
+        self.refresh_staging.deinit(allocator);
+        self.refresh_band_offsets.deinit(allocator);
+        self.refresh_deltas.deinit(allocator);
+        self.refresh_ranges.deinit(allocator);
         self.* = .{ .allocator = allocator };
     }
 
@@ -859,6 +975,7 @@ pub const TriggerStore = struct {
             self.perf.last_batches = .initFill(.{});
             self.perf.last_node_merge = .{};
             self.perf.last_refresh_fold = .{};
+            self.perf.last_refresh_sort = .{};
         }
         const before = self.planScratchCapacities();
         defer self.countScratchGrowth(changedCapacities(&before, &self.planScratchCapacities()));
@@ -873,6 +990,7 @@ pub const TriggerStore = struct {
         try self.orderTouchedPages();
         try self.planHeights();
         try self.reservePlan();
+        try self.preparePairWrites();
         const written = self.writeOutputs(threads.stage(self.tuners.getPtr(.leaf)));
         if (comptime runtime_perf_log.enabled) {
             self.perf.last_batches.set(.leaf, written.leaf);
@@ -890,6 +1008,8 @@ pub const TriggerStore = struct {
     pub fn rebuild(self: *TriggerStore, threads: StoreThreads, inserts: []const EditSource, revision: u64, allow_epoch: u64) error{OutOfMemory}!void {
         errdefer {
             self.discardPlan();
+            // The pool reset drops every page id. A partial index would name them.
+            self.clearPairIndex();
             self.ready = false;
         }
         self.discardPlan();
@@ -898,6 +1018,7 @@ pub const TriggerStore = struct {
             self.perf.last_batches = .initFill(.{});
             self.perf.last_node_merge = .{};
             self.perf.last_refresh_fold = .{};
+            self.perf.last_refresh_sort = .{};
             self.perf.last_rebuild_batches = .initFill(.{});
             self.perf.last_rebuild_node_merge = .{};
         }
@@ -908,6 +1029,7 @@ pub const TriggerStore = struct {
         self.pair_count = 0;
         self.valid_count = 0;
         self.allowed_count = 0;
+        self.clearPairIndex();
         try self.collectInsertSegments(inserts);
         const sorted = try self.sortInserts(threads.stage(self.rebuild_tuners.getPtr(.insert_place)), threads.stage(self.rebuild_tuners.getPtr(.insert_sort)));
         if (comptime runtime_perf_log.enabled) {
@@ -917,6 +1039,7 @@ pub const TriggerStore = struct {
         try self.touchRebuildLevels();
         try self.planHeights();
         try self.reservePlan();
+        try self.preparePairWrites();
         const written = self.writeOutputs(threads.stage(self.rebuild_tuners.getPtr(.leaf)));
         if (comptime runtime_perf_log.enabled) {
             self.perf.last_rebuild_batches.set(.leaf, written.leaf);
@@ -1099,6 +1222,27 @@ pub const TriggerStore = struct {
         );
     }
 
+    // The banded sort of the gathered refs, in place: `affected` is the one segment and the
+    // destination. Duplicate page and slot keys share a band, and one range owns that band,
+    // so the unique pass after the join does not depend on the partition.
+    fn sortAffected(self: *TriggerStore, threads: StoreThreads) error{OutOfMemory}!banded_sort.SortBatches {
+        const total = self.affected.items.len;
+        if (total >= no_entry) return error.OutOfMemory;
+        const segments = [_][]const PairRef{self.affected.items};
+        const starts = [_]usize{0};
+        return RefreshSort.sortSegments(
+            self.allocator,
+            threads.stage(self.refresh_sort_tuners.getPtr(.place)),
+            threads.stage(self.refresh_sort_tuners.getPtr(.sort)),
+            &segments,
+            &starts,
+            refresh_sort_range_alignment_items,
+            &self.refresh_staging,
+            &self.refresh_band_offsets,
+            self.affected.items,
+        );
+    }
+
     // ---- Plan (main; counts only) ----------------------------------------------------------
 
     // The touched levels in level-id order, so runs and inserts line up in key order.
@@ -1190,6 +1334,18 @@ pub const TriggerStore = struct {
         var total: i64 = self.pair_count;
         for (self.touched_levels.items) |level| total += @as(i64, level.inserts) - level.dropped;
         if (total >= no_entry) return error.OutOfMemory;
+        // `total` is the pair count install publishes. Refresh gathers both endpoint
+        // refs, so the ref lists and the sort staging hold two per pair. The refresh
+        // ranges hold every partition of the pairs, and the sort offsets every partition
+        // of the gathered refs. Any later subset then allocates nothing.
+        std.debug.assert(total >= 0);
+        const published: usize = @intCast(total);
+        const ref_bound = std.math.mul(usize, published, 2) catch return error.OutOfMemory;
+        try self.affected.ensureTotalCapacity(self.allocator, ref_bound);
+        try self.refresh_deltas.ensureTotalCapacity(self.allocator, ref_bound);
+        try self.refresh_staging.ensureTotalCapacity(self.allocator, ref_bound);
+        try self.refresh_ranges.ensureTotalCapacity(self.allocator, maxRangeCount(published, refresh_range_alignment_items));
+        try self.refresh_band_offsets.ensureTotalCapacity(self.allocator, maxRangeCount(ref_bound, refresh_sort_range_alignment_items));
         var order_lo: usize = 0;
         var order_hi = self.units.items.len;
         var insert_cursor: u32 = 0;
@@ -1570,6 +1726,8 @@ pub const TriggerStore = struct {
             .store = self,
             .runs = self.runs.items[self.heights[0].runs_lo..self.heights[0].runs_hi],
             .outputs = self.level_outputs[0].items,
+            .index_ops = self.index_ops.items,
+            .op_bases = self.index_op_bases.items,
             .range_count = leaf_shape.range_count,
         };
         const leaf_batch = runShaped(leaf_stage, leaf_shape, pages, rewrite_range_alignment_items, &leaf_job, leafJob);
@@ -1617,6 +1775,8 @@ pub const TriggerStore = struct {
         }
         self.pool.commitClaims(leaf_class, self.heights[0].outputs);
         self.pool.commitClaims(node_class, self.nodeOutputs());
+        // Old pages are still live, so a move reads them and a drop removes them.
+        self.commitPairIndex(mode);
         var page_releases: usize = 0;
         var node_releases: usize = 0;
         for (self.touched.items) |record| {
@@ -1661,110 +1821,365 @@ pub const TriggerStore = struct {
         self.clearScratch();
     }
 
+    // ---- Pair index ---------------------------------------------------------------------
+
+    // Frees every entity list and both maps. Page ids are no longer meaningful.
+    fn clearPairIndex(self: *TriggerStore) void {
+        var lists = self.pair_refs.iterator();
+        while (lists.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.pair_refs.clearRetainingCapacity();
+        self.slot_refs.clearRetainingCapacity();
+        for (self.spare_ref_lists.items) |*list| list.deinit(self.allocator);
+        self.spare_ref_lists.clearRetainingCapacity();
+        self.index_created.clearRetainingCapacity();
+    }
+
+    // Reserves the index for `sorted_inserts` and the leaf op scratch. On error the new empty
+    // lists are removed and the stored pairs are unchanged. Call immediately before the leaf
+    // write: nothing fallible sits between this and `commitPairIndex`.
+    fn preparePairWrites(self: *TriggerStore) error{OutOfMemory}!void {
+        errdefer self.rollbackCreatedRefs();
+        try self.reservePairRefs(self.sorted_inserts.items);
+        try self.prepareIndexOps();
+    }
+
+    fn rollbackCreatedRefs(self: *TriggerStore) void {
+        for (self.index_created.items) |id| {
+            if (self.pair_refs.fetchRemove(id)) |entry| {
+                var list = entry.value;
+                list.deinit(self.allocator);
+            }
+        }
+        self.index_created.clearRetainingCapacity();
+    }
+
+    fn reservePairRefs(self: *TriggerStore, inserts: []const InsertEdit) error{OutOfMemory}!void {
+        self.ref_counts.clearRetainingCapacity();
+        const count_room = std.math.cast(u32, inserts.len *| 2) orelse return error.OutOfMemory;
+        try self.ref_counts.ensureUnusedCapacity(self.allocator, count_room);
+        for (inserts) |edit| {
+            self.addRefCount(edit.contact.a);
+            self.addRefCount(edit.contact.b);
+        }
+        try self.pair_refs.ensureUnusedCapacity(self.allocator, self.ref_counts.count());
+        const insert_count = std.math.cast(u32, inserts.len) orelse return error.OutOfMemory;
+        try self.slot_refs.ensureUnusedCapacity(self.allocator, insert_count);
+        try self.spare_ref_lists.ensureTotalCapacity(self.allocator, self.spare_ref_lists.items.len + self.pair_refs.count() + self.ref_counts.count());
+        // Created ids, plus one slot per existing entity a drop may empty.
+        self.index_created.clearRetainingCapacity();
+        try self.index_created.ensureTotalCapacity(self.allocator, self.pair_refs.count() + self.ref_counts.count());
+        var counts = self.ref_counts.iterator();
+        while (counts.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const extra = entry.value_ptr.*;
+            const gop = self.pair_refs.getOrPutAssumeCapacity(id);
+            if (!gop.found_existing) {
+                // A drop parked this buffer. Reuse it instead of allocating another.
+                gop.value_ptr.* = self.spare_ref_lists.pop() orelse .empty;
+                self.index_created.appendAssumeCapacity(id);
+            }
+            try gop.value_ptr.ensureTotalCapacity(self.allocator, gop.value_ptr.items.len + extra);
+        }
+    }
+
+    fn addRefCount(self: *TriggerStore, id: EntityId) void {
+        const gop = self.ref_counts.getOrPutAssumeCapacity(id);
+        if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+    }
+
+    // One op window per output page, each starting on a cache line.
+    fn prepareIndexOps(self: *TriggerStore) error{OutOfMemory}!void {
+        const pages = self.heights[0].outputs;
+        try self.index_op_bases.ensureTotalCapacity(self.allocator, pages);
+        self.index_op_bases.clearRetainingCapacity();
+        self.index_op_bases.appendNTimesAssumeCapacity(0, pages);
+        const align_items: u32 = @intCast(thread_shared_record_alignment / @sizeOf(IndexOp));
+        var total: u32 = 0;
+        var covered: usize = 0;
+        for (self.runs.items[self.heights[0].runs_lo..self.heights[0].runs_hi]) |run| {
+            for (0..run.m) |index| {
+                const output = run.out_base + @as(u32, @intCast(index));
+                self.index_op_bases.items[output] = total;
+                const bounds = outputPairBounds(run, @intCast(index));
+                const count = bounds.end - bounds.begin;
+                const padded = (count + align_items - 1) & ~(align_items - 1);
+                total = std.math.add(u32, total, padded) catch return error.OutOfMemory;
+                covered += 1;
+            }
+        }
+        std.debug.assert(covered == pages);
+        try self.index_ops.ensureTotalCapacity(self.allocator, total);
+        self.index_ops.items.len = total;
+    }
+
+    fn commitPairIndex(self: *TriggerStore, mode: InstallMode) void {
+        const runs = self.runs.items[self.heights[0].runs_lo..self.heights[0].runs_hi];
+        for (runs) |run| self.applyRunOps(run, true);
+        if (mode == .patch) self.dropTouchedPairRefs();
+        for (runs) |run| self.applyRunOps(run, false);
+        self.retireEmptyRefs();
+    }
+
+    // A drop that emptied a list recorded that id. An insert in this patch refills it and
+    // the id stays. Only a list that is still empty leaves the map. A list with a buffer
+    // is spared for the next new endpoint; a bufferless list is freed.
+    fn retireEmptyRefs(self: *TriggerStore) void {
+        for (self.index_created.items) |id| {
+            const list = self.pair_refs.getPtr(id).?;
+            if (list.items.len != 0) continue;
+            var owned = self.pair_refs.fetchRemove(id).?.value;
+            if (owned.capacity == 0) {
+                owned.deinit(self.allocator);
+            } else {
+                owned.clearRetainingCapacity();
+                self.spare_ref_lists.appendAssumeCapacity(owned);
+            }
+        }
+        self.index_created.clearRetainingCapacity();
+    }
+
+    fn applyRunOps(self: *TriggerStore, run: Run, moves: bool) void {
+        for (0..run.m) |index| {
+            const output = run.out_base + @as(u32, @intCast(index));
+            const bounds = outputPairBounds(run, @intCast(index));
+            const count: usize = bounds.end - bounds.begin;
+            const base = self.index_op_bases.items[output];
+            for (self.index_ops.items[base..][0..count]) |op| {
+                if ((op.kind == .move) != moves) continue;
+                if (moves) self.movePairRef(op) else self.insertPairRef(op);
+            }
+        }
+    }
+
+    fn dropTouchedPairRefs(self: *TriggerStore) void {
+        for (self.touched.items) |record| {
+            if (record.height != 0 or record.id == no_entry or record.mask == 0) continue;
+            var mask = record.mask;
+            while (mask != 0) {
+                const slot: u8 = @intCast(@ctz(mask));
+                mask &= mask - 1;
+                self.dropPairRef(record.id, slot);
+            }
+        }
+    }
+
+    fn movePairRef(self: *TriggerStore, op: IndexOp) void {
+        const ends = self.slot_refs.fetchRemove(slotKey(op.old_page, op.old_slot)).?.value;
+        const old = self.page(op.old_page);
+        const a = old.a[op.old_slot];
+        const b = old.b[op.old_slot];
+        self.retargetRef(a, ends.a, op);
+        self.retargetRef(b, ends.b, op);
+        self.slot_refs.putAssumeCapacity(slotKey(op.new_page, op.new_slot), ends);
+    }
+
+    fn retargetRef(self: *TriggerStore, entity: EntityId, index: u32, op: IndexOp) void {
+        const list = self.pair_refs.getPtr(entity).?;
+        list.items[index] = .{ .level = op.level, .page = op.new_page, .slot = op.new_slot };
+    }
+
+    fn insertPairRef(self: *TriggerStore, op: IndexOp) void {
+        const stored = self.page(op.new_page);
+        const ref = PairRef{ .level = op.level, .page = op.new_page, .slot = op.new_slot };
+        const a = stored.a[op.new_slot];
+        const b = stored.b[op.new_slot];
+        const a_index = self.appendRefAssume(a, ref);
+        const b_index = self.appendRefAssume(b, ref);
+        self.slot_refs.putAssumeCapacityNoClobber(slotKey(op.new_page, op.new_slot), .{ .a = a_index, .b = b_index });
+    }
+
+    fn appendRefAssume(self: *TriggerStore, entity: EntityId, ref: PairRef) u32 {
+        const list = self.pair_refs.getPtr(entity).?;
+        const index: u32 = @intCast(list.items.len);
+        list.appendAssumeCapacity(ref);
+        return index;
+    }
+
+    fn dropPairRef(self: *TriggerStore, page_id: u32, slot: u8) void {
+        const ends = self.slot_refs.fetchRemove(slotKey(page_id, slot)).?.value;
+        const stored = self.page(page_id);
+        const a = stored.a[slot];
+        const b = stored.b[slot];
+        if (a.eql(b)) {
+            const hi = @max(ends.a, ends.b);
+            const lo = @min(ends.a, ends.b);
+            self.removeRefAt(a, hi);
+            self.removeRefAt(a, lo);
+        } else {
+            self.removeRefAt(a, ends.a);
+            self.removeRefAt(b, ends.b);
+        }
+    }
+
+    fn removeRefAt(self: *TriggerStore, entity: EntityId, index: u32) void {
+        const list = self.pair_refs.getPtr(entity).?;
+        const last: u32 = @intCast(list.items.len - 1);
+        if (index != last) {
+            const moved = list.items[last];
+            list.items[index] = moved;
+            self.patchSlotIndex(entity, moved, last, index);
+        }
+        list.items.len -= 1;
+        // The same patch may insert this entity again. Retire checks the id after the inserts.
+        if (list.items.len == 0) self.index_created.appendAssumeCapacity(entity);
+    }
+
+    fn patchSlotIndex(self: *TriggerStore, entity: EntityId, moved: PairRef, from: u32, to: u32) void {
+        const ends = self.slot_refs.getPtr(slotKey(moved.page, moved.slot)).?;
+        const stored = self.page(moved.page);
+        var patched = false;
+        if (stored.a[moved.slot].eql(entity) and ends.a == from) {
+            ends.a = to;
+            patched = true;
+        }
+        if (stored.b[moved.slot].eql(entity) and ends.b == from) {
+            ends.b = to;
+            patched = true;
+        }
+        std.debug.assert(patched);
+    }
+
     // ---- Refresh (workers) ---------------------------------------------------------------
 
-    /// Re-resolves every stored pair's rows and emit bits when `data`'s allow epoch moved
-    /// past `refreshed_epoch`; true when it ran. Ranges own the pages that start in them and
-    /// rewrite their masks. A range holding every page of a height-1 node writes its valid and
-    /// allowed prefixes and totals; a node split at a range edge gets each page's raw counts,
-    /// which main turns into prefixes before folding the nodes above, the level counts and the
-    /// rank. Never allocates.
-    pub fn refresh(self: *TriggerStore, threads: StoreThreads, data: *const DataSystem) bool {
+    /// Re-resolves the pairs that name an entity recorded since `refreshed_epoch`. Drains
+    /// that list and stamps the epoch even when none of them is stored. True when it
+    /// dispatched. Gathers into the reserved buffer and sorts it with the refresh sort
+    /// stages before the refresh dispatch. The sort, the job, and the fold allocate nothing
+    /// once the install has reserved them; a failure before the stamp leaves the record list
+    /// and the epoch.
+    pub fn refresh(self: *TriggerStore, threads: StoreThreads, data: *DataSystem) error{OutOfMemory}!bool {
         const epoch = data.collision_allow_epoch;
-        if (self.pair_count == 0 or (self.refreshed_epoch != null and self.refreshed_epoch.? == epoch)) return false;
+        if (self.refreshed_epoch != null and self.refreshed_epoch.? == epoch) {
+            // A rebuild stamps the epoch after writing current rows, so any ids recorded
+            // before that stamp are already reflected and are not a dispatch.
+            data.collision_allow_records.clearRetainingCapacity();
+            return false;
+        }
+        const records = &data.collision_allow_records;
+        if (records.items.len > 1) {
+            pdqSort(EntityId, records.items, {}, entityIdLess);
+            var kept: usize = 0;
+            for (records.items) |id| {
+                if (kept == 0 or !records.items[kept - 1].eql(id)) {
+                    records.items[kept] = id;
+                    kept += 1;
+                }
+            }
+            records.items.len = kept;
+        }
+        var bound: usize = 0;
+        for (records.items) |id| {
+            if (self.pair_refs.get(id)) |list| bound += list.items.len;
+        }
+        self.affected.clearRetainingCapacity();
+        self.refresh_deltas.clearRetainingCapacity();
+        try self.affected.ensureTotalCapacity(self.allocator, bound);
+        try self.refresh_deltas.ensureTotalCapacity(self.allocator, bound);
+        for (records.items) |id| {
+            const list = self.pair_refs.getPtr(id) orelse continue;
+            self.affected.appendSliceAssumeCapacity(list.items);
+        }
+        const sorted = try self.sortAffected(threads);
+        if (comptime runtime_perf_log.enabled) self.perf.last_refresh_sort = sorted;
+        if (self.affected.items.len > 1) {
+            var kept: usize = 0;
+            for (self.affected.items) |ref| {
+                if (kept == 0 or self.affected.items[kept - 1].page != ref.page or self.affected.items[kept - 1].slot != ref.slot) {
+                    self.affected.items[kept] = ref;
+                    kept += 1;
+                }
+            }
+            self.affected.items.len = kept;
+        }
+        const pair_items = self.affected.items.len;
         const dispatch = threads.stage(self.tuners.getPtr(.refresh));
-        const shape = StageShape.select(dispatch, self.pair_count, refresh_range_alignment_items);
+        const shape = StageShape.select(if (pair_items == 0) null else dispatch, pair_items, refresh_range_alignment_items);
+        try self.refresh_ranges.ensureTotalCapacity(self.allocator, shape.range_count);
+        // The scratch is reserved. A failure above left the record list and the epoch.
+        records.clearRetainingCapacity();
+        self.refreshed_epoch = epoch;
+        if (pair_items == 0) return false;
+        self.refresh_deltas.items.len = pair_items;
+        self.refresh_ranges.clearRetainingCapacity();
+        for (0..shape.range_count) |_| self.refresh_ranges.appendAssumeCapacity(.{});
         var job = RefreshJob{
             .store = self,
             .data = data,
+            .affected = self.affected.items,
+            .deltas = self.refresh_deltas.items,
+            .range_counts = self.refresh_ranges.items,
             .items_per_range = shape.items_per_range,
             .range_count = shape.range_count,
         };
-        const batch = runShaped(dispatch, shape, self.pair_count, refresh_range_alignment_items, &job, refreshJob);
+        const batch = runShaped(dispatch, shape, pair_items, refresh_range_alignment_items, &job, refreshJob);
         const timer = StageTimer.begin();
-        const entries = self.foldRefreshed(shape.items_per_range, shape.range_count);
+        const entries = self.foldDeltas(shape.items_per_range, shape.range_count);
         if (comptime runtime_perf_log.enabled) {
             self.perf.last_batches.set(.refresh, batch);
             self.perf.last_refresh_fold = .{ .entries = entries, .ns = timer.lap() };
         }
-        self.refreshed_epoch = epoch;
         return true;
     }
 
-    // After a refresh's join, on main: each height-1 node split at a range edge turns its
-    // pages' raw counts into prefixes and totals, each node above height 1 sums its children's
-    // totals, then the level counts, the rank and the store sums follow. O(R (log L + H log F
-    // + F) + N1 + L), O(1) per entry. Returns the entries it visited (counted only with
-    // `runtime_perf_log.enabled`).
-    fn foldRefreshed(self: *TriggerStore, items_per_range: usize, range_count: usize) usize {
+    // After the join, on main: each dirty page's delta walks that level's path and adds into
+    // the later prefix entries, the node totals, the level totals, the store sums, and the
+    // rank. Pair-start prefixes are not rewritten. Does not iterate `levels.items`.
+    fn foldDeltas(self: *TriggerStore, items_per_range: usize, range_count: usize) usize {
         var entries: usize = 0;
-        // The nodes split at range edges, in order: a node an edge splits holds the first page
-        // starting at or past that edge at an entry past its first.
-        var last_split: u32 = no_entry;
-        for (1..range_count) |range_index| {
-            var cursor = self.cursorAt(@intCast(range_index * items_per_range));
-            if (cursor.offset != 0) cursor.nextPage();
-            if (!cursor.valid() or cursor.height == 0 or cursor.path.entries[0] == 0) continue;
-            const split = cursor.path.nodes[0];
-            if (split == last_split) continue;
-            last_split = split;
-            const at = self.node(split);
-            var valid: u32 = 0;
-            var allowed: u32 = 0;
-            for (at.valid_start[0..at.header.count], at.allowed_start[0..at.header.count]) |*valid_start, *allowed_start| {
-                const page_valid = valid_start.*;
-                const page_allowed = allowed_start.*;
-                valid_start.* = valid;
-                allowed_start.* = allowed;
-                valid += page_valid;
-                allowed += page_allowed;
+        for (self.refresh_ranges.items[0..range_count], 0..) |range, index| {
+            const base = index * items_per_range;
+            for (self.refresh_deltas.items[base..][0..range.count]) |delta| {
+                entries += self.applyCountDelta(delta);
             }
-            at.header.totals.set(.valid, valid);
-            at.header.totals.set(.allowed, allowed);
-            if (comptime runtime_perf_log.enabled) entries += at.header.count;
         }
-        var valid: u32 = 0;
-        var allowed: u32 = 0;
-        for (self.levels.items) |*tree| {
-            if (tree.root == no_entry) continue;
-            if (tree.height >= 2) {
-                const folded = self.foldNode(tree.root, tree.height);
-                if (comptime runtime_perf_log.enabled) entries += folded;
-            }
-            const counts = self.subtreeCounts(tree.root, tree.height);
-            std.debug.assert(counts.get(.pairs) == tree.counts.get(.pairs));
-            tree.counts = counts;
-            valid += counts.get(.valid);
-            allowed += counts.get(.allowed);
-        }
-        self.level_rank.build(self.levels.items);
-        self.valid_count = valid;
-        self.allowed_count = allowed;
-        if (comptime runtime_perf_log.enabled) entries += range_count + self.levels.items.len;
         return entries;
     }
 
-    // Node `id` at `height` (at least 2) takes its children's valid and allowed totals, each
-    // child above height 1 folded first, into its prefixes and totals. Returns the entries it
-    // and its folded children hold (counted only with `runtime_perf_log.enabled`).
-    fn foldNode(self: *TriggerStore, id: u32, height: usize) usize {
-        const at = self.node(id);
-        var entries: usize = if (comptime runtime_perf_log.enabled) at.header.count else 0;
-        var valid: u32 = 0;
-        var allowed: u32 = 0;
-        for (at.child[0..at.header.count], at.valid_start[0..at.header.count], at.allowed_start[0..at.header.count]) |child, *valid_start, *allowed_start| {
-            if (height > 2) {
-                const folded = self.foldNode(child, height - 1);
-                if (comptime runtime_perf_log.enabled) entries += folded;
+    // Point-adds one dirty page. std has no point-update prefix; `level_rank` is the one.
+    fn applyCountDelta(self: *TriggerStore, delta: RefreshDelta) usize {
+        var entries: usize = 0;
+        const level: usize = delta.level;
+        const tree = &self.levels.items[level];
+        if (tree.height != 0) {
+            const key = self.pageKeys(delta.page)[0];
+            const Step = struct { id: u32, entry: u32 };
+            var steps: [max_tree_height]Step = undefined;
+            var depth: usize = 0;
+            var node_id = tree.root;
+            var height: usize = tree.height;
+            while (height > 0) {
+                height -= 1;
+                const at = self.node(node_id);
+                const entry = std.sort.upperBound(u256, at.first_key[0..at.header.count], key, orderU256) -| 1;
+                steps[depth] = .{ .id = node_id, .entry = @intCast(entry) };
+                depth += 1;
+                node_id = at.child[entry];
             }
-            const totals = self.node(child).header.totals;
-            valid_start.* = valid;
-            allowed_start.* = allowed;
-            valid += totals.get(.valid);
-            allowed += totals.get(.allowed);
+            std.debug.assert(node_id == delta.page);
+            var step_index = depth;
+            while (step_index > 0) {
+                step_index -= 1;
+                const at = self.node(steps[step_index].id);
+                var sibling = steps[step_index].entry + 1;
+                while (sibling < at.header.count) : (sibling += 1) {
+                    at.valid_start[sibling] = addDelta(at.valid_start[sibling], delta.valid_delta);
+                    at.allowed_start[sibling] = addDelta(at.allowed_start[sibling], delta.allowed_delta);
+                    if (comptime runtime_perf_log.enabled) entries += 1;
+                }
+                at.header.totals.set(.valid, addDelta(at.header.totals.get(.valid), delta.valid_delta));
+                at.header.totals.set(.allowed, addDelta(at.header.totals.get(.allowed), delta.allowed_delta));
+                if (comptime runtime_perf_log.enabled) entries += 1;
+            }
         }
-        at.header.totals.set(.valid, valid);
-        at.header.totals.set(.allowed, allowed);
+        tree.counts.set(.valid, addDelta(tree.counts.get(.valid), delta.valid_delta));
+        tree.counts.set(.allowed, addDelta(tree.counts.get(.allowed), delta.allowed_delta));
+        self.valid_count = addDelta(self.valid_count, delta.valid_delta);
+        self.allowed_count = addDelta(self.allowed_count, delta.allowed_delta);
+        var rank = std.EnumArray(PairCount, i64).initFill(0);
+        rank.set(.valid, delta.valid_delta);
+        rank.set(.allowed, delta.allowed_delta);
+        self.level_rank.add(level, rank);
+        if (comptime runtime_perf_log.enabled) entries += 1;
         return entries;
     }
 };
@@ -1975,8 +2390,17 @@ const LeafJob = struct {
     store: *const TriggerStore,
     runs: []const Run,
     outputs: []LevelOutput,
+    index_ops: []IndexOp,
+    op_bases: []const u32,
     range_count: usize,
 };
+
+fn outputPairBounds(run: Run, index_in_run: u32) struct { begin: u32, end: u32 } {
+    return .{
+        .begin = @intCast(@as(u64, index_in_run) * run.n / run.m),
+        .end = @intCast(@as(u64, index_in_run + 1) * run.n / run.m),
+    };
+}
 
 // Scalar: a key-compare merge of kept pairs with sorted inserts, the kept spans copied per
 // column with `@memcpy`, each insert transposed from its record into the columns. The range
@@ -1988,22 +2412,29 @@ fn leafJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     var run_index = std.sort.upperBound(Run, job.runs, @as(u32, @intCast(range.start)), orderRunOutput) - 1;
     for (range.start..range.end) |output| {
         while (output >= job.runs[run_index].out_base + job.runs[run_index].m) run_index += 1;
-        job.outputs[output] = writePage(job.store, job.runs[run_index], @intCast(output));
+        const run = job.runs[run_index];
+        const bounds = outputPairBounds(run, @intCast(output - run.out_base));
+        const count: usize = bounds.end - bounds.begin;
+        const base = job.op_bases[output];
+        job.outputs[output] = writePage(job.store, run, @intCast(output), job.index_ops[base..][0..count]);
     }
 }
 
-// Writes output page `output` of `run` and returns its record.
-fn writePage(store: *const TriggerStore, run: Run, output: u32) LevelOutput {
+// Writes output page `output` of `run` and returns its record. `ops` receives one record per
+// written pair, in slot order: an insert, or a move from the kept source slot.
+fn writePage(store: *const TriggerStore, run: Run, output: u32, ops: []IndexOp) LevelOutput {
     std.debug.assert(output >= run.out_base and output < run.out_base + run.m);
     const index = output - run.out_base;
-    const begin: u32 = @intCast(@as(u64, index) * run.n / run.m);
-    const end: u32 = @intCast(@as(u64, index + 1) * run.n / run.m);
+    const bounds = outputPairBounds(run, index);
+    const begin = bounds.begin;
+    const end = bounds.end;
     const segments = store.segments.items[run.seg_lo..run.seg_hi];
     const inserts = store.sorted_inserts.items[run.ins_lo..][0..run.ins_count];
     var kept_taken = mergeSplit(store, segments, run.kept, inserts, begin);
     var inserts_taken = begin - kept_taken;
     const id = store.outputId(0, output);
     const dest = store.page(id);
+    const level: u32 = store.touched_levels.items[run.level_record].level;
     // The kept cursor: segment, its page and slot of kept pair `kept_taken`. `source` is
     // set while kept pairs remain.
     var segment_index: usize = 0;
@@ -2015,12 +2446,21 @@ fn writePage(store: *const TriggerStore, run: Run, output: u32) LevelOutput {
         slot = selectBit(lowSlots(segments[segment_index].hi) & ~segments[segment_index].mask, kept_taken - segments[segment_index].pos);
     }
     const count = end - begin;
+    std.debug.assert(ops.len == count);
     var written: u32 = 0;
     while (written < count) {
         const take_kept = kept_taken < run.kept and (inserts_taken == inserts.len or
             source.keys[slot] < inserts[inserts_taken].key);
         if (!take_kept) {
             writeInsert(dest, written, inserts[inserts_taken]);
+            ops[written] = .{
+                .kind = .insert,
+                .level = level,
+                .new_page = id,
+                .new_slot = @intCast(written),
+                .old_page = 0,
+                .old_slot = 0,
+            };
             inserts_taken += 1;
             written += 1;
             continue;
@@ -2038,6 +2478,17 @@ fn writePage(store: *const TriggerStore, run: Run, output: u32) LevelOutput {
             span = below;
         }
         copyPairs(dest, written, source, slot, span);
+        const source_page = segment.id;
+        for (0..span) |pair| {
+            ops[written + @as(u32, @intCast(pair))] = .{
+                .kind = .move,
+                .level = level,
+                .new_page = id,
+                .new_slot = @intCast(written + @as(u32, @intCast(pair))),
+                .old_page = source_page,
+                .old_slot = @intCast(slot + @as(u32, @intCast(pair))),
+            };
+        }
         written += span;
         kept_taken += span;
         if (kept_taken == run.kept) continue;
@@ -2159,79 +2610,102 @@ fn writeNode(store: *const TriggerStore, id: u32, children: []const LevelOutput,
     return .{ .first_key = dest.first_key[0], .id = id, .counts = .{ .values = totals } };
 }
 
-// ---- Refresh job (stored pairs; ranges own the pages starting in them) ---------------------
+// ---- Refresh job (affected pairs; the range that owns a page's first item finishes it) ------
 
 const RefreshJob = struct {
     store: *const TriggerStore,
     data: *const DataSystem,
+    affected: []const PairRef,
+    deltas: []RefreshDelta,
+    range_counts: []RefreshRangeCount,
     items_per_range: usize,
     range_count: usize,
 };
 
+const ResolvedSlot = struct {
+    a_row: u32,
+    b_row: u32,
+    emit: u8,
+};
+
+// The assignments a stored pair's rows and emit take: hinted resolve of each endpoint, or
+// `no_row` and a clear emit when either side has no movement body.
+fn resolveStoredSlot(data: *const DataSystem, entities: []const EntityId, tier: anytype, a: EntityId, b: EntityId, a_hint: u32, b_hint: u32) ResolvedSlot {
+    const a_row = data.movementBodyDenseIndexHinted(entities, a, a_hint);
+    const b_row = data.movementBodyDenseIndexHinted(entities, b, b_hint);
+    if (a_row == null or b_row == null) {
+        return .{
+            .a_row = if (a_row) |row| storedRow(row) else no_row,
+            .b_row = if (b_row) |row| storedRow(row) else no_row,
+            .emit = 0,
+        };
+    }
+    return .{
+        .a_row = storedRow(a_row.?),
+        .b_row = storedRow(b_row.?),
+        .emit = emitBits(tier[a_row.?].allowsCollision(), tier[b_row.?].allowsCollision()),
+    };
+}
+
+fn storeResolvedSlot(page: Page, slot: usize, resolved: ResolvedSlot, valid_delta: *i32, allowed_delta: *i32) void {
+    const old = page.emit[slot];
+    valid_delta.* += @as(i32, @intFromBool(countsAs(resolved.emit, .valid))) - @as(i32, @intFromBool(countsAs(old, .valid)));
+    allowed_delta.* += @as(i32, @intFromBool(countsAs(resolved.emit, .allowed))) - @as(i32, @intFromBool(countsAs(old, .allowed)));
+    page.a_row[slot] = resolved.a_row;
+    page.b_row[slot] = resolved.b_row;
+    page.emit[slot] = resolved.emit;
+    const bit = @as(u64, 1) << @intCast(slot);
+    if (countsAs(resolved.emit, .valid)) page.header.valid_mask |= bit else page.header.valid_mask &= ~bit;
+    if (countsAs(resolved.emit, .allowed)) page.header.allowed_mask |= bit else page.header.allowed_mask &= ~bit;
+}
+
+fn addDelta(count: u32, delta: i32) u32 {
+    const sum = @as(i64, count) + delta;
+    std.debug.assert(sum >= 0 and sum <= std.math.maxInt(u32));
+    return @intCast(sum);
+}
+
 // Scalar: per pair two hinted row resolves into another store and two u8 tier loads; the
-// movement columns are not in pair order, and `simd.zig` has no u8 gather. A height-1 node
-// whose pages all start in the range gets its prefixes as a running sum over them; a node
-// split at a range edge gets each page's counts, which `foldRefreshed` prefixes.
+// movement columns are not in pair order, and `simd.zig` has no u8 gather. A page is owned
+// by the range that holds its first affected item, including items past that range's end.
+// Untouched slots are not read. Prefixes are applied on main from the deltas.
 fn refreshJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *RefreshJob = @ptrCast(@alignCast(context));
-    const store = job.store;
+    const affected = job.affected;
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start == range.index * job.items_per_range and range.end <= store.pair_count);
+    std.debug.assert(range.start == range.index * job.items_per_range and range.end <= affected.len);
+    std.debug.assert(range.end - range.start <= job.deltas.len - range.start);
     const entities = job.data.movement_bodies.sliceConst().entities;
     const tier = job.data.scopeColumnsSliceConst().tier;
     std.debug.assert(entities.len == tier.len);
-    var cursor = store.cursorAt(@intCast(range.start));
-    if (cursor.offset != 0) cursor.nextPage();
-    // Whether the range holds every page of the cursor's height-1 node: false for a node it
-    // starts inside.
-    var whole = false;
-    var valid: u32 = 0;
-    var allowed: u32 = 0;
-    while (cursor.valid() and cursor.page_start < range.end) : (cursor.nextPage()) {
-        const at = cursor.page();
-        var valid_mask: u64 = 0;
-        var allowed_mask: u64 = 0;
-        for (0..cursor.page_len) |slot| {
-            const a_row = job.data.movementBodyDenseIndexHinted(entities, at.a[slot], at.a_row[slot]);
-            const b_row = job.data.movementBodyDenseIndexHinted(entities, at.b[slot], at.b_row[slot]);
-            if (a_row == null or b_row == null) {
-                at.a_row[slot] = if (a_row) |row| storedRow(row) else no_row;
-                at.b_row[slot] = if (b_row) |row| storedRow(row) else no_row;
-                at.emit[slot] = 0;
-                continue;
-            }
-            at.a_row[slot] = storedRow(a_row.?);
-            at.b_row[slot] = storedRow(b_row.?);
-            at.emit[slot] = emitBits(tier[a_row.?].allowsCollision(), tier[b_row.?].allowsCollision());
-            const bit = @as(u64, 1) << @intCast(slot);
-            valid_mask |= bit;
-            if (countsAs(at.emit[slot], .allowed)) allowed_mask |= bit;
-        }
-        at.header.valid_mask = valid_mask;
-        at.header.allowed_mask = allowed_mask;
-        if (cursor.height == 0) continue;
-        // Reads only the parent's pairs prefixes and count, which no range writes.
-        const parent = store.node(cursor.path.nodes[0]);
-        const entry = cursor.path.entries[0];
-        const last_entry = parent.header.count - 1;
-        if (entry == 0) {
-            whole = cursor.page_start + parent.start[last_entry] < range.end;
-            valid = 0;
-            allowed = 0;
-        }
-        if (!whole) {
-            parent.valid_start[entry] = @popCount(valid_mask);
-            parent.allowed_start[entry] = @popCount(allowed_mask);
-            continue;
-        }
-        parent.valid_start[entry] = valid;
-        parent.allowed_start[entry] = allowed;
-        valid += @popCount(valid_mask);
-        allowed += @popCount(allowed_mask);
-        if (entry < last_entry) continue;
-        parent.header.totals.set(.valid, valid);
-        parent.header.totals.set(.allowed, allowed);
+    var index = range.start;
+    if (index > 0 and index < affected.len and affected[index].page == affected[index - 1].page) {
+        const page = affected[index].page;
+        while (index < affected.len and affected[index].page == page) index += 1;
     }
+    var written: usize = 0;
+    while (index < range.end) {
+        const page_id = affected[index].page;
+        const level = affected[index].level;
+        const at = job.store.page(page_id);
+        var valid_delta: i32 = 0;
+        var allowed_delta: i32 = 0;
+        while (index < affected.len and affected[index].page == page_id) {
+            const slot = affected[index].slot;
+            const resolved = resolveStoredSlot(job.data, entities, tier, at.a[slot], at.b[slot], at.a_row[slot], at.b_row[slot]);
+            storeResolvedSlot(at, slot, resolved, &valid_delta, &allowed_delta);
+            index += 1;
+        }
+        if (valid_delta == 0 and allowed_delta == 0) continue;
+        job.deltas[range.start + written] = .{
+            .level = level,
+            .page = page_id,
+            .valid_delta = valid_delta,
+            .allowed_delta = allowed_delta,
+        };
+        written += 1;
+    }
+    job.range_counts[range.index].count = @intCast(written);
 }
 
 // ---- Tests --------------------------------------------------------------------------------
@@ -2421,6 +2895,57 @@ fn expectTreeValid(store: *const TriggerStore) !void {
     for (store.leaf_pending.items) |pending| try testing.expectEqual(@as(u32, 0), pending);
     for (store.node_pending.items) |pending| try testing.expectEqual(@as(u32, 0), pending);
     for (store.level_pending.items) |pending| try testing.expectEqual(@as(u32, 0), pending);
+    try expectIndexMatches(store);
+}
+
+// Every stored pair is indexed at both endpoints, and every index ref names that pair.
+fn expectIndexMatches(store: *const TriggerStore) !void {
+    if (store.pair_count == 0) {
+        try testing.expectEqual(@as(usize, 0), store.pair_refs.count());
+        try testing.expectEqual(@as(usize, 0), store.slot_refs.count());
+        return;
+    }
+    var seen: u32 = 0;
+    var cursor = store.cursorAt(0);
+    while (cursor.valid()) : ({
+        cursor.next();
+        seen += 1;
+    }) {
+        const page_id = cursor.path.leaf;
+        const slot: u8 = @intCast(cursor.offset);
+        const ends = store.slot_refs.get(slotKey(page_id, slot)).?;
+        const page = cursor.page();
+        const a_list = store.pair_refs.getPtr(page.a[slot]).?;
+        const b_list = store.pair_refs.getPtr(page.b[slot]).?;
+        const a_ref = a_list.items[ends.a];
+        const b_ref = b_list.items[ends.b];
+        try testing.expectEqual(page_id, a_ref.page);
+        try testing.expectEqual(slot, a_ref.slot);
+        try testing.expectEqual(page_id, b_ref.page);
+        try testing.expectEqual(slot, b_ref.slot);
+        try testing.expectEqual(@as(u32, cursor.path.level), a_ref.level);
+        if (page.a[slot].eql(page.b[slot])) try testing.expect(ends.a != ends.b);
+    }
+    try testing.expectEqual(store.pair_count, seen);
+    var refs: usize = 0;
+    var lists = store.pair_refs.iterator();
+    while (lists.next()) |entry| {
+        try testing.expect(entry.value_ptr.items.len != 0);
+        for (entry.value_ptr.items, 0..) |ref, index| {
+            refs += 1;
+            const page = store.page(ref.page);
+            try testing.expect(ref.slot < page.header.len);
+            const entity = entry.key_ptr.*;
+            const is_a = page.a[ref.slot].eql(entity);
+            const is_b = page.b[ref.slot].eql(entity);
+            try testing.expect(is_a or is_b);
+            const ends = store.slot_refs.get(slotKey(ref.page, ref.slot)).?;
+            const at: u32 = @intCast(index);
+            try testing.expect((is_a and ends.a == at) or (is_b and ends.b == at));
+        }
+    }
+    try testing.expectEqual(store.pair_count * 2, refs);
+    try testing.expectEqual(store.pair_count, store.slot_refs.count());
 }
 
 // The store's walk from ordinal 0 holds exactly `reference`, with each pair's columns.
@@ -3051,6 +3576,33 @@ test "collision trigger store warm patches allocate nothing on a 2-worker pool" 
     try expectStoredKeys(&store, &keys);
 }
 
+test "a warm patch that drops an entity's last pair and inserts it again allocates nothing" {
+    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer thread_system.deinit();
+    var store = TriggerStore.init(testing.allocator);
+    defer store.deinit();
+    const key = testKey(0, 0, 1, 2);
+    try rebuildKeys(&store, testThreads(&thread_system), &.{key}, 1);
+    // The entity's only pair leaves the map, so the next insert is a new endpoint.
+    var revision: u64 = 2;
+    for (0..3) |cycle| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        if (cycle == 2) store.allocator = failing.allocator();
+        defer store.allocator = testing.allocator;
+        try testing.expectEqual(@as(usize, 0), store.spare_ref_lists.items.len);
+        try patchKeys(&store, testThreads(&thread_system), &.{}, &.{key}, &.{}, 1, revision);
+        revision += 1;
+        try testing.expectEqual(@as(usize, 2), store.spare_ref_lists.items.len);
+        try patchKeys(&store, testThreads(&thread_system), &.{key}, &.{}, &.{}, 1, revision);
+        revision += 1;
+        try testing.expectEqual(@as(usize, 0), store.spare_ref_lists.items.len);
+        try testing.expect(!failing.has_induced_failure);
+        try testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
+    try expectTreeValid(&store);
+    try expectStoredKeys(&store, &.{key});
+}
+
 // The refresh tests' pair `index`: a one-page level 0, a height-2 level 2 of three height-1
 // subtrees, and a one-page level 5.
 fn entityPairKey(index: usize) u256 {
@@ -3060,18 +3612,26 @@ fn entityPairKey(index: usize) u256 {
 
 const entity_pairs_level_end = 8600;
 
-// Stored pairs naming `entities` in a chain, every row hint stale (row 0).
-fn rebuildEntityPairs(store: *TriggerStore, threads: StoreThreads, entities: []const EntityId) !void {
+// Stored pairs naming `entities` in a chain. Rows and emit are current, so a later refresh
+// re-resolves only the entities recorded after this rebuild.
+fn rebuildEntityPairs(store: *TriggerStore, threads: StoreThreads, data: *const DataSystem, entities: []const EntityId) !void {
     var inserts: std.ArrayList(InsertEdit) = .empty;
     defer inserts.deinit(testing.allocator);
+    const tier = data.scopeColumnsSliceConst().tier;
     for (entities[0 .. entities.len - 1], entities[1..], 0..) |a, b, index| {
         const key = entityPairKey(index);
         var contact = testContact(key);
         contact.a = a;
         contact.b = b;
-        contact.a_movement_index = 0;
-        contact.b_movement_index = 0;
-        try inserts.append(testing.allocator, .{ .key = key, .contact = contact, .emit = emit_valid | emit_allowed });
+        const a_row = data.movementBodyDenseIndex(a).?;
+        const b_row = data.movementBodyDenseIndex(b).?;
+        contact.a_movement_index = a_row;
+        contact.b_movement_index = b_row;
+        try inserts.append(testing.allocator, .{
+            .key = key,
+            .contact = contact,
+            .emit = emitBits(tier[a_row].allowsCollision(), tier[b_row].allowsCollision()),
+        });
     }
     std.sort.pdq(InsertEdit, inserts.items, {}, struct {
         fn less(_: void, lhs: InsertEdit, rhs: InsertEdit) bool {
@@ -3121,8 +3681,8 @@ test "collision trigger store refresh re-resolves rows, emit bits and every coun
     defer serial.deinit();
     var threaded = TriggerStore.init(testing.allocator);
     defer threaded.deinit();
-    try rebuildEntityPairs(&serial, testThreads(&serial_system), &entities);
-    try rebuildEntityPairs(&threaded, testThreads(&thread_system), &entities);
+    try rebuildEntityPairs(&serial, testThreads(&serial_system), &data, &entities);
+    try rebuildEntityPairs(&threaded, testThreads(&thread_system), &data, &entities);
     try testing.expectEqual(@as(u8, 2), serial.levels.items[2].height);
     try testing.expect(serial.pair_count > 2 * refresh_range_alignment_items);
     // Uneven pages, so ranges start inside pages.
@@ -3131,32 +3691,259 @@ test "collision trigger store refresh re-resolves rows, emit bits and every coun
     try patchKeys(&serial, testThreads(&serial_system), &.{}, &drops, &.{}, 1, 2);
     try patchKeys(&threaded, testThreads(&thread_system), &.{}, &drops, &.{}, 1, 2);
     // Destroys swap rows and move the epoch; one entity is left without a movement row.
-    try testing.expect(data.destroyEntity(entities[5]));
-    try testing.expect(data.destroyEntity(entities[200]));
-    try testing.expect(serial.refresh(testThreads(&serial_system), &data));
-    // The refresh keeps no range slots: the first one allocates nothing.
+    try testing.expect(try data.destroyEntity(entities[5]));
+    try testing.expect(try data.destroyEntity(entities[200]));
+    // Both stores re-resolve the same recorded ids. The first refresh drains the list.
+    const recorded = try testing.allocator.dupe(EntityId, data.collision_allow_records.items);
+    defer testing.allocator.free(recorded);
+    try testing.expect(try serial.refresh(testThreads(&serial_system), &data));
+    try data.collision_allow_records.appendSlice(testing.allocator, recorded);
+    // The first refresh reserves the scratch. A later one, warm, allocates nothing.
+    try testing.expect(try threaded.refresh(testThreads(&thread_system), &data));
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     threaded.allocator = failing.allocator();
-    const ran = threaded.refresh(testThreads(&thread_system), &data);
-    threaded.allocator = testing.allocator;
-    try testing.expect(ran);
-    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    defer threaded.allocator = testing.allocator;
     try expectRefreshed(&serial, &data);
     try expectRefreshed(&threaded, &data);
     try testing.expectEqual(serial.valid_count, threaded.valid_count);
     try testing.expectEqual(serial.allowed_count, threaded.allowed_count);
     // A current epoch does not refresh; an allow crossing moves it.
-    try testing.expect(!threaded.refresh(testThreads(&thread_system), &data));
+    try testing.expect(!try threaded.refresh(testThreads(&thread_system), &data));
     try data.setSimulationTier(entities[11], .dormant);
-    try testing.expect(threaded.refresh(testThreads(&thread_system), &data));
+    const cross_11 = try testing.allocator.dupe(EntityId, data.collision_allow_records.items);
+    defer testing.allocator.free(cross_11);
+    try testing.expect(try threaded.refresh(testThreads(&thread_system), &data));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
     try expectRefreshed(&threaded, &data);
-    // Ranges three alignments wide: some height-1 nodes lie whole in one range, whose worker
-    // writes their prefixes, and the others split at a range edge, which main prefixes.
+    // A wide range still owns each dirty page from its first affected item. Main folds only
+    // those pages' prefix deltas.
     try data.setSimulationTier(entities[12], .dormant);
+    const cross_12 = try testing.allocator.dupe(EntityId, data.collision_allow_records.items);
+    defer testing.allocator.free(cross_12);
     const wide: StoreThreads = .{ .thread_system = &thread_system, .config = .{ .items_per_range = 3 * refresh_range_alignment_items, .max_worker_threads = thread_system.workerThreadCount(), .adaptive = false } };
-    try testing.expect(threaded.refresh(wide, &data));
-    try testing.expect(serial.refresh(testThreads(&serial_system), &data));
+    try testing.expect(try threaded.refresh(wide, &data));
+    try data.collision_allow_records.appendSlice(testing.allocator, cross_11);
+    try data.collision_allow_records.appendSlice(testing.allocator, cross_12);
+    try testing.expect(try serial.refresh(testThreads(&serial_system), &data));
     try expectRefreshed(&threaded, &data);
     try expectRefreshed(&serial, &data);
     try testing.expectEqual(serial.allowed_count, threaded.allowed_count);
+}
+
+// Four aligned refresh ranges: one reserved range rounds up to three slots, so this pair
+// count allocates unless the range reserve is `maxRangeCount`. Both endpoints of every
+// pair make the gather bound `2 * pair_count`.
+test "collision stored trigger refresh of every live endpoint allocates nothing after install" {
+    var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer serial_system.deinit();
+    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer thread_system.deinit();
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const pairs = 4 * refresh_range_alignment_items;
+    var entities: [pairs + 1]EntityId = undefined;
+    for (&entities, 0..) |*entity, index| {
+        entity.* = try data.createEntity();
+        const position = @as(f32, @floatFromInt(index));
+        try data.setMovementBody(entity.*, .{ .position = .{ .x = position, .y = 0 }, .previous_position = .{ .x = position, .y = 0 } });
+        try data.setSimulationTier(entity.*, .locomotion);
+    }
+    var serial = TriggerStore.init(testing.allocator);
+    defer serial.deinit();
+    var threaded = TriggerStore.init(testing.allocator);
+    defer threaded.deinit();
+    try rebuildEntityPairs(&serial, testThreads(&serial_system), &data, &entities);
+    try rebuildEntityPairs(&threaded, testThreads(&thread_system), &data, &entities);
+    try testing.expectEqual(@as(u32, @intCast(pairs)), serial.pair_count);
+    var refs: usize = 0;
+    var lists = serial.pair_refs.iterator();
+    while (lists.next()) |entry| refs += entry.value_ptr.items.len;
+    try testing.expectEqual(pairs * 2, refs);
+
+    data.collision_allow_records.clearRetainingCapacity();
+    try data.collision_allow_records.appendSlice(testing.allocator, &entities);
+    data.collision_allow_epoch +%= 1;
+    const recorded = try testing.allocator.dupe(EntityId, data.collision_allow_records.items);
+    defer testing.allocator.free(recorded);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    serial.allocator = failing.allocator();
+    threaded.allocator = failing.allocator();
+    defer serial.allocator = testing.allocator;
+    defer threaded.allocator = testing.allocator;
+    try testing.expect(try serial.refresh(testThreads(&serial_system), &data));
+    try data.collision_allow_records.appendSlice(testing.allocator, recorded);
+    try testing.expect(try threaded.refresh(testThreads(&thread_system), &data));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try testing.expectEqual(maxRangeCount(threaded.pair_count, refresh_range_alignment_items), threaded.refresh_ranges.items.len);
+    try testing.expectEqual(threaded.pair_count, @as(u32, @intCast(threaded.affected.items.len)));
+    try expectRefreshed(&serial, &data);
+    try expectRefreshed(&threaded, &data);
+    try testing.expectEqual(serial.valid_count, threaded.valid_count);
+    try testing.expectEqual(serial.allowed_count, threaded.allowed_count);
+}
+
+const SlotSnap = struct {
+    a: EntityId,
+    b: EntityId,
+    a_row: u32,
+    b_row: u32,
+    emit: u8,
+    key: u256,
+    normal_x: f32,
+    normal_y: f32,
+    valid: bool,
+    allowed: bool,
+};
+
+fn snapSlot(store: *const TriggerStore, key: u256) SlotSnap {
+    const piece = store.storedPiece(key).?;
+    const page = store.page(piece.page.path.leaf);
+    const slot: usize = piece.lo;
+    const bit = @as(u64, 1) << @intCast(piece.lo);
+    return .{
+        .a = page.a[slot],
+        .b = page.b[slot],
+        .a_row = page.a_row[slot],
+        .b_row = page.b_row[slot],
+        .emit = page.emit[slot],
+        .key = page.keys[slot],
+        .normal_x = page.normal_x[slot],
+        .normal_y = page.normal_y[slot],
+        .valid = page.header.valid_mask & bit != 0,
+        .allowed = page.header.allowed_mask & bit != 0,
+    };
+}
+
+fn corruptUntouchedRow(store: *TriggerStore, key: u256) void {
+    const piece = store.storedPiece(key).?;
+    const page = store.page(piece.page.path.leaf);
+    const slot: usize = piece.lo;
+    page.a_row[slot] = if (page.a_row[slot] == no_row) 0 else no_row;
+}
+
+// Two disjoint stored pairs. Crossing one entity's allow re-resolves only the pair that
+// names it. `adaptive = false` forces the production dispatch.
+fn expectAllowCrossLeavesOtherPair(workers: usize) !void {
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = workers });
+    defer threads.deinit();
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    var entities: [4]EntityId = undefined;
+    for (&entities, 0..) |*entity, index| {
+        entity.* = try data.createEntity();
+        const position = @as(f32, @floatFromInt(index)) * 64;
+        try data.setMovementBody(entity.*, .{ .position = .{ .x = position, .y = 0 }, .previous_position = .{ .x = position, .y = 0 } });
+        try data.setSimulationTier(entity.*, .locomotion);
+    }
+    const named_key = testKey(0, 0, 1, 0);
+    const other_key = testKey(0, 1, 1, 0);
+    var inserts: [2]InsertEdit = undefined;
+    const tier = data.scopeColumnsSliceConst().tier;
+    for (&inserts, [_]u256{ named_key, other_key }, [_][2]EntityId{ .{ entities[0], entities[1] }, .{ entities[2], entities[3] } }) |*edit, key, pair| {
+        var contact = testContact(key);
+        contact.a = pair[0];
+        contact.b = pair[1];
+        contact.a_movement_index = data.movementBodyDenseIndex(pair[0]).?;
+        contact.b_movement_index = data.movementBodyDenseIndex(pair[1]).?;
+        edit.* = .{
+            .key = key,
+            .contact = contact,
+            .emit = emitBits(tier[contact.a_movement_index].allowsCollision(), tier[contact.b_movement_index].allowsCollision()),
+        };
+    }
+    var store = TriggerStore.init(testing.allocator);
+    defer store.deinit();
+    try store.rebuild(testThreads(&threads), &.{.{ .inserts = &inserts }}, 1, data.collision_allow_epoch);
+    try testing.expect(!try store.refresh(testThreads(&threads), &data));
+    corruptUntouchedRow(&store, other_key);
+    const untouched = snapSlot(&store, other_key);
+    const named_before = snapSlot(&store, named_key);
+    try data.setSimulationTier(entities[0], .kinematic);
+    try testing.expect(try store.refresh(testThreads(&threads), &data));
+    const untouched_after = snapSlot(&store, other_key);
+    const named = snapSlot(&store, named_key);
+    try testing.expectEqual(untouched, untouched_after);
+    try testing.expectEqual(named_before.key, named.key);
+    try testing.expectEqual(named_before.normal_x, named.normal_x);
+    try testing.expectEqual(named_before.normal_y, named.normal_y);
+    try testing.expectEqual(named_before.a, named.a);
+    try testing.expectEqual(named_before.b, named.b);
+    const rows = data.movement_bodies.sliceConst().entities;
+    const scope = data.scopeColumnsSliceConst().tier;
+    const a_row = data.movementBodyDenseIndex(entities[0]).?;
+    const b_row = data.movementBodyDenseIndex(entities[1]).?;
+    try testing.expect(rows[a_row].eql(entities[0]));
+    try testing.expect(rows[b_row].eql(entities[1]));
+    try testing.expectEqual(storedRow(a_row), named.a_row);
+    try testing.expectEqual(storedRow(b_row), named.b_row);
+    try testing.expectEqual(emitBits(scope[a_row].allowsCollision(), scope[b_row].allowsCollision()), named.emit);
+    try testing.expect(named.valid);
+    try testing.expect(!named.allowed);
+}
+
+test "one entity allow crossing does not re-resolve a stored pair that does not name it" {
+    try expectAllowCrossLeavesOtherPair(0);
+    try expectAllowCrossLeavesOtherPair(2);
+}
+
+test "a failed collision allow record leaves the epoch, the tier, and the movement row" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 1, .y = 1 }, .previous_position = .{ .x = 1, .y = 1 } });
+    const row = data.movementBodyDenseIndex(entity).?;
+    const epoch = data.collision_allow_epoch;
+    const tier = data.movement_bodies.tierAt(row);
+    // The body append reserved its removal slots. A crossing past that spare still fails
+    // without moving the epoch, the tier, or the row.
+    const spare = data.collision_allow_records.capacity - data.collision_allow_records.items.len;
+    try data.collision_allow_records.appendNTimes(testing.allocator, entity, spare);
+    var tier_failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    data.allocator = tier_failing.allocator();
+    try testing.expectError(error.OutOfMemory, data.setSimulationTier(entity, .kinematic));
+    data.allocator = testing.allocator;
+    try testing.expectEqual(epoch, data.collision_allow_epoch);
+    try testing.expectEqual(tier, data.movement_bodies.tierAt(row));
+    try testing.expectEqual(row, data.movementBodyDenseIndex(entity).?);
+    var drop_failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    data.allocator = drop_failing.allocator();
+    try testing.expectError(error.OutOfMemory, data.destroyEntity(entity));
+    data.allocator = testing.allocator;
+    try testing.expectEqual(epoch, data.collision_allow_epoch);
+    try testing.expect(data.isAlive(entity));
+    try testing.expectEqual(row, data.movementBodyDenseIndex(entity).?);
+    try testing.expectEqual(tier, data.movement_bodies.tierAt(row));
+
+    // One crossing reserves the record list; its refresh reserves the scratch. The next
+    // crossing and refresh allocate nothing.
+    const other = try data.createEntity();
+    try data.setMovementBody(other, .{ .position = .{ .x = 8, .y = 0 }, .previous_position = .{ .x = 8, .y = 0 } });
+    try data.setSimulationTier(entity, .locomotion);
+    try data.setSimulationTier(other, .locomotion);
+    const key = testKey(0, 0, 1, 0);
+    var contact = testContact(key);
+    contact.a = entity;
+    contact.b = other;
+    contact.a_movement_index = data.movementBodyDenseIndex(entity).?;
+    contact.b_movement_index = data.movementBodyDenseIndex(other).?;
+    const scope = data.scopeColumnsSliceConst().tier;
+    const edit = InsertEdit{
+        .key = key,
+        .contact = contact,
+        .emit = emitBits(scope[contact.a_movement_index].allowsCollision(), scope[contact.b_movement_index].allowsCollision()),
+    };
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var store = TriggerStore.init(testing.allocator);
+    defer store.deinit();
+    try store.rebuild(testThreads(&threads), &.{.{ .inserts = &.{edit} }}, 1, data.collision_allow_epoch);
+    try data.setSimulationTier(entity, .kinematic);
+    try testing.expect(try store.refresh(testThreads(&threads), &data));
+    var warm = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    data.allocator = warm.allocator();
+    store.allocator = warm.allocator();
+    try data.setSimulationTier(entity, .locomotion);
+    try testing.expect(try store.refresh(testThreads(&threads), &data));
+    try testing.expectEqual(@as(usize, 0), warm.allocations);
 }

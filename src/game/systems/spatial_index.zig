@@ -3043,7 +3043,7 @@ test "a stale self is a candidate: only a matching generation is skipped" {
     defer data.deinit();
     const neighbor = try addTestBody(&data, 3, 3);
     const first = try addTestBody(&data, 4, 4);
-    try testing.expect(data.destroyEntity(first));
+    try testing.expect(try data.destroyEntity(first));
     const second = try addTestBody(&data, 5, 5);
     // The new entity reuses the destroyed one's index in the same cell.
     try testing.expectEqual(first.index, second.index);

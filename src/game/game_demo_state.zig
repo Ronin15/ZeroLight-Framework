@@ -912,7 +912,7 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk post.entities[post.entities.len - 1];
     } else blk: {
         const e = try data.createEntity();
-        errdefer _ = data.destroyEntity(e);
+        errdefer data.destroyCreatedEntity(e);
         try data.setMovementBody(e, .{
             .position = spec.position,
             .previous_position = spec.position,
@@ -1038,7 +1038,7 @@ fn spawnObstacles(data: *DataSystem, world: *const WorldSystem) ![obstacle_count
     var entities: [obstacle_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
         const entity = try data.createEntity();
-        errdefer _ = data.destroyEntity(entity);
+        errdefer data.destroyCreatedEntity(entity);
         try data.setMovementBody(entity, .{
             .position = spec.position,
             .previous_position = spec.position,
@@ -1076,7 +1076,7 @@ fn spawnObstaclesCompact(data: *DataSystem) ![obstacle_count]EntityId {
     var entities: [obstacle_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
         const entity = try data.createEntity();
-        errdefer _ = data.destroyEntity(entity);
+        errdefer data.destroyCreatedEntity(entity);
         try data.setMovementBody(entity, .{
             .position = spec.position,
             .previous_position = spec.position,

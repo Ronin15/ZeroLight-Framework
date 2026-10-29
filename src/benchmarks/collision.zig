@@ -28,9 +28,10 @@
 //! held pairs over their items' pair bound, and the most ranges each set prepared; each is
 //! asserted at most 2 * H(ranges) (the grow-only slots' bound over every shape they
 //! followed) on a set that never replayed, past the seam's slot 0 on a reserved system;
-//! `static_hit_rows=` the static query slots' hit rows (each asserted at most the widest
-//! query's grown rows or one alignment window's pairs) and their bytes, beside the set's
-//! held pairs and their bytes; and `slot_growth=` each set's prepare growths and replays.
+//! `static_hit_rows=` the static query slots' hit rows (each asserted at most that slot's
+//! live-query limit: the reserve window when the query fits, otherwise one geometric step
+//! above the rows grown for it) and their bytes, beside the set's held pairs and their
+//! bytes; and `slot_growth=` each set's prepare growths and replays.
 //!
 //! The static groups hold the item count of one-tile statics on a two-tile pitch, so the
 //! world grows with the static count, plus a fixed 2,048 dynamic bodies, half of them
@@ -113,18 +114,20 @@
 //! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
 //! one dynamic over a 10 x 10-cell square of them. One trigger is kinematic, so exclusion
 //! stays on, and another crosses the allow bit before every step, so every step moves the
-//! allow epoch and refreshes the stored pairs' rows and emit bits. The system is reserved to
-//! the movement bodies first, as the population seam reserves it. Pass shape: time per stored
-//! pair flat in pairs (the refresh and the stored-pair emission are linear in them). Asserts:
-//! the analytic contact count; every measured step refreshes every stored pair, on workers in
-//! a fixed threaded case, its static sort covers only the dynamic-by-static contacts, and its
+//! allow epoch and refreshes the pairs that name that trigger. The system is reserved to
+//! the movement bodies first, as the population seam reserves it. Pass shape: refresh work
+//! for that flip is flat in stored pairs; emission of stored pairs stays linear in the pairs
+//! it emits. Asserts: the analytic contact count; every measured step refreshes the toggled
+//! trigger's stored pairs (`flipped_pairs`), not every stored pair. That refresh is one
+//! pair, below the range alignment, so a fixed threaded case still runs it inline; its
+//! static sort covers only the dynamic-by-static contacts, and its
 //! emission only the step's analytic emitted stored pairs plus those contacts, never a
 //! filtered pair; one step with no allow crossing refreshes nothing; and the cold step,
 //! whose wide dynamic outgrows its static query slot's reserved hit rows while the broadphase
 //! stays inside the pair bound, is flagged and counted once. With `--details` it prints the
 //! refresh's fold on main after its join (`refresh_fold=`, its mean entries per step and
-//! time per entry: the range edges, the height-1 nodes they split, the nodes above height 1,
-//! and the levels); pass shape: time per entry flat in pairs. Its dormant variant (item code
+//! time per entry: the dirty path, flat in stored pairs for this fixture, not a walk of
+//! nodes and levels). Its dormant variant (item code
 //! `1_000_000 + pairs`) makes every eighth trigger dormant (trigger B of each cell 4m + 3), so a
 //! quarter of the stored pairs are kept but filtered from the contacts; same pass shape and
 //! asserts, the contact count less the dormant pairs and the wide dynamic's dormant hits.
@@ -789,8 +792,12 @@ const trigger_dormant_cell: usize = 3;
 // allow epoch and refreshes the stored pairs' rows and emit bits.
 const AllowToggle = struct {
     entity: EntityId,
-    // The fixture's stored pairs, which every refresh covers.
+    // The fixture's stored pairs. Emission walks the ones it emits; refresh does not.
     stored_pairs: usize,
+    // Stored pairs naming the toggled trigger. Cell 1's trigger B overlaps only that
+    // cell's trigger A: the slot-0 dynamic ends before B, slot 1 starts after it, and the
+    // wide dynamic covers the last 10 cells.
+    flipped_pairs: usize = 1,
     // The fixture's dormant triggers' stored pairs, filtered from every step's contacts.
     dormant_pairs: usize = 0,
     excluded: bool = false,
@@ -1975,7 +1982,7 @@ const StaticSeam = struct {
     // pair-bound overflow (a wide dynamic's static query hit rows grow in their set). Every
     // step checks its stored and dynamic contacts against the contact bound init's reserve
     // and the seams declared, so that bound covers the stored pairs.
-    fn checkStoredPairsInBound(self: *StaticSeam, data: *const DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
+    fn checkStoredPairsInBound(self: *StaticSeam, data: *DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
         const collision = &self.seam.pipeline.collision;
         const before = collision.perf.pair_bound_overflows;
         for (0..2) |_| _ = try self.seam.collisionStep(data, &self.world, thread_system, case);
@@ -2079,7 +2086,7 @@ fn dynamicStageBatches(perf: CollisionStats.Perf) [dynamic_stage_names.len]Batch
 }
 
 // A collision step's stage tuners, in `step_tuner_names` order.
-const step_tuner_names = [_][]const u8{ "fill", "sort", "broad", "narrow", "static_pairs", "static_rect", "static_place", "static_sort", "refresh", "emit" };
+const step_tuner_names = [_][]const u8{ "fill", "sort", "broad", "narrow", "static_pairs", "static_rect", "static_place", "static_sort", "refresh_place", "refresh_sort", "refresh", "emit" };
 
 fn stepTuners(system: *const CollisionSystem) [step_tuner_names.len]*const AdaptiveWorkTuner {
     return .{
@@ -2091,6 +2098,8 @@ fn stepTuners(system: *const CollisionSystem) [step_tuner_names.len]*const Adapt
         &system.static_rect_tuner,
         &system.static_place_tuner,
         &system.static_sort_tuner,
+        system.trigger_store.refresh_sort_tuners.getPtrConst(.place),
+        system.trigger_store.refresh_sort_tuners.getPtrConst(.sort),
         system.trigger_store.tuners.getPtrConst(.refresh),
         &system.emit_tuner,
     };
@@ -2111,8 +2120,13 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const cold = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         if (cold.candidate_pair_count > system.reserved_pair_bound) return error.CollisionColdBroadphaseOutgrewBound;
         // The wide dynamic's static query outgrows its slot's hit rows: one replay in the
-        // static set, inside the pair bound.
-        if (system.static_slots.replays != 1 or system.static_sizing.hit_rows == 0) return error.CollisionColdSlotGrowthNotCounted;
+        // static set, and that slot stays above the reserve window, inside the pair bound.
+        const hit_window = CollisionSystem.estimateContactCapacity(collision_range_alignment_items);
+        var above_window = false;
+        for (system.static_slots.list.items) |*slot| {
+            if (slot.value.hits.capacity > hit_window) above_window = true;
+        }
+        if (system.static_slots.replays != 1 or !above_window) return error.CollisionColdSlotGrowthNotCounted;
         if (cold.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 0) return error.CollisionColdSlotGrowthFlaggedPairBound;
     }
     try checkTunerLists(system);
@@ -2162,7 +2176,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         if (inputs.one_strip_per_body) std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
         const perf = last_collision_stats.perf;
         // Every flip moves the allow epoch, so every measured step refreshes the stored pairs.
-        if (inputs.toggle) |toggle| if (perf.trigger_refresh_batch.item_count != toggle.stored_pairs) return error.CollisionTriggerRefreshMissed;
+        if (inputs.toggle) |toggle| if (perf.trigger_refresh_batch.item_count != toggle.flipped_pairs) return error.CollisionTriggerRefreshMissed;
         if (inputs.static_contacts) |static_contacts| {
             if (perf.static_sort_batch.item_count != static_contacts) return error.CollisionStaticSortPastStaticContacts;
             // The emission's items are the step's analytic emitted stored pairs, never a
@@ -2248,9 +2262,8 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 // A replay grows a slot to its range's counted need instead, past that bound by design, so
 // a set that replayed prints `replayed` and is not asserted. On a reserved system slot 0
 // is the seam's, sized to the population capacity, so the ratio counts the other slots.
-// Then the static query slots' hit rows (`static_hit_rows=`): each slot holds at most the
-// widest query's grown rows (`static_sizing.hit_rows`) or the rows `reserve` gives one
-// query, one alignment window's pairs.
+// Then the static query slots' hit rows (`static_hit_rows=`): each slot's capacity is at
+// most `staticQueryHitLimit` of its live query against one alignment window's pairs.
 fn checkSlotRecords(details: *suite.DetailLines, system: *const CollisionSystem, entry_count: usize) !void {
     const sets = .{
         .{ "broad", &system.broadphase_slots, entry_count },
@@ -2269,19 +2282,19 @@ fn checkSlotRecords(details: *suite.DetailLines, system: *const CollisionSystem,
         if (slots.replays == 0 and set[2] != 0 and ratio > limit) return error.CollisionSlotRecordsPastBound;
     }
     details.print("\n", .{});
-    const query_rows = @max(system.static_sizing.hit_rows, CollisionSystem.estimateContactCapacity(collision_range_alignment_items));
+    const hit_window = CollisionSystem.estimateContactCapacity(collision_range_alignment_items);
     var rows: usize = 0;
     var bytes: usize = 0;
     var widest: usize = 0;
     for (system.static_slots.list.items) |*slot| {
         const hits = &slot.value.hits;
-        if (hits.capacity > query_rows) return error.CollisionStaticHitRowsPastWidestQuery;
+        if (hits.capacity > CollisionSystem.staticQueryHitLimit(slot.value.live_hits, hit_window)) return error.CollisionStaticHitRowsPastWidestQuery;
         rows += hits.capacity;
         bytes += @TypeOf(hits.*).capacityInBytes(hits.capacity);
         widest = @max(widest, hits.capacity);
     }
     const pair_bytes = system.static_slots.held_records * @sizeOf(std.meta.Child(@TypeOf(system.static_pairs.items)));
-    details.print("static_hit_rows={} bytes={} slot_max={} grown_rows={} (pairs held={} bytes={})\n", .{ rows, bytes, widest, system.static_sizing.hit_rows, system.static_slots.held_records, pair_bytes });
+    details.print("static_hit_rows={} bytes={} slot_max={} (pairs held={} bytes={})\n", .{ rows, bytes, widest, system.static_slots.held_records, pair_bytes });
 }
 
 // Collision's range slot sets: spill, broadphase, static query, trigger patch and rebuild.
@@ -2359,8 +2372,9 @@ fn caseTunerSettle(system: *const CollisionSystem, inputs: StepInputs) suite.Tun
     return census;
 }
 
-// Every tuner of `system`, by name: the step stages' (`stepTuners`, the store's refresh among
-// them), the trigger patch stages' (`triggerPatchTuners`), and the trigger rebuild's.
+// Every tuner of `system`, by name: the step stages' (`stepTuners`, the store's refresh
+// sort and refresh among them), the trigger patch stages' (`triggerPatchTuners`), and the
+// trigger rebuild's.
 fn collisionTunerSettle(system: *const CollisionSystem) suite.TunerSettle {
     var census = suite.TunerSettle.ofNamed(&step_tuner_names, &stepTuners(system));
     census.addNamed(&trigger_patch_stage_names, &triggerPatchTuners(system));

@@ -679,7 +679,7 @@ fn initIntentFixture(agent_count: usize, with_skips: bool) !IntentFixture {
         const destroyed = try game_data.createEntity();
         try game_data.setMovementBody(destroyed, .{ .speed = 3 });
         try game_data.setAiAgent(destroyed, .{});
-        try std.testing.expect(game_data.destroyEntity(destroyed));
+        try std.testing.expect(try game_data.destroyEntity(destroyed));
         skip_entities[@backingInt(IntentSkip.invalid_entity)] = data.EntityId.invalid;
         skip_entities[@backingInt(IntentSkip.destroyed_entity)] = destroyed;
         skip_entities[@backingInt(IntentSkip.body_without_agent)] = body_only;

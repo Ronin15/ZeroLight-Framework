@@ -29,7 +29,7 @@ pub const Player = struct {
 
     pub fn spawn(data: *DataSystem) !Player {
         const entity = try data.createEntity();
-        errdefer _ = data.destroyEntity(entity);
+        errdefer data.destroyCreatedEntity(entity);
 
         try data.setMovementBody(entity, .{
             .position = initial_position,

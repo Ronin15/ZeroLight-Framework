@@ -137,7 +137,7 @@ pub const PipelineSeam = struct {
 
     /// One collision step on the pipeline at production's inputs (`world`'s strips, the
     /// colliders' view) and `case`'s controls, emitting into the frame's contacts.
-    pub fn collisionStep(self: *PipelineSeam, data: *const DataSystem, world: *const WorldSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !CollisionStats {
+    pub fn collisionStep(self: *PipelineSeam, data: *DataSystem, world: *const WorldSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !CollisionStats {
         return self.pipeline.collision.update(data, &self.frame.contacts, thread_system, .{
             .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
             .max_worker_threads = case.maxWorkerThreads(),
