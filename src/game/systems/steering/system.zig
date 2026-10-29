@@ -104,8 +104,7 @@ pub const SteeringStats = struct {
     /// intents served available, pending, unavailable; held by replan cooldown or unavailable
     /// backoff; stuck replans), the avoidance pass's agent and obstacle samples and candidate
     /// checks (`obstacle_candidate_checks` counts static-collider query entries read), the
-    /// prepare stages' batches, and the avoidance pass's `batch`. The claim batch holds zero
-    /// items on the serial path, where selection runs its single pass.
+    /// prepare stages' batches, and the avoidance pass's `batch`.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         path_available_count: usize = 0,
         path_pending_count: usize = 0,
@@ -183,10 +182,11 @@ pub const SteeringSystem = struct {
     /// Pre-sizes every per-step buffer for `max_agents` steering rows and as many navigation
     /// intents, and each stage's per-range records for any partition of them, so a step
     /// within that population allocates nothing. Grow-only; re-run by the population seam.
-    /// Steering rows and a step's navigation intents (AI cognition emits at most one per AI
-    /// row) stay within `max_step_items` at any population, so their u32 indices never
-    /// overflow.
+    /// A count past `max_step_items` is `OutOfMemory` before any growth. Steering rows and a
+    /// step's navigation intents (one per AI row) stay within that width, so their u32
+    /// indices never overflow.
     pub fn reserve(self: *SteeringSystem, max_agents: usize) !void {
+        if (max_agents > max_step_items) return error.OutOfMemory;
         try ensureStepCapacity(self, max_agents, max_agents);
     }
 
@@ -217,10 +217,9 @@ pub const SteeringSystem = struct {
     ) !SteeringStats {
         const steering = data.steeringAgentSliceConst();
         const intents = frame.navigation_intents.mergedItems();
-        // Unreachable in play (`max_step_items`); the error is the backstop where asserts
-        // are compiled out.
+        // Unreachable in play (`max_step_items`): stores cap rows at u32, and `reserve`
+        // refuses a wider population.
         std.debug.assert(steering.entities.len <= max_step_items and intents.len <= max_step_items);
-        if (steering.entities.len > max_step_items or intents.len > max_step_items) return error.Overflow;
         try ensureStepCapacity(self, steering.entities.len, intents.len);
         var stats = SteeringStats{ .navigation_intent_count = intents.len };
 
@@ -724,6 +723,18 @@ test "steering serial matches threaded intents across multiple range splits and 
             try std.testing.expectEqual(a.movement.direction_y, b.movement.direction_y);
         }
     }
+}
+
+test "steering reserve one past the step width returns OutOfMemory" {
+    // The first allocation fails. The width guard returns before it, so the
+    // allocator is never asked and every store stays empty.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var steering = SteeringSystem.init(failing.allocator());
+    defer steering.deinit();
+    try std.testing.expectError(error.OutOfMemory, steering.reserve(max_step_items + 1));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), steering.runtime_rows.capacity);
 }
 
 test "steering update is allocation-free after reserves from the first step" {

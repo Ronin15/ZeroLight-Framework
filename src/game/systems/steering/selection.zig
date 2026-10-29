@@ -9,11 +9,9 @@
 const std = @import("std");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BandPartition = @import("../../../app/thread_system.zig").BandPartition;
-const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const setRowCount = @import("../../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const DataSystem = @import("../../data_system.zig").DataSystem;
@@ -31,13 +29,12 @@ pub const no_row: u32 = std.math.maxInt(u32);
 // Steering rows per claim block; a band owns whole blocks.
 const band_block_rows: usize = steering_range_alignment_items;
 
-/// `select_resolve`, then `select_claim`. Serial (also when no stage can get a worker),
-/// one source-order pass resolves and claims each intent. Threaded, each stage runs inline or on workers as its tuner
-/// selects: ranges resolve their intents and place them by steering band in their window;
-/// then each band claims, for the steering rows it owns, every range's band segment in
-/// range order. The bands follow the steering rows only, never the resolve partition.
-/// Either way each steering row gets its first intent in source order and its best by
-/// priority, ties to the earlier.
+/// `select_resolve`, then `select_claim`. Each stage runs inline or on workers as its tuner
+/// selects, including when no worker is available: ranges resolve their intents and place
+/// them by steering band in their window; then each band claims, for the steering rows it
+/// owns, every range's band segment in range order. The bands follow the steering rows
+/// only, never the resolve partition. Each steering row gets its first intent in source
+/// order and its best by priority, ties to the earlier.
 pub fn selectIntents(
     self: *SteeringSystem,
     data: *const DataSystem,
@@ -50,12 +47,7 @@ pub fn selectIntents(
     setRowCount(IntentRow, &self.intent_rows, intent_count);
     const intent_rows = self.intent_rows.slice();
     const claims = claimColumns(self.claims.slice());
-    const stage = StageThreads.withWorkers(threads) orelse {
-        resolveAndClaim(data, intents, 0, intent_count, intent_rows.items(.steering), intent_rows.items(.movement), claims, self.claim_stamp);
-        if (comptime runtime_perf_log.enabled) stats.perf.select_resolve_batch = inlineBatch(intent_count, steering_range_alignment_items);
-        return;
-    };
-    const resolve_stage = stage.stage(&self.select_resolve_tuner);
+    const resolve_stage = threads.stage(&self.select_resolve_tuner);
     const selection = resolve_stage.select(intent_count, steering_range_alignment_items);
     const bands = AgentBands.init(agent_count);
     setSlotCount(BandRow, &self.band_rows, selection.range_count);
@@ -74,12 +66,11 @@ pub fn selectIntents(
     const resolve_batch = resolve_stage.run(selection, intent_count, steering_range_alignment_items, &resolve, resolveJob);
     if (comptime runtime_perf_log.enabled) stats.perf.select_resolve_batch = resolve_batch;
 
-    const claim_stage = Dispatch.init(stage.thread_system, &self.select_claim_tuner, .{
-        .items_per_range = stage.config.band_items_per_range,
-        .batches_per_participant = stage.config.batches_per_participant,
-        .max_worker_threads = stage.config.max_worker_threads,
-        .adaptive = stage.config.adaptive,
-    });
+    // Bands, not intents: the claim range size is the config's band size, and its batch
+    // count stays the shared one.
+    var claim_stage = threads.stage(&self.select_claim_tuner);
+    claim_stage.items_per_range = threads.config.band_items_per_range;
+    claim_stage.batches_per_participant = threads.config.batches_per_participant;
     const claim_selection = claim_stage.select(bands.band_count, 1);
     var claim = ClaimJob{
         .intents = intents,
@@ -143,27 +134,6 @@ fn claimRow(claims: ClaimColumns, stamp: u32, row: usize, intent_index: u32, int
     }
     std.debug.assert(intent_index > claims.best[row]);
     if (intents[intent_index].priority > intents[claims.best[row]].priority) claims.best[row] = intent_index;
-}
-
-// The single source-order pass over intents `[start, end)`.
-fn resolveAndClaim(
-    data: *const DataSystem,
-    intents: []const NavigationIntent,
-    start: usize,
-    end: usize,
-    intent_steering: []u32,
-    intent_movement: []u32,
-    claims: ClaimColumns,
-    stamp: u32,
-) void {
-    for (start..end) |intent_index| {
-        const resolved = resolveIntentRow(data, intents[intent_index]);
-        intent_steering[intent_index] = resolved.steering;
-        intent_movement[intent_index] = resolved.movement;
-        if (resolved.steering == no_row) continue;
-        // Intent indices fit u32 (`max_step_items`).
-        claimRow(claims, stamp, resolved.steering, @intCast(intent_index), intents);
-    }
 }
 
 // `select_resolve`: one range of intents.

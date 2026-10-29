@@ -2311,18 +2311,6 @@ pub fn StageThreads(comptime Config: type) type {
                 .adaptive = self.config.adaptive,
             });
         }
-
-        // False when the thread system has no workers or the config allows none, so every
-        // stage runs inline whatever its tuner learns.
-        fn mayUseWorkers(self: Self) bool {
-            const workers = self.thread_system.workerThreadCount();
-            return @min(self.config.max_worker_threads orelse workers, workers) > 0;
-        }
-
-        /// `threads` when a stage there can get a worker, else null.
-        pub fn withWorkers(threads: Self) ?Self {
-            return if (threads.mayUseWorkers()) threads else null;
-        }
     };
 }
 
@@ -3222,19 +3210,13 @@ test "round dispatch records one tuner sample per step, and folds inline rounds 
     }
 }
 
-test "stage threads with workers is null with no worker or a zero worker cap" {
-    const Config = struct { items_per_range: ?usize = null, batches_per_participant: ?f64 = null, max_worker_threads: ?usize = null, adaptive: bool = true };
-    const Threads = StageThreads(Config);
-    var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer serial.deinit();
-    try std.testing.expect(Threads.withWorkers(.{ .thread_system = &serial, .config = .{} }) == null);
+test "stage threads forward their config onto the stage" {
     if (@import("builtin").single_threaded) return;
+    const Config = struct { items_per_range: ?usize = null, batches_per_participant: ?f64 = null, max_worker_threads: ?usize = null, adaptive: bool = true };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    try std.testing.expect(Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .max_worker_threads = 0 } }) == null);
-    const held = Threads.withWorkers(.{ .thread_system = &threads, .config = .{ .items_per_range = 8, .batches_per_participant = 2.0, .max_worker_threads = 1, .adaptive = false } }).?;
     var tuner = AdaptiveWorkTuner.init(.{});
-    const stage = held.stage(&tuner);
+    const stage = (StageThreads(Config){ .thread_system = &threads, .config = .{ .items_per_range = 8, .batches_per_participant = 2.0, .max_worker_threads = 1, .adaptive = false } }).stage(&tuner);
     try std.testing.expectEqual(@as(?usize, 8), stage.items_per_range);
     try std.testing.expectEqual(@as(?f64, 2.0), stage.batches_per_participant);
     try std.testing.expectEqual(@as(?usize, 1), stage.max_worker_threads);

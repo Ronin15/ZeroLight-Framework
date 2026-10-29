@@ -2107,8 +2107,7 @@ fn navConnCounters(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSu
     return summary;
 }
 
-/// Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the
-/// claim on the serial path).
+/// Steering's prepare stage shapes, in stage order; `-` for a stage whose summary is empty.
 pub fn writeSteeringStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Error!void {
     const stages = stats.steering_stages orelse SteeringStageSummary{};
     const shapes = [_]struct { []const u8, BatchSummary }{
@@ -3111,7 +3110,7 @@ fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {
 
 test "steering stage label tells a stage that did not run from an inline one" {
     var buffer: [160]u8 = undefined;
-    // The serial path: the claim never ran.
+    // An empty claim summary prints `-`. A serial step records an inline claim batch.
     try std.testing.expectEqualStrings("agents=inline resolve=inline claim=- dir=inline", formatSteeringStagesInto(&buffer, .{
         .steering_stages = .{
             .agents = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
