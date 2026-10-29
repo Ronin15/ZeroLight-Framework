@@ -303,6 +303,12 @@ labelled.
 - `f027f48`: collision refresh follows the entities recorded with the allow
   epoch, and each static-query slot's hit rows follow that slot's live query
   (`docs/architecture.md` § Collision).
+- Slice 86 closes (Debug `-Dcpu=x86_64_v2`, `fa99e72`). Broadphase range
+  slots stay inside the bench's `2 * H(ranges)` bound; the excess over 3× is
+  geometric slack plus slots a retune keeps. Tuned cases match or beat their
+  best control within spread (the one-rep +20% and +14% at 10,000 did not
+  survive the 3-rep rerun). Rows at rest moved to slice 75
+  (`docs/roadmap/archive/slice-86.md`).
 
 ## Other Changes
 

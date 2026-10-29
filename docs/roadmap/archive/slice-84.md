@@ -1,6 +1,6 @@
 ## Slice 84: Level-Aware Shared Neighbor Index
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](slice-83.md) (layout) · Before: [Slice 86](../slices/slice-86.md), [Slice 85](../slices/slice-85.md), [Slice 75](../slices/slice-75.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](slice-83.md) (layout) · Before: [Slice 86](slice-86.md), [Slice 85](../slices/slice-85.md), [Slice 75](../slices/slice-75.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: landed on `core_systems` (`c52a5ff`, `08e4799`, `3efa1e4`,
 `320023a`, `5c4babb`, `2bcd8b6`); `verify` passes. 85 moves steering

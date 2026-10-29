@@ -63,7 +63,8 @@ Scope comes from one camera and puts far entities to sleep.
     32, and 3.12 / 2.29 / 1.28 ms at side 512 / 1024 / 2048. The group's pass
     shape requires every row to advance.
   - Inert rows take tiers like agents and raise the step on the
-    `production-step` inert axis ([86](slice-86.md) holds the numbers).
+    `production-step` inert axis ([86](../archive/slice-86.md) holds the
+    numbers). This slice's collision checklist item carries collision's share.
   - `untimed` (stages with no perf-log timer: scope advance, tier policy,
     collision scope gather, plane traversal, action react, dig) is 2–20% of
     the step.
@@ -130,7 +131,14 @@ Scope comes from one camera and puts far entities to sleep.
       (`movement.zig:55`, `systems/simulation_scope.zig:576`). Failure scenario: items
       and resource nodes at rest raise every step's cost (measured above).
       Pass: `production-step` flat in inert rows. Collision's share is
-      [86](slice-86.md); render collect's is [87](slice-87.md).
+      the item below; render collect's is [87](slice-87.md).
+- [ ] Collision's share of rows at rest (moved from 86). Failure: an inert
+      row in a collision tier is gathered, sorted, and swept every step.
+      Measured (`production-step` tuned, Debug, `5d5a089`, spread P 4,096):
+      0, 1, 4 inert rows per agent give collision main 0.63 / 1.37 / 3.76 ms
+      and collision bodies 1,541 / 3,077 / 7,685. Pass: `production-step`
+      collision cost flat in inert rows. It runs in the inert-row step after
+      slice 88.
 - [ ] Bench-only (`--details`) timers for the untimed stages, so the
       `production-step` census attributes the 2–20% `untimed` share before
       this slice's policy change (`.grok/rules/threading.md`). Landed

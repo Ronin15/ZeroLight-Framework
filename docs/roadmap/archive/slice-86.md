@@ -1,8 +1,8 @@
 ## Slice 86: Collision Subsystem Pass
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (layout and tuners), [Slice 84](../archive/slice-84.md) (branch order) · Related: [Slice 71B](slice-71b.md) (the static structure's 64B row), [Slice 72](slice-72.md) D1 (destructible resolve), [Slice 75](slice-75.md) (collision fidelity per band) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](slice-83.md) (layout and tuners), [Slice 84](slice-84.md) (branch order) · Related: [Slice 71B](../slices/slice-71b.md) (the static structure's 64B row), [Slice 72](../slices/slice-72.md) D1 (destructible resolve), [Slice 75](../slices/slice-75.md) (collision fidelity per band) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Owner direction 2026-10-11: collision as a whole
+**Status: landed.** Owner direction 2026-10-11: collision as a whole
 subsystem against the current cost model and rules. 71B.1's collision queries
 and 71B.2's static split moved here (owner 2026-10-16). Landed on
 `core_systems`: banded sweep merge, one collision path, contiguous static and
@@ -14,8 +14,11 @@ slots sized from the selection (`42192b2`), the stored-trigger store
 owner closed the ReleaseFast gaps as inside the spread. Gather and sort are
 off main on the `collision` group, and the tall, stacked, and thin shapes
 meet their pass. Tier-toggle trigger refresh and static query hit rows
-landed in `f027f48`. Still open: tuned slot trim, and rows at rest (after
-slice 88, index merged order 9b). `zig build verify` passed.
+landed in `f027f48`. Range slots meet the bench's `2 * H(ranges)` bound by
+attribution (geometric slack plus slots a retune keeps; not a 3× cap).
+Tuned-versus-control runs after slice 89 match or beat the best control
+within spread. Rows at rest moved to [Slice 75](../slices/slice-75.md) for
+the inert-row step after 88. `zig build verify` passed.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -90,7 +93,7 @@ the current bench.
 - Static-hit overlap runs in the query's worker ranges
   (`writeStaticHitContacts`). Main merges those range windows
   (`.grok/rules/threading.md`).
-- From [72](slice-72.md) D1: the destructible resolve answered by the
+- From [72](../slices/slice-72.md) D1: the destructible resolve answered by the
   shared static-collider query. From 75: collision fidelity per band.
 
 ### Checklist
@@ -163,19 +166,40 @@ the current bench.
       (`checkSlotRecords` fails past `staticQueryHitLimit` of that slot's
       live count against one alignment window); serial == threaded (0 and
       2 workers).
-- [ ] Tuned range slots stay within the per-item bound's trim. Failure:
-      `slot_records` over `b * items` (`RangeSlots.recountHeld`,
-      `thread_system.zig:1654`) reads 4.02 tuned at `collision` 1,024 and
-      4.38 at `collision-thin` (about 1.5 fixed, 2.96-4.38 tuned across
-      1,024-10,000 bodies), over the 3x the L1 landing designed for. Pass: tuned
-      held records at most 3x, or the excess attributed (a retune's
-      geometric grow) and reported.
-- [ ] Rows at rest cost no per-step collision work. Owner: after slice 88.
-      Failure scenario: an
-      inert row is gathered, sorted, and swept every step it sits in a
-      collision tier. Measured: the inert axis above. Pass: `production-step`
-      collision cost flat in inert rows; static colliders through the two
-      items below.
+- [x] Tuned range slots stay inside the bench's `2 * H(ranges)` bound.
+      `recountHeld` (`thread_system.zig:2091`) sums every slot, including
+      ones past `range_count`: a set only grows until `release`
+      (`thread_system.zig:1991-1992`). `reserveRecords` (`collision.zig:1908`)
+      grows with `ensureTotalCapacity`, and `BroadphaseRangeBuffer.held`
+      (`collision.zig:465`) is `pairs.capacity`, so that geometric slack is
+      inside the ratio (derived, not a measurement of the allocator). The
+      bench limit is `2 * harmonic(ranges)` (`benchmarks/collision.zig:2280`,
+      `harmonic` `:2355`). Measured, Debug, `-Dcpu=x86_64_v2`, `fa99e72`,
+      `tools/bench_ab.py --base none` (warmup 1, iterations 3). Tuned rows
+      that name workers were `settled=yes`. Broadphase held pairs over the
+      pair bound, as `ratio/limit(ranges)`:
+
+      | group | items | case | ratio |
+      | --- | --- | --- | --- |
+      | `collision` | 1024 | serial-direct | 1.50/2.00 (1) |
+      | `collision` | 1024 | tuned | 4.68/9.49 (64) |
+      | `collision` | 4096 | serial-direct | 1.50/2.00 (1) |
+      | `collision` | 4096 | tuned | 4.15/10.29 (96) |
+      | `collision` | 10000 | tuned | 4.20/10.12 (88) |
+      | `collision-thin` | 2000001 (aspect 1) | tuned | 4.07/9.93 (80) |
+      | `collision-thin` | 2000016 (aspect 16) | tuned | 4.40/9.93 (80) |
+      | `collision-thin` | 2000256 (aspect 256) | tuned | 4.43/10.07 (86) |
+
+      Serial thin is 1.50/2.00 (1) at each aspect. Static ratios in these
+      runs were 0.00 (no static slots). A one-range serial step shows the
+      geometric factor alone. A tuned step also keeps the slots of every
+      shape the retune followed. These runs met the bound. The excess over
+      3× is that slack plus the retained retune slots. The pass is the
+      bound, not a 3× cap.
+- [x] Rows at rest routed to [75](../slices/slice-75.md). The pass is not
+      met here: an inert row in a collision tier is gathered, sorted, and
+      swept every step (measured axis in Current foundation). 75's collision
+      item owns the pass, in the inert-row step after slice 88.
 - [x] Static-collider lists read as contiguous runs (contiguity audit H3).
       Landed in `dfc6ad8`. The chunk owns the runs. `steering-static-dense`
       stayed within noise. The entity-obstacle case was a flat gap of about
@@ -418,7 +442,8 @@ the current bench.
       tall, and inert fixtures; allocation-free warmed step. Contact parity
       across range sizes and worker counts, the tall and cross-level layout
       in `fillReferenceLayout`, and the warmed allocation-free step are in
-      `collision.zig`. The inert fixture is the rows-at-rest item.
+      `collision.zig`. The inert fixture is [75](../slices/slice-75.md)'s
+      collision item.
 - [x] Docs: `docs/architecture.md` collision and response. The pipeline
       stage list matches `stage_order` (`collision_scope_gather` →
       `collision_detect` → `collision_respond`), so
@@ -434,11 +459,49 @@ the current bench.
       305 µs / 1.18 ms at 1,024 / 4,096 / 16,384 contacts, with main outside
       the stage batches 11 / 25 / 118 µs. No paired pre-slice run; the groups
       completed and their asserts held.
-- [ ] Tuned-versus-control measurements here are taken after slice 89's tuner
-      change (the `750ce0a` baseline predates it; 89 runs its own whole-suite run).
-- [ ] `production-step`: collision main time is the ordered merge only, and
-      flat in inert rows. The ordered-merge half is the gather-and-sort item.
-      Flat in inert rows is the rows-at-rest item, after slice 88.
+- [x] Tuned-versus-control measurements after slice 89. Debug,
+      `-Dcpu=x86_64_v2`, `fa99e72`, `tools/bench_ab.py --base none` (warmup 1,
+      iterations 3); tuned rows that name workers `settled=yes`. The
+      production tuned case matches or beats its best control within spread
+      at the size where that stage threads. One-rep gaps over 10% were rerun
+      at 3 reps
+      (`.grok/rules/tests-benchmarks.md` § Benchmarks) and are noise. The
+      one-rep +20% and +14% did not survive that rerun. No tuner item.
+      - `collision` 10000, 3 reps of tuned and large-range: tuned median
+        2.21 ms, spread 0.9%, 23/23; large-range median 2.43 ms, spread
+        8.2%. Matched 3/3. Worst rep tuned 2.21 ms against large-range
+        2.31 ms (−4%). The one rep of all cases was tuned 2.40 ms at 23/23
+        against large-range 2.00 ms (+20%); serial 11.51 ms, fixed-1
+        7.81 ms, fixed-2 5.00 ms, fixed-auto 2.61 ms, small-range 2.55 ms,
+        clamp 2.16 ms.
+      - `collision-sparse` 10000, 3 reps: tuned median 682.6 µs, spread
+        9.8%, 23/23; large-range median 704.2 µs, spread 21.7%. Matched
+        2/3. Worst rep tuned 710.6 µs against large-range 662.2 µs (+7%),
+        inside the control's spread. The one rep was tuned 768.7 µs at
+        23/23 against large-range 677.2 µs (+14%); serial 3.95 ms, fixed-1
+        2.55 ms, fixed-2 2.42 ms, small-range 940.4 µs, clamp 817.6 µs,
+        fixed-auto 763.0 µs.
+      - `collision-tall` items 256 (aspect 256, population fixed), one rep, all cases, 23/23: serial
+        4.75 ms, fixed-1 2.85 ms, fixed-2 2.37 ms, large-range 1.21 ms,
+        fixed-auto 1.09 ms, small-range 971.3 µs, clamp 876.4 µs, tuned
+        857.7 µs (−2% against clamp).
+      - `collision-stacked` items 1000016 (16 levels), one rep, all cases,
+        23/23: serial 18.42 ms, fixed-1 12.72 ms, fixed-2 9.47 ms,
+        fixed-auto 3.95 ms, large-range 3.94 ms, small-range 4.39 ms, clamp
+        3.30 ms, tuned 3.06 ms (−7% against clamp).
+      - `collision-response-stage` 16384 contacts, one rep, all cases,
+        23/23: serial 5.83 ms, fixed-1 5.91 ms, fixed-2 4.54 ms, large-range
+        2.57 ms, fixed-auto 1.75 ms, small-range 1.72 ms, clamp 1.32 ms,
+        tuned 880.9 µs (−33% against clamp).
+      - Same runs, serial against tuned only: `collision` 1024 serial
+        889.1 µs, tuned 314.8 µs at 9/23; `collision` 4096 serial 4.57 ms,
+        tuned 1.10 ms at 23/23; `collision-thin` at 23/23, aspect 1 serial
+        4.66 ms, tuned 1.14 ms; aspect 16 serial 4.58 ms, tuned 1.05 ms;
+        aspect 256 serial 3.64 ms, tuned 999.9 µs.
+- [x] `production-step` ordered merge: collision main time is the ordered
+      merge only, the checked gather-and-sort item. Flat in inert rows is
+      [75](../slices/slice-75.md)'s collision item, in the inert-row step
+      after slice 88.
 - [x] Static split (if the gate passes): identical filtered contacts and
       response outcomes across every fixture and worker configuration;
       static-heavy collision cost no longer grows with static count;

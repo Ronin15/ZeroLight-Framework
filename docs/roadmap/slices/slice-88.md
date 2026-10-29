@@ -31,8 +31,9 @@ in its owning slice.
 - Measured (`production-step`, Debug, `5d5a089`): the main thread carries
   75–88% of the step in every config; `untimed` is 3–31% of the step (75
   adds its timers).
-- Already owned elsewhere: inert rows paying every per-step pass (86, 75,
-  87); the commit-seam order in the demo state (74).
+- Already owned elsewhere: inert rows paying every per-step pass (75 for
+  movement, tiers, and collision; 87 for render collect; collision's share
+  moved from 86); the commit-seam order in the demo state (74).
 
 ### Checklist
 

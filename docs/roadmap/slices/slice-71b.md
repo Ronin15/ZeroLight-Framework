@@ -6,7 +6,7 @@
 follow-up, the steering level gate, the shared static structure, and
 steering's migration onto it (64G) are landed. Collision's move onto the
 structure (71B.1) and the collision static split (71B.2) moved to
-[Slice 86](slice-86.md) (owner 2026-10-16). The structure's 64B cache row
+[Slice 86](../archive/slice-86.md) (owner 2026-10-16). The structure's 64B cache row
 and prewarm (71B.3) are open.
 
 Goal:

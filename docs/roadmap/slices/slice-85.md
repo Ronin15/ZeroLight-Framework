@@ -1,6 +1,6 @@
 ## Slice 85: Steering On The Shared Neighbor Index
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 84](../archive/slice-84.md), [Slice 86](slice-86.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 84](../archive/slice-84.md), [Slice 86](../archive/slice-86.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: in progress.** Routed by the 64G combined review (area D M1, M4,
 L10) and the movement intent measurement. Landed: the movement and particle
