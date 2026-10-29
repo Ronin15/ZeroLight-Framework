@@ -58,9 +58,10 @@ decision criteria, and reports.
   new test. The
   implementer reads `tools/bench_ab.py --list` for that group's items and
   cases. An implement brief cites the design plan and lists only its
-  overrides. Locations already looked up are copied in with `file:line`,
-  and that list is where the plan's steps are written. A declaration the
-  list lacks is read once and named in the landing. A
+  overrides. The plan's numbered steps are the work, and each step already
+  carries the lines it needs. A second copy of those lines is not a survey
+  list. A declaration a step needs and the plan does not name is read once
+  and named in the landing. A
   review brief names the diff, its
   sources, and what to check, never anyone's conclusions.
 - Agents cite a loaded rule by name. They do not open it again and do not
