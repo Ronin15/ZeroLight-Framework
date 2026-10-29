@@ -349,7 +349,8 @@ test "steering threaded arbitration keeps the first appearance and the best inte
         else
             try steering.update(&data, &frame, &threads, &pathfinding, &colliders, index.view(), .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
-        // First appearance order, each agent steering along its best intent.
+        // Each agent steers along its best intent. This fixture's creation order is
+        // movement-row order, so the sorted stream lines up with `agents`.
         for (output, frame.intents.mergedItems(), agents, best) |*slot, merged, agent, best_index| {
             slot.* = merged.movement;
             try std.testing.expect(slot.entity.eql(agent));

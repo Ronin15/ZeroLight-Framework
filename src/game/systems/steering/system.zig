@@ -7,10 +7,11 @@
 //! component data, then emits final movement intents and path requests for NPC movement.
 //! Thread-system stages, each with an inline path: `agents` (runtime tick and rekey
 //! mismatches), `select_resolve` and `select_claim` (one intent per steering
-//! row), `directions` (path status and base direction), and the avoidance pass. Avoidance
-//! reads the shared spatial index. Worker jobs read immutable slices and write their range's
-//! window, or the steering rows or band slice they own. The main thread keeps per-range and
-//! per-band bookkeeping and the rekey of runtime rows a commit moved.
+//! row), `directions` (path status and base direction), the avoidance pass, then the
+//! movement-intent order place and sort. Avoidance reads the shared spatial index. Worker
+//! jobs read immutable slices and write their range's window, or the steering rows or band
+//! slice they own. The main thread keeps per-range and per-band bookkeeping and the rekey
+//! of runtime rows a commit moved.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -33,6 +34,8 @@ const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
+const SimulationIntent = @import("../../simulation.zig").SimulationIntent;
+const BandOffsets = @import("../banded_sort.zig").BandOffsets;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
@@ -101,7 +104,8 @@ pub const SteeringStats = struct {
     /// intents served available, pending, unavailable; held by replan cooldown or unavailable
     /// backoff; stuck replans), the avoidance pass's agent and obstacle samples and candidate
     /// checks (`obstacle_candidate_checks` counts static-collider query entries read), the
-    /// prepare stages' batches, and the avoidance pass's `batch`.
+    /// prepare stages' batches, the avoidance pass's `batch`, and the movement-intent order
+    /// place and sort batches.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         path_available_count: usize = 0,
         path_pending_count: usize = 0,
@@ -118,6 +122,8 @@ pub const SteeringStats = struct {
         select_claim_batch: BatchStats = .{},
         directions_batch: BatchStats = .{},
         batch: BatchStats = .{},
+        order_place_batch: BatchStats = .{},
+        order_sort_batch: BatchStats = .{},
     } else struct {};
 };
 
@@ -148,18 +154,26 @@ pub const SteeringSystem = struct {
     band_rows: SlotList(BandRow) = .empty,
     directions_tallies: SlotList(DirectionsTally) = .empty,
     movement_tallies: SlotList(MovementTally) = .empty,
-    // One tuner per stage; `adaptive_tuner` drives the avoidance pass.
+    // Movement-intent order: place staging and one band-offset slot per place range.
+    intent_order_staging: std.ArrayList(SimulationIntent) = .empty,
+    intent_order_offsets: SlotList(BandOffsets) = .empty,
+    // One tuner per stage. `adaptive_tuner` drives the avoidance pass; place and sort
+    // each have their own, over the merged movement intents.
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     agents_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     select_resolve_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     select_claim_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     directions_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
+    intent_order_place_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
+    intent_order_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
 
     pub fn init(allocator: std.mem.Allocator) SteeringSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *SteeringSystem) void {
+        self.intent_order_offsets.deinit(self.allocator);
+        self.intent_order_staging.deinit(self.allocator);
         self.movement_tallies.deinit(self.allocator);
         self.directions_tallies.deinit(self.allocator);
         self.band_rows.deinit(self.allocator);
@@ -351,6 +365,7 @@ pub fn selectedWorkSlice(self: *SteeringSystem) SelectedWorkSlice {
         .selected_avoidance_weights = s.items(.selected_avoidance_weights),
         .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
         .selected_world_level = s.items(.selected_world_level),
+        .movement_row = s.items(.movement_row),
         .request_prefix = s.items(.request_prefix),
         .emit_request = s.items(.emit_request),
     };
@@ -370,6 +385,7 @@ pub fn selectedWorkSliceConst(self: *const SteeringSystem) ConstSelectedWorkSlic
         .selected_avoidance_weights = s.items(.selected_avoidance_weights),
         .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
         .selected_world_level = s.items(.selected_world_level),
+        .movement_row = s.items(.movement_row),
         .request_prefix = s.items(.request_prefix),
         .emit_request = s.items(.emit_request),
     };
@@ -399,6 +415,9 @@ pub fn ensureStepCapacity(self: *SteeringSystem, agent_count: usize, intent_coun
     try self.selected_windows.ensureTotalCapacity(allocator, intent_ranges);
     // The avoidance pass covers at most one selected intent per navigation intent.
     try self.movement_tallies.ensureTotalCapacity(allocator, intent_ranges);
+    // Intent order places at most `intent_count` intents, one offset slot per place range.
+    try self.intent_order_staging.ensureTotalCapacity(allocator, intent_count);
+    try self.intent_order_offsets.ensureTotalCapacity(allocator, intent_ranges);
 }
 
 pub const SelectedWorkRow = struct {
@@ -414,6 +433,8 @@ pub const SelectedWorkRow = struct {
     selected_max_neighbor_samples: u16,
     /// Movement-scope world level for same-level local avoidance gating.
     selected_world_level: u16,
+    /// Dense movement row the avoidance pass copies onto the movement intent.
+    movement_row: u32,
     /// Path requests emitted by the earlier selected intents of the same window.
     request_prefix: u32,
     emit_request: bool,
@@ -470,6 +491,7 @@ pub const SelectedWorkSlice = struct {
     selected_avoidance_weights: HotF32Slice,
     selected_max_neighbor_samples: []u16,
     selected_world_level: []u16,
+    movement_row: []u32,
     request_prefix: []u32,
     emit_request: []bool,
 
@@ -490,6 +512,7 @@ const ConstSelectedWorkSlice = struct {
     selected_avoidance_weights: ConstHotF32Slice,
     selected_max_neighbor_samples: []const u16,
     selected_world_level: []const u16,
+    movement_row: []const u32,
     request_prefix: []const u32,
     emit_request: []const bool,
 

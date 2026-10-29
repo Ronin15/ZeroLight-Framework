@@ -3,8 +3,9 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! The steering avoidance pass: bounded agent and static-obstacle pushes on each selected
-//! intent's base direction, written as movement intents and path requests in selected
-//! order. Free functions over `*SteeringSystem`; its step calls `writeMovementIntents`.
+//! intent's base direction. Movement intents are reordered into movement-row order after
+//! the write; path requests stay in selected order. Free functions over `*SteeringSystem`;
+//! its step calls `writeMovementIntents`.
 
 const std = @import("std");
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
@@ -17,6 +18,7 @@ const simd = @import("../../../core/simd.zig");
 const MovementIntent = @import("../../simulation.zig").MovementIntent;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const SimulationIntent = @import("../../simulation.zig").SimulationIntent;
+const BandedSort = @import("../banded_sort.zig").BandedSort;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
@@ -46,8 +48,8 @@ const max_obstacle_work: u16 = 512;
 
 /// The avoidance pass over the selected intents in selected order: each range writes its
 /// movement intents and the path requests its intents flagged, one range of each stream
-/// per pass range, sized before dispatch from the directions' request prefixes. Both
-/// streams therefore merge in selected order.
+/// per pass range, sized before dispatch from the directions' request prefixes. Path
+/// requests merge in selected order. Movement intents are then sorted by `movement_row`.
 pub fn writeMovementIntents(
     self: *SteeringSystem,
     frame: *SimulationFrame,
@@ -93,6 +95,25 @@ pub fn writeMovementIntents(
     if (comptime runtime_perf_log.enabled) stats.perf.batch = batch;
     frame.intents.finishWrite();
     frame.path_requests.finishWrite();
+
+    const merged = frame.intents.mergedItemsMut();
+    const segments = [_][]const SimulationIntent{merged};
+    const segment_starts = [_]usize{0};
+    const order_batches = try BandedSort(SimulationIntent, movementIntentRow).sortSegments(
+        self.allocator,
+        threads.stage(&self.intent_order_place_tuner),
+        threads.stage(&self.intent_order_sort_tuner),
+        &segments,
+        &segment_starts,
+        steering_range_alignment_items,
+        &self.intent_order_staging,
+        &self.intent_order_offsets,
+        merged,
+    );
+    if (comptime runtime_perf_log.enabled) {
+        stats.perf.order_place_batch = order_batches.place;
+        stats.perf.order_sort_batch = order_batches.sort;
+    }
 
     if (comptime runtime_perf_log.enabled) {
         for (self.movement_tallies.items) |slot| {
@@ -168,6 +189,12 @@ fn windowStartsAtOrBefore(logical: usize, window: SelectedWindow) bool {
     return window.logical_base <= logical;
 }
 
+fn movementIntentRow(intent: SimulationIntent) u32 {
+    return switch (intent) {
+        .movement => |movement| movement.movement_row,
+    };
+}
+
 fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     // Jobs never append outside their assigned output ranges, which keeps the
     // transient streams deterministic across serial and threaded runs.
@@ -203,6 +230,7 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
                 .entity = selected.entity,
                 .direction_x = result.direction.x,
                 .direction_y = result.direction.y,
+                .movement_row = job.work.movement_row[index],
             } });
             if (job.work.emit_request[index]) requests.write(PathRequest{
                 .entity = selected.entity,
@@ -474,6 +502,7 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const max_steering_neighbor_samples = @import("../../data_system.zig").max_steering_neighbor_samples;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
+const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
 const buildSteeredIndex = @import("test_support.zig").buildSteeredIndex;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
@@ -1145,4 +1174,91 @@ fn pushedBehindFarEntries(far_count: usize) !bool {
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     // The static's box [320, 330] x [280, 290] pushes from (320, 290): toward -x and +y.
     return @abs(frame.intents.mergedItems()[0].movement.direction_y) > 0.01;
+}
+
+test "steering movement intents follow movement-row order across ranges" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Two avoidance ranges at the intent alignment, so the order place and sort split too.
+    const agent_count = steering_range_alignment_items + 4;
+    var agents: [agent_count]EntityId = undefined;
+    for (&agents, 0..) |*agent, index| {
+        agent.* = try addSteeredEntity(&data, .{ .x = @floatFromInt(index * 200), .y = 0 });
+    }
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
+    // A missing path emits one request per agent. The grid covers every start.
+    try pathfinding.rebuildStaticNavGrid(&data, 4096, 64, 32);
+    var colliders = try testColliders(&pathfinding, &data, 4096, 64, 32);
+    defer colliders.deinit();
+
+    // Reverse agent order, so first appearance is not movement-row order.
+    var navigation: [agent_count]NavigationIntent = undefined;
+    for (&navigation, 0..) |*intent, index| {
+        const agent_index = agent_count - 1 - index;
+        intent.* = .{ .entity = agents[agent_index], .goal = .{ .x = 999, .y = 0 }, .direct_direction_x = 1, .priority = 1 };
+    }
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = steering_range_alignment_items,
+    });
+    defer threads.deinit();
+    var index = try buildSteeredIndex(&data);
+    defer index.deinit();
+
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(4, 0, agent_count, 0, 0, 0);
+    try serial_frame.reservePathRequests(4, agent_count);
+    var serial_steering = SteeringSystem.init(std.testing.allocator);
+    defer serial_steering.deinit();
+    try serial_steering.reserve(agent_count);
+    serial_frame.beginStep();
+    try appendNavigationIntents(&serial_frame, &navigation);
+    const serial_stats = try updateSteeringInline(&serial_steering, &data, &serial_frame, &pathfinding, &colliders);
+    try std.testing.expectEqual(agent_count, serial_stats.movement_intent_count);
+
+    var threaded_frame = SimulationFrame.init(std.testing.allocator);
+    defer threaded_frame.deinit();
+    try threaded_frame.reserveStreams(4, 0, agent_count, 0, 0, 0);
+    try threaded_frame.reservePathRequests(4, agent_count);
+    var threaded_steering = SteeringSystem.init(std.testing.allocator);
+    defer threaded_steering.deinit();
+    try threaded_steering.reserve(agent_count);
+    threaded_frame.beginStep();
+    try appendNavigationIntents(&threaded_frame, &navigation);
+    const threaded_stats = try threaded_steering.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, index.view(), .{
+        .items_per_range = steering_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try std.testing.expectEqual(agent_count, threaded_stats.movement_intent_count);
+
+    const serial = serial_frame.intents.mergedItems();
+    const threaded = threaded_frame.intents.mergedItems();
+    try std.testing.expectEqual(serial.len, threaded.len);
+    for (serial, threaded) |want, got| {
+        try std.testing.expect(want.movement.entity.eql(got.movement.entity));
+        try std.testing.expectEqual(@as(u32, @bitCast(want.movement.direction_x)), @as(u32, @bitCast(got.movement.direction_x)));
+        try std.testing.expectEqual(@as(u32, @bitCast(want.movement.direction_y)), @as(u32, @bitCast(got.movement.direction_y)));
+        try std.testing.expectEqual(want.movement.movement_row, got.movement.movement_row);
+    }
+    const serial_requests = serial_frame.path_requests.mergedItems();
+    const threaded_requests = threaded_frame.path_requests.mergedItems();
+    try std.testing.expectEqualSlices(PathRequest, serial_requests, threaded_requests);
+    // Selected order is the navigation array. A sort of the request stream would
+    // still match serial to threaded and still pass the movement-row checks.
+    try std.testing.expectEqual(navigation.len, serial_requests.len);
+    for (serial_requests, navigation) |request, intent| {
+        try std.testing.expect(request.entity.eql(intent.entity));
+    }
+    var previous: u32 = 0;
+    for (serial, 0..) |intent, row| {
+        try std.testing.expectEqual(@as(u32, @intCast(row)), intent.movement.movement_row);
+        if (row > 0) try std.testing.expect(intent.movement.movement_row > previous);
+        previous = intent.movement.movement_row;
+        try std.testing.expect(intent.movement.entity.eql(agents[row]));
+    }
 }

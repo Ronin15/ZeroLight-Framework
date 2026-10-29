@@ -682,16 +682,6 @@ pub const DataSystem = struct {
         };
     }
 
-    /// One slot resolve → the dense movement row of an entity carrying both an AI agent
-    /// and a movement body. Null if either is missing (or the entity is not alive).
-    pub fn aiMovementDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        if (slot.ai_agent_index == null) return null;
-        const movement = slot.movement_body_index orelse return null;
-        // Widens the stored dense index to usize.
-        return @intCast(movement);
-    }
-
     pub fn setAssetReference(self: *DataSystem, id: EntityId, asset_ref: AssetReference) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
 

@@ -36,13 +36,14 @@
 //! `obstacle_samples=`, and `intents=`. `steering-levels` prints checks and samples per
 //! selected intent. `--details` adds each prepare stage's shape (`agents=`, `resolve=`,
 //! `claim=`, `dir=`; `-` for a stage that did not run), `steer=` (the avoidance pass), each
-//! over the measured steps (`[threaded/non-empty]`), and `main=` with `main_per_item=` (per
-//! agent). `steering-static-change` adds the seam's collider sync and trigger patch stages
-//! (`seam:`), and its main share subtracts every seam stage on workers. The tuned case
-//! settles every tuner its measured step runs (`step_tuners:`: the five steering stages, and
-//! the seam's for `steering-static-change`) and prints each steering tuner's state
-//! (`tuners:`). A fixed threaded case runs every stage of more than one range on workers
-//! at the intent alignment and checks the claim's range count against it.
+//! over the measured steps (`[threaded/non-empty]`), `stages:` for every stage in run order
+//! (including the movement-intent `place` and `sort` item counts), and `main=` with
+//! `main_per_item=` (per agent). `steering-static-change` adds the seam's collider sync and
+//! trigger patch stages (`seam:`), and its main share subtracts every seam stage on workers.
+//! The tuned case settles every tuner its measured step runs (`step_tuners:`: the seven
+//! steering stages, and the seam's for `steering-static-change`) and prints each steering
+//! tuner's state (`tuners:`). A fixed threaded case runs every stage of more than one range
+//! on workers at the intent alignment and checks the claim's range count against it.
 //!
 //! `steering-levels` times one steering step over 1, 4, and 16 levels with the check cap
 //! of agents at one xy on each level (one under the cap as the others), every agent
@@ -420,20 +421,28 @@ const MeasuredCase = struct {
 // Off-main time of one steering step's stages.
 fn stagesOffMainNs(stats: SteeringStats) u64 {
     return offMainNs(stats.perf.agents_batch) + offMainNs(stats.perf.select_resolve_batch) + offMainNs(stats.perf.select_claim_batch) + offMainNs(stats.perf.directions_batch) +
-        offMainNs(stats.perf.batch);
+        offMainNs(stats.perf.batch) + offMainNs(stats.perf.order_place_batch) + offMainNs(stats.perf.order_sort_batch);
 }
 
 // The steering step's stages, each under its own tuner, in run order: the four prepare
-// stages, then the avoidance pass (`steer`, the row's batch).
-const stage_names = [_][]const u8{ "agents", "resolve", "claim", "dir", "steer" };
+// stages, the avoidance pass (`steer`), then the movement-intent order place and sort.
+const stage_names = [_][]const u8{ "agents", "resolve", "claim", "dir", "steer", "place", "sort" };
 
 fn stageTuners(system: *const SteeringSystem) [stage_names.len]*const AdaptiveWorkTuner {
-    return .{ &system.agents_tuner, &system.select_resolve_tuner, &system.select_claim_tuner, &system.directions_tuner, &system.adaptive_tuner };
+    return .{
+        &system.agents_tuner,
+        &system.select_resolve_tuner,
+        &system.select_claim_tuner,
+        &system.directions_tuner,
+        &system.adaptive_tuner,
+        &system.intent_order_place_tuner,
+        &system.intent_order_sort_tuner,
+    };
 }
 
 fn stageBatches(stats: SteeringStats) [stage_names.len]BatchStats {
     const perf = stats.perf;
-    return .{ perf.agents_batch, perf.select_resolve_batch, perf.select_claim_batch, perf.directions_batch, perf.batch };
+    return .{ perf.agents_batch, perf.select_resolve_batch, perf.select_claim_batch, perf.directions_batch, perf.batch, perf.order_place_batch, perf.order_sort_batch };
 }
 
 // Every tuner a measured step can run: the steering system's, and the commit seam's when the
@@ -496,7 +505,13 @@ fn measureCase(
         shapes.add(stageBatches(last_stats));
         if (seam) |fixture| seam_shapes.add(fixtures.seamBatches(&fixture.seam.pipeline));
         try suite.checkStagesDispatched(case, thread_ptr, element_range, &.{
-            last_stats.perf.agents_batch, last_stats.perf.select_resolve_batch, last_stats.perf.select_claim_batch, last_stats.perf.directions_batch, last_stats.perf.batch,
+            last_stats.perf.agents_batch,
+            last_stats.perf.select_resolve_batch,
+            last_stats.perf.select_claim_batch,
+            last_stats.perf.directions_batch,
+            last_stats.perf.batch,
+            last_stats.perf.order_place_batch,
+            last_stats.perf.order_sort_batch,
         });
         try suite.checkFixedRangeCount(case, thread_ptr, element_range, last_stats.perf.select_claim_batch);
         if (last_stats.perf.select_claim_batch.item_count != last_stats.navigation_intent_count) return error.ClaimItemsNotIntentCount;
@@ -511,6 +526,7 @@ fn measureCase(
         .select_claim = suite.batchSummaryFromShapes(&shapes, 2),
         .directions = suite.batchSummaryFromShapes(&shapes, 3),
     };
+    shapes.print(&stats.details, "stages", stage_names);
     if (seam != null) seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
         stats.tuner_settle = settle.measured();

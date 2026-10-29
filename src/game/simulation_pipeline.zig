@@ -667,6 +667,8 @@ pub const SimulationPipelineStats = struct {
             perf.recordBenchBatch(.steering_select_claim, steering_stats.perf.select_claim_batch);
             perf.recordBenchBatch(.steering_directions, steering_stats.perf.directions_batch);
             perf.recordBenchBatch(.steering, steering_stats.perf.batch);
+            perf.recordBenchBatch(.steering_intent_order_place, steering_stats.perf.order_place_batch);
+            perf.recordBenchBatch(.steering_intent_order_sort, steering_stats.perf.order_sort_batch);
         }
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);

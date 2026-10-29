@@ -170,7 +170,7 @@ fn stageBatches(stage: Timing) StageBatches {
         .pipeline_ai_affect => .{ .bench = &.{.affect} },
         .pipeline_ai => .{ .bench = &.{ .ai_gather, .ai_separation, .ai_intent } },
         .pipeline_path_goals => .{ .bench = &.{ .path_goal_scan, .path_goal_project } },
-        .pipeline_steering => .{ .bench = &.{ .steering_agents, .steering_select_resolve, .steering_select_claim, .steering_directions, .steering } },
+        .pipeline_steering => .{ .bench = &.{ .steering_agents, .steering_select_resolve, .steering_select_claim, .steering_directions, .steering, .steering_intent_order_place, .steering_intent_order_sort } },
         .pipeline_pathfinding => .{
             .logged = &.{ .path_intake, .path_registry_flush, .path_resize_copy },
             .bench = &.{ .path_registry_flush_count, .path_registry_rename, .path_group_field_advance, .path_group_field_begin, .path_solve, .path_publish_copy },

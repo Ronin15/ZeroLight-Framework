@@ -68,12 +68,11 @@ pub const MovementSystem = struct {
     }
 
     /// Writes this step's movement intents into velocity as a threaded stage over the
-    /// merged stream: `direction * speed` at the entity's movement row, speed `40` when
-    /// not positive. Entities without both an AI agent and a movement body are skipped.
-    /// Ranges write rows in parallel, relying on `frame.intents` carrying at most one
-    /// movement intent per entity. Records timing into `apply_intents_tuner` only on adaptive
-    /// selection (`adaptive`, no `items_per_range`, workers available). An empty stream
-    /// records nothing.
+    /// merged stream: `direction * speed` at the intent's stored movement row, speed `40`
+    /// when not positive. Ranges write rows in parallel, relying on the stream carrying at
+    /// most one movement intent per row. Records timing into `apply_intents_tuner` only on
+    /// adaptive selection (`adaptive`, no `items_per_range`, workers available). An empty
+    /// stream records nothing.
     pub fn applyIntents(
         self: *MovementSystem,
         bodies: *data.DataSystem,
@@ -87,7 +86,6 @@ pub const MovementSystem = struct {
         const apply = (MovementThreads{ .thread_system = thread_system, .config = config }).stage(&self.apply_intents_tuner);
         const selection = apply.select(intents.len, data.movement_range_alignment_items);
         var context = ApplyIntentsJobContext{
-            .bodies = bodies,
             .intents = intents,
             .slice = bodies.movementBodySlice(),
             .range_count = selection.range_count,
@@ -101,7 +99,6 @@ pub const MovementSystem = struct {
 };
 
 const ApplyIntentsJobContext = struct {
-    bodies: *const data.DataSystem,
     intents: []const SimulationIntent,
     slice: data.MovementBodySlice,
     /// Dispatched range count; dual-asserted against `range.index` at job entry.
@@ -111,14 +108,12 @@ const ApplyIntentsJobContext = struct {
 fn applyIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *ApplyIntentsJobContext = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
-    applyIntentRange(job.bodies, job.intents, &job.slice, range);
+    applyIntentRange(job.intents, &job.slice, range);
 }
 
-// Applies the intents in `range`; written rows are the intents' movement rows, which
-// the one-intent-per-entity stream keeps disjoint across ranges. Slot resolves are
-// per-intent pointer chases and stay scalar; the speed math runs in lane blocks.
+// Applies the intents in `range`; written rows are the stored movement rows, which the
+// one-intent-per-row stream keeps disjoint across ranges. The speed math runs in lane blocks.
 fn applyIntentRange(
-    bodies: *const data.DataSystem,
     intents: []const SimulationIntent,
     slice: *const data.MovementBodySlice,
     range: ParallelRange,
@@ -130,7 +125,8 @@ fn applyIntentRange(
     for (intents[range.start..range.end]) |item| {
         switch (item) {
             .movement => |movement_intent| {
-                const row = bodies.aiMovementDenseIndex(movement_intent.entity) orelse continue;
+                const row: usize = movement_intent.movement_row;
+                std.debug.assert(row < slice.entities.len);
                 lanes.push(row, movement_intent.direction_x, movement_intent.direction_y);
                 if (lanes.count == simd.lane_count) lanes.flush(slice);
             },
@@ -197,7 +193,8 @@ fn applyIntentRangeScalar(bodies: *data.DataSystem, frame: *const SimulationFram
     for (frame.intents.mergedItems()) |item| {
         switch (item) {
             .movement => |movement_intent| {
-                const row = bodies.aiMovementDenseIndex(movement_intent.entity) orelse continue;
+                const row: usize = movement_intent.movement_row;
+                std.debug.assert(row < slice.entities.len);
                 applyIntentScalar(&slice, row, movement_intent.direction_x, movement_intent.direction_y);
             },
         }
@@ -614,9 +611,6 @@ test "dormant rows carry zero velocity and stay frozen across a full-range integ
     try std.testing.expectEqual(@as(f32, 200 - 20 * 0.5), after_moving.position.y);
 }
 
-// Intents the apply must skip, interleaved through the fixture's stream.
-const IntentSkip = enum { invalid_entity, destroyed_entity, body_without_agent, agent_without_body };
-
 // Velocity of a row no intent writes.
 const unapplied_velocity: f32 = -7.5;
 
@@ -624,8 +618,6 @@ const IntentFixture = struct {
     game_data: data.DataSystem,
     frame: SimulationFrame,
     agent_count: usize,
-    // Movement row of the body without an AI agent, when the fixture has skips.
-    body_only_row: ?usize,
 
     fn deinit(self: *IntentFixture) void {
         self.frame.deinit();
@@ -652,9 +644,9 @@ fn intentDirection(row: usize) [2]f32 {
 }
 
 // `agent_count` agents (movement body and AI agent) on movement rows `0..agent_count`,
-// one intent each in a scattered row order; with `with_skips`, one intent per
-// `IntentSkip` spread through the stream so they land in different ranges.
-fn initIntentFixture(agent_count: usize, with_skips: bool) !IntentFixture {
+// one intent each in a scattered stored-row order. A body with no intent keeps its
+// velocity by absence. Disjointness is one row per intent, not stream order.
+fn initIntentFixture(agent_count: usize) !IntentFixture {
     const allocator = std.testing.allocator;
     var game_data = data.DataSystem.init(allocator);
     errdefer game_data.deinit();
@@ -667,51 +659,29 @@ fn initIntentFixture(agent_count: usize, with_skips: bool) !IntentFixture {
         try game_data.setAiAgent(entity, .{});
     }
 
-    var skip_entities: [std.meta.tags(IntentSkip).len]data.EntityId = undefined;
-    var body_only_row: ?usize = null;
-    if (with_skips) {
-        const body_only = try game_data.createEntity();
-        try game_data.setMovementBody(body_only, .{ .velocity = .{ .x = unapplied_velocity, .y = unapplied_velocity }, .speed = 3 });
-        body_only_row = agent_count;
-        const agent_only = try game_data.createEntity();
-        try game_data.setAiAgent(agent_only, .{});
-        // Created last, so removing its movement row moves no other row.
-        const destroyed = try game_data.createEntity();
-        try game_data.setMovementBody(destroyed, .{ .speed = 3 });
-        try game_data.setAiAgent(destroyed, .{});
-        try std.testing.expect(try game_data.destroyEntity(destroyed));
-        skip_entities[@backingInt(IntentSkip.invalid_entity)] = data.EntityId.invalid;
-        skip_entities[@backingInt(IntentSkip.destroyed_entity)] = destroyed;
-        skip_entities[@backingInt(IntentSkip.body_without_agent)] = body_only;
-        skip_entities[@backingInt(IntentSkip.agent_without_body)] = agent_only;
-    }
-    const skip_count: usize = if (with_skips) skip_entities.len else 0;
-
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
     try frame.intents.prepareRangeCounts(1);
-    frame.intents.addCount(0, agent_count + skip_count);
+    frame.intents.addCount(0, agent_count);
     try frame.intents.prefix();
     var writer = frame.intents.rangeWriter(0);
     var stride: usize = if (agent_count <= 1) 1 else 7;
     while (agent_count > 1 and std.math.gcd(stride, agent_count) != 1) stride += 2;
     const entities = game_data.movementBodySliceConst().entities;
-    var next_skip: usize = 0;
     for (0..agent_count) |order| {
-        while (next_skip < skip_count and next_skip * agent_count / skip_count <= order) : (next_skip += 1) {
-            writer.write(.{ .movement = .{ .entity = skip_entities[next_skip], .direction_x = 1, .direction_y = 1 } });
-        }
         const row = order * stride % agent_count;
         const direction = intentDirection(row);
-        writer.write(.{ .movement = .{ .entity = entities[row], .direction_x = direction[0], .direction_y = direction[1] } });
-    }
-    while (next_skip < skip_count) : (next_skip += 1) {
-        writer.write(.{ .movement = .{ .entity = skip_entities[next_skip], .direction_x = 1, .direction_y = 1 } });
+        writer.write(.{ .movement = .{
+            .entity = entities[row],
+            .direction_x = direction[0],
+            .direction_y = direction[1],
+            .movement_row = @intCast(row),
+        } });
     }
     writer.finish();
     frame.intents.finishWrite();
 
-    return .{ .game_data = game_data, .frame = frame, .agent_count = agent_count, .body_only_row = body_only_row };
+    return .{ .game_data = game_data, .frame = frame, .agent_count = agent_count };
 }
 
 fn expectVelocityBitsEqual(actual: *const data.DataSystem, expected: *const data.DataSystem) !void {
@@ -722,13 +692,13 @@ fn expectVelocityBitsEqual(actual: *const data.DataSystem, expected: *const data
 }
 
 test "applied intents set velocity from direction and speed, default speed when not positive" {
-    var fixture = try initIntentFixture(data.movement_range_alignment_items * 2 + 3, true);
+    var fixture = try initIntentFixture(data.movement_range_alignment_items * 2 + 3);
     defer fixture.deinit();
 
     try applyIntentsInline(&fixture.game_data, &fixture.frame);
 
     const slice = fixture.game_data.movementBodySliceConst();
-    try std.testing.expectEqual(fixture.agent_count + 1, slice.entities.len);
+    try std.testing.expectEqual(fixture.agent_count, slice.entities.len);
     for (0..fixture.agent_count) |row| {
         const direction = intentDirection(row);
         const speed: f32 = if (row % 5 == 0) default_intent_speed else intentAgentSpeed(row);
@@ -736,15 +706,49 @@ test "applied intents set velocity from direction and speed, default speed when 
         try std.testing.expectEqual(@as(u32, @bitCast(direction[0] * speed)), @as(u32, @bitCast(slice.velocity_x[row])));
         try std.testing.expectEqual(@as(u32, @bitCast(direction[1] * speed)), @as(u32, @bitCast(slice.velocity_y[row])));
     }
-    // The body without an AI agent keeps its velocity; the other skips own no row.
-    const body_only_row = fixture.body_only_row.?;
-    try std.testing.expectEqual(unapplied_velocity, slice.velocity_x[body_only_row]);
-    try std.testing.expectEqual(unapplied_velocity, slice.velocity_y[body_only_row]);
+}
+
+test "an invalid-entity intent writes its stored movement row" {
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    const written = try game_data.createEntity();
+    try game_data.setMovementBody(written, .{
+        .velocity = .{ .x = unapplied_velocity, .y = unapplied_velocity },
+        .speed = 2,
+    });
+    // No intent names this body, so its velocity stays by absence.
+    const idle = try game_data.createEntity();
+    try game_data.setMovementBody(idle, .{
+        .velocity = .{ .x = unapplied_velocity, .y = unapplied_velocity },
+        .speed = 2,
+    });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.intents.prepareRangeCounts(1);
+    frame.intents.addCount(0, 1);
+    try frame.intents.prefix();
+    var writer = frame.intents.rangeWriter(0);
+    writer.write(.{ .movement = .{
+        .entity = data.EntityId.invalid,
+        .direction_x = 1,
+        .direction_y = 0,
+        .movement_row = 0,
+    } });
+    writer.finish();
+    frame.intents.finishWrite();
+
+    try applyIntentsInline(&game_data, &frame);
+    const slice = game_data.movementBodySliceConst();
+    try std.testing.expectEqual(@as(f32, 2), slice.velocity_x[0]);
+    try std.testing.expectEqual(@as(f32, 0), slice.velocity_y[0]);
+    try std.testing.expectEqual(unapplied_velocity, slice.velocity_x[1]);
+    try std.testing.expectEqual(unapplied_velocity, slice.velocity_y[1]);
 }
 
 test "threaded intent apply matches serial across range splits and worker counts" {
     const agent_count = data.movement_range_alignment_items * 8 + 3;
-    var serial = try initIntentFixture(agent_count, true);
+    var serial = try initIntentFixture(agent_count);
     defer serial.deinit();
     try applyIntentsInline(&serial.game_data, &serial.frame);
 
@@ -761,7 +765,7 @@ test "threaded intent apply matches serial across range splits and worker counts
         .{ .items_per_range = data.movement_range_alignment_items * 3, .workers = 3 },
     };
     for (splits) |split| {
-        var threaded = try initIntentFixture(agent_count, true);
+        var threaded = try initIntentFixture(agent_count);
         defer threaded.deinit();
         var system = MovementSystem.init();
         const stats = system.applyIntents(&threaded.game_data, &threaded.frame, &threads, .{
@@ -769,16 +773,16 @@ test "threaded intent apply matches serial across range splits and worker counts
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
-        try std.testing.expectEqual(agent_count + std.meta.tags(IntentSkip).len, stats.intent_count);
+        try std.testing.expectEqual(agent_count, stats.intent_count);
         try expectVelocityBitsEqual(&threaded.game_data, &serial.game_data);
     }
 }
 
 test "intent lanes match the scalar apply bit for bit" {
     inline for (.{ 0, 3, 4, 9, 17 }) |agent_count| {
-        var lanes = try initIntentFixture(agent_count, false);
+        var lanes = try initIntentFixture(agent_count);
         defer lanes.deinit();
-        var scalar = try initIntentFixture(agent_count, false);
+        var scalar = try initIntentFixture(agent_count);
         defer scalar.deinit();
 
         try applyIntentsInline(&lanes.game_data, &lanes.frame);
@@ -789,7 +793,7 @@ test "intent lanes match the scalar apply bit for bit" {
 }
 
 test "threaded multi-worker intent apply allocates nothing after warmup (FailingAllocator)" {
-    var fixture = try initIntentFixture(data.movement_range_alignment_items * 8, true);
+    var fixture = try initIntentFixture(data.movement_range_alignment_items * 8);
     defer fixture.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -824,7 +828,7 @@ test "threaded multi-worker intent apply allocates nothing after warmup (Failing
 }
 
 test "intent apply records into its own tuner" {
-    var fixture = try initIntentFixture(data.movement_range_alignment_items * 8, false);
+    var fixture = try initIntentFixture(data.movement_range_alignment_items * 8);
     defer fixture.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -842,7 +846,7 @@ test "intent apply records into its own tuner" {
 }
 
 test "empty intent stream applies nothing and records no batch" {
-    var fixture = try initIntentFixture(data.movement_range_alignment_items, false);
+    var fixture = try initIntentFixture(data.movement_range_alignment_items);
     defer fixture.deinit();
     fixture.frame.intents.clearRetainingCapacity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{

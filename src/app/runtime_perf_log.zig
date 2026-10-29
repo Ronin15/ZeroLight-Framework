@@ -261,12 +261,15 @@ pub const BenchBatchStage = enum {
     // The goal resolve's intent scan and blocked-goal projection.
     path_goal_scan,
     path_goal_project,
-    // Steering's prepare stages before the avoidance pass (`steering`).
+    // Steering's prepare stages, the avoidance pass (`steering`), then the movement-intent
+    // order place and sort.
     steering_agents,
     steering_select_resolve,
     steering_select_claim,
     steering_directions,
     steering,
+    steering_intent_order_place,
+    steering_intent_order_sort,
     // The pathfinding update's registry flush count, a shrink's owner rename, the group-field
     // advance and begin passes, and the publish copy, beside its logged intake and flush.
     path_registry_flush_count,

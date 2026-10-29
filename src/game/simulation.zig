@@ -499,6 +499,8 @@ pub const MovementIntent = struct {
     entity: EntityId,
     direction_x: f32,
     direction_y: f32,
+    /// Dense movement row this intent writes.
+    movement_row: u32,
 };
 
 pub const PathAgentClass = enum {
@@ -1130,6 +1132,12 @@ pub fn RangeOutputStream(comptime T: type) type {
             return self.values.items[0..self.merged_len];
         }
 
+        /// The merged prefix, mutable. Producer-only, after `finishWrite`.
+        pub fn mergedItemsMut(self: *Self) []T {
+            std.debug.assert(self.prefix_ready or self.merged_len == 0);
+            return self.values.items[0..self.merged_len];
+        }
+
         pub fn rangeCount(self: *const Self) usize {
             return self.counts.items.len;
         }
@@ -1580,10 +1588,10 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.intents.addCount(1, 1);
     try frame.intents.prefix();
     var intent_writer = frame.intents.rangeWriter(0);
-    intent_writer.write(.{ .movement = .{ .entity = EntityId.invalid, .direction_x = 1, .direction_y = 0 } });
+    intent_writer.write(.{ .movement = .{ .entity = EntityId.invalid, .direction_x = 1, .direction_y = 0, .movement_row = 0 } });
     intent_writer.finish();
     intent_writer = frame.intents.rangeWriter(1);
-    intent_writer.write(.{ .movement = .{ .entity = EntityId.invalid, .direction_x = 0, .direction_y = 1 } });
+    intent_writer.write(.{ .movement = .{ .entity = EntityId.invalid, .direction_x = 0, .direction_y = 1, .movement_row = 1 } });
     intent_writer.finish();
     frame.intents.finishWrite();
 

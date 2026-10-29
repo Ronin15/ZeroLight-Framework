@@ -219,6 +219,8 @@ fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         const best = job.claim_best[row];
         const intent = job.intents[best];
         const movement_index = job.intent_movement[best];
+        // Resolve sets both indices or neither, and this intent resolved.
+        std.debug.assert(movement_index != no_row);
         const slot = range.start + tally.count;
         const agent = steeringAgentAt(job.steering, row);
         const start = math.Vec2{ .x = job.previous_x[movement_index], .y = job.previous_y[movement_index] };
@@ -240,6 +242,7 @@ fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         job.work.selected_avoidance_weights[slot] = agent.avoidance_weight;
         job.work.selected_max_neighbor_samples[slot] = agent.max_neighbor_samples;
         job.work.selected_world_level[slot] = start_level;
+        job.work.movement_row[slot] = movement_index;
         // At most one request per intent, so the count fits u32 (`max_step_items`).
         job.work.request_prefix[slot] = @intCast(tally.requests);
         job.work.emit_request[slot] = emit_request;
