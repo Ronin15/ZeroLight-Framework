@@ -52,11 +52,30 @@ const writeMovementIntents = @import("avoidance.zig").writeMovementIntents;
 const MovementTally = @import("avoidance.zig").MovementTally;
 
 pub const steering_range_alignment_items: usize = @import("../../data_system.zig").movement_range_alignment_items;
+const hot_soa_column_alignment = @import("../../data_system.zig").hot_soa_column_alignment;
+pub const agents_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(u16);
+pub const directions_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(bool);
+
+comptime {
+    std.debug.assert(agents_range_alignment_items * @sizeOf(u16) == hot_soa_column_alignment);
+    std.debug.assert(directions_range_alignment_items * @sizeOf(bool) == hot_soa_column_alignment);
+    std.debug.assert(directions_range_alignment_items % simd.lane_count == 0);
+}
 
 // Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
 const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .initial_range_items = steering_range_alignment_items,
     .smallest_range_items = steering_range_alignment_items,
+};
+
+const agents_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = agents_range_alignment_items,
+    .smallest_range_items = agents_range_alignment_items,
+};
+
+const directions_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = directions_range_alignment_items,
+    .smallest_range_items = directions_range_alignment_items,
 };
 
 const hotStoreCapacity = @import("../../data_system.zig").hotStoreCapacity;
@@ -143,8 +162,8 @@ pub const SteeringSystem = struct {
     intent_buckets: RowList = .empty,
     claims: std.MultiArrayList(Claim) = .{},
     claim_stamp: u32 = 0,
-    // `directions` writes each intent range's selected intents into that range's window of
-    // `selected` and `selected_work_rows`; `selected_windows` maps the windows onto the
+    // `directions` writes each steering-row range's selected intents into that range's window
+    // of `selected` and `selected_work_rows`; `selected_windows` maps the windows onto the
     // selected order the avoidance pass walks. The avoidance pass writes `final_dir`.
     selected: SelectedList = .empty,
     selected_work_rows: std.MultiArrayList(SelectedWorkRow) = .{},
@@ -160,10 +179,10 @@ pub const SteeringSystem = struct {
     // One tuner per stage. `adaptive_tuner` drives the avoidance pass; place and sort
     // each have their own, over the merged movement intents.
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
-    agents_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
+    agents_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(agents_adaptive_tuner_config),
     select_resolve_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     select_claim_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
-    directions_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
+    directions_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(directions_adaptive_tuner_config),
     intent_order_place_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
     intent_order_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
 
@@ -283,11 +302,11 @@ pub const SteeringSystem = struct {
         var range_count: usize = 0;
         if (agent_count != 0) {
             const agents = threads.stage(&self.agents_tuner);
-            const selection = agents.select(agent_count, steering_range_alignment_items);
+            const selection = agents.select(agent_count, agents_range_alignment_items);
             setSlotCount(AgentsTally, &self.agents_tallies, selection.range_count);
             job.items_per_range = selection.items_per_range;
             job.tallies = self.agents_tallies.items;
-            const agents_batch = agents.run(selection, agent_count, steering_range_alignment_items, &job, agentsJob);
+            const agents_batch = agents.run(selection, agent_count, agents_range_alignment_items, &job, agentsJob);
             if (comptime runtime_perf_log.enabled) stats.perf.agents_batch = agents_batch;
             range_count = selection.range_count;
         }
@@ -401,18 +420,19 @@ pub fn ensureStepCapacity(self: *SteeringSystem, agent_count: usize, intent_coun
     try self.rekey_positions.ensureTotalCapacity(allocator, agent_count);
     try self.rekey_moves.ensureTotalCapacity(allocator, agent_count);
     try self.claims.ensureTotalCapacity(allocator, agent_count);
-    const agent_ranges = maxRangeCount(agent_count, steering_range_alignment_items);
+    const agent_ranges = maxRangeCount(agent_count, agents_range_alignment_items);
     try self.agents_tallies.ensureTotalCapacity(allocator, agent_ranges);
 
     try self.intent_rows.ensureTotalCapacity(allocator, hotStoreCapacity(intent_count));
     try self.intent_buckets.ensureTotalCapacity(allocator, intent_count);
-    try self.selected.ensureTotalCapacity(allocator, intent_count);
-    try self.selected_work_rows.ensureTotalCapacity(allocator, hotStoreCapacity(intent_count));
+    try self.selected.ensureTotalCapacity(allocator, agent_count);
+    try self.selected_work_rows.ensureTotalCapacity(allocator, hotStoreCapacity(agent_count));
     const intent_ranges = maxRangeCount(intent_count, steering_range_alignment_items);
     // `select_resolve` ranges only.
     try self.band_rows.ensureTotalCapacity(allocator, intent_ranges);
-    try self.directions_tallies.ensureTotalCapacity(allocator, intent_ranges);
-    try self.selected_windows.ensureTotalCapacity(allocator, intent_ranges);
+    const direction_ranges = maxRangeCount(agent_count, directions_range_alignment_items);
+    try self.directions_tallies.ensureTotalCapacity(allocator, direction_ranges);
+    try self.selected_windows.ensureTotalCapacity(allocator, direction_ranges);
     // The avoidance pass covers at most one selected intent per navigation intent.
     try self.movement_tallies.ensureTotalCapacity(allocator, intent_ranges);
     // Intent order places at most `intent_count` intents, one offset slot per place range.
@@ -951,12 +971,18 @@ test "steering runtime rows go with destroyed entities within a one-agent reserv
 test "steering production stage tuners use the central gate and their stage's range alignment" {
     var system = SteeringSystem.init(std.testing.allocator);
     defer system.deinit();
-    const agent_and_intent_tuners = [_]*const AdaptiveWorkTuner{ &system.adaptive_tuner, &system.agents_tuner, &system.select_resolve_tuner, &system.select_claim_tuner, &system.directions_tuner };
-    for (agent_and_intent_tuners) |tuner| {
+    const other_tuners = [_]*const AdaptiveWorkTuner{ &system.adaptive_tuner, &system.select_resolve_tuner, &system.select_claim_tuner };
+    for (other_tuners) |tuner| {
         try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, tuner.config.threaded_batch_ns);
         try std.testing.expectEqual(steering_range_alignment_items, tuner.config.initial_range_items);
         try std.testing.expectEqual(steering_range_alignment_items, tuner.config.smallest_range_items);
     }
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.agents_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(agents_range_alignment_items, system.agents_tuner.config.initial_range_items);
+    try std.testing.expectEqual(agents_range_alignment_items, system.agents_tuner.config.smallest_range_items);
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.directions_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(directions_range_alignment_items, system.directions_tuner.config.initial_range_items);
+    try std.testing.expectEqual(directions_range_alignment_items, system.directions_tuner.config.smallest_range_items);
 }
 
 test "steering threaded prepare equals serial across range splits and worker counts" {

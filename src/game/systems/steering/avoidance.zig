@@ -502,7 +502,6 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const max_steering_neighbor_samples = @import("../../data_system.zig").max_steering_neighbor_samples;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
-const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
 const buildSteeredIndex = @import("test_support.zig").buildSteeredIndex;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
@@ -1185,6 +1184,17 @@ test "steering movement intents follow movement-row order across ranges" {
     for (&agents, 0..) |*agent, index| {
         agent.* = try addSteeredEntity(&data, .{ .x = @floatFromInt(index * 200), .y = 0 });
     }
+    // A movement-only tail, then removing the first steered agent. Steering
+    // swap-removes a steered tail into row 0; movement swap-removes this body.
+    // The survivors' steering-row order and movement-row order differ.
+    const movement_only = try data.createEntity();
+    try data.setMovementBody(movement_only, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try std.testing.expect(try data.destroyEntity(agents[0]));
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
     try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
@@ -1218,7 +1228,7 @@ test "steering movement intents follow movement-row order across ranges" {
     serial_frame.beginStep();
     try appendNavigationIntents(&serial_frame, &navigation);
     const serial_stats = try updateSteeringInline(&serial_steering, &data, &serial_frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(agent_count, serial_stats.movement_intent_count);
+    try std.testing.expectEqual(agent_count - 1, serial_stats.movement_intent_count);
 
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
@@ -1234,7 +1244,7 @@ test "steering movement intents follow movement-row order across ranges" {
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expectEqual(agent_count, threaded_stats.movement_intent_count);
+    try std.testing.expectEqual(agent_count - 1, threaded_stats.movement_intent_count);
 
     const serial = serial_frame.intents.mergedItems();
     const threaded = threaded_frame.intents.mergedItems();
@@ -1248,17 +1258,31 @@ test "steering movement intents follow movement-row order across ranges" {
     const serial_requests = serial_frame.path_requests.mergedItems();
     const threaded_requests = threaded_frame.path_requests.mergedItems();
     try std.testing.expectEqualSlices(PathRequest, serial_requests, threaded_requests);
-    // Selected order is the navigation array. A sort of the request stream would
-    // still match serial to threaded and still pass the movement-row checks.
-    try std.testing.expectEqual(navigation.len, serial_requests.len);
-    for (serial_requests, navigation) |request, intent| {
-        try std.testing.expect(request.entity.eql(intent.entity));
+    // Path requests follow steering-row order. Navigation is reversed, so a stream
+    // left in source order fails.
+    const steering_entities = data.steeringAgentSliceConst().entities;
+    try std.testing.expectEqual(steering_entities.len, serial_requests.len);
+    for (serial_requests, steering_entities) |request, entity| {
+        try std.testing.expect(request.entity.eql(entity));
     }
+    // Movement intents follow movement-row order. That order is not the
+    // steering-row order in this fixture, so dropping the sort fails.
+    var expected_rows: [agent_count]u32 = undefined;
+    var expected_entities: [agent_count]EntityId = undefined;
+    var expected_count: usize = 0;
+    for (data.movementBodySliceConst().entities, 0..) |entity, movement_row| {
+        if (data.steeringAgentDenseIndex(entity) == null) continue;
+        expected_rows[expected_count] = @intCast(movement_row);
+        expected_entities[expected_count] = entity;
+        expected_count += 1;
+    }
+    try std.testing.expectEqual(expected_count, serial.len);
+    try std.testing.expect(!expected_entities[0].eql(steering_entities[0]));
     var previous: u32 = 0;
-    for (serial, 0..) |intent, row| {
-        try std.testing.expectEqual(@as(u32, @intCast(row)), intent.movement.movement_row);
-        if (row > 0) try std.testing.expect(intent.movement.movement_row > previous);
+    for (serial, 0..) |intent, intent_index| {
+        try std.testing.expectEqual(expected_rows[intent_index], intent.movement.movement_row);
+        try std.testing.expect(intent.movement.entity.eql(expected_entities[intent_index]));
+        if (intent_index > 0) try std.testing.expect(intent.movement.movement_row > previous);
         previous = intent.movement.movement_row;
-        try std.testing.expect(intent.movement.entity.eql(agents[row]));
     }
 }

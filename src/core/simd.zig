@@ -726,6 +726,43 @@ fn scatterFloat4MaskedScalar(values: []f32, indices: [lane_count]usize, vector: 
     }
 }
 
+/// Writes the lanes set in `lanes`. Distinctness is asserted only for those lanes,
+/// so an inactive index may alias a live one.
+pub fn scatterBool4Masked(values: []bool, indices: [lane_count]usize, vector: Mask4, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
+/// Scalar form of `scatterBool4Masked`.
+fn scatterBool4MaskedScalar(values: []bool, indices: [lane_count]usize, vector: [lane_count]bool, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
 /// Per-lane reciprocal square root, `1 / sqrt(values)`. Lanes that are zero or
 /// negative produce inf/NaN; guard the input when that is possible.
 pub inline fn reciprocalSqrtFloat4(values: Float4) Float4 {
@@ -1164,6 +1201,33 @@ test "loadFloat4Prefix and scatterFloat4Masked match their scalar forms bit for 
     try std.testing.expectEqual(@as(f32, 3), alias_simd[2]);
     try std.testing.expectEqual(@as(f32, 4), alias_simd[3]);
     try std.testing.expectEqual(@as(f32, 5), alias_simd[4]);
+
+    // Inactive indices alias the live one. The mask must not store them back.
+    const bool_alias = [_]usize{ 1, 1, 1, 1 };
+    const bool_alias_vector: Mask4 = .{ true, false, false, false };
+    const bool_alias_bits: MaskBits = 0b0001;
+    var bool_alias_simd = [_]bool{ false, false, true, false, true };
+    var bool_alias_scalar = bool_alias_simd;
+    scatterBool4Masked(&bool_alias_simd, bool_alias, bool_alias_vector, bool_alias_bits);
+    scatterBool4MaskedScalar(&bool_alias_scalar, bool_alias, .{ true, false, false, false }, bool_alias_bits);
+    try std.testing.expectEqualSlices(bool, &bool_alias_scalar, &bool_alias_simd);
+    try std.testing.expect(bool_alias_simd[1]);
+    try std.testing.expect(!bool_alias_simd[0]);
+    try std.testing.expect(bool_alias_simd[2]);
+    try std.testing.expect(!bool_alias_simd[3]);
+    try std.testing.expect(bool_alias_simd[4]);
+
+    const bool_indices = [_]usize{ 4, 0, 2, 1 };
+    const bool_vector: Mask4 = .{ true, false, true, false };
+    const bool_lanes = [_]bool{ true, false, true, false };
+    for (0..1 << lane_count) |bits| {
+        const lanes: MaskBits = @intCast(bits);
+        var bool_simd = [_]bool{ false, true, false, true, false };
+        var bool_scalar = bool_simd;
+        scatterBool4Masked(&bool_simd, bool_indices, bool_vector, lanes);
+        scatterBool4MaskedScalar(&bool_scalar, bool_indices, bool_lanes, lanes);
+        try std.testing.expectEqualSlices(bool, &bool_scalar, &bool_simd);
+    }
 
     const prefix_vector = float4(-0.0, 1.5, -2.5, 3.5);
     for (0..lane_count + 1) |count| {

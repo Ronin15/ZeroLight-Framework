@@ -2288,6 +2288,7 @@ test "steering agent component stores dense columns, supports set/get, rejects i
     try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .waypoint_tolerance = std.math.inf(f32) }));
     try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .avoidance_radius = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .max_neighbor_samples = max_steering_neighbor_samples + 1 }));
+    try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .stuck_step_threshold = types.max_steering_cooldown_steps + 1 }));
 
     try std.testing.expect(try data.destroyEntity(second));
     const slice = data.steeringAgentSliceConst();

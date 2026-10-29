@@ -55,6 +55,7 @@ pub fn validateSteeringAgent(agent: SteeringAgent) !void {
         agent.avoidance_radius > max_steering_radius or
         agent.avoidance_weight > max_steering_weight or
         agent.max_neighbor_samples > max_steering_neighbor_samples or
+        agent.stuck_step_threshold > max_steering_cooldown_steps or
         agent.replan_cooldown_steps > max_steering_cooldown_steps or
         agent.unavailable_backoff_steps > max_steering_cooldown_steps)
     {

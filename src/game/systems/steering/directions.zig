@@ -20,14 +20,13 @@ const ConstSteeringAgentSlice = @import("../../data_system.zig").ConstSteeringAg
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
-const steering_range_alignment_items = @import("system.zig").steering_range_alignment_items;
+const directions_range_alignment_items = @import("system.zig").directions_range_alignment_items;
 const movementScopeLevel = @import("system.zig").movementScopeLevel;
 const StageThreads = @import("system.zig").StageThreads;
 const SteeringStats = @import("system.zig").SteeringStats;
 const SteeringSystem = @import("system.zig").SteeringSystem;
 const selectedWorkSlice = @import("system.zig").selectedWorkSlice;
 const SelectedWorkRow = @import("system.zig").SelectedWorkRow;
-const RuntimeRow = @import("system.zig").RuntimeRow;
 const SelectedWorkSlice = @import("system.zig").SelectedWorkSlice;
 const SelectedIntent = @import("system.zig").SelectedIntent;
 const no_row = @import("selection.zig").no_row;
@@ -45,9 +44,8 @@ pub const direction_epsilon: f32 = 0.0001;
 /// lag behind a genuinely moving goal.
 const steering_turn_smoothing: f32 = 0.15;
 
-/// `directions` over the intents: each intent that is its steering row's first this step
-/// emits the row's best intent into its range's window, then the main thread lays the
-/// windows out in range order.
+/// `directions` over steering rows: a claimed row emits its best intent into its
+/// range's window, then the main thread lays the windows out in range order.
 pub fn prepareDirections(
     self: *SteeringSystem,
     data: *const DataSystem,
@@ -57,38 +55,55 @@ pub fn prepareDirections(
     threads: StageThreads,
     stats: *SteeringStats,
 ) void {
-    const intent_count = intents.len;
-    std.debug.assert(self.selected.capacity >= intent_count);
-    self.selected.items.len = intent_count;
-    setRowCount(SelectedWorkRow, &self.selected_work_rows, intent_count);
+    const agent_count = steering.entities.len;
+    if (agent_count == 0) {
+        self.selected.items.len = 0;
+        setRowCount(SelectedWorkRow, &self.selected_work_rows, 0);
+        self.selected_windows.clearRetainingCapacity();
+        stats.selected_intent_count = 0;
+        stats.path_request_count = 0;
+        return;
+    }
+    std.debug.assert(self.selected.capacity >= agent_count);
+    self.selected.items.len = agent_count;
+    setRowCount(SelectedWorkRow, &self.selected_work_rows, agent_count);
     const movement = data.movementBodySliceConst();
     const intent_rows = self.intent_rows.slice();
     const claims = self.claims.slice();
+    const runtime = self.runtime_rows.slice();
     var job = DirectionsJob{
         .pathfinding = pathfinding,
         .intents = intents,
-        .intent_steering = intent_rows.items(.steering),
         .intent_movement = intent_rows.items(.movement),
         .claim_stamps = claims.items(.stamp),
-        .claim_first = claims.items(.first),
         .claim_best = claims.items(.best),
         .stamp = self.claim_stamp,
         .steering = steering,
         .previous_x = movement.previous_x,
         .previous_y = movement.previous_y,
         .scope = data.scopeColumnsSliceConst(),
-        .runtime = self.runtime_rows.slice(),
+        .columns = .{
+            .waypoint_hint = runtime.items(.waypoint_hint),
+            .replan_cooldown = runtime.items(.replan_cooldown),
+            .unavailable_backoff = runtime.items(.unavailable_backoff),
+            .stuck_steps = runtime.items(.stuck_steps),
+            .previous_progress_distance = runtime.items(.previous_progress_distance),
+            .has_previous_distance = runtime.items(.has_previous_distance),
+        },
+        .prev_dir_x = runtime.items(.prev_dir_x),
+        .prev_dir_y = runtime.items(.prev_dir_y),
+        .has_prev_dir = runtime.items(.has_prev_dir),
         .selected = self.selected.items,
         .work = selectedWorkSlice(self),
-        .items_per_range = intent_count,
+        .items_per_range = agent_count,
         .tallies = &.{},
     };
     const directions = threads.stage(&self.directions_tuner);
-    const selection = directions.select(intent_count, steering_range_alignment_items);
+    const selection = directions.select(agent_count, directions_range_alignment_items);
     setSlotCount(DirectionsTally, &self.directions_tallies, selection.range_count);
     job.items_per_range = selection.items_per_range;
     job.tallies = self.directions_tallies.items;
-    const directions_batch = directions.run(selection, intent_count, steering_range_alignment_items, &job, directionsJob);
+    const directions_batch = directions.run(selection, agent_count, directions_range_alignment_items, &job, directionsJob);
     if (comptime runtime_perf_log.enabled) stats.perf.directions_batch = directions_batch;
     const range_count = selection.range_count;
 
@@ -166,22 +181,33 @@ const PathDirection = struct {
     progress_distance: f32 = 0,
 };
 
-// `directions`: one range of intents.
+// Runtime columns a claimed row's path status mutates. `prev_dir` is the lane store's write.
+const RuntimeColumns = struct {
+    waypoint_hint: []u32,
+    replan_cooldown: []u16,
+    unavailable_backoff: []u16,
+    stuck_steps: []u16,
+    previous_progress_distance: []f32,
+    has_previous_distance: []bool,
+};
+
+// `directions`: one range of steering rows. The range owns its runtime rows and the packed
+// prefix of its selected window.
 const DirectionsJob = struct {
     pathfinding: *const PathfindingSystem,
     intents: []const NavigationIntent,
-    intent_steering: []const u32,
     intent_movement: []const u32,
     claim_stamps: []const u32,
-    claim_first: []const u32,
     claim_best: []const u32,
     stamp: u32,
     steering: ConstSteeringAgentSlice,
     previous_x: []const f32,
     previous_y: []const f32,
     scope: ConstScopeColumnsSlice,
-    // Written only at the steering rows of the range's selected intents, each selected once.
-    runtime: std.MultiArrayList(RuntimeRow).Slice,
+    columns: RuntimeColumns,
+    prev_dir_x: []f32,
+    prev_dir_y: []f32,
+    has_prev_dir: []bool,
     // Range r's window starts at `r * items_per_range`.
     selected: []SelectedIntent,
     work: SelectedWorkSlice,
@@ -189,34 +215,30 @@ const DirectionsJob = struct {
     tallies: []PaddedSlot(DirectionsTally),
 };
 
-// Each intent that is its steering row's first this step emits the row's best intent into
-// the next slot of the range's window: path status and progress per intent (scalar: a
-// cache probe, a field sample, and a waypoint walk), then the direction tail per block of
-// four in lanes.
+// A claimed steering row emits its best intent into the next slot of the range's window.
+// Path status stays scalar. The direction tail is one masked lane batch.
 fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *DirectionsJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.tallies.len);
     std.debug.assert(range.start == range.index * job.items_per_range);
     std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= job.intents.len and range.end <= job.intent_steering.len);
+    std.debug.assert(range.end <= job.claim_stamps.len and range.end <= job.columns.waypoint_hint.len);
+    std.debug.assert(range.end <= job.prev_dir_x.len and range.end <= job.has_prev_dir.len);
     std.debug.assert(range.end <= job.selected.len and range.end <= job.work.len());
-    // Runtime rows are written at intents' steering rows, which index the claims.
-    std.debug.assert(job.runtime.len == job.steering.entities.len and job.claim_first.len == job.runtime.len);
-    var runtime = job.runtime;
+    std.debug.assert(job.claim_stamps.len == job.steering.entities.len);
     var tally = DirectionsTally{};
     var tail = DirectionTail{};
     const sink = DirectionTailSink{
         .base_x = job.work.base_dir_x,
         .base_y = job.work.base_dir_y,
-        .prev_x = runtime.items(.prev_dir_x),
-        .prev_y = runtime.items(.prev_dir_y),
-        .has_prev = runtime.items(.has_prev_dir),
+        .prev_x = job.prev_dir_x,
+        .prev_y = job.prev_dir_y,
+        .has_prev = job.has_prev_dir,
     };
-    for (range.start..range.end) |intent_index| {
-        const row = job.intent_steering[intent_index];
-        if (row == no_row or job.claim_first[row] != intent_index) continue;
-        std.debug.assert(job.claim_stamps[row] == job.stamp);
-        const best = job.claim_best[row];
+    for (range.start..range.end) |row| {
+        if (job.claim_stamps[row] != job.stamp) continue;
+        const best: usize = job.claim_best[row];
+        std.debug.assert(best < job.intents.len and best < job.intent_movement.len);
         const intent = job.intents[best];
         const movement_index = job.intent_movement[best];
         // Resolve sets both indices or neither, and this intent resolved.
@@ -226,11 +248,9 @@ fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         const start = math.Vec2{ .x = job.previous_x[movement_index], .y = job.previous_y[movement_index] };
         const start_level = movementScopeLevel(job.scope, movement_index);
 
-        var state = runtime.get(row);
         var emit_request = false;
-        const path_dir = directionFromPathStatus(job.pathfinding, intent, start, start_level, agent, &state, &tally.perf, &emit_request);
-        updateProgress(&state, path_dir.progress_distance, agent, path_dir.status_allows_replan, &tally.perf, &emit_request);
-        runtime.set(row, state);
+        const path_dir = directionFromPathStatus(job.pathfinding, intent, start, start_level, agent, &job.columns, row, &tally.perf, &emit_request);
+        updateProgress(&job.columns, row, path_dir.progress_distance, agent, path_dir.status_allows_replan, &tally.perf, &emit_request);
 
         job.selected[slot] = .{ .entity = intent.entity, .intent = intent };
         job.work.start_x[slot] = start.x;
@@ -255,9 +275,9 @@ fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             .path_y = path_dir.direction.y,
             .direct_x = intent.direct_direction_x,
             .direct_y = intent.direct_direction_y,
-            .prev_x = state.prev_dir_x,
-            .prev_y = state.prev_dir_y,
-            .has_prev = state.has_prev_dir,
+            .prev_x = job.prev_dir_x[row],
+            .prev_y = job.prev_dir_y[row],
+            .has_prev = job.has_prev_dir[row],
         });
         if (tail.count == simd.lane_count) tail.finish(sink);
     }
@@ -303,22 +323,31 @@ const DirectionTail = struct {
         self.count += 1;
     }
 
-    // Writes each pending base direction to its slot and makes it its row's previous
-    // direction: a full block in lanes, a partial block per item.
+    // One lane batch for a full block and the tail. Inactive lanes copy lane 0 and are not stored.
     fn finish(self: *DirectionTail, sink: DirectionTailSink) void {
-        var bases: [simd.lane_count]math.Vec2 = undefined;
-        if (self.count == simd.lane_count) {
-            bases = smoothDirectionLanes(&self.inputs);
-        } else {
-            for (self.inputs[0..self.count], bases[0..self.count]) |input, *base| base.* = smoothDirectionScalar(input);
+        if (self.count == 0) return;
+        for (self.slots[0..self.count], 0..) |slot, lane| std.debug.assert(slot == self.slots[0] + lane);
+        for (self.inputs[self.count..], self.slots[self.count..], self.rows[self.count..]) |*input, *slot, *row| {
+            input.* = .{
+                .has_path = false,
+                .path_x = 0,
+                .path_y = 0,
+                .direct_x = 0,
+                .direct_y = 0,
+                .prev_x = 0,
+                .prev_y = 0,
+                .has_prev = false,
+            };
+            slot.* = self.slots[0];
+            row.* = self.rows[0];
         }
-        for (bases[0..self.count], self.slots[0..self.count], self.rows[0..self.count]) |base, slot, row| {
-            sink.base_x[slot] = base.x;
-            sink.base_y[slot] = base.y;
-            sink.prev_x[row] = base.x;
-            sink.prev_y[row] = base.y;
-            sink.has_prev[row] = true;
-        }
+        const base = smoothDirectionLanes(&self.inputs);
+        const live = simd.lanesBelow(self.count);
+        simd.storeFloat4Lanes(sink.base_x[self.slots[0]..], base.x, self.count);
+        simd.storeFloat4Lanes(sink.base_y[self.slots[0]..], base.y, self.count);
+        simd.scatterFloat4Masked(sink.prev_x, self.rows, base.x, live);
+        simd.scatterFloat4Masked(sink.prev_y, self.rows, base.y, live);
+        simd.scatterBool4Masked(sink.has_prev, self.rows, @splat(true), live);
         self.count = 0;
     }
 };
@@ -337,7 +366,7 @@ fn smoothDirectionScalar(input: DirectionTailInput) math.Vec2 {
 }
 
 // `smoothDirectionScalar` over four inputs in lanes, equal to it bit for bit.
-fn smoothDirectionLanes(inputs: *const [simd.lane_count]DirectionTailInput) [simd.lane_count]math.Vec2 {
+fn smoothDirectionLanes(inputs: *const [simd.lane_count]DirectionTailInput) simd.Vec2x4 {
     var has_path: [simd.lane_count]bool = undefined;
     var has_prev: [simd.lane_count]bool = undefined;
     var path_x: [simd.lane_count]f32 = undefined;
@@ -366,11 +395,10 @@ fn smoothDirectionLanes(inputs: *const [simd.lane_count]DirectionTailInput) [sim
     const previous = simd.Vec2x4{ .x = simd.loadFloat4(&prev_x), .y = simd.loadFloat4(&prev_y) };
     const blended = simd.lerpVec2Float4(previous, target, simd.splatFloat4(steering_turn_smoothing));
     const smoothed = simd.normalizeOrDefaultFinite2Float4(blended.x, blended.y, direction_epsilon, target);
-    const base_x = simd.toFloatArray(simd.selectFloat4(prev_mask, smoothed.x, target.x));
-    const base_y = simd.toFloatArray(simd.selectFloat4(prev_mask, smoothed.y, target.y));
-    var bases: [simd.lane_count]math.Vec2 = undefined;
-    for (&bases, base_x, base_y) |*base, x, y| base.* = .{ .x = x, .y = y };
-    return bases;
+    return .{
+        .x = simd.selectFloat4(prev_mask, smoothed.x, target.x),
+        .y = simd.selectFloat4(prev_mask, smoothed.y, target.y),
+    };
 }
 
 fn directionFromPathStatus(
@@ -379,7 +407,8 @@ fn directionFromPathStatus(
     start: math.Vec2,
     start_level: u16,
     steering_agent: SteeringAgentView,
-    runtime: *RuntimeRow,
+    columns: *const RuntimeColumns,
+    row: usize,
     perf: *DirectionsPerf,
     emit_request: *bool,
 ) PathDirection {
@@ -388,7 +417,7 @@ fn directionFromPathStatus(
     // are followed like available ones; inside the end's refresh window they request the next
     // hop, and at the end they hold as pending paths do.
     const goal_distance = distance(start, intent.goal);
-    const view = pathfinding.statusForWorld(start_level, start, intent.goal_level, intent.goal, intent.agent_class, &runtime.waypoint_hint);
+    const view = pathfinding.statusForWorld(start_level, start, intent.goal_level, intent.goal, intent.agent_class, &columns.waypoint_hint[row]);
     switch (view.status) {
         .available => {
             if (comptime runtime_perf_log.enabled) perf.available += 1;
@@ -396,9 +425,9 @@ fn directionFromPathStatus(
         },
         .partial => {
             if (view.refresh) {
-                if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
+                if (columns.replan_cooldown[row] == 0 and columns.unavailable_backoff[row] == 0) {
                     emit_request.* = true;
-                    runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
+                    columns.replan_cooldown[row] = steering_agent.replan_cooldown_steps;
                 } else if (comptime runtime_perf_log.enabled) {
                     perf.cooldowns += 1;
                 }
@@ -410,9 +439,9 @@ fn directionFromPathStatus(
             return followWaypoint(view.next_waypoint, start, intent.goal, steering_agent.waypoint_tolerance, goal_distance);
         },
         .missing => {
-            if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
+            if (columns.replan_cooldown[row] == 0 and columns.unavailable_backoff[row] == 0) {
                 emit_request.* = true;
-                runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
+                columns.replan_cooldown[row] = steering_agent.replan_cooldown_steps;
             } else if (comptime runtime_perf_log.enabled) {
                 perf.cooldowns += 1;
             }
@@ -424,8 +453,8 @@ fn directionFromPathStatus(
         },
         .unavailable => {
             if (comptime runtime_perf_log.enabled) perf.unavailable += 1;
-            if (runtime.unavailable_backoff == 0) {
-                runtime.unavailable_backoff = steering_agent.unavailable_backoff_steps;
+            if (columns.unavailable_backoff[row] == 0) {
+                columns.unavailable_backoff[row] = steering_agent.unavailable_backoff_steps;
             } else if (comptime runtime_perf_log.enabled) {
                 perf.backoffs += 1;
             }
@@ -448,7 +477,8 @@ fn followWaypoint(waypoint: math.Vec2, start: math.Vec2, goal: math.Vec2, tolera
 }
 
 fn updateProgress(
-    runtime: *RuntimeRow,
+    columns: *const RuntimeColumns,
+    row: usize,
     progress_distance: f32,
     steering_agent: SteeringAgentView,
     status_allows_replan: bool,
@@ -460,20 +490,20 @@ fn updateProgress(
     // avoidance jitter does not immediately trigger replans and an agent walking
     // a detour around an obstacle is not mistaken for stuck.
     const progress_epsilon: f32 = 0.25;
-    if (runtime.has_previous_distance and progress_distance + progress_epsilon >= runtime.previous_progress_distance) {
-        if (runtime.stuck_steps < std.math.maxInt(u16)) runtime.stuck_steps += 1;
+    if (columns.has_previous_distance[row] and progress_distance + progress_epsilon >= columns.previous_progress_distance[row]) {
+        if (columns.stuck_steps[row] < std.math.maxInt(u16)) columns.stuck_steps[row] += 1;
     } else {
-        runtime.stuck_steps = 0;
+        columns.stuck_steps[row] = 0;
     }
-    runtime.previous_progress_distance = progress_distance;
-    runtime.has_previous_distance = true;
+    columns.previous_progress_distance[row] = progress_distance;
+    columns.has_previous_distance[row] = true;
 
     if (status_allows_replan and steering_agent.stuck_step_threshold > 0 and
-        runtime.stuck_steps >= steering_agent.stuck_step_threshold and
-        runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0)
+        columns.stuck_steps[row] >= steering_agent.stuck_step_threshold and
+        columns.replan_cooldown[row] == 0 and columns.unavailable_backoff[row] == 0)
     {
-        runtime.stuck_steps = 0;
-        runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
+        columns.stuck_steps[row] = 0;
+        columns.replan_cooldown[row] = steering_agent.replan_cooldown_steps;
         if (!emit_request.*) {
             emit_request.* = true;
             if (comptime runtime_perf_log.enabled) perf.stuck_replans += 1;
@@ -517,7 +547,13 @@ const addStaticObstacle = @import("test_support.zig").addStaticObstacle;
 const appendNavigationIntent = @import("test_support.zig").appendNavigationIntent;
 const appendNavigationIntents = @import("test_support.zig").appendNavigationIntents;
 const testColliders = @import("test_support.zig").testColliders;
+const buildSteeredIndex = @import("test_support.zig").buildSteeredIndex;
 const PathStatus = @import("../pathfinding/types.zig").PathStatus;
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const EntityId = @import("../../data_system.zig").EntityId;
+const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
+const steering_range_alignment_items = @import("system.zig").steering_range_alignment_items;
 
 // The level-0 default-class path status from `at` toward `goal`.
 fn expectPathStatus(pathfinding: *const PathfindingSystem, at: math.Vec2, goal: math.Vec2, expected: PathStatus) !void {
@@ -669,14 +705,32 @@ test "steering follows a partial path, requests the next hop inside its end wind
 
     // The direction itself: a held agent has none and allows no replan; one outside the window
     // follows the path and requests nothing.
-    var held = RuntimeRow{ .entity = agent };
+    var hint = [_]u32{0};
+    var replan = [_]u16{0};
+    var backoff = [_]u16{0};
+    var stuck = [_]u16{0};
+    var progress = [_]f32{0};
+    var has_distance = [_]bool{false};
+    const columns = RuntimeColumns{
+        .waypoint_hint = &hint,
+        .replan_cooldown = &replan,
+        .unavailable_backoff = &backoff,
+        .stuck_steps = &stuck,
+        .previous_progress_distance = &progress,
+        .has_previous_distance = &has_distance,
+    };
     var perf = DirectionsPerf{};
     var emit = false;
-    const at_end = directionFromPathStatus(&pathfinding, intent, end, 0, agent_view, &held, &perf, &emit);
+    const at_end = directionFromPathStatus(&pathfinding, intent, end, 0, agent_view, &columns, 0, &perf, &emit);
     try std.testing.expect(!at_end.has_direction and !at_end.status_allows_replan and emit);
-    var following = RuntimeRow{ .entity = agent };
+    hint = .{0};
+    replan = .{0};
+    backoff = .{0};
+    stuck = .{0};
+    progress = .{0};
+    has_distance = .{false};
     emit = false;
-    const at_start = directionFromPathStatus(&pathfinding, intent, start, 0, agent_view, &following, &perf, &emit);
+    const at_start = directionFromPathStatus(&pathfinding, intent, start, 0, agent_view, &columns, 0, &perf, &emit);
     try std.testing.expect(at_start.has_direction and at_start.status_allows_replan and !emit);
     try std.testing.expect(at_start.direction.x > 0);
 
@@ -961,27 +1015,149 @@ test "steering direction tail lanes equal the scalar smoothing" {
                 .has_prev = random.boolean(),
             };
         }
+        // Contiguous slots and a different row index, so the base store and the masked scatter are both checked.
+        const row_stride = 2;
+        const column_len = inputs.len * row_stride;
+        const fill: f32 = 42;
         for (1..inputs.len + 1) |count| {
-            var base_x: [9]f32 = @splat(0);
-            var base_y: [9]f32 = @splat(0);
-            var prev_x: [9]f32 = @splat(0);
-            var prev_y: [9]f32 = @splat(0);
-            var has_prev: [9]bool = @splat(false);
+            var base_x: [column_len]f32 = @splat(fill);
+            var base_y: [column_len]f32 = @splat(fill);
+            var prev_x: [column_len]f32 = @splat(fill);
+            var prev_y: [column_len]f32 = @splat(fill);
+            var has_prev: [column_len]bool = @splat(false);
             const sink = DirectionTailSink{ .base_x = &base_x, .base_y = &base_y, .prev_x = &prev_x, .prev_y = &prev_y, .has_prev = &has_prev };
             var tail = DirectionTail{};
             for (inputs[0..count], 0..) |input, index| {
-                tail.push(index, index, input);
+                tail.push(index, index * row_stride + 1, input);
                 if (tail.count == simd.lane_count) tail.finish(sink);
             }
             tail.finish(sink);
+            var slot_live: [column_len]bool = @splat(false);
+            var row_live: [column_len]bool = @splat(false);
             for (inputs[0..count], 0..) |input, index| {
                 const expected = smoothDirectionScalar(input);
+                const row = index * row_stride + 1;
+                slot_live[index] = true;
+                row_live[row] = true;
                 try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(base_x[index])));
                 try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(base_y[index])));
-                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(prev_x[index])));
-                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(prev_y[index])));
-                try std.testing.expect(has_prev[index]);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(prev_x[row])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(prev_y[row])));
+                try std.testing.expect(has_prev[row]);
+            }
+            for (0..column_len) |index| {
+                if (!slot_live[index]) {
+                    try std.testing.expectEqual(@as(u32, @bitCast(fill)), @as(u32, @bitCast(base_x[index])));
+                    try std.testing.expectEqual(@as(u32, @bitCast(fill)), @as(u32, @bitCast(base_y[index])));
+                }
+                if (!row_live[index]) {
+                    try std.testing.expectEqual(@as(u32, @bitCast(fill)), @as(u32, @bitCast(prev_x[index])));
+                    try std.testing.expectEqual(@as(u32, @bitCast(fill)), @as(u32, @bitCast(prev_y[index])));
+                    try std.testing.expect(!has_prev[index]);
+                }
             }
         }
     }
+}
+
+test "steering direction ranges match serial and leave unclaimed runtime rows unchanged" {
+    const agent_count = directions_range_alignment_items + 1;
+    const unclaimed = 3;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var agents: [agent_count]EntityId = undefined;
+    for (&agents, 0..) |*agent, index| {
+        agent.* = try addSteeredEntity(&data, .{ .x = @floatFromInt(index * 200), .y = 0 });
+    }
+    var intents: [agent_count - 1]NavigationIntent = undefined;
+    var cursor: usize = 0;
+    for (agents, 0..) |agent, index| {
+        if (index == unclaimed) continue;
+        intents[cursor] = .{
+            .entity = agent,
+            .goal = .{ .x = 999, .y = 0 },
+            .direct_direction_x = if (index % 2 == 0) 1 else -1,
+            .direct_direction_y = if (index % 3 == 0) 0.25 else -0.15,
+            .priority = 1,
+        };
+        cursor += 1;
+    }
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+
+    const stream_ranges = maxRangeCount(agent_count, steering_range_alignment_items);
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(stream_ranges, 0, agent_count, 0, 0, 0);
+    try serial_frame.reservePathRequests(stream_ranges, agent_count);
+    var serial_steering = SteeringSystem.init(std.testing.allocator);
+    defer serial_steering.deinit();
+    try serial_steering.reserve(agent_count);
+    serial_frame.beginStep();
+    try appendNavigationIntents(&serial_frame, &intents);
+    _ = try updateSteeringInline(&serial_steering, &data, &serial_frame, &pathfinding, &colliders);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = directions_range_alignment_items,
+    });
+    defer threads.deinit();
+    var index = try buildSteeredIndex(&data);
+    defer index.deinit();
+    var threaded_frame = SimulationFrame.init(std.testing.allocator);
+    defer threaded_frame.deinit();
+    try threaded_frame.reserveStreams(stream_ranges, 0, agent_count, 0, 0, 0);
+    try threaded_frame.reservePathRequests(stream_ranges, agent_count);
+    var threaded_steering = SteeringSystem.init(std.testing.allocator);
+    defer threaded_steering.deinit();
+    try threaded_steering.reserve(agent_count);
+    threaded_frame.beginStep();
+    try appendNavigationIntents(&threaded_frame, &intents);
+    _ = try threaded_steering.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, index.view(), .{
+        .items_per_range = directions_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    const serial_moves = serial_frame.intents.mergedItems();
+    const threaded_moves = threaded_frame.intents.mergedItems();
+    try std.testing.expectEqual(agent_count - 1, serial_moves.len);
+    try std.testing.expectEqual(serial_moves.len, threaded_moves.len);
+    for (serial_moves, threaded_moves) |want, got| {
+        try std.testing.expect(want.movement.entity.eql(got.movement.entity));
+        try std.testing.expectEqual(@as(u32, @bitCast(want.movement.direction_x)), @as(u32, @bitCast(got.movement.direction_x)));
+        try std.testing.expectEqual(@as(u32, @bitCast(want.movement.direction_y)), @as(u32, @bitCast(got.movement.direction_y)));
+        try std.testing.expectEqual(want.movement.movement_row, got.movement.movement_row);
+    }
+    try std.testing.expectEqualSlices(PathRequest, serial_frame.path_requests.mergedItems(), threaded_frame.path_requests.mergedItems());
+
+    const serial_entity = serial_steering.runtime_rows.items(.entity);
+    const serial_prev_x = serial_steering.runtime_rows.items(.prev_dir_x);
+    const serial_prev_y = serial_steering.runtime_rows.items(.prev_dir_y);
+    const serial_has_prev = serial_steering.runtime_rows.items(.has_prev_dir);
+    const threaded_entity = threaded_steering.runtime_rows.items(.entity);
+    const threaded_prev_x = threaded_steering.runtime_rows.items(.prev_dir_x);
+    const threaded_prev_y = threaded_steering.runtime_rows.items(.prev_dir_y);
+    const threaded_has_prev = threaded_steering.runtime_rows.items(.has_prev_dir);
+    try std.testing.expectEqual(agent_count, serial_entity.len);
+    for (0..agent_count) |row| {
+        try std.testing.expect(serial_entity[row].eql(threaded_entity[row]));
+        try std.testing.expectEqual(@as(u32, @bitCast(serial_prev_x[row])), @as(u32, @bitCast(threaded_prev_x[row])));
+        try std.testing.expectEqual(@as(u32, @bitCast(serial_prev_y[row])), @as(u32, @bitCast(threaded_prev_y[row])));
+        try std.testing.expectEqual(serial_has_prev[row], threaded_has_prev[row]);
+    }
+    try std.testing.expect(serial_entity[unclaimed].eql(agents[unclaimed]));
+    try std.testing.expectEqual(@as(f32, 0), serial_prev_x[unclaimed]);
+    try std.testing.expectEqual(@as(f32, 0), serial_prev_y[unclaimed]);
+    try std.testing.expect(!serial_has_prev[unclaimed]);
+    try std.testing.expect(!serial_steering.runtime_rows.items(.has_previous_distance)[unclaimed]);
+    try std.testing.expectEqual(@as(u16, 0), serial_steering.runtime_rows.items(.unavailable_backoff)[unclaimed]);
+    try std.testing.expectEqual(@as(u16, 0), serial_steering.runtime_rows.items(.replan_cooldown)[unclaimed]);
+    try std.testing.expectEqual(@as(u16, 0), serial_steering.runtime_rows.items(.stuck_steps)[unclaimed]);
+    try std.testing.expectEqual(@as(u32, 0), serial_steering.runtime_rows.items(.waypoint_hint)[unclaimed]);
+    try std.testing.expect(serial_has_prev[0]);
 }
