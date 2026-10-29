@@ -2,8 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: the core-branch review work (`f4c4844`); ahead of 86, 85, 35's tile gate, 87, and 88 · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: programming landed (`f3ee24c`, `6b7138e`, `8bfdbfc`, `bc336f4`); five items stay open
-as recorded data (owner 2026-10-25: recorded, not chased); the wake-posting item moved to
+**Status: programming landed (`f3ee24c`, `6b7138e`, `8bfdbfc`, `bc336f4`); the world-gate
+access-order item is closed (wide pair, ReleaseFast, 3 reps). Four items stay open as
+recorded data (owner 2026-10-25: recorded, not chased); the wake-posting item moved to
 [slice 90](../archive/slice-90.md).** Owner 2026-10-23: a slice for the
 world-gate and batch-tuner follow-ups. Ordered first in the core branch (owner delegated to the
 criteria 2026-10-24): its tuner fixes change how every later slice's tuned cases are judged
@@ -112,23 +113,23 @@ fixture and grouped by chunk only if they cost there.
       wake cut the full-pool dispatch floor 26.9 -> 17.2 us in a scratch version
       (`.claude/reports/slice89-wake-diag.md`). Data and pass conditions are in
       slice 90.
-- [ ] World gate access order under the data rules
+- [x] World gate access order under the data rules
       (`.grok/rules/memory-performance.md` § Data-oriented design,
       `.grok/rules/engine-design.md` § Target scale: the chunk is the unit).
-      Measured (`bc336f4`, scattered minus scattered-sorted; Debug 3 reps):
-      serial +0.40 / +0.52 / +1.84 ms at 4,096 / 16,384 / 65,536 (beyond
-      spread), tuned +10 / +37 / +430 us (within spread or at its edge);
-      ReleaseFast 1 run at 65,536: serial 1.52 against 1.05 ms, tuned 235
-      against 175 us at different settled shapes (not judged). Cause untested
-      (level-view re-resolve per lane, `systems/world_gate.zig:237`, or mispredicted
-      early returns; the terrain bits fit L1/L2 here); rows are not grouped by
-      `(level, chunk)`. A per-row terrain read at the row's position is an
-      exempt point lookup (owner 2026-10-24). Next measure: a variant with
-      terrain larger than L2, 3 ReleaseFast reps (the access-order exception,
-      `.grok/rules/build-validation.md`). Pass: the lookups reported as a
-      cost or not there; only if they cost, rows group by `(level, chunk)`,
-      serial == threaded. Links slice 35's row-order item and slice 88's
-      plane-entry item.
+      The wide pair paints each chunk's bit block in chunk order, then shuffles
+      or sorts the rows. ReleaseFast, 3 reps, this host. Serial, scattered
+      against sorted: 94.8 us (spread 49.9%) against 77.5 us (42.4%) at 4,096
+      (within spread); 399.5 us (7.3%) against 211.7 us (0.2%) at 16,384;
+      1.86 ms (3.2%) against 831.5 us (4.1%) at 65,536. That is about 12 ns/body
+      at 512KB of blocks and 16 ns/body at 2MB. Tuned, every rep settled and
+      threaded: 34.4 us (12.4%) against 35.0 us (23.6%) at 4,096 (within
+      spread); 75.6 us (12.9%) against 60.9 us (19.9%) at 16,384; 201.4 us
+      (19.7%) against 153.2 us (34.5%) at 65,536. The 16,384 and 65,536 tuned
+      reps do not overlap, and the gap is under 1 ns/body. Rows stay in store
+      order (a constant of nanoseconds, `.grok/rules/engine-design.md` § Cost
+      model). A per-row terrain read at the row's position stays an exempt
+      point lookup (owner 2026-10-24). Links slice 35's row-order item and
+      slice 88's plane-entry item.
 - [ ] `pathfinding-drain` 2048 and `pathfinding-elastic-ramp` tuned cases.
       Measured (`.claude/reports/slice89-drain-landing.md`): drain RF within
       spread; Debug +0.30 ms from the nudge stepping on Debug drift (+-25-40%

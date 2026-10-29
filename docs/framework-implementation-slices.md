@@ -277,7 +277,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    [83](roadmap/archive/slice-83.md) prep →
    [84](roadmap/archive/slice-84.md) spatial index →
    [89](roadmap/slices/slice-89.md) batch-tuner and world-gate follow-ups (programming
-   landed; five items stay recorded. Its tuner fixes change how every later
+   landed; the world-gate access-order item closed, four items stay recorded. Its tuner fixes change how every later
    slice's tuned cases are judged, `.grok/rules/tests-benchmarks.md` § Benchmarks) →
    [90](roadmap/archive/slice-90.md) wake protocol and startup calibration (landed) →
    [86](roadmap/archive/slice-86.md) collision (landed) →
@@ -285,7 +285,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    pathfinding and collision clean; the full-pool opening window, the sprite-prep
    worker proof, and the unread `final_dir` columns are fixed in the review
    commit, then tile gate
-   ([35](roadmap/slices/slice-35.md)'s `world_gate` items, next) →
+   ([35](roadmap/slices/slice-35.md)'s `world_gate` items, closed: rows stay in
+   store order) →
    [87](roadmap/slices/slice-87.md) render prep →
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
    inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
@@ -454,7 +455,7 @@ order.
 6b. **90** ThreadSystem Wake Protocol And Startup Calibration — landed (archived).
 7. **86** Collision Subsystem Pass — landed (archived), after 83, 84, 89, and 90.
 8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
-8a. **35's `world_gate` items** — next in the core branch, after 85 (the rest of 35 is line 22).
+8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22). Next is 87.
 9. **87** Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items (core-systems branch).
 9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's collect items (core-systems branch).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.

@@ -22,10 +22,15 @@
 //!   a seeded RNG and the rows stored in a seeded random order, so neighbouring lanes read
 //!   terrain bits on other levels and chunks.
 //! - `scattered-sorted` (3): the identical row set stored in `(level, chunk)` order.
+//! - `wide-scattered` (4) and `wide-scattered-sorted` (5): the same pair on a 4096-tile
+//!   side. Each body owns one chunk on level 1 or 2, and that chunk's origin cell is
+//!   solid, so every lookup reads a mixed chunk's bit block. The blocks are one per body
+//!   (128KB, 512KB, and 2MB at the three body counts).
 //!
 //! The scattered pair measures what scattered store order costs the per-row terrain
-//! lookups against the same rows grouped by level and chunk. Its pass shape (scattered
-//! within spread of scattered-sorted) is reported, not asserted.
+//! lookups against the same rows grouped by level and chunk. The wide pair is that
+//! measurement with one bit block per body. Either pass shape (scattered within
+//! spread of its sorted twin) is reported, not asserted.
 //!
 //! Pass shape: time linear in bodies and main per body flat in each shape;
 //! `thread-adaptive-tuned-range` is the production tuner and matches or beats the best
@@ -43,6 +48,7 @@ const SimulationTier = @import("../game/simulation_scope.zig").SimulationTier;
 const WorldGateConfig = @import("../game/systems/world_gate.zig").WorldGateConfig;
 const WorldGateSystem = @import("../game/systems/world_gate.zig").WorldGateSystem;
 const world_gate_range_alignment_items = @import("../game/systems/world_gate.zig").world_gate_range_alignment_items;
+const TileId = @import("../game/world/system.zig").TileId;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
@@ -56,7 +62,7 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeGateWorkload,
 };
 
-const GateShape = enum(u8) { uniform, interleaved, scattered, scattered_sorted };
+const GateShape = enum(u8) { uniform, interleaved, scattered, scattered_sorted, wide_scattered, wide_scattered_sorted };
 const GateFields = struct { shape: GateShape, bodies: u32 };
 const GateCode = suite.ItemCode(GateFields, &.{6});
 
@@ -73,10 +79,18 @@ const item_counts = [_]usize{
     GateCode.of(.{ .shape = .scattered_sorted, .bodies = 4_096 }),
     GateCode.of(.{ .shape = .scattered_sorted, .bodies = 16_384 }),
     GateCode.of(.{ .shape = .scattered_sorted, .bodies = 65_536 }),
+    GateCode.of(.{ .shape = .wide_scattered, .bodies = 4_096 }),
+    GateCode.of(.{ .shape = .wide_scattered, .bodies = 16_384 }),
+    GateCode.of(.{ .shape = .wide_scattered, .bodies = 65_536 }),
+    GateCode.of(.{ .shape = .wide_scattered_sorted, .bodies = 4_096 }),
+    GateCode.of(.{ .shape = .wide_scattered_sorted, .bodies = 16_384 }),
+    GateCode.of(.{ .shape = .wide_scattered_sorted, .bodies = 65_536 }),
 };
 
 // The fixed world: a surface and the gated levels, each of this side in tiles.
 const gate_level_side: u16 = 256;
+// Wide shapes: 256 chunks on a side, so 65,536 bodies still get one chunk each.
+const wide_level_side: u16 = 4096;
 const gate_levels = [_]u16{ 1, 2 };
 const body_size: f32 = 20;
 // The player's box, the size the demo gives it.
@@ -95,7 +109,7 @@ const BodyRow = struct { kind: RowKind, level: u16 };
 // The scattered shapes draw each row's level in `placeBodies`.
 fn bodyRow(shape: GateShape, index: usize) BodyRow {
     return switch (shape) {
-        .uniform, .scattered, .scattered_sorted => .{ .kind = .gated, .level = gate_levels[0] },
+        .uniform, .scattered, .scattered_sorted, .wide_scattered, .wide_scattered_sorted => .{ .kind = .gated, .level = gate_levels[0] },
         .interleaved => switch (index % 4) {
             0 => .{ .kind = .non_ai, .level = gate_levels[0] },
             1 => .{ .kind = .dormant, .level = gate_levels[0] },
@@ -108,7 +122,7 @@ fn bodyRow(shape: GateShape, index: usize) BodyRow {
 fn levelCount(shape: GateShape) u16 {
     return switch (shape) {
         .uniform => gate_levels[0] + 1,
-        .interleaved, .scattered, .scattered_sorted => gate_levels[1] + 1,
+        .interleaved, .scattered, .scattered_sorted, .wide_scattered, .wide_scattered_sorted => gate_levels[1] + 1,
     };
 }
 
@@ -129,24 +143,37 @@ const Fixture = struct {
 };
 
 // Every gated level's floor alternates walkable and solid tiles in a checkerboard.
-fn buildWorld(allocator: std.mem.Allocator, io: std.Io, shape: GateShape) !WorldSystem {
+// Wide shapes leave the floors walkable and paint one solid cell per body chunk later.
+const BuiltWorld = struct {
+    world: WorldSystem,
+    solid: TileId,
+};
+
+fn wideShape(shape: GateShape) bool {
+    return shape == .wide_scattered or shape == .wide_scattered_sorted;
+}
+
+fn buildWorld(allocator: std.mem.Allocator, io: std.Io, shape: GateShape) !BuiltWorld {
     var tileset = try fixtures.loadTilesetMeta(allocator, io);
     defer tileset.deinit();
     const meta = &tileset;
     const levels = levelCount(shape);
-    var world = try fixtures.buildBandedWorld(allocator, meta, gate_level_side, levels, "grass", "grass");
+    const side = if (wideShape(shape)) wide_level_side else gate_level_side;
+    var world = try fixtures.buildBandedWorld(allocator, meta, side, levels, "grass", "grass");
     errdefer world.deinit();
     const solid = try world.requireTileByName(meta, "dirt");
+    // A wide chunk becomes mixed when its origin cell is painted, one per body.
+    if (wideShape(shape)) return .{ .world = world, .solid = solid };
     const walkable = try world.requireTileByName(meta, "grass");
     for (1..levels) |level| {
         const floor = world.denseFloorLayerForLevel(@intCast(level)) orelse return error.InvalidWorldLevel;
-        for (0..gate_level_side) |y| {
-            for (0..gate_level_side) |x| {
+        for (0..side) |y| {
+            for (0..side) |x| {
                 _ = try world.setDenseTile(floor, @intCast(x), @intCast(y), if ((x + y) % 2 == 0) walkable else solid);
             }
         }
     }
-    return world;
+    return .{ .world = world, .solid = solid };
 }
 
 // One body row in store order: its previous position, the chunk it steps into, whether
@@ -205,12 +232,74 @@ fn placeBodies(allocator: std.mem.Allocator, world: *const WorldSystem, shape: G
         .uniform, .interleaved => {},
         .scattered => random.shuffle(Placement, placements),
         .scattered_sorted => std.mem.sort(Placement, placements, {}, Placement.levelChunkLessThan),
+        .wide_scattered, .wide_scattered_sorted => unreachable,
     }
     return placements;
 }
 
+// One body per (level, chunk), striped across the two gated levels. The origin cell is
+// painted before the store order changes, so each level's bit-block slots follow chunk
+// order and a shuffled store reads them out of order. A walkable body sits on the next
+// cell of its chunk. Caller owns the slice.
+fn placeWideBodies(allocator: std.mem.Allocator, world: *WorldSystem, solid_tile: TileId, shape: GateShape, bodies: usize) ![]Placement {
+    const chunk_tiles: usize = world.chunk_size_tiles;
+    const chunks_x = world.width / chunk_tiles;
+    const chunk_slots = chunks_x * (world.height / chunk_tiles);
+    if (bodies > chunk_slots * gate_levels.len) return error.WorldGateGridPastLevel;
+    const tile = world.tile_size;
+    const placements = try allocator.alloc(Placement, bodies);
+    errdefer allocator.free(placements);
+    for (placements, 0..) |*placement, index| {
+        const level = gate_levels[index % gate_levels.len];
+        const slot = index / gate_levels.len;
+        const solid = slot % 2 == 1;
+        const cx = slot % chunks_x;
+        const cy = slot / chunks_x;
+        const local_x: usize = if (solid) 0 else 1;
+        const tile_x = cx * chunk_tiles + local_x;
+        const tile_y = cy * chunk_tiles;
+        const previous = math.Vec2{
+            .x = @as(f32, @floatFromInt(tile_x)) * tile,
+            .y = @as(f32, @floatFromInt(tile_y)) * tile,
+        };
+        placement.* = .{
+            .previous = previous,
+            .chunk = world.chunkCoordForWorldPos(previous.x + step_offset.x, previous.y + step_offset.y),
+            .solid = solid,
+            .body = .{ .kind = .gated, .level = level },
+            .grid_index = index,
+        };
+        std.debug.assert(placement.chunk.x == @as(i32, @intCast(cx)));
+        std.debug.assert(placement.chunk.y == @as(i32, @intCast(cy)));
+    }
+    // Slot order is this order. Permuting first would make the gate stream the pool.
+    try paintWideSolids(world, solid_tile, placements);
+    switch (shape) {
+        .wide_scattered => {
+            var prng = std.Random.DefaultPrng.init(scatter_seed ^ bodies);
+            prng.random().shuffle(Placement, placements);
+        },
+        .wide_scattered_sorted => std.mem.sort(Placement, placements, {}, Placement.levelChunkLessThan),
+        .uniform, .interleaved, .scattered, .scattered_sorted => unreachable,
+    }
+    return placements;
+}
+
+// Paints the origin cell of each wide body's chunk solid, so the chunk is mixed and the
+// gate's lookup reads its bit block. A repeated chunk paints the same cell again.
+fn paintWideSolids(world: *WorldSystem, solid: TileId, placements: []const Placement) !void {
+    const chunk_tiles = world.chunk_size_tiles;
+    for (placements) |placement| {
+        const floor = world.denseFloorLayerForLevel(placement.body.level) orelse return error.InvalidWorldLevel;
+        const origin_x: u16 = @intCast(@as(i32, @intCast(chunk_tiles)) * placement.chunk.x);
+        const origin_y: u16 = @intCast(@as(i32, @intCast(chunk_tiles)) * placement.chunk.y);
+        _ = try world.setDenseTile(floor, origin_x, origin_y, solid);
+    }
+}
+
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, shape: GateShape, bodies: usize) !Fixture {
-    var world = try buildWorld(allocator, io, shape);
+    const built = try buildWorld(allocator, io, shape);
+    var world = built.world;
     errdefer world.deinit();
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -220,7 +309,10 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, shape: GateShape, bodi
     const tile = world.tile_size;
     // A body and its step stay inside its start tile on both axes.
     std.debug.assert(body_size + step_offset.x < tile and body_size + step_offset.y < tile);
-    const placements = try placeBodies(allocator, &world, shape, bodies);
+    const placements = if (wideShape(shape))
+        try placeWideBodies(allocator, &world, built.solid, shape, bodies)
+    else
+        try placeBodies(allocator, &world, shape, bodies);
     defer allocator.free(placements);
     var gated_rows: usize = 0;
     var held_rows: usize = 0;

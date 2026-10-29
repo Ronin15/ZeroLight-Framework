@@ -498,7 +498,9 @@ simulated state. `world-gate` has a tuned case, fixed controls, a dispatch check
 `interleaved` shape (non-AI, dormant, and gated rows across two levels), and a
 `scattered` / `scattered-sorted` pair: the identical gated rows on two levels, in
 seeded random store order against `(level, chunk)` order, measuring what store
-order costs the per-row terrain reads (reported, not asserted).
+order costs the per-row terrain reads (reported, not asserted). `wide-scattered` /
+`wide-scattered-sorted` is that pair on a 4096-tile side with one mixed chunk per
+body (128KB, 512KB, and 2MB of bit blocks).
 
 Reading results:
 

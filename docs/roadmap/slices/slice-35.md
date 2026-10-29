@@ -2,9 +2,11 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 55](slice-55.md), [Slice 52D](slice-52d.md) (archive [34](../archive/slice-34.md), [24](../archive/slice-24.md), [32](../archive/slice-32.md) landed) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** The `world_gate` threaded item landed (`f0adc9a`) on
-the core branch; its whole-file cost-model check stays open. The AI decision
-math is not started: measure after Slice 55 and 52D land.
+**Status: in progress.** The `world_gate` items are closed: the threaded pass
+landed (`f0adc9a`) and the whole-file check closed with slice 89's wide-pair
+measurement (rows stay in store order). The AI decision math is not started:
+measure after Slice 55 and 52D land. That math is the rest of this slice and
+is not on the core branch.
 
 Goal: AI decision math (`decideDir`, wander/seek blend, normalize) runs as
 SIMD kernels across agents, so per-agent cognition cost stays low at large
@@ -66,21 +68,13 @@ avoidance [85](../archive/slice-85.md)'s.
       non-movement tiers, x-then-y resolve order, and any elevation (38) or
       knockback (68B) reads present then; `FailingAllocator` proof for serial
       and multi-worker steps.
-- [ ] The whole of `systems/world_gate.zig` checked against the cost model and
-      the rules (owner 2026-10-16), not only the items above. Each finding
-      becomes an item here. Findings so far:
-      - Row order: moved to slice 89's world-gate item (measure first; a
-        per-row terrain read at the row's position is an exempt point lookup,
-        owner 2026-10-24, `.grok/rules/memory-performance.md` § Data-oriented
-        design). Failure kept for reference: `gateRange` (`world_gate.zig:248`) walks the
-        movement rows in store order and resolves each lane's terrain cell with
-        a data-dependent address (`blockedLanes`, `:317`), so work is not
-        grouped by the chunk `(level, cx, cy)` it reads; the `interleaved`
-        `world-gate` shape (non-AI, dormant, and gated rows across two levels)
-        costs per row what the uniform shape does, about 2x per gated row.
-        Pass: slice 89's item.
-      - Tuned versus fixed controls: moved to slice 89's tuner item (owner
-        2026-10-24; the measured cause points at the nudge).
+- [x] The whole of `systems/world_gate.zig` checked against the cost model and
+      the rules (owner 2026-10-16). One finding: `gateRange` walks movement
+      rows in store order and each lane's terrain read is a point lookup
+      (`blockedLanes`). Slice 89's wide pair measured it. The tuned gap is
+      under 1 ns/body, so rows stay in store order. No other finding. The
+      tuned-versus-fixed controls item stays slice 89's tuner item (owner
+      2026-10-24).
 - [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path.
 
 ### Acceptance checks
