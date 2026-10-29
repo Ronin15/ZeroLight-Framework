@@ -3661,8 +3661,8 @@ fn expectRefreshed(store: *const TriggerStore, data: *const DataSystem) !void {
     }
 }
 
-// Refresh ranges that start inside pages, hold some height-1 nodes whole and split others
-// (one across several ranges), over a height-2 level whose nodes fold on main.
+// A tier cross refreshes the pairs that name that entity. A wide range owns each dirty
+// page from its first affected item, and main folds only those pages' prefix deltas.
 test "collision trigger store refresh re-resolves rows, emit bits and every count over several ranges, serial and 2 workers, and allocates nothing warm" {
     var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
     defer serial_system.deinit();

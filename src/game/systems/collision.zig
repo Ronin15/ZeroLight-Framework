@@ -569,8 +569,8 @@ fn releaseHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocato
 }
 
 // A range's static query output. `pairs` accumulates over the range's queries; `hits` is
-// one query's scratch, sized to this slot's widest query, not the range's pairs and not
-// another slot's query.
+// this slot's scratch, released to its reserve window when the live query fits, not the
+// range's pairs and not another slot's query.
 const StaticPairBuffer = struct {
     pub const Context = *StaticSlotSizing;
     pub const max_passes = 2;
