@@ -59,10 +59,15 @@ plan is the brief itself.
 4. Run `zig build check` while editing, and `zig build test-compile` with no
    filter after a test body changes. Then run the test command and the bench
    command the brief names (`build-validation.md`, `tests-benchmarks.md`).
-   Write each run to a file and judge it by the exit code. On a failure, keep
-   that test's name and message. A bench summary is read for its verdict
-   lines. A crash, hang, or leak is reported for zig-debug-specialist. A
-   timing dispute is reported for the main session.
+   ThreadSanitizer is `zig build test -Dsanitize-thread=true` with the
+   brief's filter. Pass `--summary all` on every `zig build test` and
+   `zig build verify`. A success with no summary prints nothing; the
+   summary's pass line is the result. Write each run to a file and judge it
+   by that line and the exit code. Exit 0 with that pass line ends the
+   check. On a failure, keep that test's name and message.
+   A bench summary is read for its verdict lines. A crash, hang, or leak is
+   reported for zig-debug-specialist. A timing dispute is reported for the
+   main session.
 5. The cost model is the plan's. A measured hot-path cause the brief names
    is optimized and re-measured. A replan is only when that re-measure still
    misses and the counters show the structure is the cost, or the brief says

@@ -316,7 +316,8 @@ intent); dig and move keep their existing keyboard / stick bindings — see
 ## Testing
 
 Unit tests live beside the code they cover as `test` blocks. Run them with
-`zig build test`. `-Dtest-filter=<text>` (repeatable) compiles and runs only
+`zig build test --summary all`. A success with no summary prints nothing.
+`-Dtest-filter=<text>` (repeatable) compiles and runs only
 tests whose names contain the text; names carry their module path, so
 `-Dtest-filter=systems.pathfinding` selects the pathfinding modules. A filter
 that matches nothing compiles an empty stub and does not type-check the suite.
@@ -335,8 +336,8 @@ them).
 ## Thread Sanitizer
 
 ```sh
-zig build test -Dsanitize-thread=true -Dtest-filter=<that test's name>
-zig build test -Dsanitize-thread=true
+zig build test --summary all -Dsanitize-thread=true -Dtest-filter=<that test's name>
+zig build test --summary all -Dsanitize-thread=true
 ```
 
 Slice work uses the first command, on the new test, at the small fixture

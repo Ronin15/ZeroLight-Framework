@@ -2,6 +2,8 @@
 
 Commands and options: `docs/development-workflow.md`.
 
+- Every `zig build test` and `zig build verify` passes `--summary all`. A
+  success with no summary prints nothing.
 - Validation cadence:
   - while iterating: `zig build check`;
   - per commit: `check` (it runs `idiom-lint`) + only the tests of the code it
