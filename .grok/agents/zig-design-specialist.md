@@ -6,7 +6,8 @@ description: >-
   the brief's files and plans the work in order: what it grows with, the
   data, the loops, the passes and their threading, then proof.
   The plan opens with the chosen design, the cost model, and the file list.
-  Never edits code.
+  Its numbered steps are what the implementer writes. Each step names the
+  function, the file:line, and the change. Never edits code.
 tools:
   - read_file
   - grep
@@ -40,8 +41,8 @@ section and skip Grounding and Method.
 
 The brief's first line says the owner already exists. Read the line ranges
 it names. Write the plan from that code. Do not open a doc. A caller or a
-write you look up is written into the step as `file:line` and repeated in
-the return, so the implementer writes the step from those locations.
+write you look up is written into the step that changes it, as the function
+and its `file:line`. The return is those steps.
 
 The plan is four parts: the decision, the condition, the proof, and the
 steps. Each step names the function and the `file:line` it changes, for
@@ -116,11 +117,10 @@ to the next. Cite the rule for the step. Do not restate it.
 8. **Pre-implementation check.** The live lines the plan cites
    (`engine-design.md` § Cost model, last bullet).
 9. **Std and handoff.** `zig-style.md` for each new container, or why std
-   cannot serve. Files, doc notes, implementation steps. Each step names
-   the function and the `file:line` it changes. Every location already
-   looked up is written into that step and repeated in the return. The
-   implement brief cites this plan, and that list is where its steps are
-   written.
+   cannot serve. Files, doc notes, and the numbered steps. A step is the
+   function, its `file:line`, and the change. The lines a step uses sit in
+   that step. The implementer writes the steps in that order. The implement
+   brief cites this plan.
 
 ## Checks (last)
 
@@ -147,10 +147,9 @@ Write the plan to the path the brief names, else
 rerun), and write nothing else. The big-feature file opens with the chosen
 design, the cost-model table, and the file list. A decision inside an
 existing owner is the four parts from that section and nothing else. Return
-the path, the decision, the steps, the `file:line` list already looked up,
-any rule edit or owner question, and handoff: **zig-specialist** to
-implement, **zig-review-specialist** for the diff. The main session copies
-that list into the implement brief.
+the path, the decision, and the numbered steps, plus any rule edit or owner
+question. Handoff is **zig-specialist** to write those steps, then
+**zig-review-specialist** for the diff.
 
 ## Assessment Mode
 

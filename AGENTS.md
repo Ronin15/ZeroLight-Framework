@@ -44,26 +44,22 @@ order, verifies agent claims against live code and the rules, calls out a
 needed direction change to the owner, answers rule questions with the
 decision criteria, and reports.
 
-- **Briefs** go to `.grok/reports/<topic>-brief.md`; the spawn prompt cites
-  the path. A brief names the files in scope, the declarations to read, and
-  the cost-model questions. It cites a plan and lists only its overrides;
-  every fact in it is checked against live code or a cited source, and a
-  hypothesis is labelled one; every validation step and bench size it names
-  exercises the changed code. When the owner already exists, the first line
-  says so and the brief names the line ranges to read. It states the
-  decision and does not tour the module. An implement brief names the test
-  helper a new test calls, the `-Dtest-filter` words shared by that test
-  and the existing tests of the same behavior, and the bench groups when a
-  bench runs. The words are not the module and not a phrase unique to the
-  new test. The
-  implementer reads `tools/bench_ab.py --list` for that group's items and
-  cases. An implement brief cites the design plan and lists only its
-  overrides. The plan's numbered steps are the work, and each step already
-  carries the lines it needs. A second copy of those lines is not a survey
-  list. A declaration a step needs and the plan does not name is read once
-  and named in the landing. A
-  review brief names the diff, its
-  sources, and what to check, never anyone's conclusions.
+- **One unit, one plan.** Design writes the plan. Its numbered steps are
+  the work: each step is the function, the `file:line`, and the change.
+  The implement brief cites that plan, states any override, and copies the
+  proof's test filter and bench group. The specialist writes the steps in
+  that order, opening the file a step names while writing it. The review
+  brief names the diff's files and the behaviors the plan's results state.
+  A review finding is the next step: `file:line`, the failure, and the
+  fix. A local fix's implement brief is that finding list plus the test
+  command. An open choice goes back to design.
+  A design brief names the files, the declarations, and the cost-model
+  questions, and every fact in it is checked against live code or a cited
+  source. When the owner already exists, its first line says so and names
+  the line ranges. The test filter shares words with the existing tests of
+  that behavior, and the implementer reads `tools/bench_ab.py --list` for
+  the group's items and cases. A declaration a step needs and the plan does
+  not name is read once and named in the landing.
 - Agents cite a loaded rule by name. They do not open it again and do not
   restate it. A repeated constraint belongs in `.grok/rules/`.
 - **Design** (`zig-design-specialist`) only when a design is open or the
