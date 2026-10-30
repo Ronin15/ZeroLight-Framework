@@ -77,11 +77,10 @@ not name a rule the diff does not touch.
    structural finding.
 3. **Threading**: stages, tuners, dispatch shapes, writes, and diagnostics
    against `threading.md`.
-4. **Rules and std**: the diff against the other loaded rules (a rule it does
-   not touch is one line). A container, heap, bitset, sort, search, hash, or
-   parse the diff adds is the std function that call uses (`zig-style.md`).
-   The call in the diff is the check. A construct the diff already contains
-   is reviewed in the diff.
+4. **Rules**: the diff against the other loaded rules. A container, heap,
+   bitset, sort, search, hash, or parse is checked at the call in the diff
+   (`zig-style.md`). The declaration is the one this repo calls. A
+   construct the diff already contains is reviewed in the diff.
 5. **Contract**: read the `docs/architecture.md` heading that describes the
    functions the diff edits, and stop at the next heading of the same level.
    Check the diff against that heading. A heading the diff does not touch
@@ -92,10 +91,10 @@ not name a rule the diff does not touch.
    construction or an allowed precondition assert is not a finding. Owner
    questions are `AGENTS.md` § Decision criteria.
 6. **Tests and benches** against `tests-benchmarks.md`: for a weak test, the
-   untested contract and a scenario that exposes a regression; for each new
-   test, the mutation it catches (one that passes with the change reverted is
-   a finding). Judge a bench claim from numbers in the diff. No bench numbers
-   there means no bench verdict. Do not re-run a bench.
+   fixture values that still match if the change is reverted; for each new
+   test, the values that change when it is reverted. Judge a bench claim
+   from numbers in the diff. No bench numbers there means no bench verdict.
+   Do not re-run a bench.
 7. **Scope**: changed files against the prompt's list. **Roadmap docs**, when
    edited, against the roadmap index § Ground Rules.
 

@@ -54,10 +54,10 @@ finishes, or a review routes the next one, the main session rewrites the file.
   states the slice pass. An open how is the specialist's decision. The
   prompt does not choose it or tour the module.
 - **Implement** prompt: the design plan's path and only its overrides. The
-  plan lists the exact test and bench commands. The implementer runs those
-  and does not look them up. A stated fix with no plan is the prompt, and
-  that prompt carries the same commands. Every command it names exercises
-  the changed code.
+  plan lists the exact test and bench commands, and the values the new test
+  asserts. The implementer runs those commands. That result is the proof.
+  A stated fix with no plan is the prompt, and that prompt carries the same
+  commands and values. Every command it names exercises the changed code.
 - **Review** prompt: the files and the report path. It does not name the
   plan or the landing.
 - Agents cite a loaded rule by name. They do not open it again and do not

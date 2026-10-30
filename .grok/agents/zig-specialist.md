@@ -37,20 +37,21 @@ the edit and the tests the plan names. The cost model is the plan's.
 
 ## Workflow
 
-1. Read the files the prompt names and the declarations the change uses.
+1. Read the files the prompt names and the functions this change calls.
    Then edit. That read is not a survey of the module or of other groups.
+   The contract is that function's signature. A sort calls `pdq` or
+   `insertion` in `src/core/sort.zig`.
 2. Edit the files the prompt or the plan names. Open another file when a
    `zig build` error names it. An architecture heading the plan cites is
    that heading, through the next heading of the same level.
 3. A bench case goes in the file that already defines that group. Assert
    the pass shape the prompt states, in that file's existing style. Do not
    open another group's file, the suite, or assets to copy a pattern.
-4. The new test calls the helper the prompt names. Read that helper and
-   write the test. Doc changes are notes in the landing.
+4. The new test calls the helper the prompt names and asserts the values
+   the prompt names. Doc changes are notes in the landing.
 5. Run `zig build check` while editing, and `zig build test-compile` with no
-   filter after a test body changes. Run the test and bench commands the
-   plan lists. Do not look up a filter, a group, an item, or a case. Do not
-   run a bench the plan says not to run.
+   filter after a test body changes. Then run the test and bench commands
+   the plan lists. That result is the proof.
 6. The cost model is the plan's. A measured hot-path cause the prompt names
    is optimized and re-measured. A replan is only when that re-measure still
    misses and the counters show the structure is the cost, or the prompt says
