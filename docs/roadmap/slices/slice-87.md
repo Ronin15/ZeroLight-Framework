@@ -3,7 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: collect items landed. The backend and subsystem passes are done.**
-Their unfixed findings are the open items below. Next is the tier collect gate.
+Their unfixed findings are the open items below. Next is the dense layer order.
 Do not start slice 88 until those items are fixed or explicitly left.
 `verify` passes. `gpu-smoke` passed on Vulkan only.
 
@@ -109,7 +109,7 @@ and `.grok/rules/render.md` in the backend pass.
       patched into the sorted window rows. Test: `an in-window add or
       removal patches that chunk into the window sparse list and leaves
       the other chunks' rows`.
-- [ ] Tier does not gate collect. `entityVisibleForRenderCollect`
+- [x] Tier does not gate collect. `entityVisibleForRenderCollect`
       (`src/game/render_prep.zig:794`) is not called by collect. Failure
       scenario: skipping a dormant in-window row leaves the helper tests
       green. Pass: `collectDynamicRecords` emits an in-window dormant row

@@ -8,7 +8,6 @@ const math = @import("../core/math.zig");
 const pdqSort = @import("../core/sort.zig").pdq;
 const DataSystem = @import("data_system.zig").DataSystem;
 const DrawableRunColumns = @import("data_system.zig").DrawableRunColumns;
-const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const AssetReference = @import("data_system.zig").AssetReference;
@@ -30,8 +29,6 @@ const WorldSystem = @import("world/system.zig").WorldSystem;
 const GpuTileCopyThreads = @import("world/gpu_tiles.zig").GpuTileCopyThreads;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const level_z_step = @import("world/system.zig").level_z_step;
-const SimulationTier = @import("simulation_scope.zig").SimulationTier;
-const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const ConstParticleSlice = @import("systems/particle.zig").ConstParticleSlice;
 
@@ -786,23 +783,6 @@ fn markerRectAt(
     };
 }
 
-/// Camera chunk gate before interpolation and draw prep. Uses the world's render
-/// visibility window (same source as sparse tiles). Simulation tier is not consulted
-/// here — render visibility is camera policy only; sim LOD lives in the pipeline.
-/// Callers must set world visibility before collect; when the window is unset,
-/// every entity is skipped. Pixel AABB overlap is applied afterward in the caller.
-fn entityVisibleForRenderCollect(
-    movement_index: usize,
-    scope: ConstScopeColumnsSlice,
-    visible_chunks: ?ActiveRegion,
-) bool {
-    const region = visible_chunks orelse return false;
-    return region.containsChunk(.{
-        .x = scope.chunk_x[movement_index],
-        .y = scope.chunk_y[movement_index],
-    });
-}
-
 fn sortRecordIndexLessThan(records: []const DynamicRenderRecord, lhs_index: usize, rhs_index: usize) bool {
     const lhs = records[lhs_index];
     const rhs = records[rhs_index];
@@ -829,54 +809,6 @@ fn placeRecordsInIndexOrder(records: []DynamicRenderRecord, order: []usize) void
             dest = source;
         }
     }
-}
-
-fn testScopeColumns(chunk_x: []const i32, chunk_y: []const i32, tier: []const SimulationTier) ConstScopeColumnsSlice {
-    return .{
-        .entities = &.{},
-        .tier = tier,
-        .chunk_x = chunk_x,
-        .chunk_y = chunk_y,
-        .level = &.{},
-        .stagger_phase = &.{},
-        .always_active = &.{},
-    };
-}
-
-test "render collect chunk gate rejects rows when visibility window is unset" {
-    var chunk_x = [_]i32{0};
-    var chunk_y = [_]i32{0};
-    var tier = [_]SimulationTier{.cognition};
-    const scope = testScopeColumns(&chunk_x, &chunk_y, &tier);
-    try std.testing.expect(!entityVisibleForRenderCollect(0, scope, null));
-}
-
-test "render collect chunk gate uses scope chunk columns only" {
-    var chunk_x = [_]i32{ 0, 4 };
-    var chunk_y = [_]i32{ 0, 4 };
-    var tier = [_]SimulationTier{ .dormant, .cognition };
-    const scope = testScopeColumns(&chunk_x, &chunk_y, &tier);
-    const region = ActiveRegion{
-        .min = .{ .x = 0, .y = 0 },
-        .max_exclusive = .{ .x = 1, .y = 1 },
-    };
-    try std.testing.expect(entityVisibleForRenderCollect(0, scope, region));
-    try std.testing.expect(!entityVisibleForRenderCollect(1, scope, region));
-}
-
-test "render collect chunk gate ignores simulation tier" {
-    var chunk_x = [_]i32{ 0, 0 };
-    var chunk_y = [_]i32{ 0, 0 };
-    var dormant = [_]SimulationTier{.dormant};
-    var cognition = [_]SimulationTier{.cognition};
-    const dormant_scope = testScopeColumns(&chunk_x, &chunk_y, &dormant);
-    const cognition_scope = testScopeColumns(&chunk_x, &chunk_y, &cognition);
-    const region = ActiveRegion{
-        .min = .{ .x = 0, .y = 0 },
-        .max_exclusive = .{ .x = 1, .y = 1 },
-    };
-    try std.testing.expect(entityVisibleForRenderCollect(0, dormant_scope, region));
-    try std.testing.expect(entityVisibleForRenderCollect(0, cognition_scope, region));
 }
 
 test "render collect record sort orders depth then sequence" {
@@ -1160,6 +1092,65 @@ test "render collect dynamic records follow the visible chunk" {
     try std.testing.expectEqual(render_depth.worldZWithOffset(0, .actor), near_depth);
     try std.testing.expect(marker_depth != render_depth.worldZWithOffset(15, .marker));
     try std.testing.expect(near_depth != render_depth.worldZWithOffset(15, .actor));
+}
+
+test "collect dynamic records emits an in-window dormant row and drops an out-of-window row" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, 0);
+
+    const visual: @import("data_system.zig").PrimitiveVisual = .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+    const player = try data.createEntity();
+    try data.setMovementBody(player, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+
+    const in_window = try data.createEntity();
+    try data.setMovementBody(in_window, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setPrimitiveVisual(in_window, visual);
+    try data.setSimulationMetadata(in_window, .{ .tier = .dormant, .chunk = .{ .x = 0, .y = 0 } });
+
+    // Same pixel rect as the in-window row, so the chunk window is what drops it.
+    const out_of_window = try data.createEntity();
+    try data.setMovementBody(out_of_window, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setPrimitiveVisual(out_of_window, visual);
+    try data.setSimulationMetadata(out_of_window, .{ .tier = .dormant, .chunk = .{ .x = 4, .y = 4 } });
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const scope = data.scopeColumnsSliceConst();
+    const in_window_index = data.movementBodyDenseIndex(in_window).?;
+    const out_of_window_index = data.movementBodyDenseIndex(out_of_window).?;
+    try std.testing.expect(scope.tier[in_window_index] == .dormant);
+    try std.testing.expect(scope.tier[out_of_window_index] == .dormant);
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const visible = VisibleWorldRect.fromCameraRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, world.chunk_size_tiles, world.tile_size);
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    try std.testing.expect(recordWithSequence(&prep, in_window_index * 2) != null);
+    try std.testing.expect(recordWithSequence(&prep, out_of_window_index * 2) == null);
+    try std.testing.expectEqual(@as(usize, 1), prep.records.items.len);
 }
 
 fn recordWithSequence(prep: *const DynamicScenePrep, sequence: usize) ?DynamicRenderRecord {
