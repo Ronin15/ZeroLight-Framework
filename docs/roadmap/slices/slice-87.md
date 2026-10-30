@@ -106,8 +106,6 @@ and `.grok/rules/render.md` in the backend pass.
 - [ ] `zig build gpu-smoke` on each available backend (display-gated).
       Vulkan exited 0 (window, sprite, tilemap, upload growth, OOM reserve).
       No other backend was run.
-- [ ] `zig build verify` passes. Failed: 2038 pass, 7 fail. All seven are
-      warmed `FailingAllocator` paths that now allocate in
-      `reserveDrawableDestination` (`movement.zig`) from `setWorldLevel` →
-      `retargetDrawable` during a level change of a body with a primitive
-      visual. Idiom-lint was clean.
+- [x] `zig build verify` passes. The warmed `FailingAllocator` paths stay
+      allocation-free: a level change uses the neighbor-level drawable run
+      reserved when the visual is placed.
