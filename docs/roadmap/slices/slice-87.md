@@ -2,35 +2,26 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: collect and sparse runs are in `c6c066c`.** Next on this slice is
-`render-game-prep` for the submit-order pass, then the in-view collect test.
-The GPU fill stage is in that commit and stays; its pass is not met. The
-backend pass, the subsystem check, `gpu-smoke`, and `verify` close the core
-branch after slice 88.
+**Status: collect items landed (`c6c066c` through `5011383`).** Next is
+[slice 88](slice-88.md). Still on this file, after 88 and 75: the render
+backend pass, the subsystem check, `gpu-smoke`, and `verify`. The
+`render-game-prep` regression line stays open because the commit before the
+bench fix aborts.
 
 Goal: render collect work and its record and command capacity follow the
-rows in the visible chunks, never the world's population. The GPU tile sync's
-per-change copying stays off the main thread. The renderer, sprite batch,
-text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
+rows in the visible chunks, never the world's population. The GPU tile fill
+is a stage and stays inline, because a worker dispatch costs more than the
+copy. The renderer, sprite batch, text, and GPU buffers meet the cost model
+and `.grok/rules/render.md` in the backend pass.
 
 ### Current foundation
 
-- `render_prep.collectDynamicRecords` (`src/game/render_prep.zig:362`) walks
-  every movement body (`:385`) on main each frame. For each row it tests the
-  level window and the visible chunks.
-- `dynamicRecordCapacity` (`:302`) and `spriteCommandCapacity` (`:311`) size
-  to every primitive visual in the world.
-- GPU tile sync: `GpuTileMirror.plan` and `commit`
-  (`src/game/world/gpu_tiles.zig:266`, `:446`) copy a batched change's
-  written layers serially; the batched `chunk-scale-gpu-sync-dig` variant is
-  serial only.
-- Measured:
-  - `render-game-prep-offview`, serial (Debug, `5d5a089`): collect goes
-    0.44 → 1.37 → 8.6 ms as the off-view rows go 4,096 → 32,768 → 262,144,
-    with the same 1,088 records collected each time (1,024 rows in view plus
-    particles). The capacities follow the total rows.
-  - `chunk-scale-gpu-sync-dig`, batched (Debug, `639f55d`): about 2 ms on main
-    for 32 written layers, linear in what changed.
+- Collect walks each visible chunk's drawable run. Capacities follow those
+  rows, the player marker, and the live particles.
+- Each chunk owns its sparse rows. The window walk streams that run.
+- Dynamic records are reordered once. Submit streams that order. Sparse emit
+  streams its sorted columns.
+- The GPU tile fill is a stage. The tuner keeps it inline.
 
 ### Architecture notes
 
@@ -38,8 +29,8 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
   (`.grok/rules/render.md`). Collect cost follows what is visible
   (`.grok/rules/engine-design.md` § Cost model).
 - The record and command capacities grow at the pre-reserve before the
-  submission pass (`.grok/rules/memory-performance.md`), and the GPU tile
-  sync's byte copying threads (`.grok/rules/threading.md`).
+  submission pass (`.grok/rules/memory-performance.md`). The GPU tile fill
+  is a stage; the tuner keeps it inline.
 - Render state and draw records are per world (`.grok/rules/render.md`);
   74 binds presentation to the viewed world.
 - The backend pass is review-only (`zig-best-practices-review`), followed by

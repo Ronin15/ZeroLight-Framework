@@ -208,9 +208,9 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
+| [**87**](roadmap/slices/slice-87.md) | Collect items landed | Render Collect By Visible Chunks — backend pass closes the branch after 88 and 75 |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
-| [**89**](roadmap/slices/slice-89.md) | Programming landed; five items open as data | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); five items stay recorded |
+| [**89**](roadmap/slices/slice-89.md) | Programming landed; four items recorded | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); four items stay recorded |
 
 **Recently settled (archive only):** 85, 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -287,7 +287,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    commit, then tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items, closed: rows stay in
    store order) →
-   [87](roadmap/slices/slice-87.md) render prep →
+   [87](roadmap/slices/slice-87.md) collect items landed →
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
    inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
    backend pass closes the branch (owner 2026-10-16). 89 was added by the owner
