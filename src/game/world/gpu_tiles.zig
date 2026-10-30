@@ -610,7 +610,8 @@ pub const GpuTileMirror = struct {
 
     /// Copies this sync's upload values into `dest`. `source` is the region list, or the
     /// carried op list plus `old_values`. One `u32` per item; null `threads` runs inline.
-    /// Workers write only `dest`.
+    /// Workers write only `dest`. The fill is a short contiguous copy, and a worker
+    /// dispatch costs more than it, so the tuner keeps the production path inline.
     pub fn fillUploadValues(
         self: *const GpuTileMirror,
         dest: []u32,

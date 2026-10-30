@@ -65,12 +65,13 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       Measured: `render-game-prep-offview` above. Pass: collect time and the
       record and command capacities flat in off-view rows (group doc); the
       shape asserts land with the fix.
-- [x] GPU sync copying off main. The fill stage is in `c6c066c`. The
-      largest case is 32 layers and 118,528 elements, shaped as 3 ranges.
-      Debug, one rep: tuned 1.47 ms inline, 12 ns/element. Forcing those
-      ranges onto workers ran them and was slower (2.63 ms at 2 workers,
-      1.82 ms at 23). Production stays inline. There is no larger copy in
-      this group.
+- [x] GPU sync copying off main. The fill is a stage and the tuner keeps
+      it inline: the copy is a short contiguous `u32` fill, and a worker
+      dispatch costs more than it. Largest case, 32 layers, 118,528
+      elements, 3 ranges. ReleaseFast, one rep: serial 149.6 µs, tuned
+      99.2 µs inline, forced 2 workers 642 µs, forced pool 424 µs. Debug
+      forced workers were also slower (2.63 ms and 1.82 ms against about
+      1.5 ms inline). Do not force this copy onto workers.
 - [x] Sparse tiles read as contiguous runs per (level, chunk). Each chunk
       holds its own row list; the last removal frees it. Debug, tree only,
       one rep, serial. Pan layouts at 1,000 / 16,000 / 256,000 tiles:
