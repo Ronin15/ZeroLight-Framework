@@ -12,7 +12,7 @@ multi-world colony simulator (target and the demo's role:
 - **Rules** live only in `.grok/rules/`, one topic per file
   (`engine-design.md`). Every rule loads every session. Cite a loaded rule
   and do not open it again.
-- Agent definitions, docs, briefs, plans, and reports cite rule files by name
+- Agent definitions, docs, plans, and reports cite rule files by name
   and never restate them; a plan cites the rule each decision meets, a review
   the rule each standards finding breaks.
 - `docs/architecture.md`: source layout, ownership, frame flow, Target Model.
@@ -37,32 +37,28 @@ Add code under the owning module: boundaries in `engine-design.md`
 
 Non-trivial Zig design, implementation, review, and debugging goes through the
 `.grok/agents/` specialists (`spawn_subagent`, `subagent_type` = its name); the
-brief file is the child's whole task. Trivial work (a local fix in 1-2 files,
+spawn prompt is the child's whole task. Trivial work (a local fix in 1-2 files,
 no design question) may be done inline. The main session coordinates and is
 the second set of eyes on every unit: it keeps the work on the agreed goal and
 order, verifies agent claims against live code and the rules, calls out a
 needed direction change to the owner, answers rule questions with the
 decision criteria, and reports.
 
-- **Briefs** go to `.grok/reports/<topic>-brief.md`; the spawn prompt cites
-  the path. A brief names the files in scope, the declarations to read, and
-  the cost-model questions. It cites a plan and lists only its overrides;
-  every fact in it is checked against live code or a cited source, and a
-  hypothesis is labelled one; every validation step and bench size it names
-  exercises the changed code. When the owner already exists, the first line
-  says so and the brief names the line ranges to read. It states the
-  decision and does not tour the module. An implement brief names the test
-  helper a new test calls, the `-Dtest-filter` words shared by that test
-  and the existing tests of the same behavior, and the bench groups when a
-  bench runs. The words are not the module and not a phrase unique to the
-  new test. The
-  implementer reads `tools/bench_ab.py --list` for that group's items and
-  cases. An implement brief cites the design plan and lists only its
-  overrides. The plan's steps name their `file:line`. The specialist writes
-  the first step before opening a file a later step names. A declaration
-  the plan does not name is read once and named in the landing. A
-  review brief names the diff, its
-  sources, and what to check, never anyone's conclusions.
+- **Design** prompt: the files, the declarations to read, the cost-model
+  questions, and the plan path. Every fact in it is checked against live
+  code or a cited source, and a hypothesis is labelled one. When the owner
+  already exists, the first line says so and names the line ranges to read.
+  It states the decision and does not tour the module.
+- **Implement** prompt: the design plan's path and only its overrides. It
+  names the test helper a new test calls, the `-Dtest-filter` words shared
+  by that test and the existing tests of the same behavior, and the bench
+  groups when a bench runs. The words are not the module and not a phrase
+  unique to the new test. The implementer executes that plan and reads
+  `tools/bench_ab.py --list` for that group's items and cases. A stated fix
+  with no plan is the prompt. Every validation step and bench size it names
+  exercises the changed code.
+- **Review** prompt: the files and the report path. It does not name the
+  plan or the landing.
 - Agents cite a loaded rule by name. They do not open it again and do not
   restate it. A repeated constraint belongs in `.grok/rules/`.
 - **Design** (`zig-design-specialist`) only when a design is open or the
@@ -70,7 +66,7 @@ decision criteria, and reports.
   a call already made goes straight to `zig-specialist`.
 - **Review** (`zig-review-specialist`) once per landing, before commit,
   spawned the same turn the code is ready. A large diff is two review
-  agents, spawned together. Each brief names its own files. The split is
+  agents, spawned together. Each prompt names its own files. The split is
   files that do not share a write. The main session merges the two reports
   into one finding list. That is one review, not a second round. Fixes fold
   into that commit. A
@@ -78,10 +74,11 @@ decision criteria, and reports.
   design. A High structural data-layout finding in new code is fixed in its
   landing. Any finding not fixed becomes a checklist item in its owning slice
   (`file:line`, failure scenario, pass condition).
-- **Debug** (`zig-debug-specialist`) for failures. **Docs**
-  (`docs-specialist`) write a slice's docs commit once its programming is
-  done, from the code as landed; each landing's doc changes are notes in its
-  commit message.
+- **Debug** (`zig-debug-specialist`) for failures. Its prompt is the failing
+  command and the first error block. **Docs** (`docs-specialist`) write a
+  slice's docs commit once its programming is done, from the code as landed;
+  the prompt names those sources and the slices. Each landing's doc changes
+  are notes in its commit message.
 - Never generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work here.
 - **Decision criteria**: uniformity, scalability, best practice, efficiency,
@@ -96,8 +93,10 @@ decision criteria, and reports.
   before using it. Implementation agents run one at a time in the main tree,
   one commit-sized unit each; new work goes to a fresh agent. One commit per
   logical change, review fixes folded in; no per-finding commits, worktrees,
-  or merge commits; never known-broken or unfinished code; the owner pushes.
-- Agents work from live code and the sources the brief names, never memory or
+  or merge commits; never known-broken or unfinished code. A completed slice
+  unit is committed once its review fixes are in, so the next unit stays
+  separate. The owner pushes.
+- Agents work from live code and the sources the prompt names, never memory or
   chat summaries; they report what is outside their role and the main session
   routes it.
 - Reports are terse and drop no findings; perf reports and explanations of
@@ -108,7 +107,10 @@ decision criteria, and reports.
 
 ## Commands
 
-Zig 0.17.0 minimum. `zig build -h` lists the steps and the `-D` options; stop
+Zig 0.17.0 minimum. `zig` on `PATH` is the current binary. `zig build test`
+with its `-Dtest-filter`, and `zig build bench` or `tools/bench_ab.py` with
+its group, run that binary. Do not search `.zig-cache` or `zig-out` for a
+test or bench executable. `zig build -h` lists the steps and the `-D` options; stop
 at System Integration Options. `tools/bench_ab.py --help` lists that script's
 flags and the bench flags it forwards, and runs nothing. `tools/bench_ab.py
 --list` lists each group's items and cases. Do not open `build.zig`,
@@ -119,10 +121,9 @@ Validation cadence and modes: `build-validation.md`.
 ## Grok Tooling (`.grok/`)
 
 - Agent names stay stable. Spawn them with `subagent_type` set to that name.
-- Plans, reviews, unit briefs, and landing reports go in `.grok/reports/`
-  (gitignored). Design and review agents write theirs; the main session
-  writes `<topic>-brief.md`; `zig-specialist` writes `<topic>-landing.md`
-  unless the brief names another path. A spawn prompt cites the file.
+- Plans, reviews, and landing reports go in `.grok/reports/` (gitignored).
+  Design writes the plan, review writes the report, and `zig-specialist`
+  writes `<topic>-landing.md`, each to the path the prompt names.
 - `tools/bench_ab.py` is the before/after bench (DW § Benchmarks; modes:
   `build-validation.md`; verdicts: `tests-benchmarks.md`). Never revert
   implemented work without the owner.

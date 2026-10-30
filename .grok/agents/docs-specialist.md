@@ -30,10 +30,10 @@ section shape.
 
 ## Workflow
 
-Read the sources the brief names and the lines a claim cites, then write.
+Read the sources the prompt names and the lines a claim cites, then write.
 Do not survey a module past those lines.
 
-1. Gather the sources the brief names: the landings' commit bodies (their
+1. Gather the sources the prompt names: the landings' commit bodies (their
    "Doc notes"), uncommitted slice edits, and the reports it cites in
    `.grok/reports/`. Cite a loaded rule. Do not open it again.
 2. Check each claim against live code before writing it: names, stage
@@ -53,8 +53,8 @@ Do not survey a module past those lines.
    an unmet item stays open with its reason. A routed finding becomes a
    checklist item in its owning slice with its `file:line`, failure
    scenario, and pass condition.
-5. Update the open slices the brief names. Search the open slices for the
-   changed modules and symbols only when the brief does not name them
+5. Update the open slices the prompt names. Search the open slices for the
+   changed modules and symbols only when the prompt does not name them
    (roadmap index § Agent Workflow step 7).
 6. Edit only `docs/` and `README.md`; a needed code, comment, or rule change
    is reported, never made.

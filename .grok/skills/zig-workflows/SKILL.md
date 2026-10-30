@@ -17,8 +17,8 @@ Pipeline. Agents are `.grok/agents/`. Presets are
 [references/module-presets.md](references/module-presets.md). This file only
 routes and bounds the read.
 
-Do not restate a rule or the brief in a spawn prompt. Agents load `AGENTS.md`.
-The brief file is the child's whole task. The prompt cites that path.
+The spawn prompt is the child's whole task (`AGENTS.md` § Agent Pipeline).
+Agents load `AGENTS.md`. Do not restate a rule or the agent's job in it.
 
 ## Route
 
@@ -29,41 +29,29 @@ test fix stays inline.
 | Signal | Route |
 |--------|--------|
 | The how is open, or the structure fails the cost model | Design, then implement |
-| The slice or the brief already names the change | Implement |
+| The change is already decided | Implement |
 | A decision inside an existing owner, how still open | Design on the short path, then implement |
 | A command failed | Debug |
 | The landing's code is ready | Review, the same turn |
 | The slice's programming is done | Docs |
 | Pathfinder / best-practices / deep-correctness / architecture | That skill |
 
-A short-path brief is `AGENTS.md` § Briefs. The agent reads the named ranges
-and writes the four-part plan from that code. Locations it already looked
-up are copied into the implement brief. The brief cites the design plan,
-lists only its overrides, and that list is where the plan's steps are
-written. An implement brief names the
-test helper a new test calls, the behavior-word test filter, and the bench groups. The implementer picks
-items and cases from `tools/bench_ab.py --list`. Owner questions are `AGENTS.md`
-§ Decision criteria.
-
 When unsure, implement. Review a substantive diff. Debug a failing command.
 
 ## Spawn
 
 `spawn_subagent` with `subagent_type`, `description`, `prompt`, and
-`background`. Do not set a model. The prompt is the brief path. Add the
-product path only when the brief does not name it. Paste nothing else.
+`background`. Do not set a model. The prompt is the task in `AGENTS.md`
+§ Agent Pipeline.
 
 Design, review, and docs use `background: true`. Independent read-only units
 spawn together. Implement and debug run one at a time in the main tree. Do
 not run design and implement together on the same files.
 
-A review brief names the diff, its sources, and what to check. It carries no
-conclusion. A large diff is two briefs, spawned together, split on files
-that do not share a write. The parent merges the reports into one finding
-list. The review enforces the rules and the architecture on the lines
-the diff changes. The read stays on those lines. A debug prompt may be the failing command and the first error
-block when that is the whole failure. Skip `zig build verify` until that
-command is green.
+A large diff is two review prompts, spawned together, split on files that
+do not share a write. The parent merges the reports into one finding list.
+A debug prompt is the failing command and the first error block when that
+is the whole failure. Skip `zig build verify` until that command is green.
 
 The parent checks a load-bearing claim against the function it cites and
 against the command output. It does not re-walk the file.
