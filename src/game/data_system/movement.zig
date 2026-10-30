@@ -441,6 +441,21 @@ pub const MovementBodyStore = struct {
         run.refreshed_epoch = self.pose_epoch;
     }
 
+    /// Copies row `index`'s pose into its slot in `run_index`. Does not walk the run
+    /// and does not mark it refreshed, so the other rows stay stale.
+    pub fn refreshSlotPose(self: *MovementBodyStore, index: usize, run_index: u32) ?usize {
+        const movement = self.rows.slice();
+        if (movement.items(.drawable_run)[index] != run_index) return null;
+        const slot: usize = movement.items(.drawable_slot)[index];
+        const drawn = self.runs.items[run_index].rows.slice();
+        drawn.items(.previous_x)[slot] = movement.items(.previous_x)[index];
+        drawn.items(.position_x)[slot] = movement.items(.position_x)[index];
+        drawn.items(.previous_y)[slot] = movement.items(.previous_y)[index];
+        drawn.items(.position_y)[slot] = movement.items(.position_y)[index];
+        drawn.items(.position_z)[slot] = movement.items(.position_z)[index];
+        return slot;
+    }
+
     pub fn drawableRunSlice(self: *MovementBodyStore, run_index: u32) DrawableRunColumns {
         const drawn = self.runs.items[run_index].rows.slice();
         return .{

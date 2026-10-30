@@ -506,12 +506,10 @@ pub fn collectDynamicRecords(
                 if (outside and region.containsChunk(.{ .x = scope.chunk_x[player_row], .y = scope.chunk_y[player_row] })) {
                     if (movement.has_primitive_visual[player_row]) {
                         if (bodies.drawableRunIndex(@intCast(player_level), scope.chunk_x[player_row], scope.chunk_y[player_row])) |run_index| {
-                            bodies.refreshRunPose(run_index);
-                            const run = bodies.drawableRunSlice(run_index);
-                            for (run.movement_index, 0..) |movement_row, slot| {
-                                if (movement_row != player_row) continue;
+                            // The movement row holds its slot. One pose copy; the chunk is not walked.
+                            if (bodies.refreshSlotPose(player_row, run_index)) |slot| {
+                                const run = bodies.drawableRunSlice(run_index);
                                 emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, run, slot, run.previous_x[slot], run.position_x[slot], run.previous_y[slot], run.position_y[slot], run.size_x[slot], run.size_y[slot]);
-                                break;
                             }
                         }
                     }
@@ -1460,6 +1458,82 @@ test "collect dynamic records excludes an entity beyond the render window depth"
 
     // Player + the level-6 entity only; the level-7 entity is dropped.
     try std.testing.expectEqual(@as(usize, 2), prep.records.items.len);
+}
+
+test "collect dynamic records emits the out-of-window player at its drawable slot" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const visual: @import("data_system.zig").PrimitiveVisual = .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+    // Same chunk, outside the level window. The neighbor links first, so the player's slot is not zero.
+    const neighbor = try data.createEntity();
+    try data.setMovementBody(neighbor, .{ .position = .{ .x = 4, .y = 4 }, .previous_position = .{ .x = 4, .y = 4 } });
+    try data.setPrimitiveVisual(neighbor, visual);
+    try data.setWorldLevel(neighbor, 1);
+
+    const player = try data.createEntity();
+    try data.setMovementBody(player, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setPrimitiveVisual(player, visual);
+    try data.setWorldLevel(player, 1);
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addLevel(-level_z_step);
+    world.render_window = .{ .levels_below = 0 };
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, 0);
+
+    const player_index = data.movementBodyDenseIndex(player).?;
+    const neighbor_index = data.movementBodyDenseIndex(neighbor).?;
+    const run_index = data.movement_bodies.drawableRunIndex(1, 0, 0).?;
+    const run = data.movement_bodies.drawableRunSlice(run_index);
+    try std.testing.expect(run.movement_index[0] == neighbor_index);
+    try std.testing.expect(run.movement_index[1] == player_index);
+
+    // Poses live on the movement rows until collect copies the player's slot.
+    data.movementBodyPtr(neighbor).?.position_x.* = 30;
+    data.movementBodyPtr(player).?.position_x.* = 20;
+    data.movementBodyPtr(player).?.previous_x.* = 20;
+    data.movementBodyPtr(player).?.position_z.* = 4;
+    data.movement_bodies.bumpPoseEpoch();
+    try std.testing.expectEqual(@as(f32, 4), run.position_x[0]);
+    try std.testing.expectEqual(@as(f32, 8), run.position_x[1]);
+
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const visible = VisibleWorldRect.fromCameraRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0, world.chunk_size_tiles, world.tile_size);
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+
+    const player_visual = recordWithSequence(&prep, player_index * 2) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f32, 20), dynamicRecordX(player_visual));
+    try std.testing.expectEqual(render_depth.worldZWithOffset(4, .actor), player_visual.depth);
+    try std.testing.expect(recordWithSequence(&prep, neighbor_index * 2) == null);
+    try std.testing.expectEqual(@as(usize, 1), prep.records.items.len);
+    // The neighbor row was not refreshed. A walk of the chunk would have copied 30.
+    try std.testing.expectEqual(@as(f32, 4), run.position_x[0]);
+    try std.testing.expectEqual(@as(f32, 20), run.position_x[1]);
 }
 
 fn expectCollectedAppearance(

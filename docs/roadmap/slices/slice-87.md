@@ -3,7 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: collect items landed. The backend and subsystem passes are done.**
-Their unfixed findings are the open items below. Next is the out-of-window player `drawable_slot`.
+The code items below are done. Next is the docs commit and the acceptance checks.
 Do not start slice 88 until those items are fixed or explicitly left.
 `verify` passes. `gpu-smoke` passed on Vulkan only.
 
@@ -117,10 +117,11 @@ and `.grok/rules/render.md` in the backend pass.
 - [x] Dense layer order slices once. `collectDenseSubmitLayers` fills one
       depth per layer, then `pdq` sorts `{ depth, id }`. The cut reads that
       depth slice. A compare does not gather columns through the layer id.
-- [ ] Out-of-window player uses `drawable_slot`. Collect scans the chunk
-      run for `player_row` (`src/game/render_prep.zig:515`) when the scope
-      level is outside the render window. Failure scenario: that transition
-      walks every row of the chunk. Pass: emit the row at `drawable_slot`.
+- [x] Out-of-window player uses `drawable_slot`. When the scope level is
+      outside the render window, collect emits that row at its slot
+      (`src/game/render_prep.zig:512`) and does not walk the chunk.
+      Failure scenario: that transition walks every row of the chunk.
+      Pass: emit the row at `drawable_slot`.
 - [x] Facing pointer lifetime. `facingPtr` and `directionPtr` are gone.
       Facing changes go through `setFacing`, which writes the drawable run.
 - [x] The `render_game_prep` bench's module doc carries no review tags
