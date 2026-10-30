@@ -420,6 +420,21 @@ pub const MovementBodyStore = struct {
         const chunk_y = movement.items(.chunk_y)[index];
         try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
         self.commitDrawableLink(index, level, chunk_x, chunk_y);
+        // A level change moves the row into the neighbor level's run. That run is
+        // reserved with the visual, so the fall does not allocate.
+        if (level > 0) try self.reserveDrawableDestination(allocator, level - 1, chunk_x, chunk_y);
+        if (level != std.math.maxInt(u16)) try self.reserveDrawableDestination(allocator, level + 1, chunk_x, chunk_y);
+    }
+
+    /// Reserves the runs a level change from this row would move into, so that change allocates nothing.
+    pub fn reserveDrawableNeighborLevels(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
+        const movement = self.rows.slice();
+        if (!movement.items(.has_primitive_visual)[index]) return;
+        const level = movement.items(.level)[index];
+        const chunk_x = movement.items(.chunk_x)[index];
+        const chunk_y = movement.items(.chunk_y)[index];
+        if (level > 0) try self.reserveDrawableDestination(allocator, level - 1, chunk_x, chunk_y);
+        if (level != std.math.maxInt(u16)) try self.reserveDrawableDestination(allocator, level + 1, chunk_x, chunk_y);
     }
 
     /// Reserves the run for (`level`, `chunk_x`, `chunk_y`) and one more row slot in it.
@@ -457,6 +472,13 @@ pub const MovementBodyStore = struct {
     /// reserved before the unlink, so a failure leaves membership unchanged.
     pub fn retargetDrawable(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize, level: u16, chunk_x: i32, chunk_y: i32) !void {
         if (!self.rows.slice().items(.has_primitive_visual)[index]) return;
+        const key = drawableKey(level, chunk_x, chunk_y);
+        if (self.run_of.get(key)) |dest| {
+            if (self.runs.items[dest].reserved_extra > 0) {
+                self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
+                return;
+            }
+        }
         try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
         self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
     }

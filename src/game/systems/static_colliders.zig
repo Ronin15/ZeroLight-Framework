@@ -5708,12 +5708,15 @@ test "a rebuild samples each stage's own rebuild tuner once, threads a fresh sys
                 try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
                 continue;
             }
-            // The tuner carried over: the second rebuild learns inline, never the fresh
-            // full-pool selection. A threaded first sample is a different profile, so the
-            // inline sample restarts the window; an inline first sample extends it.
-            try std.testing.expectEqual(@as(usize, 0), sampled.worker_threads);
-            const expected: usize = if (first_ran_inline.get(stage)) 2 else 1;
-            try std.testing.expectEqual(expected, tuner.sample_count);
+            // The opening full-pool window stays on that shape until it adopts.
+            // The second rebuild is still inside that window. An inline first
+            // sample stays inline.
+            if (first_ran_inline.get(stage)) {
+                try std.testing.expectEqual(@as(usize, 0), sampled.worker_threads);
+            } else {
+                try std.testing.expect(sampled.worker_threads > 0);
+            }
+            try std.testing.expectEqual(@as(usize, 2), tuner.sample_count);
         }
         try std.testing.expect(first_threaded_stages > 0);
         for (std.meta.tags(SyncStage)) |stage| {

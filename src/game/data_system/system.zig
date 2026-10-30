@@ -309,6 +309,7 @@ pub const DataSystem = struct {
             try self.movement_bodies.retargetDrawable(self.allocator, di, new_level, metadata.chunk.x, metadata.chunk.y);
         }
         self.movement_bodies.setScopeMetadata(di, resolved);
+        try self.movement_bodies.reserveDrawableNeighborLevels(self.allocator, di);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
 
