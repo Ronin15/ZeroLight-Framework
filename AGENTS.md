@@ -53,14 +53,11 @@ finishes, or a review routes the next one, the main session rewrites the file.
   the first line says so and names the line ranges to read. The prompt
   states the slice pass. An open how is the specialist's decision. The
   prompt does not choose it or tour the module.
-- **Implement** prompt: the design plan's path and only its overrides. It
-  names the test helper a new test calls, the `-Dtest-filter` words shared
-  by that test and the existing tests of the same behavior, and the bench
-  groups when a bench runs. The words are not the module and not a phrase
-  unique to the new test. The implementer executes that plan and reads
-  `tools/bench_ab.py --list` for that group's items and cases. A stated fix
-  with no plan is the prompt. Every validation step and bench size it names
-  exercises the changed code.
+- **Implement** prompt: the design plan's path and only its overrides. The
+  plan lists the exact test and bench commands. The implementer runs those
+  and does not look them up. A stated fix with no plan is the prompt, and
+  that prompt carries the same commands. Every command it names exercises
+  the changed code.
 - **Review** prompt: the files and the report path. It does not name the
   plan or the landing.
 - Agents cite a loaded rule by name. They do not open it again and do not

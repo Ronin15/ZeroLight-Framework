@@ -38,32 +38,8 @@ test fix stays inline.
 
 When unsure, implement. Review a substantive diff. Debug a failing command.
 
-## Spawn
-
-`spawn_subagent` with `subagent_type`, `description`, `prompt`, and
-`background`. Do not set a model. The prompt is the task in `AGENTS.md`
-§ Agent Pipeline.
-
-Design, review, and docs use `background: true`. Independent read-only units
-spawn together. Implement and debug run one at a time in the main tree. Do
-not run design and implement together on the same files.
-
-A large diff is two review prompts, spawned together, split on files that
-do not share a write. The parent merges the reports into one finding list.
-A debug prompt is the failing command and the first error block when that
-is the whole failure. Skip `zig build verify` until that command is green.
-
-The parent coordinates. Specialists own the design and the code. Its check
-is that the result still matches the slice pass and the named plan. It does
-not design the change or walk the module. It checks a load-bearing claim
-against the function it cites and against the command output.
-
-## After
-
-A review finding with a stated local fix goes to implement and folds into
-the landing commit. An open choice goes to design. Do not start a second
-review round. Docs notes ride the landing commit. The docs specialist writes
-the slice's docs commit from the code as landed and does not commit.
+Spawn, review split, and the parent's check are `AGENTS.md` § Agent
+Pipeline. The spawn prompt does not restate this skill or the agent's job.
 
 ## Multi-phase
 

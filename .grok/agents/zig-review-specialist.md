@@ -62,10 +62,9 @@ the diff already read.
 
 ## Procedure
 
-This is the review, on every diff. You are enforcing the rules and the
-architecture on the lines the diff changes. A step whose subject the diff
-does not touch is one line naming the rule. Cite the rule a finding breaks.
-Do not restate it.
+This is the review, on the lines the diff changes. Skip a step the diff
+does not touch. Cite the rule a finding breaks. Do not restate it, and do
+not name a rule the diff does not touch.
 
 1. **Scale**: every operation the diff adds or changes, against
    `engine-design.md` § Target scale and § Cost model, `threading.md` § What
@@ -104,7 +103,8 @@ Do not restate it.
 
 1. Findings, highest severity first: severity, tag, the broken behavior, why
    it matters, the rule it breaks, a narrow fix direction, `file:line`.
-2. Open questions only if they affect confidence; then a brief summary.
+2. Open questions only if they affect confidence. The summary is the
+   findings.
 3. If nothing is found, say so and note residual risk or tests not run.
 4. Unless the prompt sets the output, write the same report to
    `.grok/reports/<slice>-<landing>-review.md` and write nothing else;
