@@ -2,11 +2,10 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: collect items landed (`c6c066c` through `5011383`).** Next is
-[slice 88](slice-88.md). Still on this file, after 88 and 75: the render
-backend pass, the subsystem check, `gpu-smoke`, and `verify`. The
-`render-game-prep` regression line stays open because the commit before the
-bench fix aborts.
+**Status: collect items landed (`c6c066c` through `5011383`).** Still on
+this slice: the backend pass, the subsystem pass, the `render-game-prep`
+regression line, `gpu-smoke` on the other backends, and `verify`. Do not
+start slice 88 until those are written up and fixed.
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile fill
@@ -105,4 +104,10 @@ and `.grok/rules/render.md` in the backend pass.
       submit item). The previous commit aborts in `render-game-prep`, so
       the regression comparison was not run.
 - [ ] `zig build gpu-smoke` on each available backend (display-gated).
-- [ ] `zig build verify` passes.
+      Vulkan exited 0 (window, sprite, tilemap, upload growth, OOM reserve).
+      No other backend was run.
+- [ ] `zig build verify` passes. Failed: 2038 pass, 7 fail. All seven are
+      warmed `FailingAllocator` paths that now allocate in
+      `reserveDrawableDestination` (`movement.zig`) from `setWorldLevel` →
+      `retargetDrawable` during a level change of a body with a primitive
+      visual. Idiom-lint was clean.
