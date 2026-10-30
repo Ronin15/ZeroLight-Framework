@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: programming landed. Off-view collect meets its pass shape.**
-`verify` passes. `gpu-smoke` passed on Vulkan only. Slice 88 waits on
-`gpu-smoke` for any other available backend.
+**Status: programming landed. Acceptance met on this machine.**
+`verify` passes. `gpu-smoke` passed on Vulkan. Owner 2026-10-30: that run
+is enough. Other machines are not a gate; smoke them when they are reachable.
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile fill
@@ -144,9 +144,9 @@ and `.grok/rules/render.md` in the backend pass.
       serial, one rep, tree `87fab8e`: 576 µs, 486 µs, and 520 µs at
       4,096, 32,768, and 262,144 outside rows. In-view rows stay 1,024 and
       collected rows stay 1,088.
-- [ ] `zig build gpu-smoke` on each available backend (display-gated).
-      Vulkan exited 0 (window, sprite, tilemap, upload growth, OOM reserve).
-      No other backend was run.
+- [x] `zig build gpu-smoke` (display-gated). Vulkan on this machine exited 0
+      (window, sprite, tilemap, upload growth, OOM reserve). Other machines
+      are not a gate (owner 2026-10-30).
 - [x] `zig build verify` passes. The warmed `FailingAllocator` paths stay
       allocation-free: a level change uses the neighbor-level drawable run
       reserved when the visual is placed.

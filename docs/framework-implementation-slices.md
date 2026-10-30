@@ -208,7 +208,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**87**](roadmap/slices/slice-87.md) | Programming landed; acceptance checks open | Render Collect By Visible Chunks — acceptance before 88 |
+| [**87**](roadmap/slices/slice-87.md) | Programming landed | Render Collect By Visible Chunks — Vulkan `gpu-smoke` passed; other machines are not a gate |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; four items recorded | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); four items stay recorded |
 
@@ -288,7 +288,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items, closed: rows stay in
    store order) →
    [87](roadmap/slices/slice-87.md) programming landed (collect, backend, and
-   subsystem); acceptance checks remain, then
+   subsystem; Vulkan `gpu-smoke` passed, other machines are not a gate), then
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
    inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics. The render
    backend pass has landed; it does not wait on the inert-row items. 89 was added by the owner
@@ -438,7 +438,9 @@ earlier line or is landed. Tables T1–T6 number versions in this relative
 order.
 
 - **Residual verification (any time):** [33](roadmap/slices/slice-33.md)
-  (visual/`gpu-smoke`), [43](roadmap/slices/slice-43.md) (hardware).
+  (visual/`gpu-smoke`), [43](roadmap/slices/slice-43.md) (hardware). Slice 87's
+  `gpu-smoke` on other machines, when those hosts are reachable; it does not
+  gate later slices.
 - **Capacity sizing:** [72](roadmap/slices/slice-72.md), any time; F and G
   are re-scoped against 64G first. Its open items cross-edit the slices they
   name in the same change.
@@ -457,8 +459,8 @@ order.
 7. **86** Collision Subsystem Pass — landed (archived), after 83, 84, 89, and 90.
 8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
 8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22).
-9. **87** Render Collect By Visible Chunks — programming landed; acceptance checks open (core-systems branch).
-9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's acceptance checks (core-systems branch).
+9. **87** Render Collect By Visible Chunks — programming landed (core-systems branch). Vulkan `gpu-smoke` passed; other machines are not a gate.
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 (core-systems branch).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.
 9c. **87's render backend pass** — landed with the slice checklist. It does not wait on 9b.
 10. **76** Cave-Ins — after 64G, 88.
