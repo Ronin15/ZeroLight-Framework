@@ -230,11 +230,6 @@ pub const FacingData = struct {
     direction: Facing = .down,
 };
 
-pub const ConstFacingSlice = struct {
-    entities: []const EntityId,
-    directions: []const Facing,
-};
-
 /// Data-only primitive visual component. Render order and colors live here, but
 /// prepared draw records and renderer handles stay outside DataSystem.
 pub const PrimitiveVisual = struct {
@@ -289,14 +284,6 @@ pub const BodyLevelFaction = struct {
     movement_body: usize,
     level: ?u16 = null,
     faction: ?Faction = null,
-};
-
-/// Primitive-visual and optional facing/asset indices for one movement-body row.
-/// Returned only when the entity carries a drawable primitive visual.
-pub const RenderCollectIndices = struct {
-    visual_index: usize,
-    asset_ref_index: ?usize = null,
-    facing_index: ?usize = null,
 };
 
 /// Dense movement + primitive-visual row indices from a single entity slot resolve, so

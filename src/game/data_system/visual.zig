@@ -11,7 +11,6 @@ const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Facing = types.Facing;
 const FacingData = types.FacingData;
-const ConstFacingSlice = types.ConstFacingSlice;
 const PrimitiveVisual = types.PrimitiveVisual;
 const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
 const AssetReference = types.AssetReference;
@@ -91,10 +90,6 @@ pub const FacingStore = struct {
         self.rows.slice().items(.direction)[index] = direction;
     }
 
-    pub fn directionPtr(self: *FacingStore, index: usize) *Facing {
-        return &self.rows.slice().items(.direction)[index];
-    }
-
     pub fn directionAt(self: *const FacingStore, index: usize) Facing {
         return self.rows.slice().items(.direction)[index];
     }
@@ -105,11 +100,6 @@ pub const FacingStore = struct {
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
         self.rows.swapRemove(index);
         return moved_entity;
-    }
-
-    pub fn sliceConst(self: *const FacingStore) ConstFacingSlice {
-        const s = self.rows.slice();
-        return .{ .entities = s.items(.entity), .directions = s.items(.direction) };
     }
 
     pub fn clearRetainingCapacity(self: *FacingStore) void {

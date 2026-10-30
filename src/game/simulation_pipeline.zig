@@ -2078,7 +2078,7 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
     // Player stands at cell (5,3) facing right, so this step's dig punches a
     // hole at (6,3) -- the same cell an NPC crosses into this step.
     placePlayerFlush(&data, player, .{ 5, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
 
     try std.testing.expect(!world.denseFloorIsEmpty(0, 6, 3));
 
@@ -2162,7 +2162,7 @@ test "pipeline update after reserve allocates nothing on frame streams with dig,
     var player = try Player.spawn(&data);
     player.current_level = 0;
     placePlayerFlush(&data, player, .{ 5, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
 
     const npc = try data.createEntity();
     try data.setMovementBody(npc, .{});
@@ -3994,7 +3994,7 @@ const NavSeamFixture = struct {
         self.player = try Player.spawn(&self.data);
         self.player.current_level = 0;
         placePlayerFlush(&self.data, self.player, .{ 5, 3 });
-        self.data.facingPtr(self.player.entity).?.* = .right;
+        try self.data.setFacing(self.player.entity, .{ .direction = .right });
         self.frame = SimulationFrame.init(std.testing.allocator);
         errdefer self.frame.deinit();
         try self.frame.reserveStreams(4, 8, 8, 8, 8, 8);
@@ -4704,7 +4704,7 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
     // Player stands underground at cell (5,3) facing right, so this step's dig
     // mines a walkable tunnel at (6,3) -- the cell the NPC crosses into.
     placePlayerFlush(&data, player, .{ 5, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
 
     // Level 1 is solid dirt: the forward cell blocks movement until dig mines it.
     try std.testing.expect(world.levelBlocksMovement(1, 6, 3));
@@ -5360,7 +5360,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     // Player at cell (5,3) facing right punches a hole at (6,3) on level 0, whose
     // cell-center is the stimulus position.
     placePlayerFlush(&data, player, .{ 5, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
 
     // Cognition-tier AiPerception observer at cell (7,3) -- within earshot of the
     // dig cell (6,3), same level, but far enough that it never steps onto the hole.
@@ -5802,7 +5802,7 @@ test "dig stage reserves its world edit before promoting, so a failed reserve ke
     try data.setWorldLevel(player.entity, 1);
     // Cell (3,3), facing right: the ramp goes into level 1's solid cell (4,3).
     placePlayerFlush(&data, player, .{ 3, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -6103,7 +6103,7 @@ test "captureActionIntent stamps faced cell matching dig targeting" {
     };
     defer world.deinit();
     placePlayerFlush(&data, player, .{ 3, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
     player.current_level = 2;
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -6131,7 +6131,7 @@ test "captureActionIntent stamps faced cell matching dig targeting" {
     // Facing change must move the stamp (shared dig helper).
     frame.beginStep();
     pipeline.interact_held_last = false;
-    data.facingPtr(player.entity).?.* = .down;
+    try data.setFacing(player.entity, .{ .direction = .down });
     input.setHeld(.interact, true);
     pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     const down_intent = frame.action_intents.mergedItems()[0];
@@ -6384,7 +6384,7 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     var player = try Player.spawn(&data);
     player.current_level = 0;
     placePlayerFlush(&data, player, .{ 5, 3 });
-    data.facingPtr(player.entity).?.* = .right;
+    try data.setFacing(player.entity, .{ .direction = .right });
 
     const dig_stimulus_x: f32 = 6 * 32 + 16;
     const dig_stimulus_y: f32 = 3 * 32 + 16;

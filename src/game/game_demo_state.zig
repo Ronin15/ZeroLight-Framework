@@ -1559,7 +1559,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
-    demo.data.facingPtr(demo.player.entity).?.* = .right;
+    try demo.data.setFacing(demo.player.entity, .{ .direction = .right });
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
     try traversePlaneForTest(&demo); // seed player_last_cell = (3,3)
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
@@ -1600,7 +1600,7 @@ test "a demo ramp dig is routable from both levels the next step" {
     defer demo.deinit();
 
     // Row 2, whose ramp exit on the surface holds no static body.
-    demo.data.facingPtr(demo.player.entity).?.* = .right;
+    try demo.data.setFacing(demo.player.entity, .{ .direction = .right });
     placePlayerInCell(&demo, 3, 2);
     try traversePlaneForTest(&demo);
 
@@ -1642,7 +1642,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
-    demo.data.facingPtr(demo.player.entity).?.* = .right;
+    try demo.data.setFacing(demo.player.entity, .{ .direction = .right });
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
     try traversePlaneForTest(&demo); // seed player_last_cell = (3,3)
 

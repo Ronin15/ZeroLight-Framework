@@ -3,7 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: collect items landed. The backend and subsystem passes are done.**
-Their unfixed findings are the open items below. Next is collect reading the drawable run.
+Their unfixed findings are the open items below. Next is the GPU plan visiting the changed chunks.
 Do not start slice 88 until those items are fixed or explicitly left.
 `verify` passes. `gpu-smoke` passed on Vulkan only.
 
@@ -92,12 +92,12 @@ and `.grok/rules/render.md` in the backend pass.
       to 7.94 ms (+4.6%), serial 9.00 ms to 9.88 ms (+9.8%), both within
       noise, 23 workers. Snapshot 368 µs to 729 µs. Tuned vertex emit
       380 µs to 314 µs.
-- [ ] Collect reads the drawable run only. `emitCollectedRow`
-      (`src/game/render_prep.zig:468`) resolves each visible row through the
-      entity slot into visual, asset, and facing columns. Failure scenario:
-      every frame gathers those columns at unrelated indices, and the
-      collect tests stay green. Pass: the columns this loop reads live on
-      the drawable run, and `emitCollectedRow` reads only that run.
+- [x] Collect reads the drawable run only. Appearance columns live on
+      the drawable run. `emitCollectedRow` reads that run. `refreshRunPose`
+      stays pose-only. Debug `render-game-prep` at 10,000, one rep: tuned
+      7.94 ms to 8.01 ms (+0.9%), serial 9.88 ms to 9.40 ms (-4.9%), both
+      within noise, 23 workers. Tuned `entity_collect` 6.90 ms to 6.67 ms.
+      Serial `entity_collect` 7.63 ms to 7.22 ms.
 - [ ] GPU plan visits the changed chunks. `markRenderChanged`
       (`src/game/world/render.zig:778`) stores a layer bool, and
       `GpuTileMirror.plan` (`src/game/world/gpu_tiles.zig:403`) then scans
@@ -111,7 +111,7 @@ and `.grok/rules/render.md` in the backend pass.
       one add or removal costs the whole window. Pass: the edited chunk's
       run is patched into the sorted window rows.
 - [ ] Tier does not gate collect. `entityVisibleForRenderCollect`
-      (`src/game/render_prep.zig:758`) is not called by collect. Failure
+      (`src/game/render_prep.zig:794`) is not called by collect. Failure
       scenario: skipping a dormant in-window row leaves the helper tests
       green. Pass: `collectDynamicRecords` emits an in-window dormant row
       and drops an out-of-window row, and the helper is gone.
@@ -121,14 +121,11 @@ and `.grok/rules/render.md` in the backend pass.
       slices per compare. Pass: `collectDenseSubmitLayers` and
       `partitionDenseCompositeBuckets` slice once and pass the columns.
 - [ ] Out-of-window player uses `drawable_slot`. Collect scans the chunk
-      run for `player_row` (`src/game/render_prep.zig:486`) when the scope
+      run for `player_row` (`src/game/render_prep.zig:515`) when the scope
       level is outside the render window. Failure scenario: that transition
       walks every row of the chunk. Pass: emit the row at `drawable_slot`.
-- [ ] Facing pointer lifetime. `FacingStore.directionPtr`
-      (`src/game/data_system/visual.zig:94`) returns a pointer into `rows`
-      with no lifetime. Failure scenario: a later growth frees the pointer
-      while a caller still writes it. Pass: the declaration states the
-      pointer is invalid after `rows` grows, or the setter is the only write.
+- [x] Facing pointer lifetime. `facingPtr` and `directionPtr` are gone.
+      Facing changes go through `setFacing`, which writes the drawable run.
 - [x] The `render_game_prep` bench's module doc carries no review tags
       (`baa4e62`; `src/benchmarks/render_game_prep.zig:5-10` states what the
       group measures).

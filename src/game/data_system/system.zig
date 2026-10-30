@@ -24,13 +24,11 @@ const ConstMovementBodySlice = types.ConstMovementBodySlice;
 const ScopeColumnsSlice = types.ScopeColumnsSlice;
 const ConstScopeColumnsSlice = types.ConstScopeColumnsSlice;
 const FacingData = types.FacingData;
-const ConstFacingSlice = types.ConstFacingSlice;
 const PrimitiveVisual = types.PrimitiveVisual;
 const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
 const AssetReference = types.AssetReference;
 const ConstAssetReferenceSlice = types.ConstAssetReferenceSlice;
 const BodyLevelFaction = types.BodyLevelFaction;
-const RenderCollectIndices = types.RenderCollectIndices;
 const MovementVisualDenseIndices = types.MovementVisualDenseIndices;
 const MovementSteeringDenseIndices = types.MovementSteeringDenseIndices;
 const CollisionBounds = types.CollisionBounds;
@@ -517,6 +515,8 @@ pub const DataSystem = struct {
         // the new row's flag so render collect doesn't skip it.
         if (slot.primitive_visual_index != null) {
             try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(dense_index), true);
+            // Before the level sync, so a failed sync cannot leave a linked row of defaults.
+            self.mirrorDrawableAppearance(id);
         }
         // Bounds and AI rows may already exist: the new row mirrors them for the world gate.
         if (slot.collision_bounds_index) |bounds_index| {
@@ -581,31 +581,6 @@ pub const DataSystem = struct {
         };
     }
 
-    /// Drawable indices for a movement-body dense row. The movement index is the
-    /// loop anchor for render collect and matches scope columns (`tier`, `chunk_*`).
-    /// The caller passes the movement column slice it is already iterating and the
-    /// primitive-visual row count (for the debug bounds assert) so this stays a pure
-    /// slot resolve with no per-row MultiArrayList slice rebuild — the 11-column and
-    /// 15-column rebuilds this used to do are dead work in the hot render-collect
-    /// loop (and the 15-column rebuild only fed a bounds assert ReleaseFast strips).
-    /// The caller has already confirmed `movement.has_primitive_visual[movement_index]`.
-    pub fn renderCollectIndicesForMovement(
-        self: *const DataSystem,
-        movement: ConstMovementBodySlice,
-        movement_index: usize,
-        primitive_visual_count: usize,
-    ) ?RenderCollectIndices {
-        if (movement_index >= movement.entities.len) return null;
-        const slot = self.resolveSlotConst(movement.entities[movement_index]) orelse return null;
-        const visual_index = slot.primitive_visual_index orelse return null;
-        std.debug.assert(visual_index < primitive_visual_count);
-        return .{
-            .visual_index = @intCast(visual_index),
-            .asset_ref_index = if (slot.asset_ref_index) |index| @intCast(index) else null,
-            .facing_index = if (slot.facing_index) |index| @intCast(index) else null,
-        };
-    }
-
     pub fn movementBodySlice(self: *DataSystem) MovementBodySlice {
         return self.movement_bodies.slice();
     }
@@ -618,28 +593,18 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.facing_index) |index| {
             self.facings.setDirection(@intCast(index), facing.direction);
-            return;
+        } else {
+            const dense_index = try self.facings.append(self.allocator, id, facing);
+            slot.facing_index = dense_index;
+            slot.addComponent(.facing);
         }
-
-        const dense_index = try self.facings.append(self.allocator, id, facing);
-        slot.facing_index = dense_index;
-        slot.addComponent(.facing);
-    }
-
-    pub fn facingPtr(self: *DataSystem, id: EntityId) ?*Facing {
-        const slot = self.resolveSlot(id) orelse return null;
-        const dense_index = slot.facing_index orelse return null;
-        return self.facings.directionPtr(@intCast(dense_index));
+        self.mirrorDrawableAppearance(id);
     }
 
     pub fn facingConst(self: *const DataSystem, id: EntityId) ?FacingData {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.facing_index orelse return null;
         return .{ .direction = self.facings.directionAt(@intCast(dense_index)) };
-    }
-
-    pub fn facingSliceConst(self: *const DataSystem) ConstFacingSlice {
-        return self.facings.sliceConst();
     }
 
     pub fn setPrimitiveVisual(self: *DataSystem, id: EntityId, visual: PrimitiveVisual) !void {
@@ -650,6 +615,7 @@ pub const DataSystem = struct {
             if (slot.movement_body_index) |movement_index| {
                 try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(movement_index), true);
             }
+            self.mirrorDrawableAppearance(id);
             return;
         }
 
@@ -659,6 +625,7 @@ pub const DataSystem = struct {
         if (slot.movement_body_index) |movement_index| {
             try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(movement_index), true);
         }
+        self.mirrorDrawableAppearance(id);
     }
 
     pub fn primitiveVisualConst(self: *const DataSystem, id: EntityId) ?PrimitiveVisual {
@@ -700,12 +667,44 @@ pub const DataSystem = struct {
 
         if (slot.asset_ref_index) |index| {
             self.asset_refs.set(@intCast(index), asset_ref);
-            return;
+        } else {
+            const dense_index = try self.asset_refs.append(self.allocator, id, asset_ref);
+            slot.asset_ref_index = dense_index;
+            slot.addComponent(.asset_reference);
         }
+        self.mirrorDrawableAppearance(id);
+    }
 
-        const dense_index = try self.asset_refs.append(self.allocator, id, asset_ref);
-        slot.asset_ref_index = dense_index;
-        slot.addComponent(.asset_reference);
+    // One write of every appearance column. A facing change rewrites visual and asset too.
+    fn mirrorDrawableAppearance(self: *DataSystem, id: EntityId) void {
+        const slot = self.resolveSlot(id) orelse return;
+        const movement_index = slot.movement_body_index orelse return;
+        const visual_index = slot.primitive_visual_index orelse return;
+        const visual = self.primitive_visuals.get(@intCast(visual_index));
+        const asset = if (slot.asset_ref_index) |index| self.asset_refs.get(@intCast(index)) else null;
+        const direction = if (slot.facing_index) |index| self.facings.directionAt(@intCast(index)) else Facing.down;
+        self.movement_bodies.writeDrawableAppearance(@intCast(movement_index), .{
+            .size_x = visual.size.x,
+            .size_y = visual.size.y,
+            .color_r = visual.color.r,
+            .color_g = visual.color.g,
+            .color_b = visual.color.b,
+            .color_a = visual.color.a,
+            .depth_value = @backingInt(visual.depth),
+            .has_asset = asset != null,
+            .sprite = if (asset) |row| row.sprite else @as(SpriteAssetId, @fromBackingInt(0)),
+            .atlas_entry_id = if (asset) |row| row.atlas_entry_id else AssetReference.no_atlas_entry,
+            .has_facing = slot.facing_index != null,
+            .direction = direction,
+            .marker_color_r = visual.marker_color.r,
+            .marker_color_g = visual.marker_color.g,
+            .marker_color_b = visual.marker_color.b,
+            .marker_color_a = visual.marker_color.a,
+            .marker_depth_value = @backingInt(visual.marker_depth_band),
+            .marker_length = visual.marker_length,
+            .marker_depth = visual.marker_depth,
+            .marker_margin = visual.marker_margin,
+        });
     }
 
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
@@ -1854,52 +1853,6 @@ test "movementSteeringDenseIndices resolves both rows from one slot lookup" {
     try std.testing.expect(data.movementSteeringDenseIndices(EntityId.invalid) == null);
 }
 
-test "render collect indices resolve drawable rows from movement dense index" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, testBody(1));
-    try data.setFacing(entity, .{ .direction = .left });
-    try data.setPrimitiveVisual(entity, .{
-        .size = .{ .x = 16, .y = 16 },
-        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-    });
-    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
-
-    const indices = data.renderCollectIndicesForMovement(
-        data.movementBodySliceConst(),
-        0,
-        data.primitiveVisualSliceConst().entities.len,
-    ).?;
-    try std.testing.expectEqual(@as(usize, 0), indices.visual_index);
-    try std.testing.expect(indices.asset_ref_index != null);
-    try std.testing.expect(indices.facing_index != null);
-
-    const movement_only = try data.createEntity();
-    try data.setMovementBody(movement_only, testBody(2));
-    try std.testing.expect(!data.movementBodySliceConst().has_primitive_visual[1]);
-    try std.testing.expect(data.renderCollectIndicesForMovement(
-        data.movementBodySliceConst(),
-        1,
-        data.primitiveVisualSliceConst().entities.len,
-    ) == null);
-    try std.testing.expect(data.renderCollectIndicesForMovement(
-        data.movementBodySliceConst(),
-        99,
-        data.primitiveVisualSliceConst().entities.len,
-    ) == null);
-
-    _ = try data.destroyEntity(entity);
-    try std.testing.expect(data.renderCollectIndicesForMovement(
-        data.movementBodySliceConst(),
-        0,
-        data.primitiveVisualSliceConst().entities.len,
-    ) == null);
-    try std.testing.expect(data.movementBodySliceConst().entities.len == 1);
-}
-
 // Expects `id`'s movement row to mirror its collision bounds (zero without) and AI membership.
 fn expectBoundsAndAiMirrored(data: *const DataSystem, id: EntityId) !void {
     const row = data.movementBodyDenseIndex(id).?;
@@ -1965,11 +1918,57 @@ test "setMovementBody syncs has_primitive_visual when the visual row already exi
     try data.setMovementBody(entity, testBody(1));
 
     try std.testing.expect(data.movementBodySliceConst().has_primitive_visual[0]);
-    try std.testing.expect(data.renderCollectIndicesForMovement(
-        data.movementBodySliceConst(),
-        0,
-        data.primitiveVisualSliceConst().entities.len,
-    ) != null);
+    const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0).?;
+    try std.testing.expectEqual(@as(f32, 16), data.movement_bodies.drawableRunSlice(run_index).size_x[0]);
+}
+
+test "setMovementBody keeps the level-0 run size and color when the level-2 retarget reserve fails" {
+    const color_r: f32 = 0.25;
+    const color_g: f32 = 0.5;
+    const color_b: f32 = 0.75;
+    const color_a: f32 = 1;
+    const visual: PrimitiveVisual = .{
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = color_r, .g = color_g, .b = color_b, .a = color_a },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+
+    // `placeDrawable` reserves level 1 with the level-0 link, then the mirror writes this
+    // size and color. The next allocation is the level-2 retarget reserve. An earlier
+    // failure still has the row defaults, so it is not this case.
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        const entity = try data.createEntity();
+        try data.setPrimitiveVisual(entity, visual);
+        try data.setWorldLevel(entity, 2);
+
+        const original = data.allocator;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        data.allocator = failing.allocator();
+        defer data.allocator = original;
+
+        if (data.setMovementBody(entity, .{})) |_| {
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+
+        const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0) orelse continue;
+        const run = data.movement_bodies.drawableRunSlice(run_index);
+        const mirrored = run.entity.len == 1 and run.entity[0].eql(entity) and
+            run.size_x[0] == 16 and run.size_y[0] == 16 and
+            run.color_r[0] == color_r and run.color_g[0] == color_g and
+            run.color_b[0] == color_b and run.color_a[0] == color_a;
+        if (!mirrored) continue;
+
+        try std.testing.expect(data.movement_bodies.drawableRunIndex(2, 0, 0) == null);
+        try std.testing.expectEqual(@as(u16, 0), data.scopeColumnsSliceConst().level[0]);
+        try std.testing.expectEqual(@as(u16, 2), data.worldLevelConst(entity).?);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "movement body columns can be loaded directly through simd helpers" {
@@ -2023,7 +2022,7 @@ test "destroying an entity removes every attached data row" {
 
     try std.testing.expect(try data.destroyEntity(entity));
     try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 0), data.facingSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.facings.len());
     try std.testing.expectEqual(@as(usize, 0), data.primitiveVisualSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.assetReferenceSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.collisionBoundsSliceConst().entities.len);

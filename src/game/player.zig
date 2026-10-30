@@ -54,19 +54,23 @@ pub const Player = struct {
         input: *const InputState,
     ) !void {
         const body = data.movementBodyPtr(self.entity) orelse return error.MissingPlayerMovementBody;
-        const facing = data.facingPtr(self.entity) orelse return error.MissingPlayerFacing;
+        const facing = data.facingConst(self.entity) orelse return error.MissingPlayerFacing;
 
         const direction = input.movementVector();
         body.velocity_x.* = direction.x * body.speed.*;
         body.velocity_y.* = direction.y * body.speed.*;
-        if (direction.x < 0) {
-            facing.* = .left;
-        } else if (direction.x > 0) {
-            facing.* = .right;
-        } else if (direction.y < 0) {
-            facing.* = .up;
-        } else if (direction.y > 0) {
-            facing.* = .down;
+        const turned: ?Facing = if (direction.x < 0)
+            .left
+        else if (direction.x > 0)
+            .right
+        else if (direction.y < 0)
+            .up
+        else if (direction.y > 0)
+            .down
+        else
+            null;
+        if (turned) |next| {
+            if (next != facing.direction) try data.setFacing(self.entity, .{ .direction = next });
         }
     }
 
@@ -185,6 +189,23 @@ test "player facing updates from movement and remains while idle" {
 
     try player.applyInput(&data, &InputState{});
     try std.testing.expectEqual(Facing.up, data.facingConst(player.entity).?.direction);
+}
+
+test "player facing updates the drawable run direction from held movement" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+
+    var input = InputState{};
+    input.setHeld(.move_up, true);
+    try player.applyInput(&data, &input);
+
+    // Spawn mirrors `.down`. A facing-store write that skips `setFacing` leaves this `.down`.
+    const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0).?;
+    try std.testing.expectEqual(Facing.up, data.movement_bodies.drawableRunSlice(run_index).direction[0]);
+
+    try player.applyInput(&data, &InputState{});
+    try std.testing.expectEqual(Facing.up, data.movement_bodies.drawableRunSlice(run_index).direction[0]);
 }
 
 test "player facing marker remains in actor render depth band" {

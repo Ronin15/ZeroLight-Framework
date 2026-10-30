@@ -792,7 +792,7 @@ const TestWorld = struct {
         const body = self.data.movementBodyPtr(self.player.entity).?;
         body.position_x.* = 96;
         body.position_y.* = 96;
-        self.data.facingPtr(self.player.entity).?.* = facing;
+        try self.data.setFacing(self.player.entity, .{ .direction = facing });
     }
 
     fn deinit(self: *TestWorld) void {

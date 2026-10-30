@@ -10,9 +10,11 @@
 const std = @import("std");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
+const Facing = types.Facing;
 const MovementBody = types.MovementBody;
 const MovementBodyPtr = types.MovementBodyPtr;
 const CollisionBounds = types.CollisionBounds;
+const SpriteAssetId = @import("../../assets/manifest.zig").SpriteAssetId;
 const MovementBodySlice = types.MovementBodySlice;
 const ConstMovementBodySlice = types.ConstMovementBodySlice;
 const ScopeColumnsSlice = types.ScopeColumnsSlice;
@@ -70,6 +72,83 @@ const DrawableRow = struct {
     previous_y: f32,
     position_y: f32,
     position_z: i32,
+    size_x: f32 = 0,
+    size_y: f32 = 0,
+    color_r: f32 = 0,
+    color_g: f32 = 0,
+    color_b: f32 = 0,
+    color_a: f32 = 0,
+    depth_value: i32 = 0,
+    has_asset: bool = false,
+    // Unread when `has_asset` is false.
+    sprite: SpriteAssetId = @as(SpriteAssetId, @fromBackingInt(0)),
+    atlas_entry_id: u16 = 0,
+    has_facing: bool = false,
+    // Unread when `has_facing` is false.
+    direction: Facing = .down,
+    marker_color_r: f32 = 0,
+    marker_color_g: f32 = 0,
+    marker_color_b: f32 = 0,
+    marker_color_a: f32 = 0,
+    marker_depth_value: i32 = 0,
+    marker_length: f32 = 0,
+    marker_depth: f32 = 0,
+    marker_margin: f32 = 0,
+};
+
+/// Appearance columns of one drawable row, by value.
+const DrawableAppearance = struct {
+    size_x: f32,
+    size_y: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    color_a: f32,
+    depth_value: i32,
+    has_asset: bool,
+    sprite: SpriteAssetId,
+    atlas_entry_id: u16,
+    has_facing: bool,
+    direction: Facing,
+    marker_color_r: f32,
+    marker_color_g: f32,
+    marker_color_b: f32,
+    marker_color_a: f32,
+    marker_depth_value: i32,
+    marker_length: f32,
+    marker_depth: f32,
+    marker_margin: f32,
+};
+
+/// Every column collect reads from one drawable run.
+pub const DrawableRunColumns = struct {
+    entity: []EntityId,
+    movement_index: []u32,
+    previous_x: []f32,
+    position_x: []f32,
+    previous_y: []f32,
+    position_y: []f32,
+    position_z: []i32,
+    size_x: []f32,
+    size_y: []f32,
+    color_r: []f32,
+    color_g: []f32,
+    color_b: []f32,
+    color_a: []f32,
+    depth_value: []i32,
+    has_asset: []bool,
+    sprite: []SpriteAssetId,
+    atlas_entry_id: []u16,
+    has_facing: []bool,
+    direction: []Facing,
+    marker_color_r: []f32,
+    marker_color_g: []f32,
+    marker_color_b: []f32,
+    marker_color_a: []f32,
+    marker_depth_value: []i32,
+    marker_length: []f32,
+    marker_depth: []f32,
+    marker_margin: []f32,
 };
 
 const DrawableRun = struct {
@@ -362,15 +441,7 @@ pub const MovementBodyStore = struct {
         run.refreshed_epoch = self.pose_epoch;
     }
 
-    pub fn drawableRunSlice(self: *MovementBodyStore, run_index: u32) struct {
-        entity: []EntityId,
-        movement_index: []u32,
-        previous_x: []f32,
-        position_x: []f32,
-        previous_y: []f32,
-        position_y: []f32,
-        position_z: []i32,
-    } {
+    pub fn drawableRunSlice(self: *MovementBodyStore, run_index: u32) DrawableRunColumns {
         const drawn = self.runs.items[run_index].rows.slice();
         return .{
             .entity = drawn.items(.entity),
@@ -380,6 +451,26 @@ pub const MovementBodyStore = struct {
             .previous_y = drawn.items(.previous_y),
             .position_y = drawn.items(.position_y),
             .position_z = drawn.items(.position_z),
+            .size_x = drawn.items(.size_x),
+            .size_y = drawn.items(.size_y),
+            .color_r = drawn.items(.color_r),
+            .color_g = drawn.items(.color_g),
+            .color_b = drawn.items(.color_b),
+            .color_a = drawn.items(.color_a),
+            .depth_value = drawn.items(.depth_value),
+            .has_asset = drawn.items(.has_asset),
+            .sprite = drawn.items(.sprite),
+            .atlas_entry_id = drawn.items(.atlas_entry_id),
+            .has_facing = drawn.items(.has_facing),
+            .direction = drawn.items(.direction),
+            .marker_color_r = drawn.items(.marker_color_r),
+            .marker_color_g = drawn.items(.marker_color_g),
+            .marker_color_b = drawn.items(.marker_color_b),
+            .marker_color_a = drawn.items(.marker_color_a),
+            .marker_depth_value = drawn.items(.marker_depth_value),
+            .marker_length = drawn.items(.marker_length),
+            .marker_depth = drawn.items(.marker_depth),
+            .marker_margin = drawn.items(.marker_margin),
         };
     }
 
@@ -454,7 +545,7 @@ pub const MovementBodyStore = struct {
     }
 
     /// Unlinks `index` and links it into a destination `reserveDrawableDestination` already reserved.
-    /// Allocates nothing.
+    /// Allocates nothing. Appearance is copied onto the new slot; the same-run return does not.
     pub fn relinkReservedDrawable(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
         const key = drawableKey(level, chunk_x, chunk_y);
         const dest = self.run_of.get(key).?;
@@ -464,8 +555,15 @@ pub const MovementBodyStore = struct {
             self.runs.items[dest].reserved_extra -= 1;
             return;
         }
-        self.unlinkDrawable(index);
-        self.commitDrawableLink(index, level, chunk_x, chunk_y);
+        if (current != no_drawable) {
+            const appearance = self.appearanceAt(index);
+            self.unlinkDrawable(index);
+            self.commitDrawableLink(index, level, chunk_x, chunk_y);
+            self.writeDrawableAppearance(index, appearance);
+        } else {
+            self.unlinkDrawable(index);
+            self.commitDrawableLink(index, level, chunk_x, chunk_y);
+        }
     }
 
     /// Links `index` at (`level`, `chunk_x`, `chunk_y`). The destination run and its row slot are
@@ -481,6 +579,66 @@ pub const MovementBodyStore = struct {
         }
         try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
         self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
+    }
+
+    /// Writes `appearance` onto `index`'s drawable row. An unlinked row is unchanged.
+    pub fn writeDrawableAppearance(self: *MovementBodyStore, index: usize, appearance: DrawableAppearance) void {
+        // One mixed row, so the copy stays scalar.
+        const movement = self.rows.slice();
+        const run_index = movement.items(.drawable_run)[index];
+        if (run_index == no_drawable) return;
+        const slot: usize = movement.items(.drawable_slot)[index];
+        const drawn = self.runs.items[run_index].rows.slice();
+        drawn.items(.size_x)[slot] = appearance.size_x;
+        drawn.items(.size_y)[slot] = appearance.size_y;
+        drawn.items(.color_r)[slot] = appearance.color_r;
+        drawn.items(.color_g)[slot] = appearance.color_g;
+        drawn.items(.color_b)[slot] = appearance.color_b;
+        drawn.items(.color_a)[slot] = appearance.color_a;
+        drawn.items(.depth_value)[slot] = appearance.depth_value;
+        drawn.items(.has_asset)[slot] = appearance.has_asset;
+        drawn.items(.sprite)[slot] = appearance.sprite;
+        drawn.items(.atlas_entry_id)[slot] = appearance.atlas_entry_id;
+        drawn.items(.has_facing)[slot] = appearance.has_facing;
+        drawn.items(.direction)[slot] = appearance.direction;
+        drawn.items(.marker_color_r)[slot] = appearance.marker_color_r;
+        drawn.items(.marker_color_g)[slot] = appearance.marker_color_g;
+        drawn.items(.marker_color_b)[slot] = appearance.marker_color_b;
+        drawn.items(.marker_color_a)[slot] = appearance.marker_color_a;
+        drawn.items(.marker_depth_value)[slot] = appearance.marker_depth_value;
+        drawn.items(.marker_length)[slot] = appearance.marker_length;
+        drawn.items(.marker_depth)[slot] = appearance.marker_depth;
+        drawn.items(.marker_margin)[slot] = appearance.marker_margin;
+    }
+
+    fn appearanceAt(self: *const MovementBodyStore, index: usize) DrawableAppearance {
+        const movement = self.rows.slice();
+        const run_index = movement.items(.drawable_run)[index];
+        std.debug.assert(run_index != no_drawable);
+        const slot: usize = movement.items(.drawable_slot)[index];
+        const drawn = self.runs.items[run_index].rows.slice();
+        return .{
+            .size_x = drawn.items(.size_x)[slot],
+            .size_y = drawn.items(.size_y)[slot],
+            .color_r = drawn.items(.color_r)[slot],
+            .color_g = drawn.items(.color_g)[slot],
+            .color_b = drawn.items(.color_b)[slot],
+            .color_a = drawn.items(.color_a)[slot],
+            .depth_value = drawn.items(.depth_value)[slot],
+            .has_asset = drawn.items(.has_asset)[slot],
+            .sprite = drawn.items(.sprite)[slot],
+            .atlas_entry_id = drawn.items(.atlas_entry_id)[slot],
+            .has_facing = drawn.items(.has_facing)[slot],
+            .direction = drawn.items(.direction)[slot],
+            .marker_color_r = drawn.items(.marker_color_r)[slot],
+            .marker_color_g = drawn.items(.marker_color_g)[slot],
+            .marker_color_b = drawn.items(.marker_color_b)[slot],
+            .marker_color_a = drawn.items(.marker_color_a)[slot],
+            .marker_depth_value = drawn.items(.marker_depth_value)[slot],
+            .marker_length = drawn.items(.marker_length)[slot],
+            .marker_depth = drawn.items(.marker_depth)[slot],
+            .marker_margin = drawn.items(.marker_margin)[slot],
+        };
     }
 
     fn writeRunPose(self: *MovementBodyStore, index: usize, body: MovementBody) void {

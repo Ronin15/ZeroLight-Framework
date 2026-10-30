@@ -7,11 +7,8 @@ const Color = @import("../config.zig").Color;
 const math = @import("../core/math.zig");
 const pdqSort = @import("../core/sort.zig").pdq;
 const DataSystem = @import("data_system.zig").DataSystem;
-const ConstAssetReferenceSlice = @import("data_system.zig").ConstAssetReferenceSlice;
-const ConstMovementBodySlice = @import("data_system.zig").ConstMovementBodySlice;
-const ConstFacingSlice = @import("data_system.zig").ConstFacingSlice;
+const DrawableRunColumns = @import("data_system.zig").DrawableRunColumns;
 const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
-const ConstPrimitiveVisualSlice = @import("data_system.zig").ConstPrimitiveVisualSlice;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const AssetReference = @import("data_system.zig").AssetReference;
@@ -87,16 +84,13 @@ pub fn submitPreparedDraw(renderer: *Renderer, draw: PreparedDraw) !void {
     }
 }
 
-fn assetReferenceAt(assets: ConstAssetReferenceSlice, index: usize) AssetReference {
-    return .{
-        .sprite = assets.sprite_ids[index],
-        .atlas_entry_id = assets.atlas_entry_ids[index],
-    };
-}
-
 fn preparePrimitiveVisualRectSoA(
-    visuals: ConstPrimitiveVisualSlice,
-    visual_index: usize,
+    size_x: f32,
+    size_y: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    color_a: f32,
     render_x: f32,
     render_y: f32,
     record_depth: i32,
@@ -105,22 +99,27 @@ fn preparePrimitiveVisualRectSoA(
         .rect = .{
             .x = render_x,
             .y = render_y,
-            .w = visuals.size_x[visual_index],
-            .h = visuals.size_y[visual_index],
+            .w = size_x,
+            .h = size_y,
         },
         .color = .{
-            .r = visuals.color_r[visual_index],
-            .g = visuals.color_g[visual_index],
-            .b = visuals.color_b[visual_index],
-            .a = visuals.color_a[visual_index],
+            .r = color_r,
+            .g = color_g,
+            .b = color_b,
+            .a = color_a,
         },
         .order = RenderOrder.world(record_depth),
     } };
 }
 
 fn preparePrimitiveVisualSoA(
-    visuals: ConstPrimitiveVisualSlice,
-    visual_index: usize,
+    size_x: f32,
+    size_y: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    color_a: f32,
+    depth_value: i32,
     render_x: f32,
     render_y: f32,
     position_z: i32,
@@ -130,16 +129,16 @@ fn preparePrimitiveVisualSoA(
     const dest = Rect{
         .x = render_x,
         .y = render_y,
-        .w = visuals.size_x[visual_index],
-        .h = visuals.size_y[visual_index],
+        .w = size_x,
+        .h = size_y,
     };
-    const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
+    const depth_band: WorldDepth = @fromBackingInt(depth_value);
     const order = worldOrder(position_z, depth_band);
     const color = Color{
-        .r = visuals.color_r[visual_index],
-        .g = visuals.color_g[visual_index],
-        .b = visuals.color_b[visual_index],
-        .a = visuals.color_a[visual_index],
+        .r = color_r,
+        .g = color_g,
+        .b = color_b,
+        .a = color_a,
     };
 
     if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
@@ -201,7 +200,7 @@ pub fn worldOrder(base_z: i32, depth: WorldDepth) RenderOrder {
 }
 
 /// Gameplay inputs for one layered world render frame. Collect refreshes
-/// drawable-run poses through `data`.
+/// drawable-run poses from movement; appearance is already on the run.
 pub const GameplayScene = struct {
     data: *DataSystem,
     world: *WorldSystem,
@@ -402,42 +401,73 @@ fn emitCollectedRow(
     visible: VisibleWorldRect,
     runtime_assets: *const RuntimeAssets,
     interpolation_alpha: f32,
-    movement: ConstMovementBodySlice,
-    visuals: ConstPrimitiveVisualSlice,
-    assets: ConstAssetReferenceSlice,
-    facings: ConstFacingSlice,
-    entity: EntityId,
-    movement_index: usize,
+    run: DrawableRunColumns,
+    slot: usize,
     previous_x: f32,
     position_x: f32,
     previous_y: f32,
     position_y: f32,
-    position_z: i32,
+    size_x: f32,
+    size_y: f32,
 ) void {
-    const collect_indices = scene.data.renderCollectIndicesForMovement(movement, movement_index, visuals.entities.len) orelse return;
-    const visual_index = collect_indices.visual_index;
     const render_x = math.lerp(previous_x, position_x, interpolation_alpha);
     const render_y = math.lerp(previous_y, position_y, interpolation_alpha);
-    const size_x = visuals.size_x[visual_index];
-    const size_y = visuals.size_y[visual_index];
     if (!visible.overlapsAabb(render_x, render_y, size_x, size_y)) return;
 
-    if (collect_indices.asset_ref_index) |asset_index| {
-        const asset_ref = assetReferenceAt(assets, asset_index);
-        const prepared = preparePrimitiveVisualSoA(visuals, visual_index, render_x, render_y, position_z, asset_ref, runtime_assets);
+    const movement_index: usize = run.movement_index[slot];
+    const has_asset = run.has_asset[slot];
+    const asset_ref: ?AssetReference = if (has_asset) .{
+        .sprite = run.sprite[slot],
+        .atlas_entry_id = run.atlas_entry_id[slot],
+    } else null;
+    const color_r = run.color_r[slot];
+    const color_g = run.color_g[slot];
+    const color_b = run.color_b[slot];
+    const color_a = run.color_a[slot];
+    const depth_value = run.depth_value[slot];
+    const position_z = run.position_z[slot];
+    if (asset_ref) |stored| {
+        const prepared = preparePrimitiveVisualSoA(
+            size_x,
+            size_y,
+            color_r,
+            color_g,
+            color_b,
+            color_a,
+            depth_value,
+            render_x,
+            render_y,
+            position_z,
+            stored,
+            runtime_assets,
+        );
         prep.appendWithSequence(.{ .depth = prepared.depth(), .draw = prepared }, movement_index * 2);
     } else {
-        const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
+        const depth_band: WorldDepth = @fromBackingInt(depth_value);
         const record_depth = render_depth.worldZWithOffset(position_z, depth_band);
         prep.appendWithSequence(.{
             .depth = record_depth,
-            .draw = preparePrimitiveVisualRectSoA(visuals, visual_index, render_x, render_y, record_depth),
+            .draw = preparePrimitiveVisualRectSoA(size_x, size_y, color_r, color_g, color_b, color_a, render_x, render_y, record_depth),
         }, movement_index * 2);
     }
-    const is_player = entity.index == scene.player_entity.index and entity.generation == scene.player_entity.generation;
-    if (!is_player) return;
-    const facing_index = collect_indices.facing_index orelse return;
-    const marker = preparePlayerMarkerSoA(visuals, visual_index, facings.directions[facing_index], render_x, render_y, position_z) orelse return;
+    if (!run.entity[slot].eql(scene.player_entity)) return;
+    if (!run.has_facing[slot]) return;
+    const marker = preparePlayerMarkerSoA(
+        size_x,
+        size_y,
+        run.marker_color_r[slot],
+        run.marker_color_g[slot],
+        run.marker_color_b[slot],
+        run.marker_color_a[slot],
+        run.marker_depth_value[slot],
+        run.marker_length[slot],
+        run.marker_depth[slot],
+        run.marker_margin[slot],
+        run.direction[slot],
+        render_x,
+        render_y,
+        position_z,
+    );
     prep.appendWithSequence(.{ .depth = marker.depth(), .draw = marker }, movement_index * 2 + 1);
 }
 
@@ -453,9 +483,6 @@ pub fn collectDynamicRecords(
 
     const movement = scene.data.movementBodySliceConst();
     const scope = scene.data.scopeColumnsSliceConst();
-    const visuals = scene.data.primitiveVisualSliceConst();
-    const assets = scene.data.assetReferenceSliceConst();
-    const facings = scene.data.facingSliceConst();
     const visible_chunks = scene.world.visibleChunkRegion();
     const bodies = &scene.data.movement_bodies;
     if (visible_chunks) |region| {
@@ -469,8 +496,9 @@ pub fn collectDynamicRecords(
                         const run_index = bodies.drawableRunIndex(@intCast(level), chunk_x, chunk_y) orelse continue;
                         bodies.refreshRunPose(run_index);
                         const run = bodies.drawableRunSlice(run_index);
-                        for (run.entity, run.movement_index, run.previous_x, run.position_x, run.previous_y, run.position_y, run.position_z) |entity, movement_row, previous_x, position_x, previous_y, position_y, position_z| {
-                            emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, movement, visuals, assets, facings, entity, movement_row, previous_x, position_x, previous_y, position_y, position_z);
+                        // Scalar: a hit branches into a sprite, a rect, or the player marker, each a draw record.
+                        for (run.previous_x, run.position_x, run.previous_y, run.position_y, run.size_x, run.size_y, 0..) |previous_x, position_x, previous_y, position_y, size_x, size_y, slot| {
+                            emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, run, slot, previous_x, position_x, previous_y, position_y, size_x, size_y);
                         }
                     }
                 }
@@ -485,7 +513,7 @@ pub fn collectDynamicRecords(
                             const run = bodies.drawableRunSlice(run_index);
                             for (run.movement_index, 0..) |movement_row, slot| {
                                 if (movement_row != player_row) continue;
-                                emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, movement, visuals, assets, facings, run.entity[slot], movement_row, run.previous_x[slot], run.position_x[slot], run.previous_y[slot], run.position_y[slot], run.position_z[slot]);
+                                emitCollectedRow(prep, scene, visible, runtime_assets, interpolation_alpha, run, slot, run.previous_x[slot], run.position_x[slot], run.previous_y[slot], run.position_y[slot], run.size_x[slot], run.size_y[slot]);
                                 break;
                             }
                         }
@@ -658,31 +686,39 @@ fn nextDynamicDepth(prep: *const DynamicScenePrep, span_index: *usize) ?i32 {
 }
 
 fn preparePlayerMarkerSoA(
-    visuals: ConstPrimitiveVisualSlice,
-    visual_index: usize,
+    size_x: f32,
+    size_y: f32,
+    marker_color_r: f32,
+    marker_color_g: f32,
+    marker_color_b: f32,
+    marker_color_a: f32,
+    marker_depth_value: i32,
+    marker_length: f32,
+    marker_depth: f32,
+    marker_margin: f32,
     facing: Facing,
     render_x: f32,
     render_y: f32,
     position_z: i32,
-) ?PreparedDraw {
-    const marker_depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.marker_depth_values[visual_index]));
+) PreparedDraw {
+    const marker_depth_band: WorldDepth = @fromBackingInt(marker_depth_value);
     const marker_order = worldOrder(position_z, marker_depth_band);
     return .{ .rect = .{
         .rect = markerRectAt(
             render_x,
             render_y,
             facing,
-            visuals.size_x[visual_index],
-            visuals.size_y[visual_index],
-            visuals.marker_lengths[visual_index],
-            visuals.marker_depths[visual_index],
-            visuals.marker_margins[visual_index],
+            size_x,
+            size_y,
+            marker_length,
+            marker_depth,
+            marker_margin,
         ),
         .color = .{
-            .r = visuals.marker_color_r[visual_index],
-            .g = visuals.marker_color_g[visual_index],
-            .b = visuals.marker_color_b[visual_index],
-            .a = visuals.marker_color_a[visual_index],
+            .r = marker_color_r,
+            .g = marker_color_g,
+            .b = marker_color_b,
+            .a = marker_color_a,
         },
         .order = marker_order,
     } };
@@ -1433,6 +1469,189 @@ test "collect dynamic records excludes an entity beyond the render window depth"
 
     // Player + the level-6 entity only; the level-7 entity is dropped.
     try std.testing.expectEqual(@as(usize, 2), prep.records.items.len);
+}
+
+fn expectCollectedAppearance(
+    prep: *const DynamicScenePrep,
+    movement_index: usize,
+    sprite_source: ?Rect,
+    size_x: f32,
+    size_y: f32,
+    tint: Color,
+    marker_y: f32,
+) !void {
+    const visual = recordWithSequence(prep, movement_index * 2) orelse return error.TestExpectedEqual;
+    const marker = recordWithSequence(prep, movement_index * 2 + 1) orelse return error.TestExpectedEqual;
+    switch (visual.draw) {
+        .sprite => |sprite| {
+            const expected = sprite_source orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(size_x, sprite.dest.w);
+            try std.testing.expectEqual(size_y, sprite.dest.h);
+            try std.testing.expectEqual(tint.r, sprite.tint.r);
+            try std.testing.expectEqual(tint.g, sprite.tint.g);
+            try std.testing.expectEqual(tint.b, sprite.tint.b);
+            try std.testing.expectEqual(tint.a, sprite.tint.a);
+            const source = sprite.source orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(expected.x, source.x);
+            try std.testing.expectEqual(expected.y, source.y);
+            try std.testing.expectEqual(expected.w, source.w);
+            try std.testing.expectEqual(expected.h, source.h);
+        },
+        .rect => |rect| {
+            if (sprite_source != null) return error.TestExpectedEqual;
+            try std.testing.expectEqual(size_x, rect.rect.w);
+            try std.testing.expectEqual(size_y, rect.rect.h);
+            try std.testing.expectEqual(tint.r, rect.color.r);
+            try std.testing.expectEqual(tint.g, rect.color.g);
+            try std.testing.expectEqual(tint.b, rect.color.b);
+            try std.testing.expectEqual(tint.a, rect.color.a);
+        },
+    }
+    switch (marker.draw) {
+        .rect => |rect| try std.testing.expectEqual(marker_y, rect.rect.y),
+        .sprite => return error.TestExpectedEqual,
+    }
+}
+
+test "collect dynamic records reads appearance from the drawable run" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const position_x: f32 = 8;
+    const position_y: f32 = 8;
+    const first_size_x: f32 = 16;
+    const first_size_y: f32 = 20;
+    const first_tint = Color{ .r = 0.2, .g = 0.4, .b = 0.6, .a = 0.8 };
+    const first_marker_length: f32 = 6;
+    const first_marker_depth: f32 = 3;
+    const first_marker_margin: f32 = 2;
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = position_x, .y = position_y },
+        .previous_position = .{ .x = position_x, .y = position_y },
+    });
+    try data.setFacing(entity, .{ .direction = .up });
+    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = first_size_x, .y = first_size_y },
+        .color = first_tint,
+        .marker_color = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 1 },
+        .marker_length = first_marker_length,
+        .marker_depth = first_marker_depth,
+        .marker_margin = first_marker_margin,
+    });
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    const chunk_pixels: f32 = @as(f32, @floatFromInt(world.chunk_size_tiles)) * world.tile_size;
+    const camera = Rect{ .x = 0, .y = 0, .w = chunk_pixels * 2, .h = chunk_pixels };
+    try world.setVisibleChunksForWorldRect(camera, 0, 0);
+    const region = world.visibleChunkRegion() orelse return error.TestExpectedEqual;
+    try std.testing.expect(region.containsChunk(.{ .x = 0, .y = 0 }));
+    try std.testing.expect(region.containsChunk(.{ .x = 1, .y = 0 }));
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
+    try setSpriteAtlasMetadataForTest(&runtime_assets, .grim_characters);
+    defer deinitAtlasMetadataForTest(&runtime_assets, .grim_characters);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect.fromCameraRect(camera, 0, world.chunk_size_tiles, world.tile_size);
+    const movement_index = data.movementBodyDenseIndex(entity).?;
+    const atlas_source = runtime_assets.spriteAtlasMeta(.grim_characters).?.sourceRectForId(0) orelse return error.TestExpectedEqual;
+    const first_source = Rect{
+        .x = atlas_source.x,
+        .y = atlas_source.y,
+        .w = atlas_source.w,
+        .h = atlas_source.h,
+    };
+    const first_marker_y = markerRectAt(
+        position_x,
+        position_y,
+        .up,
+        first_size_x,
+        first_size_y,
+        first_marker_length,
+        first_marker_depth,
+        first_marker_margin,
+    ).y;
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    try expectCollectedAppearance(&prep, movement_index, first_source, first_size_x, first_size_y, first_tint, first_marker_y);
+
+    data.primitive_visuals.set(0, .{
+        .size = .{ .x = 4, .y = 4 },
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 0, .b = 0, .a = 1 },
+        .marker_length = 1,
+        .marker_depth = 1,
+        .marker_margin = 0,
+    });
+    data.facings.setDirection(0, .down);
+    data.asset_refs.set(0, .{ .sprite = .grim_characters, .atlas_entry_id = 4096 });
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    try expectCollectedAppearance(&prep, movement_index, first_source, first_size_x, first_size_y, first_tint, first_marker_y);
+
+    const next_size_x: f32 = 24;
+    const next_size_y: f32 = 30;
+    const next_tint = Color{ .r = 0.9, .g = 0.1, .b = 0.2, .a = 0.7 };
+    const next_marker_length: f32 = 8;
+    const next_marker_depth: f32 = 5;
+    const next_marker_margin: f32 = 1;
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = next_size_x, .y = next_size_y },
+        .color = next_tint,
+        .marker_color = .{ .r = 0.3, .g = 0.4, .b = 0.5, .a = 1 },
+        .marker_length = next_marker_length,
+        .marker_depth = next_marker_depth,
+        .marker_margin = next_marker_margin,
+    });
+    try data.setFacing(entity, .{ .direction = .down });
+    try data.setAssetReference(entity, .{ .sprite = .grim_items });
+    const next_marker_y = markerRectAt(
+        position_x,
+        position_y,
+        .down,
+        next_size_x,
+        next_size_y,
+        next_marker_length,
+        next_marker_depth,
+        next_marker_margin,
+    ).y;
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    try expectCollectedAppearance(&prep, movement_index, null, next_size_x, next_size_y, next_tint, next_marker_y);
+
+    try data.setSimulationMetadata(entity, .{ .chunk = .{ .x = 1, .y = 0 } });
+    data.primitive_visuals.set(0, .{
+        .size = .{ .x = 3, .y = 3 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 1, .b = 0, .a = 1 },
+        .marker_length = 2,
+        .marker_depth = 2,
+        .marker_margin = 0,
+    });
+    data.facings.setDirection(0, .left);
+    data.asset_refs.set(0, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1);
+    try expectCollectedAppearance(&prep, movement_index, null, next_size_x, next_size_y, next_tint, next_marker_y);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
