@@ -108,10 +108,8 @@ Do not restate it.
 
 ## Output
 
-1. Findings, highest severity first. A finding is a step for the next
-   implement brief: severity, tag, the broken behavior, why it matters, the
-   rule it breaks, the local fix, and `file:line`. A structural finding whose
-   fix is an open choice names **zig-design-specialist** instead of a fix.
+1. Findings, highest severity first: severity, tag, the broken behavior, why
+   it matters, the rule it breaks, a narrow fix direction, `file:line`.
 2. Open questions only if they affect confidence; then a brief summary.
 3. If nothing is found, say so and note residual risk or tests not run.
 4. Unless the brief sets the output, write the same report to
