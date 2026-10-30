@@ -2,10 +2,10 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: collect items landed, and both passes are written below.** Next
-is the High draw-list merge, then the collect gather. Do not start slice 88
-until the findings below are fixed or explicitly left. `verify` passes.
-`gpu-smoke` passed on Vulkan only.
+**Status: collect items landed. The backend and subsystem passes are done.**
+Their unfixed findings are the open items below. Next is the draw-list merge.
+Do not start slice 88 until those items are fixed or explicitly left.
+`verify` passes. `gpu-smoke` passed on Vulkan only.
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile fill
@@ -77,34 +77,60 @@ and `.grok/rules/render.md` in the backend pass.
       workers. The previous commit aborts in this bench, so there is no
       before.
 - [x] Render backend pass. Camera, debug overlay, fps counter, resources,
-      and the GPU helpers had no finding. Two findings:
-      - High. `mergeDrawList` (`renderer.zig:1912`) sorts two already-ordered
-        streams on the main thread every frame. The batcher must merge them
-        in order, static winning a tie, then coalesce. A stable `std.mem.sort`
-        stays green against the existing compare test.
-      - High. Sprite prep (`sprite_batch.zig:664`) runs a 4-corner kernel
-        inside the per-sprite loop and drains it to scalar stores. The lane
-        axis is across sprites. Needs a design before code.
+      and the GPU helpers had no finding. The two findings are items below.
 - [x] Subsystem pass. `render_depth.zig` matches its z contract. The GPU
-      fill staying inline is the landed decision. Findings:
-      - High. `emitCollectedRow` (`render_prep.zig:468`) still resolves each
-        visible row through the entity slot into visual, asset, and facing
-        columns. Copy those columns into the drawable run and read only the
-        run. The collect tests do not lock this.
-      - Medium. One cell edit makes `GpuTileMirror.plan` (`gpu_tiles.zig:403`)
-        scan every window chunk of each flagged layer. Record the changed
-        chunk and plan that list.
-      - Medium. One in-window sparse edit rebuilds and sorts the whole window
-        (`render.zig:163`). Patch the edited chunk's run into the sorted list.
-      - Medium. Tier-does-not-gate-drawing is tested on a helper collect does
-        not call (`render_prep.zig:758`). Assert it through
-        `collectDynamicRecords`.
-      - Low. `denseLayerOrder` slices inside the sort (`render.zig:793`).
-        Slice once and pass the columns.
-      - Low. The out-of-window player path scans the chunk run
-        (`render_prep.zig:486`). Emit `drawable_slot`.
-      - Low. `FacingStore.directionPtr` (`visual.zig:94`) needs its lifetime:
-        invalid after `rows` grows.
+      fill staying inline is the landed decision. The findings are items
+      below.
+- [ ] Draw-list merge. `mergeDrawList` (`src/render/renderer.zig:1912`)
+      sorts two already-ordered streams on the main thread every frame.
+      Failure scenario: visible sprite count G pays O(G log G) wide swaps,
+      and `test "linear merge matches stable sort"` stays green with the
+      sort left in place. Pass: a two-pointer merge, static winning an equal
+      order, then the existing coalesce. `appendStaticTilemapSpan` asserts
+      nondecreasing order.
+- [ ] Sprite-prep lanes. `writeSpriteQuad` (`src/render/sprite_batch.zig:664`)
+      runs a 4-corner kernel inside the per-sprite loop and drains it to
+      scalar stores. Failure scenario: the sprite population never streams
+      one lane of sprites into the vertex columns. Pass: design first, then
+      SoA sprite columns in submission order, one lane path across sprites,
+      stores staying in lanes until the vertex columns.
+- [ ] Collect reads the drawable run only. `emitCollectedRow`
+      (`src/game/render_prep.zig:468`) resolves each visible row through the
+      entity slot into visual, asset, and facing columns. Failure scenario:
+      every frame gathers those columns at unrelated indices, and the
+      collect tests stay green. Pass: the columns this loop reads live on
+      the drawable run, and `emitCollectedRow` reads only that run.
+- [ ] GPU plan visits the changed chunks. `markRenderChanged`
+      (`src/game/world/render.zig:778`) stores a layer bool, and
+      `GpuTileMirror.plan` (`src/game/world/gpu_tiles.zig:403`) then scans
+      every window chunk of each flagged layer. Failure scenario: one cell
+      edit searches the whole camera window. Pass: the mark records the
+      changed chunk, and plan walks that list.
+- [ ] Sparse window patch. One in-window sparse edit sets
+      `sparse_window.dirty`, and the next
+      `setVisibleChunksForWorldRect` (`src/game/world/render.zig:163`)
+      recounts, refills, and sorts every window chunk. Failure scenario:
+      one add or removal costs the whole window. Pass: the edited chunk's
+      run is patched into the sorted window rows.
+- [ ] Tier does not gate collect. `entityVisibleForRenderCollect`
+      (`src/game/render_prep.zig:758`) is not called by collect. Failure
+      scenario: skipping a dormant in-window row leaves the helper tests
+      green. Pass: `collectDynamicRecords` emits an in-window dormant row
+      and drops an out-of-window row, and the helper is gone.
+- [ ] Dense layer order slices once. `denseLayerOrder`
+      (`src/game/world/render.zig:793`) calls `dense_layers.slice()` on
+      every comparison. Failure scenario: the sort rebuilds the column
+      slices per compare. Pass: `collectDenseSubmitLayers` and
+      `partitionDenseCompositeBuckets` slice once and pass the columns.
+- [ ] Out-of-window player uses `drawable_slot`. Collect scans the chunk
+      run for `player_row` (`src/game/render_prep.zig:486`) when the scope
+      level is outside the render window. Failure scenario: that transition
+      walks every row of the chunk. Pass: emit the row at `drawable_slot`.
+- [ ] Facing pointer lifetime. `FacingStore.directionPtr`
+      (`src/game/data_system/visual.zig:94`) returns a pointer into `rows`
+      with no lifetime. Failure scenario: a later growth frees the pointer
+      while a caller still writes it. Pass: the declaration states the
+      pointer is invalid after `rows` grows, or the setter is the only write.
 - [x] The `render_game_prep` bench's module doc carries no review tags
       (`baa4e62`; `src/benchmarks/render_game_prep.zig:5-10` states what the
       group measures).
