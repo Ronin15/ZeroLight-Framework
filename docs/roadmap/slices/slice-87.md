@@ -65,12 +65,12 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       Measured: `render-game-prep-offview` above. Pass: collect time and the
       record and command capacities flat in off-view rows (group doc); the
       shape asserts land with the fix.
-- [ ] GPU sync copying off main. The fill stage is in `c6c066c`; do not
-      rewrite it. Debug, tree only, one
-      rep, 118,528 uploaded elements at 32 layers: serial-direct 1.42–1.62 ms
-      on main, thread-fixed-2 2.63 ms (2 workers), thread-fixed-auto 1.82 ms
-      (23 workers). The tuned case stayed inline. Pass not met: main still
-      copies the bytes, and forcing workers is slower at this size.
+- [x] GPU sync copying off main. The fill stage is in `c6c066c`. The
+      largest case is 32 layers and 118,528 elements, shaped as 3 ranges.
+      Debug, one rep: tuned 1.47 ms inline, 12 ns/element. Forcing those
+      ranges onto workers ran them and was slower (2.63 ms at 2 workers,
+      1.82 ms at 23). Production stays inline. There is no larger copy in
+      this group.
 - [x] Sparse tiles read as contiguous runs per (level, chunk). Each chunk
       holds its own row list; the last removal frees it. Debug, tree only,
       one rep, serial. Pan layouts at 1,000 / 16,000 / 256,000 tiles:
@@ -97,8 +97,10 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
 - [x] The `render_game_prep` bench's module doc carries no review tags
       (`baa4e62`; `src/benchmarks/render_game_prep.zig:5-10` states what the
       group measures).
-- [ ] Tests: collect output matches today's for in-view rows (order
-      included); allocation-free warmed collect.
+- [x] Tests: `render collect dynamic records follow the visible chunk`
+      locks in-view rows, order, and the far row left out.
+      `collect dynamic records after structural growth stays within reserve
+      and allocates only on warmup` is the warmed `FailingAllocator` proof.
 - [x] Docs: `docs/rendering-assets-shaders.md` collect and capacities, and
       `docs/architecture.md` per-chunk sparse runs.
 

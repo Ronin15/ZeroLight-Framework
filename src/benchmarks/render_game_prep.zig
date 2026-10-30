@@ -165,6 +165,11 @@ fn runCaseWithConfig(
         allocator.destroy(fixture);
     }
 
+    // Capacity follows the visible window. Collect uses the whole world; the
+    // sparse emit uses the camera. Read each after its window is set.
+    try setBenchCollectChunkVisibility(fixture);
+    fixture.dynamic_record_capacity = render_prep.dynamicRecordCapacity(fixture.gameplayScene());
+    try setBenchSparseEmitChunkVisibility(fixture);
     const command_capacity = fixture.world.reserveRenderRecords() + fixture.dynamic_record_capacity;
     const vertex_capacity = command_capacity * 6;
 
