@@ -25,6 +25,7 @@ const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const resources = @import("resources.zig");
 const perf_diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
+const setRowCount = @import("../app/thread_system.zig").setRowCount;
 const simd = @import("../core/simd.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
@@ -133,7 +134,7 @@ pub const Position = [2]f32;
 pub const Uv = [2]f32;
 pub const VertexColor = [4]f32;
 
-/// Vertex emission's range alignment in prepared commands: each range spans whole cache lines
+/// Vertex emission's range alignment in prepared sprites: each range spans whole cache lines
 /// of bytes in every vertex column, so neighbouring ranges share at most their boundary line.
 pub const sprite_prep_range_alignment_items: usize = 4;
 
@@ -326,7 +327,8 @@ pub const SpriteBatch = struct {
 
     allocator: std.mem.Allocator,
     commands: CommandList = .empty,
-    prepared_commands: std.ArrayList(PreparedSpriteCommand) = .empty,
+    prepared_sprites: std.MultiArrayList(PreparedSprite) = .empty,
+    prepared_groups: std.MultiArrayList(PreparedSpriteGroup) = .empty,
     positions: std.ArrayList(Position) = .empty,
     uvs: std.ArrayList(Uv) = .empty,
     colors: std.ArrayList(VertexColor) = .empty,
@@ -348,7 +350,8 @@ pub const SpriteBatch = struct {
 
     pub fn deinit(self: *SpriteBatch) void {
         self.commands.deinit(self.allocator);
-        self.prepared_commands.deinit(self.allocator);
+        self.prepared_sprites.deinit(self.allocator);
+        self.prepared_groups.deinit(self.allocator);
         self.positions.deinit(self.allocator);
         self.uvs.deinit(self.allocator);
         self.colors.deinit(self.allocator);
@@ -362,7 +365,8 @@ pub const SpriteBatch = struct {
         self.uvs.clearRetainingCapacity();
         self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
-        self.prepared_commands.clearRetainingCapacity();
+        self.prepared_sprites.clearRetainingCapacity();
+        self.prepared_groups.clearRetainingCapacity();
         self.reservation_drift.beginFrame();
         self.last_order = null;
         self.last_prep_stats = .{};
@@ -416,23 +420,32 @@ pub const SpriteBatch = struct {
         // `ensureTotalCapacity` is non-destructive on failure; do not `errdefer
         // deinit` here — that would wipe a successful prior reserve when a later
         // grow attempt OOMs.
+        const row_capacity = std.mem.alignForward(usize, command_capacity, simd.lane_count);
         try self.commands.ensureTotalCapacity(self.allocator, command_capacity);
-        try self.prepared_commands.ensureTotalCapacity(self.allocator, command_capacity);
+        try self.prepared_sprites.ensureTotalCapacity(self.allocator, row_capacity);
+        try self.prepared_groups.ensureTotalCapacity(self.allocator, row_capacity);
         try self.positions.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.uvs.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.colors.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.draw_groups.ensureTotalCapacity(self.allocator, draw_group_capacity);
+        std.debug.assert(self.prepared_sprites.capacity >= row_capacity);
+        std.debug.assert(self.prepared_groups.capacity >= row_capacity);
     }
 
     pub fn ensureFrameStorage(self: *SpriteBatch) !void {
-        const needed_vertices = try std.math.mul(usize, self.commands.items.len, 6);
+        const command_count = self.commands.items.len;
+        const needed_vertices = try std.math.mul(usize, command_count, 6);
         if (needed_vertices == 0) return;
 
-        try self.prepared_commands.ensureTotalCapacity(self.allocator, self.commands.items.len);
+        const row_capacity = std.mem.alignForward(usize, command_count, simd.lane_count);
+        try self.prepared_sprites.ensureTotalCapacity(self.allocator, row_capacity);
+        try self.prepared_groups.ensureTotalCapacity(self.allocator, row_capacity);
         try self.positions.ensureTotalCapacity(self.allocator, needed_vertices);
         try self.uvs.ensureTotalCapacity(self.allocator, needed_vertices);
         try self.colors.ensureTotalCapacity(self.allocator, needed_vertices);
-        try self.draw_groups.ensureTotalCapacity(self.allocator, self.commands.items.len);
+        try self.draw_groups.ensureTotalCapacity(self.allocator, command_count);
+        std.debug.assert(self.prepared_sprites.capacity >= row_capacity);
+        std.debug.assert(self.prepared_groups.capacity >= row_capacity);
     }
 
     /// Builds prepared vertices and draw groups without allocating. Callers must
@@ -456,32 +469,88 @@ pub const SpriteBatch = struct {
         self.uvs.clearRetainingCapacity();
         self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
-        self.prepared_commands.clearRetainingCapacity();
+        self.prepared_sprites.clearRetainingCapacity();
+        self.prepared_groups.clearRetainingCapacity();
 
-        std.debug.assert(self.positions.capacity >= self.commands.items.len * 6);
-        std.debug.assert(self.uvs.capacity >= self.commands.items.len * 6);
-        std.debug.assert(self.colors.capacity >= self.commands.items.len * 6);
-        std.debug.assert(self.draw_groups.capacity >= self.commands.items.len);
-        std.debug.assert(self.prepared_commands.capacity >= self.commands.items.len);
+        const command_count = self.commands.items.len;
+        std.debug.assert(self.positions.capacity >= command_count * 6);
+        std.debug.assert(self.uvs.capacity >= command_count * 6);
+        std.debug.assert(self.colors.capacity >= command_count * 6);
+        std.debug.assert(self.draw_groups.capacity >= command_count);
+        std.debug.assert(self.prepared_sprites.capacity >= command_count);
+        std.debug.assert(self.prepared_groups.capacity >= command_count);
 
+        setRowCount(PreparedSprite, &self.prepared_sprites, command_count);
+        setRowCount(PreparedSpriteGroup, &self.prepared_groups, command_count);
+        const sprites = self.prepared_sprites.slice();
+        const groups = self.prepared_groups.slice();
+        const rotation = sprites.items(.rotation);
+        const origin_x = sprites.items(.origin_x);
+        const origin_y = sprites.items(.origin_y);
+        const dest_w = sprites.items(.dest_w);
+        const dest_h = sprites.items(.dest_h);
+        const dest_x = sprites.items(.dest_x);
+        const dest_y = sprites.items(.dest_y);
+        const source_x = sprites.items(.source_x);
+        const source_y = sprites.items(.source_y);
+        const source_w = sprites.items(.source_w);
+        const source_h = sprites.items(.source_h);
+        const tex_w = sprites.items(.tex_w);
+        const tex_h = sprites.items(.tex_h);
+        const tint_r = sprites.items(.tint_r);
+        const tint_g = sprites.items(.tint_g);
+        const tint_b = sprites.items(.tint_b);
+        const tint_a = sprites.items(.tint_a);
+        const texture = groups.items(.texture);
+        const coordinate_space = groups.items(.coordinate_space);
+        const order = groups.items(.order);
+
+        var prepared: usize = 0;
         for (self.commands.items) |command| {
-            const texture = texture_resolver.textureDesc(command.sprite.texture) orelse continue;
-            self.prepared_commands.appendAssumeCapacity(.{
-                .sprite = command.sprite,
-                .texture_desc = texture,
-            });
+            const desc = texture_resolver.textureDesc(command.sprite.texture) orelse continue;
+            const source = command.sprite.source orelse Rect{
+                .x = 0,
+                .y = 0,
+                .w = @floatFromInt(desc.width),
+                .h = @floatFromInt(desc.height),
+            };
+            const sprite = command.sprite;
+            rotation[prepared] = sprite.rotation;
+            origin_x[prepared] = sprite.origin.x;
+            origin_y[prepared] = sprite.origin.y;
+            dest_w[prepared] = sprite.dest.w;
+            dest_h[prepared] = sprite.dest.h;
+            dest_x[prepared] = sprite.dest.x;
+            dest_y[prepared] = sprite.dest.y;
+            source_x[prepared] = source.x;
+            source_y[prepared] = source.y;
+            source_w[prepared] = source.w;
+            source_h[prepared] = source.h;
+            tex_w[prepared] = @floatFromInt(desc.width);
+            tex_h[prepared] = @floatFromInt(desc.height);
+            tint_r[prepared] = sprite.tint.r;
+            tint_g[prepared] = sprite.tint.g;
+            tint_b[prepared] = sprite.tint.b;
+            tint_a[prepared] = sprite.tint.a;
+            texture[prepared] = sprite.texture;
+            coordinate_space[prepared] = sprite.coordinate_space;
+            order[prepared] = sprite.order;
+            prepared += 1;
         }
-        return self.prepared_commands.items.len;
+        setRowCount(PreparedSprite, &self.prepared_sprites, prepared);
+        setRowCount(PreparedSpriteGroup, &self.prepared_groups, prepared);
+        return prepared;
     }
 
-    /// Emits vertices for the prepared command snapshot. This is the only
+    /// Emits vertices for the prepared sprite rows. This is the only
     /// currently thread-schedulable render-prep phase.
     pub fn emitVerticesAssumeCapacity(
         self: *SpriteBatch,
         thread_system: *ThreadSystem,
         prep_config: SpritePrepConfig,
     ) BatchStats {
-        const valid_count = self.prepared_commands.items.len;
+        const valid_count = self.prepared_sprites.len;
+        std.debug.assert(self.prepared_groups.len == valid_count);
         const vertex_count = valid_count * 6;
         setVertexCountAssumeCapacity(Position, &self.positions, vertex_count);
         setVertexCountAssumeCapacity(Uv, &self.uvs, vertex_count);
@@ -494,7 +563,7 @@ pub const SpriteBatch = struct {
                 .uvs = self.uvs.items,
                 .colors = self.colors.items,
             };
-            // Disjoint vertex ranges from prepared command indices. Inline runs
+            // Disjoint vertex ranges from prepared sprite rows. Inline runs
             // this same job. Draw groups stay serial: they depend on ordered
             // texture and presentation transitions.
             const prep = Dispatch.init(thread_system, &self.adaptive_tuner, .{
@@ -507,7 +576,7 @@ pub const SpriteBatch = struct {
             // the dispatched range count.
             const selection = prep.select(valid_count, sprite_prep_range_alignment_items);
             var context = SpritePrepJobContext{
-                .commands = self.prepared_commands.items,
+                .sprites = self.prepared_sprites.slice(),
                 .columns = columns,
                 .range_count = selection.range_count,
             };
@@ -523,8 +592,8 @@ pub const SpriteBatch = struct {
     pub fn finishPrepStats(self: *SpriteBatch, batch: BatchStats) SpritePrepStats {
         self.last_prep_stats = .{
             .command_count = self.commands.items.len,
-            .valid_sprite_count = self.prepared_commands.items.len,
-            .skipped_invalid_count = self.commands.items.len - self.prepared_commands.items.len,
+            .valid_sprite_count = self.prepared_sprites.len,
+            .skipped_invalid_count = self.commands.items.len - self.prepared_sprites.len,
             .vertex_count = self.positions.items.len,
             .draw_group_count = self.draw_groups.items.len,
             .command_overflow_grows = self.reservation_drift.frameGrows(),
@@ -540,15 +609,22 @@ pub const SpriteBatch = struct {
     fn buildDrawGroups(self: *SpriteBatch) void {
         self.draw_groups.clearRetainingCapacity();
 
+        const groups = self.prepared_groups.slice();
+        const textures = groups.items(.texture);
+        const spaces = groups.items(.coordinate_space);
+        const orders = groups.items(.order);
+
         var active_texture: ?TextureId = null;
         var active_presentation: CoordinatePresentation = .logical;
         var active_order: RenderOrder = .{};
         var active_first_vertex: u32 = 0;
         var active_vertex_count: u32 = 0;
 
-        for (self.prepared_commands.items, 0..) |command, prepared_index| {
+        for (0..groups.len) |prepared_index| {
             const first_vertex: u32 = @intCast(prepared_index * 6);
-            const group_presentation = presentationForCoordinateSpace(command.sprite.coordinate_space);
+            const group_texture = textures[prepared_index];
+            const group_order = orders[prepared_index];
+            const group_presentation = presentationForCoordinateSpace(spaces[prepared_index]);
 
             // Break on order change as well as texture/presentation so every group
             // is order-homogeneous. A same-texture run spanning multiple depths must
@@ -558,9 +634,9 @@ pub const SpriteBatch = struct {
             // Contiguous same-order groups re-coalesce in the renderer when nothing
             // interleaves, so this does not inflate the steady-state draw count.
             if (active_texture == null or
-                !textureIdsEqual(active_texture.?, command.sprite.texture) or
+                !textureIdsEqual(active_texture.?, group_texture) or
                 active_presentation != group_presentation or
-                !renderOrdersEqual(active_order, command.sprite.order))
+                !renderOrdersEqual(active_order, group_order))
             {
                 if (active_texture) |texture| {
                     self.draw_groups.appendAssumeCapacity(.{
@@ -572,9 +648,9 @@ pub const SpriteBatch = struct {
                         .vertex_count = active_vertex_count,
                     });
                 }
-                active_texture = command.sprite.texture;
+                active_texture = group_texture;
                 active_presentation = group_presentation;
-                active_order = command.sprite.order;
+                active_order = group_order;
                 active_first_vertex = first_vertex;
                 active_vertex_count = 6;
             } else {
@@ -599,13 +675,78 @@ const SpriteCommand = struct {
     sprite: Sprite,
 };
 
-const PreparedSpriteCommand = struct {
-    sprite: Sprite,
-    texture_desc: resources.TextureDesc,
+// SoA rows for the vertex kernel. Field order is that kernel's read order.
+const PreparedSprite = struct {
+    rotation: f32,
+    origin_x: f32,
+    origin_y: f32,
+    dest_w: f32,
+    dest_h: f32,
+    dest_x: f32,
+    dest_y: f32,
+    source_x: f32,
+    source_y: f32,
+    source_w: f32,
+    source_h: f32,
+    tex_w: f32,
+    tex_h: f32,
+    tint_r: f32,
+    tint_g: f32,
+    tint_b: f32,
+    tint_a: f32,
+};
+
+// Draw-group keys only. The vertex pass does not read these.
+const PreparedSpriteGroup = struct {
+    texture: TextureId,
+    coordinate_space: CoordinateSpace,
+    order: RenderOrder,
+};
+
+const PreparedSpriteColumns = struct {
+    rotation: []const f32,
+    origin_x: []const f32,
+    origin_y: []const f32,
+    dest_w: []const f32,
+    dest_h: []const f32,
+    dest_x: []const f32,
+    dest_y: []const f32,
+    source_x: []const f32,
+    source_y: []const f32,
+    source_w: []const f32,
+    source_h: []const f32,
+    tex_w: []const f32,
+    tex_h: []const f32,
+    tint_r: []const f32,
+    tint_g: []const f32,
+    tint_b: []const f32,
+    tint_a: []const f32,
+
+    fn capture(sprites: std.MultiArrayList(PreparedSprite).Slice) PreparedSpriteColumns {
+        return .{
+            .rotation = sprites.items(.rotation),
+            .origin_x = sprites.items(.origin_x),
+            .origin_y = sprites.items(.origin_y),
+            .dest_w = sprites.items(.dest_w),
+            .dest_h = sprites.items(.dest_h),
+            .dest_x = sprites.items(.dest_x),
+            .dest_y = sprites.items(.dest_y),
+            .source_x = sprites.items(.source_x),
+            .source_y = sprites.items(.source_y),
+            .source_w = sprites.items(.source_w),
+            .source_h = sprites.items(.source_h),
+            .tex_w = sprites.items(.tex_w),
+            .tex_h = sprites.items(.tex_h),
+            .tint_r = sprites.items(.tint_r),
+            .tint_g = sprites.items(.tint_g),
+            .tint_b = sprites.items(.tint_b),
+            .tint_a = sprites.items(.tint_a),
+        };
+    }
 };
 
 const SpritePrepJobContext = struct {
-    commands: []const PreparedSpriteCommand,
+    sprites: std.MultiArrayList(PreparedSprite).Slice,
     columns: VertexColumns,
     /// Dispatched range count; dual-asserted against `range.index` at job entry.
     range_count: usize,
@@ -616,35 +757,109 @@ fn writePreparedSpritesJob(context: *anyopaque, range: ParallelRange, _: WorkerI
     // Dual worker asserts (mirror affect.zig / particle.zig). Write-span bounds
     // also live in fillPreparedRange.
     std.debug.assert(range.index < job.range_count);
-    fillPreparedRange(job.commands, job.columns, range);
+    fillPreparedRange(job.sprites, job.columns, range);
 }
 
 fn fillPreparedRange(
-    commands: []const PreparedSpriteCommand,
-    columns: VertexColumns,
+    sprites: std.MultiArrayList(PreparedSprite).Slice,
+    vertices: VertexColumns,
     range: ParallelRange,
 ) void {
-    // Dual write-range bounds: the command slice and the vertex columns the
-    // worker will scatter into. Vertex columns are sized to `commands.len * 6`
-    // before dispatch (`emitVerticesAssumeCapacity`).
+    // Dual write-range bounds: the sprite rows and the vertex columns the
+    // worker writes. Vertex columns are sized to `sprites.len * 6` before
+    // dispatch (`emitVerticesAssumeCapacity`).
     std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= commands.len);
-    std.debug.assert(range.end * 6 <= columns.positions.len);
-    std.debug.assert(columns.positions.len == columns.uvs.len);
-    std.debug.assert(columns.positions.len == columns.colors.len);
-    for (range.start..range.end) |index| {
-        writePreparedSpriteVertices(commands[index], columns, index * 6);
+    std.debug.assert(range.end <= sprites.len);
+    std.debug.assert(range.end * 6 <= vertices.positions.len);
+    std.debug.assert(range.end * 6 <= vertices.uvs.len);
+    std.debug.assert(range.end * 6 <= vertices.colors.len);
+    std.debug.assert(vertices.positions.len == vertices.uvs.len);
+    std.debug.assert(vertices.positions.len == vertices.colors.len);
+    const columns = PreparedSpriteColumns.capture(sprites);
+    var index = range.start;
+    while (index + simd.lane_count <= range.end) : (index += simd.lane_count) {
+        writeSpriteLanes(&columns, index, simd.lane_count, vertices);
     }
+    if (index == range.end) return;
+    writeSpriteLanes(&columns, index, range.end - index, vertices);
 }
 
-fn writePreparedSpriteVertices(
-    prepared: PreparedSpriteCommand,
-    out: VertexColumns,
-    base: usize,
-) void {
-    // All spaces emit world/identity-space geometry; the renderer applies the
-    // camera via its vertex uniform, never on the CPU.
-    writeSpriteQuad(prepared.sprite, prepared.texture_desc, out, base);
+// One lane group of sprites: `count` is `simd.lane_count`, or the short tail.
+// Corner x/y/u/v stay in lanes until the six-vert store.
+fn writeSpriteLanes(columns: *const PreparedSpriteColumns, base: usize, count: usize, out: VertexColumns) void {
+    std.debug.assert(count > 0 and count <= simd.lane_count);
+    std.debug.assert(base + count <= columns.rotation.len);
+    std.debug.assert((base + count) * 6 <= out.positions.len);
+
+    // simd.zig has no sin/cos, and each sprite has its own angle, so only live
+    // lanes are evaluated and then packed. A dead lane is not sined.
+    var sine_lanes = [_]f32{ 0, 0, 0, 0 };
+    var cosine_lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..count) |lane| {
+        const angle = math.sinCos(columns.rotation[base + lane]);
+        sine_lanes[lane] = angle.sin;
+        cosine_lanes[lane] = angle.cos;
+    }
+    const sine = simd.loadFloat4Lanes(&sine_lanes, count);
+    const cosine = simd.loadFloat4Lanes(&cosine_lanes, count);
+
+    const origin_x = simd.loadFloat4Lanes(columns.origin_x[base..], count);
+    const origin_y = simd.loadFloat4Lanes(columns.origin_y[base..], count);
+    const dest_w = simd.loadFloat4Lanes(columns.dest_w[base..], count);
+    const dest_h = simd.loadFloat4Lanes(columns.dest_h[base..], count);
+    const dest_x = simd.loadFloat4Lanes(columns.dest_x[base..], count);
+    const dest_y = simd.loadFloat4Lanes(columns.dest_y[base..], count);
+    const source_x = simd.loadFloat4Lanes(columns.source_x[base..], count);
+    const source_y = simd.loadFloat4Lanes(columns.source_y[base..], count);
+    const source_w = simd.loadFloat4Lanes(columns.source_w[base..], count);
+    const source_h = simd.loadFloat4Lanes(columns.source_h[base..], count);
+    const tex_w = simd.loadFloat4Lanes(columns.tex_w[base..], count);
+    const tex_h = simd.loadFloat4Lanes(columns.tex_h[base..], count);
+    const tint_r = simd.loadFloat4Lanes(columns.tint_r[base..], count);
+    const tint_g = simd.loadFloat4Lanes(columns.tint_g[base..], count);
+    const tint_b = simd.loadFloat4Lanes(columns.tint_b[base..], count);
+    const tint_a = simd.loadFloat4Lanes(columns.tint_a[base..], count);
+
+    const tex_u0 = simd.divFloat4(source_x, tex_w);
+    const tex_u1 = simd.divFloat4(simd.addFloat4(source_x, source_w), tex_w);
+    const tex_v0 = simd.divFloat4(source_y, tex_h);
+    const tex_v1 = simd.divFloat4(simd.addFloat4(source_y, source_h), tex_h);
+
+    const zero = simd.splatFloat4(0);
+    const neg_origin_x = simd.subFloat4(zero, origin_x);
+    const neg_origin_y = simd.subFloat4(zero, origin_y);
+    const far_x = simd.subFloat4(dest_w, origin_x);
+    const far_y = simd.subFloat4(dest_h, origin_y);
+    const translate_x = simd.addFloat4(dest_x, origin_x);
+    const translate_y = simd.addFloat4(dest_y, origin_y);
+
+    const x0 = simd.addFloat4(simd.subFloat4(simd.mulFloat4(neg_origin_x, cosine), simd.mulFloat4(neg_origin_y, sine)), translate_x);
+    const y0 = simd.addFloat4(simd.addFloat4(simd.mulFloat4(neg_origin_x, sine), simd.mulFloat4(neg_origin_y, cosine)), translate_y);
+    const x1 = simd.addFloat4(simd.subFloat4(simd.mulFloat4(far_x, cosine), simd.mulFloat4(neg_origin_y, sine)), translate_x);
+    const y1 = simd.addFloat4(simd.addFloat4(simd.mulFloat4(far_x, sine), simd.mulFloat4(neg_origin_y, cosine)), translate_y);
+    const x2 = simd.addFloat4(simd.subFloat4(simd.mulFloat4(neg_origin_x, cosine), simd.mulFloat4(far_y, sine)), translate_x);
+    const y2 = simd.addFloat4(simd.addFloat4(simd.mulFloat4(neg_origin_x, sine), simd.mulFloat4(far_y, cosine)), translate_y);
+    const x3 = simd.addFloat4(simd.subFloat4(simd.mulFloat4(far_x, cosine), simd.mulFloat4(far_y, sine)), translate_x);
+    const y3 = simd.addFloat4(simd.addFloat4(simd.mulFloat4(far_x, sine), simd.mulFloat4(far_y, cosine)), translate_y);
+
+    const corner_x = [_]simd.Float4{ x0, x1, x2, x3 };
+    const corner_y = [_]simd.Float4{ y0, y1, y2, y3 };
+    const corner_u = [_]simd.Float4{ tex_u0, tex_u1, tex_u0, tex_u1 };
+    const corner_v = [_]simd.Float4{ tex_v0, tex_v0, tex_v1, tex_v1 };
+    // Six verts duplicate the four corners. That is not the lane layout, and the
+    // GPU columns stay, so the Float4 is indexed here.
+    const slots = [_]usize{ 0, 1, 2, 1, 3, 2 };
+
+    inline for (0..simd.lane_count) |lane| {
+        if (lane < count) {
+            const vert = (base + lane) * 6;
+            @memset(out.colors[vert..][0..6], VertexColor{ tint_r[lane], tint_g[lane], tint_b[lane], tint_a[lane] });
+            inline for (slots, 0..) |corner, slot| {
+                out.positions[vert + slot] = .{ corner_x[corner][lane], corner_y[corner][lane] };
+                out.uvs[vert + slot] = .{ corner_u[corner][lane], corner_v[corner][lane] };
+            }
+        }
+    }
 }
 
 /// Writes one world-space sprite quad with identity transform. The world builds
@@ -1189,7 +1404,8 @@ test "reserveStorage mid-list grow failure preserves prior data and capacity" {
 
     try batch.reserveStorage(8, 48, 8);
     const commands_capacity = batch.commands.capacity;
-    const prepared_capacity = batch.prepared_commands.capacity;
+    const sprites_capacity = batch.prepared_sprites.capacity;
+    const groups_capacity = batch.prepared_groups.capacity;
     const positions_capacity = batch.positions.capacity;
     const uvs_capacity = batch.uvs.capacity;
     const colors_capacity = batch.colors.capacity;
@@ -1202,11 +1418,11 @@ test "reserveStorage mid-list grow failure preserves prior data and capacity" {
     });
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
 
-    // reserveStorage grows commands → prepared_commands → positions → …;
-    // fail_index=2 lets the first two ensureTotalCapacity calls succeed (and
+    // reserveStorage grows commands → sprites → groups → positions → …;
+    // fail_index=3 lets the first three ensureTotalCapacity calls succeed (and
     // possibly enlarge those lists) then OOMs on positions. Prior data and the
     // later columns' capacity must remain intact — no blanket errdefer deinit.
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 3 });
     batch.allocator = failing.allocator();
     try std.testing.expectError(error.OutOfMemory, batch.reserveStorage(4096, 4096 * 6, 4096));
     batch.allocator = allocator;
@@ -1214,7 +1430,8 @@ test "reserveStorage mid-list grow failure preserves prior data and capacity" {
     try std.testing.expect(failing.has_induced_failure);
     // Early columns may have grown; later ones must still match the prior reserve.
     try std.testing.expect(batch.commands.capacity >= commands_capacity);
-    try std.testing.expect(batch.prepared_commands.capacity >= prepared_capacity);
+    try std.testing.expect(batch.prepared_sprites.capacity >= sprites_capacity);
+    try std.testing.expect(batch.prepared_groups.capacity >= groups_capacity);
     try std.testing.expectEqual(positions_capacity, batch.positions.capacity);
     try std.testing.expectEqual(uvs_capacity, batch.uvs.capacity);
     try std.testing.expectEqual(colors_capacity, batch.colors.capacity);
@@ -1425,6 +1642,89 @@ test "warmed multi-worker sprite prep does not allocate" {
     try std.testing.expect(!emit.ran_inline);
     try std.testing.expect(emit.active_worker_threads > 0);
     try std.testing.expect(emit.worker_thread_ranges > 0);
+}
+
+test "sprite prep lanes match one-quad vertices" {
+    const allocator = std.testing.allocator;
+    const desc = resources.TextureDesc{ .width = 64, .height = 32 };
+    const texture = testTextureId(0, 1);
+    const slots = [_]TestTextureSlot{
+        .{ .id = texture, .desc = desc },
+    };
+    const table = TestTextureTable{ .slots = &slots };
+    var batch = try initBatchTest(allocator, &table);
+    defer batch.deinit();
+
+    // One full lane group plus a prefix. The unresolved texture sits between
+    // the valid sprites and must not leave a vertex hole.
+    const valid = [_]Sprite{
+        .{
+            .texture = texture,
+            .dest = .{ .x = 1, .y = 2, .w = 8, .h = 9 },
+        },
+        .{
+            .texture = texture,
+            .source = .{ .x = 2, .y = 3, .w = 4, .h = 5 },
+            .dest = .{ .x = 11, .y = 13, .w = 15, .h = 17 },
+            .origin = .{ .x = 1.5, .y = 2.5 },
+            .rotation = 0.35,
+            .tint = .{ .r = 0.25, .g = 0.5, .b = 0.75, .a = 1 },
+        },
+        .{
+            .texture = texture,
+            .dest = .{ .x = 3, .y = 4, .w = 5, .h = 6 },
+            .rotation = -0.2,
+        },
+        .{
+            .texture = texture,
+            .dest = .{ .x = 7, .y = 8, .w = 9, .h = 10 },
+            .origin = .{ .x = 0.5, .y = 0.25 },
+        },
+        .{
+            .texture = texture,
+            .source = .{ .x = 1, .y = 1, .w = 6, .h = 7 },
+            .dest = .{ .x = -4, .y = 6, .w = 12, .h = 14 },
+            .origin = .{ .x = 2, .y = 3 },
+            .rotation = 1.1,
+            .tint = .{ .r = 1, .g = 0, .b = 0.5, .a = 0.25 },
+        },
+    };
+    try std.testing.expectEqual(simd.lane_count + 1, valid.len);
+    for (valid, 0..) |sprite, index| {
+        if (index == 2) {
+            try batch.drawSprite(.{
+                .texture = testTextureId(9, 1),
+                .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            });
+        }
+        try batch.drawSprite(sprite);
+    }
+
+    const stats = try prepareInline(&batch, table.resolver(), .{});
+    try std.testing.expectEqual(simd.lane_count + 1, stats.valid_sprite_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_invalid_count);
+    try std.testing.expectEqual((simd.lane_count + 1) * 6, stats.vertex_count);
+
+    for (valid, 0..) |sprite, prepared| {
+        var positions: [6]Position = undefined;
+        var uvs: [6]Uv = undefined;
+        var colors: [6]VertexColor = undefined;
+        writeWorldSpriteQuad(sprite, desc, .{
+            .positions = &positions,
+            .uvs = &uvs,
+            .colors = &colors,
+        });
+        const base = prepared * 6;
+        try expectEqualVertices(.{
+            .positions = &positions,
+            .uvs = &uvs,
+            .colors = &colors,
+        }, .{
+            .positions = batch.positions.items[base..][0..6],
+            .uvs = batch.uvs.items[base..][0..6],
+            .colors = batch.colors.items[base..][0..6],
+        });
+    }
 }
 
 fn addParallelParityCommands(batch: *SpriteBatch) !void {

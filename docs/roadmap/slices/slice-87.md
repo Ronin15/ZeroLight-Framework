@@ -3,7 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: collect items landed. The backend and subsystem passes are done.**
-Their unfixed findings are the open items below. Next is the sprite-prep layout.
+Their unfixed findings are the open items below. Next is collect reading the drawable run.
 Do not start slice 88 until those items are fixed or explicitly left.
 `verify` passes. `gpu-smoke` passed on Vulkan only.
 
@@ -86,12 +86,12 @@ and `.grok/rules/render.md` in the backend pass.
       asserts nondecreasing order. Debug `render-game-prep` at 10,000 is
       within noise: serial 9.00 ms against 8.85 ms, tuned 7.59 ms against
       7.53 ms, 23 workers.
-- [ ] Sprite-prep lanes. `writeSpriteQuad` (`src/render/sprite_batch.zig:664`)
-      runs a 4-corner kernel inside the per-sprite loop and drains it to
-      scalar stores. Failure scenario: the sprite population never streams
-      one lane of sprites into the vertex columns. Pass: design first, then
-      SoA sprite columns in submission order, one lane path across sprites,
-      stores staying in lanes until the vertex columns.
+- [x] Sprite-prep lanes. Valid sprites are SoA columns. `writeSpriteLanes`
+      is one lane path across sprites; the 6-vertex store stays the GPU
+      layout. Debug `render-game-prep` at 10,000, one rep: tuned 7.59 ms
+      to 7.94 ms (+4.6%), serial 9.00 ms to 9.88 ms (+9.8%), both within
+      noise, 23 workers. Snapshot 368 µs to 729 µs. Tuned vertex emit
+      380 µs to 314 µs.
 - [ ] Collect reads the drawable run only. `emitCollectedRow`
       (`src/game/render_prep.zig:468`) resolves each visible row through the
       entity slot into visual, asset, and facing columns. Failure scenario:
