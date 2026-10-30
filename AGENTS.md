@@ -38,17 +38,21 @@ Add code under the owning module: boundaries in `engine-design.md`
 Non-trivial Zig design, implementation, review, and debugging goes through the
 `.grok/agents/` specialists (`spawn_subagent`, `subagent_type` = its name); the
 spawn prompt is the child's whole task. Trivial work (a local fix in 1-2 files,
-no design question) may be done inline. The main session coordinates and is
-the second set of eyes on every unit: it keeps the work on the agreed goal and
-order, verifies agent claims against live code and the rules, calls out a
-needed direction change to the owner, answers rule questions with the
-decision criteria, and reports.
+no design question) may be done inline. The main session coordinates.
+Specialists own the design and the code. It keeps each unit on the agreed
+goal and order. Its check is that the result still matches that goal: the
+slice pass and the named plan. It does not design the change or walk the
+module. It calls out a needed direction change to the owner and reports.
+Before it starts or continues a unit, it reads `.grok/reports/handoffs.md`.
+That file names the next unit, the specialist, and the sources. When a unit
+finishes, or a review routes the next one, the main session rewrites the file.
 
 - **Design** prompt: the files, the declarations to read, the cost-model
-  questions, and the plan path. Every fact in it is checked against live
-  code or a cited source, and a hypothesis is labelled one. When the owner
-  already exists, the first line says so and names the line ranges to read.
-  It states the decision and does not tour the module.
+  questions, and the plan path. The specialist checks those lines. A
+  hypothesis in the prompt is labelled one. When the owner already exists,
+  the first line says so and names the line ranges to read. The prompt
+  states the slice pass. An open how is the specialist's decision. The
+  prompt does not choose it or tour the module.
 - **Implement** prompt: the design plan's path and only its overrides. It
   names the test helper a new test calls, the `-Dtest-filter` words shared
   by that test and the existing tests of the same behavior, and the bench
@@ -95,7 +99,8 @@ decision criteria, and reports.
   logical change, review fixes folded in; no per-finding commits, worktrees,
   or merge commits; never known-broken or unfinished code. A completed slice
   unit is committed once its review fixes are in, so the next unit stays
-  separate. The owner pushes.
+  separate. A workflow edit is its own commit, separate from a slice unit.
+The owner pushes.
 - Agents work from live code and the sources the prompt names, never memory or
   chat summaries; they report what is outside their role and the main session
   routes it.

@@ -53,8 +53,10 @@ do not share a write. The parent merges the reports into one finding list.
 A debug prompt is the failing command and the first error block when that
 is the whole failure. Skip `zig build verify` until that command is green.
 
-The parent checks a load-bearing claim against the function it cites and
-against the command output. It does not re-walk the file.
+The parent coordinates. Specialists own the design and the code. Its check
+is that the result still matches the slice pass and the named plan. It does
+not design the change or walk the module. It checks a load-bearing claim
+against the function it cites and against the command output.
 
 ## After
 

@@ -65,15 +65,8 @@ failures from compiler output.
 ## Triage
 
 1. Capture the command, failure text, and timing class; identify the layer.
-2. Run the narrowest relevant command (`check`, `test` with its
-   `-Dtest-filter`, `shaders`; `run` only
-   when behavior needs the app; `gpu-smoke` per `build-validation.md`). A
-   bench is `zig build bench` or `tools/bench_ab.py` with its group. Those
-   commands run the current binary. Do not search `.zig-cache` or `zig-out`
-   for a test or bench executable. A
-   step or `-D` option not named there: `zig build -h`, and stop at System
-   Integration Options. A bench flag: `tools/bench_ab.py --help`. Do not open
-   `build.zig`, the bench sources, or DW except a section a loaded rule names.
+2. Run the narrowest command that reproduces the failure. Command lookup
+   is `AGENTS.md` § Commands. `gpu-smoke` follows `build-validation.md`.
    Read the declaration the error names and the failing test. Do not read
    the file's other tests.
 3. Test one hypothesis.
