@@ -208,7 +208,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**87**](roadmap/slices/slice-87.md) | Collect items landed; review findings open | Render Collect By Visible Chunks — findings before 88 |
+| [**87**](roadmap/slices/slice-87.md) | Programming landed; acceptance checks open | Render Collect By Visible Chunks — acceptance before 88 |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; four items recorded | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); four items stay recorded |
 
@@ -287,11 +287,11 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    commit, then tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items, closed: rows stay in
    store order) →
-   [87](roadmap/slices/slice-87.md) collect items landed; its review findings are
-   the open items, then
+   [87](roadmap/slices/slice-87.md) programming landed (collect, backend, and
+   subsystem); acceptance checks remain, then
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
-   inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
-   backend pass closes the branch (owner 2026-10-16). 89 was added by the owner
+   inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics. The render
+   backend pass has landed; it does not wait on the inert-row items. 89 was added by the owner
    2026-10-23 and ordered first 2026-10-24. Items the 64G combined
    review routed here (refs at `e2b9b2c`):
    - Tile gate on main (area D H1): 35 (threaded, `f0adc9a`); row order and chunk grouping: 89.
@@ -300,11 +300,11 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - Commit-seam order in the demo state (L5): 74.
    - Any create re-resolves every steering row (L10): 85 (landed: the movement-index cache is gone).
    - File splits (L11) and per-system tuner fields: 83 (landed).
-   - Render collect and GPU sync copying (area C): 87.
+   - Render collect and GPU sync copying (area C): 87 (landed).
    - Movement intent order: 85 (landed).
    - World creation and worldgen: measured; its findings are in 74; the world paint's first pick: 89.
    - Collision, whole subsystem: 86.
-   - Render backend pass: 87, last.
+   - Render backend pass: 87 (landed).
 
    Items the 2026-10-16 audits and the 84 chunk-index review routed here
    (tags name findings in that review's local reports). Every
@@ -313,8 +313,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - 85 (landed): steering on the shared index (contiguity H1, code H2); the
      vectorized avoidance accumulate, moved from 35 (docs M9); intent order
      (contiguity M3).
-   - 87: visible-chunk source (contiguity H4); sparse tile lists (contiguity
-     M1); submit reads in sort order (contiguity M2).
+   - 87 (landed): visible-chunk source (contiguity H4); sparse tile lists
+     (contiguity M1); submit reads in sort order (contiguity M2).
    - 88: stagger phase stripe by dense index (roadmap verify); DataSystem
      hot-pass data layout (contiguity H5); structural-share
      deferral (docs M7); index and AI scratch sized by AI rows (code M2).
@@ -330,7 +330,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      - 86: collision, response, static colliders, destructibles;
      - 85 (landed): steering, movement, particles;
      - 35: tile gate;
-     - 87: render prep, GPU tile sync, world render, and the render backend;
+     - 87 (landed): render prep, GPU tile sync, world render, and the render backend;
      - 88: `DataSystem`, step contracts, pipeline, `src/core` kernels;
      - 75: simulation scope;
      - 89: batch tuner follow-ups, world gate under the data rules;
@@ -351,8 +351,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      from `ThreadSystem`, `src/assets`, `src/platform`.
 
    Coverage gaps (docs audit L5): `src/render/camera.zig`,
-   `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig` go to 87's
-   backend pass, and `src/core/logging.zig` to 88's kernels item.
+   `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig` were 87's
+   backend pass (no finding). `src/core/logging.zig` goes to 88's kernels item.
 3. **AI:** cognition, perception, memory, affect, sensory bus and interest
    markers, built on the core branch's final form.
 4. **Remaining layers, when normal roadmap flow resumes after the AI branch:**
@@ -366,12 +366,12 @@ writes the findings into slice checklists or new slice files.
 
 **Core findings** (measured at `5d5a089`; detail in each slice):
 - **High:** spatial index and perception check budget (84, landed); collision
-  broadphase (86, landed); tile gate (35, landed); render collect (87); inert rows (75 for
-  movement, tiers, and collision, recorded when 86 closed; 87 for render collect).
+  broadphase (86, landed); tile gate (35, landed); render collect (87, landed); inert rows (75 for
+  movement, tiers, and collision, recorded when 86 closed; 87's render share landed).
 - **Medium:** destructible resolve (72 D1); structural commands past the
   fixed share (88's deferral; 56, 57, 61, 62, 76, 77 use it).
 - **Already owned:** far-tier freeze (75); GPU per-edit sync (64G measured,
-  `639f55d`; its main-thread copying is 87).
+  `639f55d`; 87 landed the recorded-chunk plan, and the tuner keeps the fill inline).
 
 **AI findings** (derived from code, 2026-10-11; benches to confirm):
 - **Critical:** far AI stops advancing (no thinking outside the halo, dormant
@@ -456,11 +456,11 @@ order.
 6b. **90** ThreadSystem Wake Protocol And Startup Calibration — landed (archived).
 7. **86** Collision Subsystem Pass — landed (archived), after 83, 84, 89, and 90.
 8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
-8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22). Next is 87.
-9. **87** Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items (core-systems branch).
-9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's collect items (core-systems branch).
+8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22).
+9. **87** Render Collect By Visible Chunks — programming landed; acceptance checks open (core-systems branch).
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's acceptance checks (core-systems branch).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.
-9c. **87's render backend pass** — after 9b; closes the core-systems branch.
+9c. **87's render backend pass** — landed with the slice checklist. It does not wait on 9b.
 10. **76** Cave-Ins — after 64G, 88.
 11. **77** Explosions — after 64G, 76, 88.
 12. **49** Session Seed And Determinism Checksum Harness — after 64G.

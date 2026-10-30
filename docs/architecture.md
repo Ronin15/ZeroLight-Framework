@@ -111,8 +111,8 @@ Designs start here, then read the live structure below (rules:
   - `gpu_tiles.zig`: the mirror of the renderer-owned GPU tile store: the
     store's non-owning id, the resident window, each resident layer's toroidal
     directory and chain link, and the directory and block allocator it plans
-    and commits each frame, uploading changed chunks found through layer flags
-    and block change marks; reset when the renderer retires the store.
+    and commits each frame. A resident in-window edit records its chunk, and
+    the plan walks that list. Reset when the renderer retires the store.
   - `interest.zig`: durable **interest/affordance markers** (Slice 41).
     Markers are world-authored POIs with fixed inline slot capacity
     (allocation-free by construction) — not `DataSystem` components and not
@@ -350,9 +350,9 @@ depth, or world count. `WorldSystem.syncDenseTileStore` (`world/render.zig`;
 mirror: `world/gpu_tiles.zig`) runs once per frame in render prep before
 swapchain acquisition: a level entering the window uploads its window directory and
 mixed blocks, a pan across a chunk boundary uploads the entering chunks, a dig
-uploads one element, and everything goes in the frame's one batched copy pass.
-The value fill is a worker stage over that upload's elements; main commits the
-spans and adopts the buffer.
+uploads that chunk's word or its block when the uploaded form differs, and everything goes in the frame's one
+batched copy pass. The value fill is a stage over that upload's elements; the
+tuner keeps it inline. Main commits the spans and adopts the buffer.
 Store uploads always use `cycle=false`; vertex ring buffers alone use
 `cycle=true` on the final upload. The world holds only a generational
 `TileDataId` and claims the store each sync (`Renderer.claimTileStore`);
@@ -362,13 +362,16 @@ frame with no teardown call and no device drain (sweep O(store-slot high
 water), derived). A world whose claim fails re-uploads its window into a new
 store, O(resident layers × window chunks), derived.
 Multi-level compositing requires back-to-front dense-layer depth order at
-submit and in `mergeDrawList`. Sparse tiles draw from a per-window list the
-window update builds from the window's levels and chunks, ordered by (depth,
-cell, tile id): memory O(V), rebuild O(window levels × window chunks + V log V)
-for the V tiles in the window, independent of the world's sparse count.
-Dynamic entities collect from movement-body dense rows (Slice 24B): scope
-columns and `renderCollectIndicesForMovement` align on `movement_index`; render
-visibility is camera chunk + AABB only (simulation tier does not gate draw).
+submit and in `mergeDrawList`. Sparse tiles draw from a per-window list ordered
+by (depth, cell, tile id). An unchanged view patches the queued chunks into
+that list; a view change recounts and sorts. Memory is O(V) for the V tiles in
+the window, and a recount is O(window levels × window chunks + V log V),
+independent of the world's sparse count.
+Dynamic entities collect from each visible chunk's drawable run. Appearance is
+on that run. When the player's level is outside the render window, collect
+emits that row at its `drawable_slot` and does not walk the chunk. Render
+visibility is the camera chunk window plus AABB; simulation tier does not gate
+collect.
 Dense floor submit buckets the resident layer set into a small number of
 composite draws (`partitionDenseCompositeBuckets`, cut only at true
 depth-interleave points where a dynamic entity, particle, or sparse tile
@@ -392,9 +395,8 @@ comes only from the fixed-step camera (`GameDemoState.simViewRect()` passed as
 render visibility window, which follows the interpolated render camera and so
 depends on frame pacing. Scope pin metadata
 may keep an entity in a higher sim band off-camera without bypassing render
-visibility (`.grok/rules/simulation.md`). Open scaling gaps (collect scan cost, dense-floor layer quads,
-movement contiguous-path vs dormant rows, per-entity depth alignment, component
-mask headroom) are consolidated under **Scaling Gaps And Hardening Frontier** in
+visibility (`.grok/rules/simulation.md`). Measured pressure points that still
+await a benchmark are in
 [`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
 
 Game code submits sprites and rectangles through `Renderer` using prepared
@@ -867,10 +869,11 @@ arrive grouped by chunk (`groupDenseCellWrites` groups a batch given in any orde
 in O(1) per write through each level's ordered chunk set, with no sort), storage
 is reserved on the main thread first (`reserveDenseCellWrites`), chunks are written in parallel on the
 `ThreadSystem`, and results merge in a fixed order, so threaded equals serial
-(`.grok/rules/threading.md`). A write marks its block changed and, on a layer
-resident in the GPU tile store, flags the layer for the next
-`syncDenseTileStore`, which uploads each changed window chunk once; edits hold
-no render memory. Dense layers can be added in play. Visibility is the
+(`.grok/rules/threading.md`). A write marks its block changed and, on a
+resident layer, records that chunk for the next `syncDenseTileStore`. The plan
+walks the recorded chunks and uploads each one that differs. Edits hold no
+render memory. Upload kinds are in `docs/rendering-assets-shaders.md`
+(GPU-Driven Tilemap). Dense layers can be added in play. Visibility is the
 cached render chunk window, not per-chunk rows. `WorldSystem` prepares world draw records during
 render, using explicit world-depth bands from `src/game/render_depth.zig`.
 Runtime gameplay construction uses the Engine-owned `ThreadSystem` to build the

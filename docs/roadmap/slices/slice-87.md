@@ -2,10 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: collect items landed. The backend and subsystem passes are done.**
-The code items below are done. Next is the docs commit and the acceptance checks.
-Do not start slice 88 until those items are fixed or explicitly left.
-`verify` passes. `gpu-smoke` passed on Vulkan only.
+**Status: programming landed. Off-view collect meets its pass shape.**
+`verify` passes. `gpu-smoke` passed on Vulkan only. Slice 88 waits on
+`gpu-smoke` for any other available backend.
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile fill
@@ -15,12 +14,17 @@ and `.grok/rules/render.md` in the backend pass.
 
 ### Current foundation
 
-- Collect walks each visible chunk's drawable run. Capacities follow those
-  rows, the player marker, and the live particles.
-- Each chunk owns its sparse rows. The window walk streams that run.
+- Collect walks each visible chunk's drawable run. Appearance is on that run.
+  Tier does not gate collect. An out-of-window player emits one slot and does
+  not walk the chunk. Capacities follow the visible rows, the player marker,
+  and the live particles.
+- Each chunk owns its sparse rows. A view change streams those runs. An
+  unchanged view patches the queued chunks.
 - Dynamic records are reordered once. Submit streams that order. Sparse emit
-  streams its sorted columns.
-- The GPU tile fill is a stage. The tuner keeps it inline.
+  streams its sorted columns. The draw list merges the two ordered streams;
+  static wins an equal order.
+- A GPU edit records the changed chunks, and the plan walks that list. The
+  GPU tile fill is a stage. The tuner keeps it inline.
 
 ### Architecture notes
 
@@ -136,10 +140,10 @@ and `.grok/rules/render.md` in the backend pass.
 
 ### Acceptance checks
 
-- [ ] `render-game-prep-offview` meets its pass shape (recorded on the
-      collect item). `render-game-prep` runs on this tree (numbers on the
-      submit item). The previous commit aborts in `render-game-prep`, so
-      the regression comparison was not run.
+- [x] `render-game-prep-offview` is flat in the off-view count. Debug,
+      serial, one rep, tree `87fab8e`: 576 µs, 486 µs, and 520 µs at
+      4,096, 32,768, and 262,144 outside rows. In-view rows stay 1,024 and
+      collected rows stay 1,088.
 - [ ] `zig build gpu-smoke` on each available backend (display-gated).
       Vulkan exited 0 (window, sprite, tilemap, upload growth, OOM reserve).
       No other backend was run.

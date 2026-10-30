@@ -69,10 +69,12 @@ rejected deterministically during batch prep.
 
 The renderer owns a second, **static** set of vertex buffers for retained world
 geometry — now a small, bounded number of composite dense tilemap quads rather
-than one per dense layer (see GPU-Driven Tilemap). Each frame it
-builds one order-merged draw list from the dynamic draw groups plus the static spans,
-stable-sorted by `RenderOrder` (static appended first, so world/dense geometry draws
-under sparse/dynamic at equal order). Per source it binds that source's three
+than one per dense layer (see GPU-Driven Tilemap). Each frame `mergeDrawList`
+merges the two nondecreasing streams, static spans and dynamic groups. Equal
+orders emit static (`RenderOrder.lessOrEqual`), so dense geometry draws under
+sparse and dynamic draws at the same order. Adjacent sprite groups then
+coalesce. The merge does not sort. `appendStaticTilemapSpan` asserts each
+static span's order is nondecreasing. Per source it binds that source's three
 per-attribute buffers (position/uv/color at slots 0/1/2; both pipelines declare three
 vertex buffers) and the **sprite** or **tilemap** pipeline per `DrawGroup.material`.
 The static buffers re-upload only on a structural change, so a still or panning frame
@@ -277,32 +279,32 @@ growth source unchanged for retry.
   viewport crossing a power of two) lays the window out anew in a new store;
   the old one is swept. A layer added in play on an in-window level enters at
   the next sync.
-- **Edits.** A dig/build (`setDenseTile`, or a batched `applyDenseCellWrites`)
-  writes the CPU chunk store, the source of truth, which marks each block it
-  takes or changes (`BlockFill.changed`, render-only, never saved). A change on a
-  resident layer also flags the layer (`render_changed`) and the world
-  (`resident_layers_changed`); edits hold no GPU-side memory, so a world nobody renders
-  pays nothing for them. The next sync scans each flagged layer's chunks in the
-  window and compares the CPU form with the uploaded directory word: a chunk
-  that split takes a block and uploads its word and whole block, one that
-  returned to a single tile frees its block and uploads its word, a uniform
-  chunk at a new tile uploads its word, and a mixed chunk whose block is marked
-  uploads the whole block once. Every uploaded block's mark and every resident
-  flag clear at commit. A change on a chunk outside the window, or on a layer
-  not resident, uploads nothing; the chunk uploads whole when it enters.
-- **Cost.** Steady frame O(resident layers): the plan's per-slot scan and the
-  interleave collect. Pan across a chunk boundary O(L × Wc) CPU (`Wc`
-  window chunks) and O(L × e) uploads (`e` window edge in chunks), GPU memory
-  flat (`chunk-scale-gpu-sync-pan`, which also varies L at 2, 8, and 32).
-  Active level change O(L × Wc + the entering layer's mixed window blocks)
-  (`chunk-scale-gpu-sync-level-enter`, flat across level size and depth, L at
-  2, 8, and 32). One dig: an O(Wc) scan of its layer and one word or block
-  upload (`chunk-scale-gpu-sync-dig`, measured `639f55d`: flat across level size
-  and depth, linear in window chunks at about 82 ns per window chunk per flagged
-  layer, Debug). A batched change over many resident layers: one scan and its
-  uploads per written layer (measured linear in written layers, about 61 µs per
-  layer, upload-bound, Debug). Never dependent on chunks or levels
-  outside the window. Serial render-boundary work, O(window).
+- **Edits.** A dig or build (`setDenseTile`, or a batched `applyDenseCellWrites`)
+  writes the CPU chunk store, the source of truth, and marks each block it
+  takes or changes (`BlockFill.changed`, render-only, never saved). A resident
+  in-window chunk is recorded (`markRenderChanged` into `changed_chunks`) and
+  the layer and world are flagged (`render_changed`,
+  `resident_layers_changed`). Edits hold no GPU-side memory, so a world nobody
+  renders pays nothing for them. The next `GpuTileMirror.plan` walks that
+  recorded list, not the window's other chunks, and compares each chunk that
+  stays resident with its uploaded directory word: a chunk that split takes a
+  block and uploads its word and whole block, one that returned to a single
+  tile frees its block and uploads its word, a uniform chunk at a new tile
+  uploads its word, and a mixed chunk whose block is marked uploads the whole
+  block once. Commit clears every uploaded block's mark, every resident
+  layer's flag, and the recorded list. A chunk outside the window, or a layer
+  that is not resident, is not recorded and uploads nothing until it enters.
+- **Cost.** Derived from `syncDenseTileStore` and `GpuTileMirror.plan`: O(1)
+  when nothing changed; O(recorded chunks) for an edit, which never scans the
+  window; O(resident layers × window chunks) when the window, level, or layer
+  set moves. A pan uploads the chunks entering the window
+  (`chunk-scale-gpu-sync-pan`). An active-level change uploads the entering
+  layers (`chunk-scale-gpu-sync-level-enter`). One dig uploads that chunk's
+  word or its block when the uploaded form differs
+  (`chunk-scale-gpu-sync-dig`). GPU memory follows the
+  window. Never dependent on chunks or levels outside the window. The value
+  fill is a stage over the upload's `u32` elements; a worker dispatch costs
+  more than the copy, so the tuner keeps that path inline (`fillUploadValues`).
 
 The world holds only a non-owning, generational `TileDataId` (slot index plus
 generation, the `TextureId` pattern); no game teardown releases the store.
@@ -349,25 +351,29 @@ Default `DenseLayerRenderWindow` (`world/render.zig`):
 authored underground stack: composite bucketing keeps fragment cost off window
 depth in the common case (one draw), and the chain carries any number of
 layers. `collectDenseSubmitLayers` visits only the window's levels through their
-band lists, sorts back-to-front, and lists them topmost-first for the chain.
+band lists, records one depth per layer, and sorts that key with the layer
+id. The composite cut reads the resident layers' depth column. The list is
+topmost-first for the chain.
 Nothing caps the window's layers except the store width fit above.
 `render_prep.staticGeometryCapacity` reserves one span per resident layer
 (`WorldSystem.maxDenseSubmitDrawCount`), the most composite draws a frame can
 cut.
 
 **Sparse/dense boundary:** the window update (`setVisibleChunksForWorldRect`,
-which also takes the active level and sets `render_side`) builds the window's
-sparse list: the sparse tiles on the render window's levels, in its chunks
-(each chunk's own row list, streamed as one run) and inside its tile bounds,
-copied as depth, cell, and tile id and sorted into that order, with one range
-per distinct depth. It counts, reserves, then fills, so work and memory follow
-the tiles in the window (O(window levels × window chunks + V log V)), never the
-world's sparse count, level size, or depth; an allocation failure leaves the
-previous window and list in place and the next call retries. A still camera or
-sub-tile pan returns early. `addSparseTile` appends into that chunk's run, or
-doubles the run when it is full, and marks the list for rebuild only when the
-tile lands inside the current window. A removal marks it only when the removed
-tile is inside the window. Nothing is listed before a window is set. Dynamic
+which also takes the active level and sets `render_side`) keeps the window's
+sparse list: depth, cell, and tile id, one range per distinct depth. An
+unchanged window, level, and `render_window` with nothing queued returns
+without walking. That same view with queued chunks splices each queued chunk's
+run into the sorted rows; the other chunks are not walked or sorted. A view
+change recounts and sorts: it counts, reserves, then fills, walking each
+chunk's own row list inside the tile bounds. A recount is O(window levels ×
+window chunks + V log V) for the V tiles in the window, never the world's
+sparse count, level size, or depth. An allocation failure leaves the previous
+window and list in place and the next call retries. `addSparseTile` appends into that chunk's run, or grows that chunk only (one
+row when empty, otherwise double), and queues the chunk when the tile is
+inside the current window. A removal queues the chunk
+when the removed tile is inside the window. Nothing is listed before a window
+is set. Dynamic
 sparse prep reserves `reserveRenderRecords` (the list's length);
 `sparseDepthRangeCount`/`sparseDepthRangeAt` give the window's sparse depths
 for interleave points, and `submitVisibleSparseRange` submits one range. Draw
@@ -375,40 +381,46 @@ order never depends on a tile's storage index. Sparse overlays and dense
 composite draws interleave in the merged draw list by `RenderOrder`;
 per-entity depth cull (Slice 25E) is separate from this floor window.
 
-### Dynamic entity collect (Slice 24B)
+### Dynamic entity collect
 
-`render_prep.collectDynamicRecords` walks each visible chunk's drawable run on
-the movement store, for the render window's levels, plus the player row when
-its chunk is inside the camera rect and its level is not. It does not visit
-off-view rows. `dynamicRecordCapacity` and `spriteCommandCapacity` follow those
-visible rows, the player marker, and the live particles, not the world's
-population. Scope tier and pin metadata are not read during collect.
+`render_prep.collectDynamicRecords` walks each visible chunk's drawable run
+for the render window's levels. It does not visit off-view rows. Appearance
+(color, depth, asset, facing, and the player marker) lives on that run;
+`emitCollectedRow` reads it. `refreshRunPose` copies only the run's pose.
+Scope tier and pin metadata are not read.
 
-Gates before interpolation and `PreparedDraw` construction (in order):
+When the player's level is outside the render window and the player's chunk is
+inside `visibleChunkRegion()`, collect copies that one movement row's pose
+into its `drawable_slot` and emits that slot. It does not walk the chunk.
+`visibleDrawableRows` counts that row in the capacity.
 
-1. **Chunk** — `WorldSystem.visibleChunkRegion()` (camera window; unset skips all
-   rows). Uses `scope.chunk_x/y` from the movement-body scope columns — updated
-   during the movement integration pass. Entities teleported via `setMovementBody`
-   or rendered before the first movement tick may retain default `(0,0)` chunk
-   coords until movement runs; pixel AABB is the second gate.
+`dynamicRecordCapacity` is those visible-chunk rows, plus one player-marker
+slot, plus the live particles. `spriteCommandCapacity` is the window's sparse
+list (`reserveRenderRecords`), the same rows, marker, and particles, and the
+stacked-UI headroom. Neither follows the world's population.
+
+Gates for an entity row, before its record is built:
+
+1. **Chunk run** — drawable runs of `visibleChunkRegion()` on the render
+   window's levels. An unset window skips the entity walk. The out-of-window
+   player above is the one exception, and it is a single slot.
 2. **Camera AABB** — `VisibleWorldRect.overlapsAabb` on the lerped footprint
    (camera rect + `overscan_chunks` margin). Demo runtime uses
    `world_render_overscan_chunks = 1` in `game_demo_state.zig`.
 
-**Simulation tier is not consulted.** Slice 24 LOD (`dormant`/`kinematic`/etc.)
-controls fixed-step processor participation only. Render visibility is camera
-policy only — an on-screen `dormant` row still draws; an off-screen `cognition`
-row does not.
+Live particles are separate: each renderable particle is tested against that
+same AABB, not against a chunk run.
+
+**Simulation tier is not consulted.** Tier (`dormant`, `kinematic`, and the
+rest) controls fixed-step processor participation only. Render visibility is
+camera policy only: an in-window `dormant` row whose footprint overlaps the
+camera rect is emitted; a row outside the window is not.
 
 **Dense floors (separate cost model):** in-window dense layers submit as a small,
 bounded number of composite tilemap quads (see GPU-Driven Tilemap), not one draw
 per layer or per visible tile. GPU clips to the viewport; submit/draw count
 scales with interleave points this frame, not window depth. Chunked dense submit
 is a future optimization if profiling requires it.
-
-A pre-built visible movement dense-index list (parallel to scoped simulation
-gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
-[`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 
