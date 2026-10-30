@@ -3,7 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: collect items landed. The backend and subsystem passes are done.**
-Their unfixed findings are the open items below. Next is the draw-list merge.
+Their unfixed findings are the open items below. Next is the sprite-prep layout.
 Do not start slice 88 until those items are fixed or explicitly left.
 `verify` passes. `gpu-smoke` passed on Vulkan only.
 
@@ -81,13 +81,11 @@ and `.grok/rules/render.md` in the backend pass.
 - [x] Subsystem pass. `render_depth.zig` matches its z contract. The GPU
       fill staying inline is the landed decision. The findings are items
       below.
-- [ ] Draw-list merge. `mergeDrawList` (`src/render/renderer.zig:1912`)
-      sorts two already-ordered streams on the main thread every frame.
-      Failure scenario: visible sprite count G pays O(G log G) wide swaps,
-      and `test "linear merge matches stable sort"` stays green with the
-      sort left in place. Pass: a two-pointer merge, static winning an equal
-      order, then the existing coalesce. `appendStaticTilemapSpan` asserts
-      nondecreasing order.
+- [x] Draw-list merge. `mergeDrawList` merges the two ordered streams,
+      static wins an equal order, then coalesces. `appendStaticTilemapSpan`
+      asserts nondecreasing order. Debug `render-game-prep` at 10,000 is
+      within noise: serial 9.00 ms against 8.85 ms, tuned 7.59 ms against
+      7.53 ms, 23 workers.
 - [ ] Sprite-prep lanes. `writeSpriteQuad` (`src/render/sprite_batch.zig:664`)
       runs a 4-corner kernel inside the per-sprite loop and drains it to
       scalar stores. Failure scenario: the sprite population never streams

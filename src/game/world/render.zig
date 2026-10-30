@@ -2058,8 +2058,8 @@ test "underground dense layers append in storage order not ascending render dept
     const dirt_dark_depth = denseLayerOrder(&world, 2).depth;
     // Back-to-front draw order: dirt_dark, dirt, grass (grass on top).
     try std.testing.expect(dirt_dark_depth < dirt_depth and dirt_depth < grass_depth);
-    // `submitStaticDenseGeometry` walks dense_layer index order (surface first):
-    // depths descend with index, so a linear merge must not assume ascending input.
+    // Storage index is not depth order. Submit appends the sorted resident
+    // layers, so successive appendStaticTilemapSpan orders are nondecreasing.
     try std.testing.expect(grass_depth > dirt_depth and dirt_depth > dirt_dark_depth);
 }
 

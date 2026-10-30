@@ -793,6 +793,12 @@ pub const Renderer = struct {
         try self.static_groups.ensureTotalCapacity(self.allocator, self.static_groups.items.len + 1);
         try self.tilemap_window_layers.ensureTotalCapacity(self.allocator, self.tilemap_window_layers.items.len + 1);
         const window_slot = std.math.cast(u32, self.tilemap_window_layers.items.len) orelse return error.StaticGeometryTooLarge;
+        // One cycle is nondecreasing. `beginStaticGeometry` cleared the list, so
+        // the first span has no previous order.
+        if (self.static_groups.items.len != 0) {
+            const previous = self.static_groups.items[self.static_groups.items.len - 1].order;
+            std.debug.assert(previous.lessOrEqual(order));
+        }
         self.static_positions.appendSliceAssumeCapacity(vertices.positions);
         self.static_uvs.appendSliceAssumeCapacity(vertices.uvs);
         self.static_colors.appendSliceAssumeCapacity(vertices.colors);
@@ -932,8 +938,9 @@ pub const Renderer = struct {
             error.InvalidDrawableSize => return .skipped_no_swapchain,
             else => return err,
         };
-        // Sorting, texture metadata snapshots, and optional worker vertex prep
-        // happen before acquiring the swapchain to keep the acquired window short.
+        // The draw-list merge, texture metadata snapshots, and optional worker
+        // vertex prep happen before acquiring the swapchain to keep the acquired
+        // window short.
         try self.prepareFrameCommands(thread_system);
         // Unified draw list: retained static spans + dynamic groups, ordered and
         // coalesced. Rebuilt every frame because the dynamic groups change; the
@@ -1859,16 +1866,6 @@ pub const Renderer = struct {
     }
 };
 
-// Stable comparator for the unified draw list: by render order only, so equal
-// orders keep append order (static spans are appended before dynamic groups,
-// preserving the prior world-before-dynamic tie-break at the same depth).
-fn drawGroupOrderLessThan(_: void, a: DrawGroup, b: DrawGroup) bool {
-    const a_domain = @backingInt(a.order.domain);
-    const b_domain = @backingInt(b.order.domain);
-    if (a_domain != b_domain) return a_domain < b_domain;
-    return a.order.depth < b.order.depth;
-}
-
 // Coalesces adjacent draw groups sharing source, texture, and presentation that
 // are contiguous in their buffer. Compacts in place; returns the new length.
 fn coalesceDrawList(items: []DrawGroup) usize {
@@ -1894,8 +1891,10 @@ fn coalesceDrawList(items: []DrawGroup) usize {
     return write + 1;
 }
 
-// Builds the per-frame unified draw list from retained static spans and dynamic
-// groups: append (static first), stable-sort by order, then coalesce.
+/// Merges two nondecreasing draw streams into `out`: static spans and dynamic
+/// groups. Equal orders emit static (`RenderOrder.lessOrEqual`). Coalesces in
+/// place afterward. Does not sort. Clears, reserves the sum, then writes with
+/// `appendAssumeCapacity`.
 pub fn mergeDrawList(
     out: *std.ArrayList(DrawGroup),
     allocator: std.mem.Allocator,
@@ -1904,12 +1903,24 @@ pub fn mergeDrawList(
 ) !void {
     out.clearRetainingCapacity();
     try out.ensureTotalCapacity(allocator, static_groups.len + dynamic_groups.len);
-    out.appendSliceAssumeCapacity(static_groups);
-    out.appendSliceAssumeCapacity(dynamic_groups);
-    // Stability is load-bearing: static groups are appended first so that at equal
-    // order they draw before dynamic (world/dense under sparse/entities). Do not
-    // swap to an unstable sort without restoring that tie-break another way.
-    std.mem.sort(DrawGroup, out.items, {}, drawGroupOrderLessThan);
+    // Each step copies one group and branches on order, so this stays scalar.
+    var static_index: usize = 0;
+    var dynamic_index: usize = 0;
+    while (static_index < static_groups.len and dynamic_index < dynamic_groups.len) {
+        if (static_groups[static_index].order.lessOrEqual(dynamic_groups[dynamic_index].order)) {
+            out.appendAssumeCapacity(static_groups[static_index]);
+            static_index += 1;
+        } else {
+            out.appendAssumeCapacity(dynamic_groups[dynamic_index]);
+            dynamic_index += 1;
+        }
+    }
+    while (static_index < static_groups.len) : (static_index += 1) {
+        out.appendAssumeCapacity(static_groups[static_index]);
+    }
+    while (dynamic_index < dynamic_groups.len) : (dynamic_index += 1) {
+        out.appendAssumeCapacity(dynamic_groups[dynamic_index]);
+    }
     out.items.len = coalesceDrawList(out.items);
 }
 
@@ -2374,32 +2385,31 @@ test "draw list keeps non-contiguous spans separate" {
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
 }
 
-test "mergeDrawList sorts unsorted underground dense layers back to front" {
+test "draw list merge keeps a descending dynamic run in submission order" {
     const allocator = std.testing.allocator;
     var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
-    // `submitStaticDenseGeometry` appends in dense-layer index order (surface
-    // grass first), which is not ascending by render depth. The merge must sort
-    // so dirt_dark draws first and grass last.
-    var grass = testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6);
-    grass.material = .tilemap;
-    var dirt = testDrawGroup(.static, 0, .world, RenderOrder.world(-18), 6, 6);
-    dirt.material = .tilemap;
-    var dirt_dark = testDrawGroup(.static, 0, .world, RenderOrder.world(-34), 12, 6);
-    dirt_dark.material = .tilemap;
-    const static_groups = [_]DrawGroup{ grass, dirt, dirt_dark };
+    // One static group at depth 1, then a dynamic run at 2 then 0. A sort would
+    // emit 0, 1, 2; the merge copies the dynamic run as submitted.
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(1), 0, 6),
+    };
+    // Non-contiguous vertices so coalesce leaves both dynamic groups in place.
     const dynamic_groups = [_]DrawGroup{
-        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(-1), 0, 6),
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(2), 0, 6),
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(0), 12, 6),
     };
 
     try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
 
-    try std.testing.expectEqual(@as(usize, 4), list.items.len);
-    try std.testing.expectEqual(@as(i32, -34), list.items[0].order.depth);
-    try std.testing.expectEqual(@as(i32, -18), list.items[1].order.depth);
-    try std.testing.expectEqual(@as(i32, -2), list.items[2].order.depth);
-    try std.testing.expectEqual(@as(i32, -1), list.items[3].order.depth);
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqual(@as(i32, 1), list.items[0].order.depth);
+    try std.testing.expectEqual(DrawSource.static, list.items[0].source);
+    try std.testing.expectEqual(@as(i32, 2), list.items[1].order.depth);
+    try std.testing.expectEqual(DrawSource.dynamic, list.items[1].source);
+    try std.testing.expectEqual(@as(i32, 0), list.items[2].order.depth);
+    try std.testing.expectEqual(DrawSource.dynamic, list.items[2].source);
 }
 
 test "tilemap layer quads interleave with dynamic groups by render order" {
@@ -3219,6 +3229,16 @@ test "submits past the reservation inside the command list's slack pass the high
     // what makes `ensureFrameBatchCapacity` grow (and can GPU-idle stall).
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
     try std.testing.expect(renderer.spriteCommandCount() > renderer.command_high_water);
+}
+
+// Reference comparator for the pre-sorted parity test. Stable: domain, then
+// depth; equal orders keep append order. The test appends static before
+// dynamic, so an equal order stays static-first, matching the merge.
+fn drawGroupOrderLessThan(_: void, a: DrawGroup, b: DrawGroup) bool {
+    const a_domain = @backingInt(a.order.domain);
+    const b_domain = @backingInt(b.order.domain);
+    if (a_domain != b_domain) return a_domain < b_domain;
+    return a.order.depth < b.order.depth;
 }
 
 test "linear merge matches stable sort for pre-sorted static and dynamic groups" {
