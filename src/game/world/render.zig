@@ -133,11 +133,19 @@ pub const SparseWindow = struct {
     }
 };
 
+// One desired slot's sort key. Depth is filled once before the sort.
+const DenseLayerKey = struct {
+    depth: i32,
+    id: u32,
+};
+
 /// Render-path state of the dense window, sized at the GPU sync's plan to the
 /// window's layer count so the frame's submit allocates nothing. Render-only.
 pub const DenseRenderScratch = struct {
     // The window's layers, topmost first (`collectDenseSubmitLayers`).
     desired: std.ArrayList(u32) = .empty,
+    // Sort buffer for `desired`: one depth per window layer, moved with its id.
+    desired_keys: std.ArrayList(DenseLayerKey) = .empty,
     // Resident layers, deepest first, and their render depths (ascending).
     layers: std.ArrayList(u32) = .empty,
     layer_depths: std.ArrayList(i32) = .empty,
@@ -150,6 +158,7 @@ pub const DenseRenderScratch = struct {
 
     pub fn deinit(self: *DenseRenderScratch, allocator: std.mem.Allocator) void {
         self.desired.deinit(allocator);
+        self.desired_keys.deinit(allocator);
         self.layers.deinit(allocator);
         self.layer_depths.deinit(allocator);
         self.interleave.deinit(allocator);
@@ -677,13 +686,14 @@ pub fn submitStaticDenseGeometry(
     }
 
     const layers = self.dense_render.layers.items;
+    const layer_depths = self.dense_render.layer_depths.items;
     try self.dense_render.buckets.resize(self.allocator, layers.len);
     try self.dense_render.submitted_interleave.ensureTotalCapacity(self.allocator, interleave_depths.len);
     renderer.beginStaticGeometry();
 
     if (layers.len > 0) {
         const buckets = self.dense_render.buckets.items;
-        const bucket_count = partitionDenseCompositeBuckets(self, layers, interleave_depths, buckets);
+        const bucket_count = partitionDenseCompositeBuckets(layers, layer_depths, interleave_depths, buckets);
 
         // Only the world-space corners (position) are consumed by the tilemap
         // shader; the source/uv are ignored, so the source rect is a
@@ -709,7 +719,7 @@ pub fn submitStaticDenseGeometry(
             // `resolved_depth == 0` within its own draw.
             window_layers.is_shallowest_bucket = bucket.end == layers.len;
             // Order = the bucket's own shallowest layer (the last in its range).
-            const order = denseLayerOrder(self, layers[bucket.end - 1]);
+            const order = RenderOrder.world(layer_depths[bucket.end - 1]);
             try renderer.appendStaticTilemapSpan(
                 prepared.texture,
                 order,
@@ -726,20 +736,21 @@ pub fn submitStaticDenseGeometry(
     self.dense_render.submitted_interleave.appendSliceAssumeCapacity(interleave_depths);
 }
 
-/// Cuts `layers` (depth-ascending, deepest first) into composite-draw buckets:
-/// a new bucket boundary is placed at every point where an `interleave_depths`
-/// value falls strictly between two consecutive layers' depths (or exactly at
-/// the shallower one, since nothing may draw between that pair once composited
-/// together). `interleave_depths` must be sorted ascending and deduplicated
-/// (asserted). Writes bucket ranges into `out` (at least `layers.len` long) and
-/// returns the count; every cut consumes at least one layer, so the count never
-/// exceeds `layers.len`.
+/// Cuts `layers` (depth-ascending, deepest first) into composite-draw buckets.
+/// `layer_depths` is parallel to `layers`. A new bucket boundary is placed at
+/// every point where an `interleave_depths` value falls strictly between two
+/// consecutive depths (or exactly at the shallower one, since nothing may draw
+/// between that pair once composited together). `interleave_depths` must be
+/// sorted ascending and deduplicated (asserted). Writes bucket ranges into
+/// `out` (at least `layers.len` long) and returns the count; every cut consumes
+/// at least one layer, so the count never exceeds `layers.len`.
 fn partitionDenseCompositeBuckets(
-    self: *const WorldSystem,
     layers: []const u32,
+    layer_depths: []const i32,
     interleave_depths: []const i32,
     out: []WorldSystem.DenseCompositeBucket,
 ) usize {
+    std.debug.assert(layer_depths.len == layers.len);
     if (layers.len == 0) return 0;
     std.debug.assert(out.len >= layers.len);
     if (std.debug.runtime_safety and interleave_depths.len > 1) {
@@ -753,8 +764,8 @@ fn partitionDenseCompositeBuckets(
     for (1..layers.len + 1) |index| {
         var cut = index == layers.len;
         if (!cut) {
-            const prev_depth = denseLayerOrder(self, layers[index - 1]).depth;
-            const next_depth = denseLayerOrder(self, layers[index]).depth;
+            const prev_depth = layer_depths[index - 1];
+            const next_depth = layer_depths[index];
             while (interleave_index < interleave_depths.len and interleave_depths[interleave_index] <= prev_depth) {
                 interleave_index += 1;
             }
@@ -803,7 +814,9 @@ pub fn renderWindowLevels(self: *const WorldSystem, active_level: u16) ?RenderWi
 /// window's levels through their band lists: O(window layers log window layers).
 fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMemory}![]const u32 {
     const desired = &self.dense_render.desired;
+    const keys = &self.dense_render.desired_keys;
     desired.clearRetainingCapacity();
+    keys.clearRetainingCapacity();
     const levels = renderWindowLevels(self, active_level) orelse return desired.items;
     var count: usize = 0;
     var level = levels.first;
@@ -812,13 +825,27 @@ fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMe
         count += self.level_terrain.items[level].bandLayers().len;
     }
     try desired.ensureTotalCapacity(self.allocator, count);
+    try keys.ensureTotalCapacity(self.allocator, count);
     level = levels.first;
     while (level <= levels.last) : (level += 1) {
         if (!self.render_window.levelInWindow(active_level, @intCast(level), levels.max_level)) continue;
         desired.appendSliceAssumeCapacity(self.level_terrain.items[level].bandLayers());
     }
-    pdqSort(u32, desired.items, self, denseLayerIndexLessThan);
-    std.mem.reverse(u32, desired.items);
+    // One i32 depth per desired slot, before the sort. Compares read the key.
+    const columns = denseLayerOrderColumns(self);
+    for (desired.items) |id| {
+        keys.appendAssumeCapacity(.{
+            .depth = denseLayerDepth(&columns, id),
+            .id = id,
+        });
+    }
+    pdqSort(DenseLayerKey, keys.items, {}, denseLayerIndexLessThan);
+    // Ascending keys are deepest first. The id order written back is topmost first.
+    var index = keys.items.len;
+    for (desired.items) |*id| {
+        index -= 1;
+        id.* = keys.items[index].id;
+    }
     return desired.items;
 }
 
@@ -990,12 +1017,18 @@ pub fn commitDenseGpuSync(
     std.debug.assert(layers.capacity >= order.len and depths.capacity >= order.len);
     layers.clearRetainingCapacity();
     depths.clearRetainingCapacity();
+    const order_columns = DenseLayerOrderColumns{
+        .world = self,
+        .level_index = rows.items(.level_index),
+        .base_z = rows.items(.base_z),
+        .depth_band = rows.items(.depth_band),
+    };
     var index = order.len;
     while (index > 0) {
         index -= 1;
         const layer = self.gpu_tiles.slot_layer.items[order[index]];
         layers.appendAssumeCapacity(layer);
-        depths.appendAssumeCapacity(denseLayerOrder(self, layer).depth);
+        depths.appendAssumeCapacity(denseLayerDepth(&order_columns, layer));
     }
 }
 
@@ -1079,21 +1112,42 @@ pub fn sparseTileInWindow(self: *const WorldSystem, level: u16, x: u16, y: u16) 
     return view.window.tiles.contains(x, y);
 }
 
-fn denseLayerOrder(self: *const WorldSystem, layer_index: usize) RenderOrder {
+// Columns a depth read uses. A sort or a cut slices once and passes this.
+const DenseLayerOrderColumns = struct {
+    world: *const WorldSystem,
+    level_index: []const u16,
+    base_z: []const i32,
+    depth_band: []const WorldDepth,
+};
+
+fn denseLayerOrderColumns(self: *const WorldSystem) DenseLayerOrderColumns {
     const dense = self.dense_layers.slice();
-    return RenderOrder.world(self.worldZForLevel(
-        dense.items(.level_index)[layer_index],
-        dense.items(.base_z)[layer_index],
-        dense.items(.depth_band)[layer_index],
-    ));
+    return .{
+        .world = self,
+        .level_index = dense.items(.level_index),
+        .base_z = dense.items(.base_z),
+        .depth_band = dense.items(.depth_band),
+    };
 }
 
-// Depth, then layer index, so equal depths keep layer order whatever the input order.
-fn denseLayerIndexLessThan(self: *const WorldSystem, a: u32, b: u32) bool {
-    const depth_a = denseLayerOrder(self, a).depth;
-    const depth_b = denseLayerOrder(self, b).depth;
-    if (depth_a != depth_b) return depth_a < depth_b;
-    return a < b;
+fn denseLayerDepth(columns: *const DenseLayerOrderColumns, layer_index: usize) i32 {
+    return columns.world.worldZForLevel(
+        columns.level_index[layer_index],
+        columns.base_z[layer_index],
+        columns.depth_band[layer_index],
+    );
+}
+
+// One layer. Callers that read many layers pass `DenseLayerOrderColumns`.
+fn denseLayerOrder(self: *const WorldSystem, layer_index: usize) RenderOrder {
+    const columns = denseLayerOrderColumns(self);
+    return RenderOrder.world(denseLayerDepth(&columns, layer_index));
+}
+
+// Depth, then id, so equal depths keep layer order whatever the input order.
+fn denseLayerIndexLessThan(_: void, a: DenseLayerKey, b: DenseLayerKey) bool {
+    if (a.depth != b.depth) return a.depth < b.depth;
+    return a.id < b.id;
 }
 
 // Chunks a pixel extent spans at most, capped at `chunks`.
@@ -1129,6 +1183,14 @@ fn testSubmitLayers(world: *WorldSystem, active_level: u16, out: []u32) ![]u32 {
     const layers = out[0..desired.len];
     for (desired, 0..) |layer, index| layers[desired.len - 1 - index] = layer;
     return layers;
+}
+
+// One depth per `layers` entry, gathered once into the parallel buffer `out`.
+fn testLayerDepths(world: *const WorldSystem, layers: []const u32, out: []i32) []const i32 {
+    const columns = denseLayerOrderColumns(world);
+    const depths = out[0..layers.len];
+    for (layers, depths) |layer, *depth| depth.* = denseLayerDepth(&columns, layer);
+    return depths;
 }
 
 // Sets the render window to exactly the chunks [min, min + size) on both axes.
@@ -2650,6 +2712,41 @@ test "the window sparse list matches a chunk-ordered walk after interleaved adds
     try expectChunkLiveIndices(&mixed);
 }
 
+test "dense layer order from collectDenseSubmitLayers is topmost first" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const grass = try world.requireTileByName(&meta, "grass");
+    // Shallow levels first, so the band lists are not already depth order.
+    // The later equal-depth layer sits on the earlier level: the band walk is
+    // the reverse of layer index, and both layers share a base_z.
+    const early = try world.addLevel(10);
+    const late = try world.addLevel(10);
+    const lower = try world.addLevel(0);
+    const earlier_on_late = try world.addDenseLayer(late, 0, .floor, grass);
+    const later_on_early = try world.addDenseLayer(early, 0, .floor, grass);
+    const lower_floor = try world.addDenseLayer(lower, 0, .floor, grass);
+    try std.testing.expectEqual(@as(usize, 0), earlier_on_late);
+    try std.testing.expectEqual(@as(usize, 1), later_on_early);
+    try std.testing.expectEqual(@as(usize, 2), lower_floor);
+    try std.testing.expectEqual(denseLayerOrder(&world, later_on_early).depth, denseLayerOrder(&world, earlier_on_late).depth);
+    try std.testing.expect(denseLayerOrder(&world, lower_floor).depth < denseLayerOrder(&world, later_on_early).depth);
+
+    const layers = try collectDenseSubmitLayers(&world, 0);
+    // Equal depths keep layer-index order; the topmost-first reverse puts the higher index first.
+    const expected = [_]u32{ 1, 0, 2 };
+    try std.testing.expectEqualSlices(u32, &expected, layers);
+}
+
 test "dense layer submit order sorts back to front by render depth" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2657,11 +2754,16 @@ test "dense layer submit order sorts back to front by render depth" {
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    var indices: [3]u32 = .{ 0, 1, 2 };
-    std.mem.sort(u32, &indices, &world, denseLayerIndexLessThan);
-    try std.testing.expectEqual(@as(i32, -34), denseLayerOrder(&world, indices[0]).depth);
-    try std.testing.expectEqual(@as(i32, -18), denseLayerOrder(&world, indices[1]).depth);
-    try std.testing.expectEqual(@as(i32, -2), denseLayerOrder(&world, indices[2]).depth);
+    const columns = denseLayerOrderColumns(&world);
+    var keys = [_]DenseLayerKey{
+        .{ .depth = denseLayerDepth(&columns, 0), .id = 0 },
+        .{ .depth = denseLayerDepth(&columns, 1), .id = 1 },
+        .{ .depth = denseLayerDepth(&columns, 2), .id = 2 },
+    };
+    pdqSort(DenseLayerKey, &keys, {}, denseLayerIndexLessThan);
+    try std.testing.expectEqual(@as(i32, -34), keys[0].depth);
+    try std.testing.expectEqual(@as(i32, -18), keys[1].depth);
+    try std.testing.expectEqual(@as(i32, -2), keys[2].depth);
 }
 
 test "underground dense layers append in storage order not ascending render depth" {
@@ -2904,11 +3006,13 @@ test "partitionDenseCompositeBuckets returns a single bucket with no interleave 
     try world.addUndergroundLevels(&meta);
 
     var layer_buffer: [64]u32 = undefined;
+    var depth_buffer: [64]i32 = undefined;
     const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const depths = testLayerDepths(&world, layers, &depth_buffer);
     const count = layers.len;
 
     var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = partitionDenseCompositeBuckets(&world, layers[0..count], &.{}, &buckets);
+    const bucket_count = partitionDenseCompositeBuckets(layers, depths, &.{}, &buckets);
 
     try std.testing.expectEqual(@as(usize, 1), bucket_count);
     try std.testing.expectEqual(@as(usize, 0), buckets[0].start);
@@ -2935,7 +3039,9 @@ test "partitionDenseCompositeBuckets splits off the ceiling layer at the active 
     }
 
     var layer_buffer: [64]u32 = undefined;
+    var depth_buffer: [64]i32 = undefined;
     const layers = try testSubmitLayers(&world, 2, &layer_buffer);
+    const depths = testLayerDepths(&world, layers, &depth_buffer);
     const count = layers.len;
     try std.testing.expectEqual(@as(usize, 4), count);
 
@@ -2943,7 +3049,7 @@ test "partitionDenseCompositeBuckets splits off the ceiling layer at the active 
     // today's ceiling-vs-window split, now expressed as the general rule.
     const interleave = [_]i32{world.activeLevelActorDepth(2)};
     var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = partitionDenseCompositeBuckets(&world, layers[0..count], &interleave, &buckets);
+    const bucket_count = partitionDenseCompositeBuckets(layers, depths, &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, 2), bucket_count);
     try std.testing.expectEqual(@as(usize, 3), buckets[0].end - buckets[0].start);
@@ -2970,7 +3076,9 @@ test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a
     }
 
     var layer_buffer: [64]u32 = undefined;
+    var depth_buffer: [64]i32 = undefined;
     const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const depths = testLayerDepths(&world, layers, &depth_buffer);
     const count = layers.len;
     try std.testing.expectEqual(@as(usize, 7), count);
 
@@ -2979,7 +3087,7 @@ test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a
     // shallowest layer. This is the case an active-level-only design would miss.
     const interleave = [_]i32{world.worldZForLevel(5, 0, .effect)};
     var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = partitionDenseCompositeBuckets(&world, layers[0..count], &interleave, &buckets);
+    const bucket_count = partitionDenseCompositeBuckets(layers, depths, &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, 2), bucket_count);
     try std.testing.expectEqual(@as(usize, 2), buckets[0].end - buckets[0].start);
@@ -3009,20 +3117,22 @@ test "partitionDenseCompositeBuckets produces one bucket per cut point when ever
     }
 
     var layer_buffer: [64]u32 = undefined;
+    var depth_buffer: [64]i32 = undefined;
     const layers = try testSubmitLayers(&world, 0, &layer_buffer);
+    const depths = testLayerDepths(&world, layers, &depth_buffer);
     try std.testing.expectEqual(@as(usize, level_count), layers.len);
 
     // One interleave point strictly between every consecutive pair: one bucket per
     // layer, the most a partition can produce.
     var interleave: [level_count - 1]i32 = undefined;
     for (&interleave, 0..) |*depth, i| {
-        const deeper = denseLayerOrder(&world, layers[i]).depth;
-        const shallower = denseLayerOrder(&world, layers[i + 1]).depth;
+        const deeper = depths[i];
+        const shallower = depths[i + 1];
         depth.* = deeper + @divTrunc(shallower - deeper, 2);
     }
 
     var buckets: [64]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = partitionDenseCompositeBuckets(&world, layers, &interleave, &buckets);
+    const bucket_count = partitionDenseCompositeBuckets(layers, depths, &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, level_count), bucket_count);
     for (buckets[0..bucket_count]) |bucket| {
