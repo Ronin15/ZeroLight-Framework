@@ -2,10 +2,10 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: collect items landed (`c6c066c` through `5011383`).** Still on
-this slice: the backend pass, the subsystem pass, the `render-game-prep`
-regression line, `gpu-smoke` on the other backends, and `verify`. Do not
-start slice 88 until those are written up and fixed.
+**Status: collect items landed, and both passes are written below.** Next
+is the High draw-list merge, then the collect gather. Do not start slice 88
+until the findings below are fixed or explicitly left. `verify` passes.
+`gpu-smoke` passed on Vulkan only.
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile fill
@@ -76,17 +76,35 @@ and `.grok/rules/render.md` in the backend pass.
       3.95 ms at 4,096; 7.51 ms versus 8.84 ms at 10,000. Tuned used 23
       workers. The previous commit aborts in this bench, so there is no
       before.
-- [ ] Render backend pass, last on the core branch: the renderer, sprite
-      batch, text, and GPU buffers, plus `src/render/camera.zig`,
-      `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig`, which no
-      other pass covers (docs audit L5), against the cost model and
-      `render.md`; local fixes land here, and structural findings become
-      items here.
-- [ ] The whole subsystem checked against the cost model and the rules
-      (owner 2026-10-16), not only the items above: `src/game/render_prep.zig`
-      the GPU tile sync (`src/game/world/gpu_tiles.zig`), `world/render.zig`,
-      `render_depth.zig`, and the `data_system/visual.zig` store. Each finding
-      becomes an item here.
+- [x] Render backend pass. Camera, debug overlay, fps counter, resources,
+      and the GPU helpers had no finding. Two findings:
+      - High. `mergeDrawList` (`renderer.zig:1912`) sorts two already-ordered
+        streams on the main thread every frame. The batcher must merge them
+        in order, static winning a tie, then coalesce. A stable `std.mem.sort`
+        stays green against the existing compare test.
+      - High. Sprite prep (`sprite_batch.zig:664`) runs a 4-corner kernel
+        inside the per-sprite loop and drains it to scalar stores. The lane
+        axis is across sprites. Needs a design before code.
+- [x] Subsystem pass. `render_depth.zig` matches its z contract. The GPU
+      fill staying inline is the landed decision. Findings:
+      - High. `emitCollectedRow` (`render_prep.zig:468`) still resolves each
+        visible row through the entity slot into visual, asset, and facing
+        columns. Copy those columns into the drawable run and read only the
+        run. The collect tests do not lock this.
+      - Medium. One cell edit makes `GpuTileMirror.plan` (`gpu_tiles.zig:403`)
+        scan every window chunk of each flagged layer. Record the changed
+        chunk and plan that list.
+      - Medium. One in-window sparse edit rebuilds and sorts the whole window
+        (`render.zig:163`). Patch the edited chunk's run into the sorted list.
+      - Medium. Tier-does-not-gate-drawing is tested on a helper collect does
+        not call (`render_prep.zig:758`). Assert it through
+        `collectDynamicRecords`.
+      - Low. `denseLayerOrder` slices inside the sort (`render.zig:793`).
+        Slice once and pass the columns.
+      - Low. The out-of-window player path scans the chunk run
+        (`render_prep.zig:486`). Emit `drawable_slot`.
+      - Low. `FacingStore.directionPtr` (`visual.zig:94`) needs its lifetime:
+        invalid after `rows` grows.
 - [x] The `render_game_prep` bench's module doc carries no review tags
       (`baa4e62`; `src/benchmarks/render_game_prep.zig:5-10` states what the
       group measures).
