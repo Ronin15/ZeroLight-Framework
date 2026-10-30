@@ -547,8 +547,8 @@ fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMe
 /// need and whenever the directory side changes; layers past the store's `u32`
 /// width are dropped deepest first and reported once. Call once per frame on
 /// the main thread before `submitStaticDenseGeometry` and swapchain acquisition.
-/// O(1) when nothing changed; O(window chunks) per resident layer changed since the
-/// last sync; O(resident layers × window chunks) when the window, level, or layer
+/// O(1) when nothing changed; O(recorded chunks) when resident chunks changed since
+/// the last sync; O(resident layers × window chunks) when the window, level, or layer
 /// set moves; never depends on chunks or levels outside the window. Every
 /// fallible step (plan, store creation, upload reserve) precedes the mirror
 /// commit, and the queue after it cannot fail, so an error leaves residency and
@@ -772,13 +772,17 @@ fn emitSparseRange(self: *const WorldSystem, sink: anytype, texture: TextureId, 
     return range.count;
 }
 
-/// Flags resident `layer_index` (columns `gpu_slots`, `render_changed`) for the
-/// next GPU sync after one of its cells changed; a layer outside the render window
-/// uploads whole when it enters. O(1).
-pub fn markRenderChanged(self: *WorldSystem, gpu_slots: []const u32, render_changed: []bool, layer_index: usize) void {
-    if (gpu_slots[layer_index] == world_gpu_tiles.no_slot) return;
+/// Records resident `layer_index`'s changed `chunk` (columns `gpu_slots`,
+/// `render_changed`) for the next GPU sync. A layer that is not resident, and a
+/// chunk outside the render window, uploads whole when it enters. The caller
+/// reserved one list slot when that chunk was not yet recorded. O(1).
+pub fn markRenderChanged(self: *WorldSystem, gpu_slots: []const u32, render_changed: []bool, layer_index: usize, chunk: u32) void {
+    const slot = gpu_slots[layer_index];
+    if (slot == world_gpu_tiles.no_slot) return;
     render_changed[layer_index] = true;
     self.resident_layers_changed = true;
+    const geom = self.chunkGeometry();
+    self.gpu_tiles.recordChangedChunk(@intCast(layer_index), slot, chunk % geom.chunks_x, chunk / geom.chunks_x, chunk);
 }
 
 /// Whether the current render window draws a sparse tile at (x, y) on `level`:
@@ -1737,6 +1741,75 @@ test "a new directory side with nothing resident lets the old store go and re-su
     try std.testing.expectEqual(world_gpu_tiles.no_slot, world.dense_layers.items(.gpu_slot)[layer]);
     try std.testing.expect(world.dense_quads_dirty);
     try std.testing.expectEqual(@as(usize, 0), world.maxDenseSubmitDrawCount());
+}
+
+test "a one-chunk edit uploads that chunk and does not walk the other window chunks" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 16x4 tiles in 4-tile chunks: four chunks in a row, all inside the window.
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = 16,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 0 },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    try testShowChunks(&world, 0, 0, 4, 1, 0);
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer deinitStaticTestRenderer(&renderer);
+    _ = try attachFakeTileStore(&renderer, &world);
+    try world.syncDenseTileStore(&renderer, 0, null);
+
+    // The edit records chunk 0. Chunk 2's store then disagrees with its uploaded
+    // word, but nothing recorded it: a window scan would upload it too.
+    _ = try world.setDenseTile(layer, 1, 1, water);
+    const geom = world.chunkGeometry();
+    const store = &world.dense_layers.items(.store)[layer];
+    _ = try store.ensureAvailable(allocator, geom.blockCells(), 1);
+    const poisoned: u32 = 2;
+    store.write(geom, poisoned, 0, water);
+    try std.testing.expect(store.blockChanged(poisoned));
+    const recorded = world.gpu_tiles.changed_chunks.items;
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqual(@as(u32, 0), recorded[0].chunk);
+    try std.testing.expectEqual(@as(u32, @intCast(layer)), recorded[0].layer);
+
+    try world.syncDenseTileStore(&renderer, 0, null);
+
+    const slot = world.dense_layers.items(.gpu_slot)[layer];
+    const directory = world.gpu_tiles.slotDirectory(slot);
+    // Chunk row 0, and the side covers the four-chunk window, so word == chunk x.
+    try std.testing.expect(world.gpu_tiles.side >= 4);
+    const edited_word = directory;
+    const poisoned_word = directory + poisoned;
+    var saw_edited = false;
+    for (world.gpu_tiles.spans.items) |span| {
+        try std.testing.expect(span.dst_element != poisoned_word);
+        if (span.dst_element == edited_word) saw_edited = true;
+    }
+    try std.testing.expect(saw_edited);
+    try std.testing.expectEqual(@as(usize, 2), world.gpu_tiles.spans.items.len);
+    try std.testing.expect(!store.blockChanged(0));
+    try std.testing.expect(store.blockChanged(poisoned));
+    try std.testing.expect(!world.resident_layers_changed);
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.changed_chunks.items.len);
 }
 
 test "setDenseTile on a resident layer uploads at the next sync; one outside the level window uploads when it enters" {

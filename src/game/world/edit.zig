@@ -269,7 +269,8 @@ pub fn beginDenseCellWriteReserve(self: *WorldSystem) void {
 /// A uniform chunk the write would split gets its tile block (and a composed chunk
 /// the write would split its bits slot) now, once per chunk, so N reserves in one
 /// scope (`beginDenseCellWriteReserve`) cover N writes however they share chunks.
-/// Reads are unchanged. O(bands + sparse tiles in the chunk), plus a one-time
+/// A resident in-window chunk reserves one GPU list slot per distinct chunk, not
+/// per cell. Reads are unchanged. O(bands + sparse tiles in the chunk), plus a one-time
 /// O(edge²) block and pool growth.
 pub fn reserveDenseCellWrite(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) WorldEditError!void {
     if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
@@ -279,6 +280,8 @@ pub fn reserveDenseCellWrite(self: *WorldSystem, layer_index: usize, x: u16, y: 
     const local = geom.localOf(x, y);
     const store = &self.dense_layers.items(.store)[layer_index];
     if (store.tile(geom, x, y) == tile_id) return;
+    const gpu_slot = self.dense_layers.items(.gpu_slot)[layer_index];
+    try self.gpu_tiles.reserveChangedChunk(self.allocator, gpu_slot, chunk % geom.chunks_x, chunk / geom.chunks_x);
     const level = self.denseLayerLevel(layer_index);
     const blocked = &self.level_terrain.items[level].blocked;
     const needs_block = store.writeNeedsBlock(chunk, tile_id);
@@ -302,9 +305,9 @@ pub fn reserveDenseCellWrite(self: *WorldSystem, layer_index: usize, x: u16, y: 
 /// truth, which marks its block changed) and the level's composed blocked bit,
 /// flags the layer for the next GPU sync when it is resident, and returns the
 /// compact change event. Tile-id validity is the caller's concern, so an empty
-/// (`invalid_tile_id`) write is allowed here. Every growth (tile block, bits
-/// slot) is ensured before the first mutation, so an OOM leaves the world
-/// unchanged and retryable; the GPU side allocates nothing.
+/// (`invalid_tile_id`) write is allowed here. Every growth (changed-chunk slot,
+/// tile block, bits slot) is ensured before the first mutation, so an OOM leaves
+/// the world unchanged and retryable.
 fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) WorldEditError!?WorldTileChangedEvent {
     if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
     if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
@@ -317,6 +320,10 @@ fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, ti
     const level = self.denseLayerLevel(layer_index);
     const blocked = &self.level_terrain.items[level].blocked;
     const new_composed = composedBlockedWith(self, level, x, y, layer_index, tile_id);
+    const gpu_slot = self.dense_layers.items(.gpu_slot)[layer_index];
+    if (self.gpu_tiles.changedChunkIsNew(gpu_slot, chunk % geom.chunks_x, chunk / geom.chunks_x)) {
+        try self.gpu_tiles.reserveChangedChunks(self.allocator, 1);
+    }
     if (store.writeNeedsBlock(chunk, tile_id)) try ensureDenseBlocks(self, store, geom.blockCells(), 1);
     if (blocked.setNeedsSlot(chunk, local, new_composed)) try ensureBlockedSlots(self, blocked, 1);
 
@@ -324,7 +331,7 @@ fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, ti
     blocked.set(geom, chunk, local, new_composed);
     // A layer outside the render window flags nothing: it uploads whole when it
     // enters.
-    world_render.markRenderChanged(self, self.dense_layers.items(.gpu_slot), self.dense_layers.items(.render_changed), layer_index);
+    world_render.markRenderChanged(self, self.dense_layers.items(.gpu_slot), self.dense_layers.items(.render_changed), layer_index, chunk);
     return .{
         .level = level,
         .x = x,
@@ -434,6 +441,23 @@ pub fn applyDenseCellWrites(
         .invalid_tile => return error.InvalidWorldTile,
     };
 
+    // One list slot per resident written layer not already recorded. Before any
+    // mutation, so an OOM leaves the world unchanged; a group that then changes
+    // no cell keeps the spare slot.
+    const gpu_slots = rows.items(.gpu_slot);
+    var render_marks: usize = 0;
+    for (groups, 0..) |group, group_index| {
+        const written = groupBandBits(masks, mask_words, group_index, false);
+        var cursor: u32 = 0;
+        while (written.next(cursor)) |band| : (cursor = band + 1) {
+            const layer = levels[group.level].bands.items[band];
+            const chunk_y = group.chunk / geom.chunks_x;
+            const chunk_x = group.chunk - chunk_y * geom.chunks_x;
+            render_marks += @intFromBool(self.gpu_tiles.changedChunkIsNew(gpu_slots[layer], chunk_x, chunk_y));
+        }
+    }
+    try self.gpu_tiles.reserveChangedChunks(self.allocator, render_marks);
+
     // Groups are in level order, so each level's pools reserve once: one block per
     // (band, chunk) a write splits and one slot per chunk not already mixed. The
     // counts are zeroed, summed, and read through the claimed bits alone.
@@ -516,7 +540,6 @@ pub fn applyDenseCellWrites(
     // Ordered merge: compact the event windows in group order (each window starts
     // at or after the merged length), flag the resident written layers of each
     // group that changed a cell, then return chunks left uniform to the pools.
-    const gpu_slots = rows.items(.gpu_slot);
     const render_changed = rows.items(.render_changed);
     var merged: usize = 0;
     for (groups, 0..) |group, group_index| {
@@ -526,7 +549,7 @@ pub fn applyDenseCellWrites(
         if (group.change_count == 0) continue;
         const written = groupBandBits(masks, mask_words, group_index, false);
         var cursor: u32 = 0;
-        while (written.next(cursor)) |band| : (cursor = band + 1) world_render.markRenderChanged(self, gpu_slots, render_changed, levels[group.level].bands.items[band]);
+        while (written.next(cursor)) |band| : (cursor = band + 1) world_render.markRenderChanged(self, gpu_slots, render_changed, levels[group.level].bands.items[band], group.chunk);
     }
     events.items.len += merged;
     for (groups, 0..) |group, group_index| {
@@ -822,14 +845,20 @@ pub fn reserveClearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y:
     const floor_layer = self.denseFloorLayerForLevel(level_index);
     const terrain = &self.level_terrain.items[level_index];
     var block_count: usize = 0;
+    var render_marks: usize = 0;
+    const gpu_slots = self.dense_layers.items(.gpu_slot);
+    const chunk_x = chunk % geom.chunks_x;
+    const chunk_y = chunk / geom.chunks_x;
     for (terrain.bandLayers()) |layer| {
         if (!self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) continue;
         block_count += @intFromBool(stores[layer].writeNeedsBlock(chunk, clearedBandTile(layer, floor_layer, floor_tile)));
+        render_marks += @intFromBool(self.gpu_tiles.changedChunkIsNew(gpu_slots[layer], chunk_x, chunk_y));
     }
     const needs_slot = terrain.blocked.setNeedsSlot(chunk, geom.localOf(x, y), false);
 
     // Fallible growth first; each materialized chunk is recorded for the scope.
     try self.dense_reserved_chunks.ensureUnusedCapacity(self.allocator, block_count + @intFromBool(needs_slot));
+    try self.gpu_tiles.reserveChangedChunks(self.allocator, render_marks);
     for (terrain.bandLayers()) |layer| {
         if (!self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) continue;
         if (!stores[layer].writeNeedsBlock(chunk, clearedBandTile(layer, floor_layer, floor_tile))) continue;
@@ -864,7 +893,7 @@ pub fn clearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y: u16, f
     for (self.level_terrain.items[level_index].bandLayers()) |layer| {
         if (!self.flagsFor(stores[layer].tile(geom, x, y)).blocks_movement) continue;
         stores[layer].write(geom, chunk, geom.localOf(x, y), clearedBandTile(layer, floor_layer, floor_tile));
-        world_render.markRenderChanged(self, gpu_slots, render_changed, layer);
+        world_render.markRenderChanged(self, gpu_slots, render_changed, layer, chunk);
         changed = true;
     }
 
@@ -1167,12 +1196,14 @@ const chunkBlockedCount = @import("test_support.zig").chunkBlockedCount;
 test "reserveDenseCellWrite covers N writes across uniform chunks on a resident layer (FailingAllocator)" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    // 8x8 tiles, 4x4 chunks: three writes land in three different uniform chunks and
-    // split three composed chunks; two more share the first chunk.
+    // 28x4 tiles, 4-tile chunks: seven chunks in a row, all resident. Fifteen cells
+    // of the first chunk (one left, so it stays mixed) plus one cell in each of the
+    // next five: six distinct chunks. The changed-chunk list's first growth is 5,
+    // so three chunks still fit without a stacked reserve and the sixth does not.
     var world = WorldSystem{
         .allocator = std.testing.allocator,
-        .width = 8,
-        .height = 8,
+        .width = 28,
+        .height = 4,
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 4,
     };
@@ -1188,7 +1219,18 @@ test "reserveDenseCellWrite covers N writes across uniform chunks on a resident 
     _ = try testSyncGpuTiles(&world, level);
     try testApplySync(&world, &gpu);
 
-    const writes = [_][2]u16{ .{ 0, 0 }, .{ 5, 1 }, .{ 2, 6 }, .{ 1, 0 }, .{ 3, 3 } };
+    var writes: [20][2]u16 = undefined;
+    var write_count: usize = 0;
+    for (0..4) |y| for (0..4) |x| {
+        if (x == 3 and y == 3) continue;
+        writes[write_count] = .{ @intCast(x), @intCast(y) };
+        write_count += 1;
+    };
+    for (1..6) |chunk_x| {
+        writes[write_count] = .{ @intCast(chunk_x * 4), 0 };
+        write_count += 1;
+    }
+    std.debug.assert(write_count == writes.len);
     world.beginDenseCellWriteReserve();
     for (writes) |cell| try world.reserveDenseCellWrite(layer, cell[0], cell[1], water);
     // Reads are unchanged by the reserve.
@@ -1196,9 +1238,12 @@ test "reserveDenseCellWrite covers N writes across uniform chunks on a resident 
         try std.testing.expectEqual(grass, world.denseTile(layer, cell[0], cell[1]));
         try std.testing.expect(!world.levelBlocksMovement(level, cell[0], cell[1]));
     }
-    // One block and one slot per distinct chunk, not per write.
-    try std.testing.expectEqual(@as(usize, 3), liveBlockCount(world.dense_layers.items(.store)[layer]));
-    try std.testing.expectEqual(@as(usize, 3), liveSlotCount(world.level_terrain.items[level].blocked));
+    // One block, one slot, and one GPU list slot per distinct chunk, not per cell.
+    // The list length has not moved; the slots are only reserved.
+    try std.testing.expectEqual(@as(usize, 6), liveBlockCount(world.dense_layers.items(.store)[layer]));
+    try std.testing.expectEqual(@as(usize, 6), liveSlotCount(world.level_terrain.items[level].blocked));
+    try std.testing.expectEqual(@as(usize, 0), world.gpu_tiles.changed_chunks.items.len);
+    try std.testing.expectEqual(@as(usize, 6), world.gpu_tiles.changed_held);
     {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         world.allocator = failing.allocator();
@@ -1214,13 +1259,13 @@ test "reserveDenseCellWrite covers N writes across uniform chunks on a resident 
     // A reserve whose write never comes leaves only an early block, which the next
     // scope returns to uniform.
     world.beginDenseCellWriteReserve();
-    try world.reserveDenseCellWrite(layer, 6, 6, water);
-    try std.testing.expectEqual(@as(?TileId, null), world.dense_layers.items(.store)[layer].uniformTile(3));
-    try std.testing.expectEqual(ChunkForm.mixed, world.levelChunkBlockedForm(level, 3));
+    try world.reserveDenseCellWrite(layer, 24, 0, water);
+    try std.testing.expectEqual(@as(?TileId, null), world.dense_layers.items(.store)[layer].uniformTile(6));
+    try std.testing.expectEqual(ChunkForm.mixed, world.levelChunkBlockedForm(level, 6));
     world.beginDenseCellWriteReserve();
-    try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(3));
-    try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 3));
-    try std.testing.expectEqual(@as(usize, 3), liveBlockCount(world.dense_layers.items(.store)[layer]));
+    try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(6));
+    try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 6));
+    try std.testing.expectEqual(@as(usize, 6), liveBlockCount(world.dense_layers.items(.store)[layer]));
 
     // Reserving a write that changes nothing reserves nothing.
     try world.reserveDenseCellWrite(layer, 0, 0, water);
@@ -1252,9 +1297,23 @@ test "writeDenseTileCell reserves its growth before mutating CPU tiles (FailingA
     try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(0));
     try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
 
-    // The block pool fails first; then, warmed, the composed-bits slot. Each OOM
-    // leaves the chunk's tiles and form, the composed bits, and the layer's render
-    // flag exactly as they were.
+    // The changed-chunk list is empty, so its reserve fails before any tile write.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+        try std.testing.expectError(error.OutOfMemory, world.setDenseTile(layer, 1, 1, water));
+        try std.testing.expectEqual(old_tile, world.denseTile(layer, 1, 1));
+        try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(0));
+        try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 0));
+        try std.testing.expect(!world.levelBlocksMovement(level, 1, 1));
+        try std.testing.expect(!world.dense_layers.items(.render_changed)[layer]);
+        try std.testing.expect(!world.resident_layers_changed);
+    }
+
+    // One changed-chunk slot, so the next failures are the block pool and then,
+    // warmed, the composed-bits slot. Each OOM leaves the tile and the render flag.
+    try world.gpu_tiles.reserveChangedChunks(std.testing.allocator, 1);
     for (0..2) |warmed| {
         if (warmed == 1) _ = try world.dense_layers.items(.store)[layer].ensureAvailable(std.testing.allocator, world.chunkGeometry().blockCells(), 1);
         // Block remap (resize_fail_index) as well as fresh alloc: ArrayList growth

@@ -98,12 +98,9 @@ and `.grok/rules/render.md` in the backend pass.
       7.94 ms to 8.01 ms (+0.9%), serial 9.88 ms to 9.40 ms (-4.9%), both
       within noise, 23 workers. Tuned `entity_collect` 6.90 ms to 6.67 ms.
       Serial `entity_collect` 7.63 ms to 7.22 ms.
-- [ ] GPU plan visits the changed chunks. `markRenderChanged`
-      (`src/game/world/render.zig:778`) stores a layer bool, and
-      `GpuTileMirror.plan` (`src/game/world/gpu_tiles.zig:403`) then scans
-      every window chunk of each flagged layer. Failure scenario: one cell
-      edit searches the whole camera window. Pass: the mark records the
-      changed chunk, and plan walks that list.
+- [x] GPU plan visits the changed chunks. `markRenderChanged` records the
+      changed chunk, and `GpuTileMirror.plan` walks that list. A one-chunk
+      edit uploads that chunk and does not walk the other window chunks.
 - [ ] Sparse window patch. One in-window sparse edit sets
       `sparse_window.dirty`, and the next
       `setVisibleChunksForWorldRect` (`src/game/world/render.zig:163`)

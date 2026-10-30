@@ -171,7 +171,7 @@ const DenseLayerRow = struct {
     // the layer is outside the render window.
     gpu_slot: u32,
     // Render-only: a cell changed on this layer while resident since the last GPU
-    // sync, which scans its window chunks' change marks. False while not resident.
+    // sync. The changed chunks are on `gpu_tiles`. False while not resident.
     render_changed: bool,
 };
 
@@ -240,9 +240,9 @@ pub const WorldSystem = struct {
     perf: Perf = .{},
     // Mirror of the renderer-owned GPU tile store holding the render window's dense
     // layers by chunk; `syncDenseTileStore` uploads what changed. Edits hold no GPU
-    // memory: a change on a resident layer sets the layer's `render_changed` and
-    // this flag, and the next sync scans that layer's window chunks for blocks
-    // marked changed (`BlockFill.changed`). Render-only; never read by simulation.
+    // store memory: a change on a resident in-window chunk records that chunk and
+    // sets the layer's `render_changed` and this flag, and the next sync walks that
+    // list. Render-only; never read by simulation.
     gpu_tiles: GpuTileMirror = .{},
     resident_layers_changed: bool = false,
     // The GPU directory side for the last visibility rect: a power of two covering
