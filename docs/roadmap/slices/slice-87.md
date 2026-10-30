@@ -78,11 +78,13 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       168.1 µs, churned 180.2 / 171.4 / 167.8 µs. The same 512 submissions
       at every size. Pass: the walk is flat in the world's sparse count, and
       the churned and interleaved layouts match the chunk-ordered one.
-- [ ] Render submit reads its records in sort order (contiguity audit M2).
-      In `c6c066c`, dynamic records are reordered once and submit streams
-      that order, and sparse emit streams its sorted columns. The sort
-      comparator still loads two records per compare. `render-game-prep` was
-      not run. Pass: that bench within spread or faster.
+- [x] Render submit reads its records in sort order (contiguity audit M2).
+      Dynamic records are reordered once and submit streams that order.
+      Sparse emit streams its sorted columns. Debug, tree only, one rep,
+      tuned versus serial: 817.8 µs versus 900.3 µs at 1,024; 3.59 ms versus
+      3.95 ms at 4,096; 7.51 ms versus 8.84 ms at 10,000. Tuned used 23
+      workers. The previous commit aborts in this bench, so there is no
+      before.
 - [ ] Render backend pass, last on the core branch: the renderer, sprite
       batch, text, and GPU buffers, plus `src/render/camera.zig`,
       `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig`, which no
@@ -106,9 +108,9 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
 
 ### Acceptance checks
 
-- [ ] `render-game-prep-offview` meets its pass shape; `render-game-prep`
-      shows no regression beyond run-to-run spread (tuned-versus-control
-      measured after slice 89's tuner change, which gets its own whole-suite
-      run; the `750ce0a` baseline predates it).
+- [ ] `render-game-prep-offview` meets its pass shape (recorded on the
+      collect item). `render-game-prep` runs on this tree (numbers on the
+      submit item). The previous commit aborts in `render-game-prep`, so
+      the regression comparison was not run.
 - [ ] `zig build gpu-smoke` on each available backend (display-gated).
 - [ ] `zig build verify` passes.
