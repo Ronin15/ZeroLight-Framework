@@ -2,13 +2,11 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](../archive/slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: collect walk landed.** The visible-chunk runs, the two capacities,
-and the off-view measure are in. Collect time and both capacities stay flat
-as the off-view rows grow.
-Routed by the 64G combined review (area C). The render backend pass closes
-the core branch and comes after the collect moves, so the same files are
-touched once; 88 follows the collect items, before the backend pass (index,
-merged order).
+**Status: collect and sparse runs are in `c6c066c`.** Next on this slice is
+`render-game-prep` for the submit-order pass, then the in-view collect test.
+The GPU fill stage is in that commit and stays; its pass is not met. The
+backend pass, the subsystem check, `gpu-smoke`, and `verify` close the core
+branch after slice 88.
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile sync's
@@ -67,7 +65,8 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       Measured: `render-game-prep-offview` above. Pass: collect time and the
       record and command capacities flat in off-view rows (group doc); the
       shape asserts land with the fix.
-- [ ] GPU sync copying off main. The fill is a stage. Debug, tree only, one
+- [ ] GPU sync copying off main. The fill stage is in `c6c066c`; do not
+      rewrite it. Debug, tree only, one
       rep, 118,528 uploaded elements at 32 layers: serial-direct 1.42–1.62 ms
       on main, thread-fixed-2 2.63 ms (2 workers), thread-fixed-auto 1.82 ms
       (23 workers). The tuned case stayed inline. Pass not met: main still
@@ -80,17 +79,10 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       at every size. Pass: the walk is flat in the world's sparse count, and
       the churned and interleaved layouts match the chunk-ordered one.
 - [ ] Render submit reads its records in sort order (contiguity audit M2).
-      Failure: `DynamicScenePrep` sorts an index array, `sort_indices`, by
-      (depth, sequence) (`render_prep.zig:216`, sorted at `:266`), its comparator loading two
-      records per compare (`:726-731`), and submit reads
-      `records[record_index]` through it (`:270-271`); the sparse window sorts
-      row ids over three pool columns (`world/render.zig:231`), and
-      `emitSparseRange` (`:627`) reads each row by id
-      (`.grok/rules/memory-performance.md` § Data-oriented design, § Hot
-      paths). Failure scenario: every frame reads the visible records out of
-      order, and the sort chases two records per compare. Pass: the dynamic
-      submit and the sparse emit each read their sorted rows in memory order;
-      `render-game-prep` within spread or faster.
+      In `c6c066c`, dynamic records are reordered once and submit streams
+      that order, and sparse emit streams its sorted columns. The sort
+      comparator still loads two records per compare. `render-game-prep` was
+      not run. Pass: that bench within spread or faster.
 - [ ] Render backend pass, last on the core branch: the renderer, sprite
       batch, text, and GPU buffers, plus `src/render/camera.zig`,
       `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig`, which no
