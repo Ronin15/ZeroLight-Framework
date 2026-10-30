@@ -1890,10 +1890,14 @@ fn exitOverlayLayer(world: *const WorldSystem) usize {
 // Level `level`'s sparse tiles as (cell, tile) pairs in row order, into `out`.
 fn sparseRowsOf(world: *const WorldSystem, level: u16, out: []CellTile) []CellTile {
     var count: usize = 0;
-    for (world.sparse_tiles.items(.level_index), 0..) |row_level, index| {
-        if (row_level != level) continue;
-        out[count] = .{ .cell = sparseTileCellCoord(world, index), .tile = world.sparse_tiles.items(.tile_id)[index] };
-        count += 1;
+    for (world.level_terrain.items[level].sparse_runs, 0..) |run, chunk_index| {
+        if (run.rows.len == 0) continue;
+        const chunk: u32 = @intCast(chunk_index);
+        const tiles = run.rows.items(.tile_id);
+        for (tiles, 0..) |tile, offset| {
+            out[count] = .{ .cell = sparseTileCellCoord(world, level, chunk, offset), .tile = tile };
+            count += 1;
+        }
     }
     return out[0..count];
 }

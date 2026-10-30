@@ -462,6 +462,7 @@ NON_PRODUCTION_ROOTS = {"src/tests.zig", "src/benchmark_runner.zig", "src/gpu_sm
 # for games), keyed `(path, name)` with the owner's reason. Only the owner adds entries.
 OWNER_KEPT_API = {
     ("src/app/state.zig", "pass_through_overlay"): "owner 2026-10-17: engine state preset kept for games",
+    ("src/render/renderer.zig", "queueTileStoreUploads"): "packed tile-upload API kept for gpu_smoke; the game sync adopts a filled buffer",
 }
 PUB_DECL = re.compile(r"^\s*pub\s+(?:inline\s+|extern\s+|export\s+)?(?:fn|const|var)\s+([A-Za-z_][A-Za-z0-9_]*)")
 # Entry hooks the compiler or std looks up by name.

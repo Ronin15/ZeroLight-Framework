@@ -30,6 +30,8 @@ const manifest = @import("../assets/manifest.zig");
 const WorldDepth = @import("render_depth.zig").WorldDepth;
 const render_depth = @import("render_depth.zig");
 const WorldSystem = @import("world/system.zig").WorldSystem;
+const GpuTileCopyThreads = @import("world/gpu_tiles.zig").GpuTileCopyThreads;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const level_z_step = @import("world/system.zig").level_z_step;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -211,9 +213,13 @@ pub const GameplayScene = struct {
 
 /// Reusable dynamic-record storage for a gameplay scene. Owned by the state
 /// instance for grow-only capacity; all algorithms live in this module.
+/// After collect, `records` are in (depth, sequence) order and each depth
+/// span is a contiguous range of them. `sort_indices` is reorder scratch and
+/// is empty then.
 pub const DynamicScenePrep = struct {
     allocator: std.mem.Allocator,
     records: std.ArrayList(DynamicRenderRecord) = .empty,
+    /// Reorder scratch. Empty once `records` are in (depth, sequence) order.
     sort_indices: std.ArrayList(usize) = .empty,
     depth_spans: std.ArrayList(DynamicDepthRange) = .empty,
     next_sequence: usize = 0,
@@ -271,19 +277,20 @@ pub const DynamicScenePrep = struct {
 
         const records = self.records.items;
         pdqSort(usize, self.sort_indices.items, records, sortRecordIndexLessThan);
+        placeRecordsInIndexOrder(records, self.sort_indices.items);
+        self.sort_indices.clearRetainingCapacity();
 
         var span_start: usize = 0;
-        var current_depth = records[self.sort_indices.items[0]].depth;
-        for (self.sort_indices.items, 0..) |record_index, sorted_index| {
-            const depth = records[record_index].depth;
-            if (depth != current_depth) {
+        var current_depth = records[0].depth;
+        for (records, 0..) |record, index| {
+            if (record.depth != current_depth) {
                 self.depth_spans.appendAssumeCapacity(.{
                     .start = span_start,
-                    .end = sorted_index,
+                    .end = index,
                     .depth = current_depth,
                 });
-                span_start = sorted_index;
-                current_depth = depth;
+                span_start = index;
+                current_depth = record.depth;
             }
         }
         self.depth_spans.appendAssumeCapacity(.{
@@ -353,6 +360,7 @@ pub fn submitGameplayFrame(
     runtime_assets: *const RuntimeAssets,
     interpolation_alpha: f32,
     camera_rect: Rect,
+    thread_system: ?*ThreadSystem,
 ) !void {
     const visible = VisibleWorldRect.fromCameraRect(
         camera_rect,
@@ -361,7 +369,7 @@ pub fn submitGameplayFrame(
         scene.world.tile_size,
     );
     try collectDynamicRecords(prep, scene, visible, runtime_assets, interpolation_alpha);
-    try submitLayeredWorld(scene, prep, renderer, runtime_assets);
+    try submitLayeredWorld(scene, prep, renderer, runtime_assets, thread_system);
 }
 
 fn visibleDrawableRows(scene: GameplayScene) usize {
@@ -526,8 +534,14 @@ fn submitLayeredWorld(
     prep: *DynamicScenePrep,
     renderer: *Renderer,
     runtime_assets: *const RuntimeAssets,
+    thread_system: ?*ThreadSystem,
 ) !void {
-    try scene.world.syncDenseTileStore(renderer, scene.player_level);
+    const threads: ?GpuTileCopyThreads = if (thread_system) |system| .{
+        .thread_system = system,
+        .tuner = &scene.world.gpu_tile_copy_tuner,
+        .controls = .{},
+    } else null;
+    try scene.world.syncDenseTileStore(renderer, scene.player_level, threads);
     try ensureStaticGeometryCapacity(scene, renderer);
     const interleave_depths = collectDenseInterleaveDepths(scene, prep);
     try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level, interleave_depths);
@@ -545,10 +559,8 @@ fn submitLayeredWorld(
             },
             .dynamic => {
                 const dynamic_range = prep.depth_spans.items[dynamic_span_index - 1];
-                const sorted_indices = prep.sort_indices.items;
-                const records = prep.records.items;
-                for (sorted_indices[dynamic_range.start..dynamic_range.end]) |record_index| {
-                    try submitPreparedDraw(renderer, records[record_index].draw);
+                for (prep.records.items[dynamic_range.start..dynamic_range.end]) |record| {
+                    try submitPreparedDraw(renderer, record.draw);
                 }
                 dynamic_depth = nextDynamicDepth(prep, &dynamic_span_index);
             },
@@ -762,6 +774,27 @@ fn sortRecordIndexLessThan(records: []const DynamicRenderRecord, lhs_index: usiz
     return lhs.sequence < rhs.sequence;
 }
 
+// Scalar: the next source is the permutation. A placed slot stores its own
+// index so a later start skips it. `order[dest]` is the source slot.
+fn placeRecordsInIndexOrder(records: []DynamicRenderRecord, order: []usize) void {
+    std.debug.assert(order.len == records.len);
+    for (0..records.len) |start| {
+        if (order[start] == start) continue;
+        const held = records[start];
+        var dest = start;
+        while (true) {
+            const source = order[dest];
+            order[dest] = dest;
+            if (source == start) {
+                records[dest] = held;
+                break;
+            }
+            records[dest] = records[source];
+            dest = source;
+        }
+    }
+}
+
 fn testScopeColumns(chunk_x: []const i32, chunk_y: []const i32, tier: []const SimulationTier) ConstScopeColumnsSlice {
     return .{
         .entities = &.{},
@@ -813,14 +846,75 @@ test "render collect chunk gate ignores simulation tier" {
 test "render collect record sort orders depth then sequence" {
     const unit_rect = Rect{ .x = 0, .y = 0, .w = 1, .h = 1 };
     const unit_color = Color{ .r = 1, .g = 1, .b = 1, .a = 1 };
-    const records = [_]DynamicRenderRecord{
-        .{ .depth = 10, .sequence = 2, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } },
-        .{ .depth = 5, .sequence = 9, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(5) } } },
-        .{ .depth = 10, .sequence = 1, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } },
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try prep.ensureCapacity(4);
+    prep.appendWithSequence(.{ .depth = 10, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } }, 2);
+    prep.appendWithSequence(.{ .depth = 5, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(5) } } }, 9);
+    prep.appendWithSequence(.{ .depth = 10, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } }, 1);
+    prep.appendWithSequence(.{ .depth = 30, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(30) } } }, 4);
+    prep.finalizeDepthBuckets();
+
+    const records = prep.records.items;
+    try std.testing.expectEqual(@as(usize, 0), prep.sort_indices.items.len);
+    try std.testing.expectEqual(@as(usize, 4), records.len);
+    try std.testing.expectEqual(@as(i32, 5), records[0].depth);
+    try std.testing.expectEqual(@as(usize, 9), records[0].sequence);
+    try std.testing.expectEqual(@as(i32, 10), records[1].depth);
+    try std.testing.expectEqual(@as(usize, 1), records[1].sequence);
+    try std.testing.expectEqual(@as(i32, 10), records[2].depth);
+    try std.testing.expectEqual(@as(usize, 2), records[2].sequence);
+    try std.testing.expectEqual(@as(i32, 30), records[3].depth);
+    try std.testing.expectEqual(@as(usize, 4), records[3].sequence);
+
+    const spans = prep.depthSpans();
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(DynamicDepthRange{ .start = 0, .end = 1, .depth = 5 }, spans[0]);
+    try std.testing.expectEqual(DynamicDepthRange{ .start = 1, .end = 3, .depth = 10 }, spans[1]);
+    try std.testing.expectEqual(DynamicDepthRange{ .start = 3, .end = 4, .depth = 30 }, spans[2]);
+}
+
+test "render collect record sort submit streams reordered records" {
+    const allocator = std.testing.allocator;
+    const unit_rect = Rect{ .x = 0, .y = 0, .w = 1, .h = 1 };
+    const unit_color = Color{ .r = 1, .g = 1, .b = 1, .a = 1 };
+    var prep = DynamicScenePrep.init(allocator);
+    defer prep.deinit();
+    try prep.ensureCapacity(2);
+    prep.appendWithSequence(.{ .depth = 10, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } }, 2);
+    prep.appendWithSequence(.{ .depth = 5, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(5) } } }, 1);
+    prep.finalizeDepthBuckets();
+
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64, 64);
+    defer world.deinit();
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0, 0);
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+    var renderer = headlessRendererForTest(allocator);
+    defer deinitHeadlessRendererForTest(&renderer);
+    try fakeTileStoreForTest(&renderer, &world);
+    const scene = GameplayScene{
+        .data = undefined,
+        .world = &world,
+        .player_entity = try EntityId.init(0, 1),
+        .player_level = 0,
+        .particles = undefined,
+        .overscan_chunks = 0,
     };
-    try std.testing.expect(sortRecordIndexLessThan(&records, 1, 0));
-    try std.testing.expect(sortRecordIndexLessThan(&records, 2, 0));
-    try std.testing.expect(!sortRecordIndexLessThan(&records, 2, 1));
+
+    const before = renderer.spriteCommandCount();
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets, null);
+    const commands = renderer.batch.commands.items;
+    var matched: usize = 0;
+    for (commands[before..]) |command| {
+        if (command.sprite.dest.w != 1 or command.sprite.dest.h != 1) continue;
+        const record = prep.records.items[matched];
+        try std.testing.expectEqual(record.draw.rect.order, command.sprite.order);
+        matched += 1;
+    }
+    try std.testing.expectEqual(prep.records.items.len, matched);
 }
 
 test "layered world merge picks sparse on tie and exhausts either stream" {
@@ -1110,7 +1204,7 @@ test "static geometry capacity covers one span per resident layer" {
 
     // Nothing resident before the first sync.
     try std.testing.expectEqual(@as(usize, 0), staticGeometryCapacity(scene).span_capacity);
-    try world.syncDenseTileStore(&renderer, 0);
+    try world.syncDenseTileStore(&renderer, 0, null);
     const capacity = staticGeometryCapacity(scene);
     try std.testing.expectEqual(@as(usize, 4), capacity.span_capacity);
     try std.testing.expectEqual(capacity.span_capacity * 6, capacity.vertex_capacity);
@@ -1524,6 +1618,7 @@ fn deinitHeadlessRendererForTest(renderer: *Renderer) void {
     renderer.tile_stores.deinit(allocator);
     renderer.tile_merge_spans.deinit(allocator);
     renderer.tile_merge_values.deinit(allocator);
+    renderer.tile_merge_ops.deinit(allocator);
 }
 
 fn testWorldTilesetMeta() !WorldTilesetMeta {
@@ -1576,7 +1671,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
         .overscan_chunks = 0,
     };
 
-    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets, null);
 
     try std.testing.expectEqual(@as(usize, 2), renderer.static_groups.items.len);
     try std.testing.expectEqual(Material.tilemap, renderer.static_groups.items[0].material);
@@ -1626,7 +1721,7 @@ test "window sparse depths cut dense composites at any in-window level; a sparse
     };
 
     // Outside the window: one composite draw for both levels.
-    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets, null);
     try std.testing.expectEqual(@as(usize, 2), world.maxDenseSubmitDrawCount());
     try std.testing.expectEqual(@as(usize, 1), renderer.static_groups.items.len);
 
@@ -1635,7 +1730,7 @@ test "window sparse depths cut dense composites at any in-window level; a sparse
     renderer.tile_stores.items[0].pending_spans.clearRetainingCapacity();
     renderer.tile_stores.items[0].pending_values.clearRetainingCapacity();
     try world.setVisibleChunksForWorldRect(far, 0, 0);
-    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets, null);
     try std.testing.expectEqual(@as(usize, 2), renderer.static_groups.items.len);
 }
 
@@ -1691,7 +1786,7 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
 
     // One composite draw per resident layer: every one of the `num_gaps` cuts
     // survived despite 3x as many raw candidate depths feeding the collector.
-    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets, null);
     try std.testing.expectEqual(@as(usize, level_count), renderer.static_groups.items.len);
 }
 
@@ -1757,7 +1852,7 @@ test "a warmed layered-world frame allocates nothing across a pan and a level ch
             .particles = undefined,
             .overscan_chunks = 0,
         };
-        try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+        try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets, null);
         // The frame copy pass drains the store's queued uploads.
         renderer.tile_stores.items[0].pending_spans.clearRetainingCapacity();
         renderer.tile_stores.items[0].pending_values.clearRetainingCapacity();

@@ -67,24 +67,18 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       Measured: `render-game-prep-offview` above. Pass: collect time and the
       record and command capacities flat in off-view rows (group doc); the
       shape asserts land with the fix.
-- [ ] GPU sync copying off main. Failure scenario: an explosion's batched
-      change costs main time linear in the bytes it wrote. Measured: about
-      2 ms for 32 layers. Pass: main keeps only the ordered upload commit;
-      serial == threaded; `chunk-scale-gpu-sync-dig` gains threaded cases.
-- [ ] Sparse tiles read as contiguous runs per (level, chunk) (contiguity
-      audit M1). Failure: `sparse_tiles` (`world/system.zig:275`) links its
-      rows newest-first per (level, chunk) through `chunk_next` and
-      `chunk_prev` (`:194-195`) over one world-wide pool, and
-      `walkWindowSparseTiles` (`world/render.zig:178`) walks each window
-      chunk's list, reading `cell_index` from scattered pool rows;
-      `addSparseTile` appends in call order (`world/edit.zig:726`), so
-      worldgen order already interleaves chunks
-      (`.grok/rules/memory-performance.md` § Data-oriented design). Failure
-      scenario: the walk reruns whenever the window crosses a tile edge
-      (`world/system.zig:277-280`), walking fragments, more scattered after
-      dig and build churn. Pass: the window walk reads each chunk's sparse
-      rows as one contiguous run; churned and interleaved-creation
-      `render-sparse-window-pan` cases match a chunk-ordered one.
+- [ ] GPU sync copying off main. The fill is a stage. Debug, tree only, one
+      rep, 118,528 uploaded elements at 32 layers: serial-direct 1.42–1.62 ms
+      on main, thread-fixed-2 2.63 ms (2 workers), thread-fixed-auto 1.82 ms
+      (23 workers). The tuned case stayed inline. Pass not met: main still
+      copies the bytes, and forcing workers is slower at this size.
+- [x] Sparse tiles read as contiguous runs per (level, chunk). Each chunk
+      holds its own row list; the last removal frees it. Debug, tree only,
+      one rep, serial. Pan layouts at 1,000 / 16,000 / 256,000 tiles:
+      chunk-ordered 188.8 / 191.0 / 173.4 µs, interleaved 180.3 / 177.0 /
+      168.1 µs, churned 180.2 / 171.4 / 167.8 µs. The same 512 submissions
+      at every size. Pass: the walk is flat in the world's sparse count, and
+      the churned and interleaved layouts match the chunk-ordered one.
 - [ ] Render submit reads its records in sort order (contiguity audit M2).
       Failure: `DynamicScenePrep` sorts an index array, `sort_indices`, by
       (depth, sequence) (`render_prep.zig:216`, sorted at `:266`), its comparator loading two
@@ -113,7 +107,8 @@ text, and GPU buffers meet the cost model and `.grok/rules/render.md`.
       group measures).
 - [ ] Tests: collect output matches today's for in-view rows (order
       included); allocation-free warmed collect.
-- [ ] Docs: `docs/rendering-assets-shaders.md` collect and capacities.
+- [x] Docs: `docs/rendering-assets-shaders.md` collect and capacities, and
+      `docs/architecture.md` per-chunk sparse runs.
 
 ### Acceptance checks
 

@@ -5,14 +5,18 @@
 //! Sparse-tile render prep against the camera window as the world's sparse tile count (the
 //! item count) grows. A 2048x2048 world of 8 levels holds exactly 256 sparse tiles inside a
 //! fixed 1280x720 camera window on the active level, over four depths; every other tile sits
-//! outside the window's chunks on all levels. The window's work is the same at every size,
-//! so each group passes when flat in the world's sparse count:
+//! outside the window's chunks on all levels. The window's work is the same at every size.
+//! Pass shape: each layout is flat in the world's sparse count, and the interleaved and
+//! churned pans match the chunk-ordered pan. No timing-ratio assert.
 //!   - `render-sparse-window-frame`: one frame's window update (unchanged, so O(1)), depth
-//!     range walk, and sparse submit into a headless `SpriteBatch`.
-//!   - `render-sparse-window-pan`: the window pans one chunk across, a frame, back, a frame;
-//!     each pan rebuilds the window's sparse list.
+//!     range walk, and sparse submit into a headless `SpriteBatch`. Today's cell placement.
+//!   - `render-sparse-window-pan`: the same cells added chunk by chunk. The window pans one
+//!     chunk across, a frame, back, a frame; each pan rebuilds the window's sparse list.
+//!   - `render-sparse-window-pan-interleaved`: that same cell list shuffled with a fixed seed.
+//!   - `render-sparse-window-pan-churned`: chunk order, then an untimed clear and re-add of
+//!     every other blocking tile, so the timed pan sees the same set.
 //!   - `render-sparse-window-add`: one sparse tile added outside the window, then a frame.
-//!     Tiles are append-only in play, so the untimed reset drops the added tile.
+//!     Today's cell placement. The untimed reset drops that tile from its run.
 //! Fixtures build once per case outside the timed loop. Sparse prep is main-thread work, so
 //! the groups run serial only.
 
@@ -21,7 +25,7 @@ const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const TileId = @import("../game/world/system.zig").TileId;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
-const no_sparse_tile = @import("../game/world/terrain.zig").no_sparse_tile;
+const ChunkGeometry = @import("../game/world/terrain.zig").ChunkGeometry;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const Rect = @import("../render/renderer.zig").Rect;
 const TextureId = @import("../render/resources.zig").TextureId;
@@ -80,6 +84,24 @@ pub const pan_group = suite.BenchmarkGroup{
     .cases = &suite.serial_cases,
 };
 
+pub const pan_interleaved_group = suite.BenchmarkGroup{
+    .name = "render-sparse-window-pan-interleaved",
+    .item_label = "sparse tiles in the world",
+    .item_counts = &sparse_tile_counts,
+    .runCase = runPanInterleavedCase,
+    .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
+};
+
+pub const pan_churned_group = suite.BenchmarkGroup{
+    .name = "render-sparse-window-pan-churned",
+    .item_label = "sparse tiles in the world",
+    .item_counts = &sparse_tile_counts,
+    .runCase = runPanChurnedCase,
+    .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
+};
+
 pub const add_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-add",
     .item_label = "sparse tiles in the world",
@@ -92,15 +114,23 @@ pub const add_group = suite.BenchmarkGroup{
 const Workload = enum { frame, pan, add };
 
 fn runFrameCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .frame);
+    return runCase(allocator, io, options, case, item_count, .frame, .insertion);
 }
 
 fn runPanCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .pan);
+    return runCase(allocator, io, options, case, item_count, .pan, .chunk_ordered);
+}
+
+fn runPanInterleavedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .pan, .interleaved);
+}
+
+fn runPanChurnedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .pan, .churned);
 }
 
 fn runAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .add);
+    return runCase(allocator, io, options, case, item_count, .add, .insertion);
 }
 
 const Fixture = struct {
@@ -108,8 +138,9 @@ const Fixture = struct {
     batch: SpriteBatch,
     texture: TextureId,
     window_tile: TileId,
-    // Non-blocking, so adding and dropping it leaves the level's blocked bits alone.
+    // Blocking, so the untimed drop goes through `clearCellBlocking`.
     added_tile: TileId,
+    floor_tile: TileId,
     sparse_count: usize,
 
     fn deinit(self: *Fixture) void {
@@ -145,33 +176,62 @@ const Fixture = struct {
     }
 
     fn addOutsideTile(self: *Fixture) !void {
-        // An obstacle event would mean the tile set blocked bits the drop does not clear.
         const event = try self.world.addSparseTile(added_tile_level, added_tile_x, added_tile_y, self.added_tile, 0, .marker);
-        if (event != null) return error.AddedTileBlocksMovement;
+        if (event == null) return error.AddedTileBlocksMovement;
+        // Before the frame rebuild, which clears the flag.
+        if (self.world.sparse_window.dirty) return error.OutsideAddDirtiedWindow;
     }
 
-    // Drops the tile `addOutsideTile` appended, returning the world to `sparse_count`
-    // tiles: unlinks it from the head of its chunk list and truncates `sparse_tiles`.
-    // It invalidates nothing, as the add outside the window invalidated nothing.
+    // Drops the tile `addOutsideTile` wrote through the production clear.
     fn dropAddedTile(self: *Fixture) !void {
-        const world = &self.world;
-        if (world.sparse_tiles.len != self.sparse_count + 1) return error.AddedTileCountMismatch;
-        const added_index: u32 = @intCast(self.sparse_count);
-        const chunk = world.chunkCoordForCell(added_tile_x, added_tile_y);
-        const chunk_index: usize = @intCast(chunk.y * @as(i32, @intCast(world.chunkGeometry().chunks_x)) + chunk.x);
-        const heads = world.level_terrain.items[added_tile_level].sparse_heads;
-        if (heads[chunk_index] != added_index) return error.AddedTileIndexMismatch;
-        const rows = world.sparse_tiles.slice();
-        const next = rows.items(.chunk_next)[added_index];
-        heads[chunk_index] = next;
-        if (next != no_sparse_tile) rows.items(.chunk_prev)[next] = no_sparse_tile;
-        world.sparse_tiles.shrinkRetainingCapacity(self.sparse_count);
-        if (world.sparse_window.dirty) return error.OutsideAddDirtiedWindow;
+        const cleared = try self.world.clearCellBlocking(added_tile_level, added_tile_x, added_tile_y, self.floor_tile);
+        if (cleared == null) return error.AddedTileIndexMismatch;
+        if (@as(usize, self.world.sparse_live) != self.sparse_count) return error.AddedTileCountMismatch;
     }
 };
 
+const SparseLayout = enum { insertion, chunk_ordered, interleaved, churned };
+
+const layout_shuffle_seed: u64 = 0x87c0_a5e1;
+
+const SparseCell = struct { level: u16, x: u16, y: u16, depth: WorldDepth };
+
+fn sparseCellLessThan(geom: ChunkGeometry, a: SparseCell, b: SparseCell) bool {
+    if (a.level != b.level) return a.level < b.level;
+    const chunk_a = geom.chunkOf(a.x, a.y);
+    const chunk_b = geom.chunkOf(b.x, b.y);
+    if (chunk_a != chunk_b) return chunk_a < chunk_b;
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+}
+
+fn assertSparseRuns(world: *const WorldSystem, sparse_count: usize) void {
+    std.debug.assert(@as(usize, world.sparse_live) == sparse_count);
+    const geom = world.chunkGeometry();
+    var live: u32 = 0;
+    for (world.level_terrain.items, 0..) |terrain, level_index| {
+        for (terrain.sparse_runs, 0..) |run, chunk_index| {
+            if (run.rows.len == 0) {
+                std.debug.assert(run.rows.capacity == 0);
+                continue;
+            }
+            const rows = run.rows.slice();
+            const levels = rows.items(.level_index);
+            const cells = rows.items(.cell_index);
+            for (levels, cells) |row_level, cell| {
+                std.debug.assert(row_level == @as(u16, @intCast(level_index)));
+                const x: u16 = @intCast(cell % world.width);
+                const y: u16 = @intCast(cell / world.width);
+                std.debug.assert(geom.chunkOf(x, y) == chunk_index);
+            }
+            live += @intCast(run.rows.len);
+        }
+    }
+    std.debug.assert(live == world.sparse_live);
+}
+
 // The world reads the tileset metadata only while it builds; `sourceRect` reads its catalog.
-fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, sparse_count: usize) !void {
+fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, sparse_count: usize, layout: SparseLayout) !void {
     std.debug.assert(sparse_count >= window_tile_count);
     var meta = try fixtures.loadTilesetMeta(allocator, io);
     defer meta.deinit();
@@ -187,6 +247,7 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
         .texture = TextureId.init(1, 1) catch unreachable,
         .window_tile = undefined,
         .added_tile = undefined,
+        .floor_tile = undefined,
         .sparse_count = sparse_count,
     };
     errdefer fixture.batch.deinit();
@@ -194,17 +255,27 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
     const world = &fixture.world;
     try world.buildCatalog(&meta);
     fixture.window_tile = try world.requireTileByName(&meta, "deco_0");
-    fixture.added_tile = try world.requireTileByName(&meta, "grass_patchy");
+    const blocking_tile = try world.requireTileByName(&meta, "tree_0");
+    const floor_tile = try world.requireTileByName(&meta, "stone_floor");
+    fixture.added_tile = blocking_tile;
+    fixture.floor_tile = floor_tile;
+    std.debug.assert(world.flagsFor(blocking_tile).blocks_movement);
+    std.debug.assert(!world.flagsFor(floor_tile).blocks_movement);
     for (0..world_levels) |level_index| {
         _ = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
 
+    var cells: std.ArrayList(SparseCell) = .empty;
+    defer cells.deinit(allocator);
+    try cells.ensureTotalCapacity(allocator, sparse_count);
     for (0..window_tile_count) |index| {
-        const x = window_block_x + @as(u16, @intCast(index % window_block_edge));
-        const y = window_block_y + @as(u16, @intCast(index / window_block_edge));
-        _ = try world.addSparseTile(active_level, x, y, fixture.window_tile, 0, window_depths[index % window_depths.len]);
+        cells.appendAssumeCapacity(.{
+            .level = active_level,
+            .x = window_block_x + @as(u16, @intCast(index % window_block_edge)),
+            .y = window_block_y + @as(u16, @intCast(index / window_block_edge)),
+            .depth = window_depths[index % window_depths.len],
+        });
     }
-
     // The rest spread over every level's outside rows, row-major on a fixed column
     // stride, with the row stride spreading each level's share over the rows.
     const outside_count = sparse_count - window_tile_count;
@@ -218,17 +289,45 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
         const x: u16 = @intCast((slot % outside_columns) * outside_column_stride + level);
         const y: u16 = @intCast(outside_first_row + (slot / outside_columns) * row_stride);
         std.debug.assert(y < world_side);
-        _ = try world.addSparseTile(level, x, y, fixture.window_tile, 0, window_depths[index % window_depths.len]);
+        cells.appendAssumeCapacity(.{
+            .level = level,
+            .x = x,
+            .y = y,
+            .depth = window_depths[index % window_depths.len],
+        });
     }
-    std.debug.assert(world.sparse_tiles.len == sparse_count);
+
+    // Frame and add keep this insertion order. The pan layouts reorder the same cells.
+    const tile = if (layout == .insertion) fixture.window_tile else blocking_tile;
+    switch (layout) {
+        .insertion => {},
+        .chunk_ordered, .churned => std.mem.sort(SparseCell, cells.items, world.chunkGeometry(), sparseCellLessThan),
+        .interleaved => {
+            var prng = std.Random.DefaultPrng.init(layout_shuffle_seed);
+            prng.random().shuffle(SparseCell, cells.items);
+        },
+    }
+    for (cells.items) |cell| {
+        _ = try world.addSparseTile(cell.level, cell.x, cell.y, tile, 0, cell.depth);
+    }
+    if (layout == .churned) {
+        var index: usize = 0;
+        while (index < cells.items.len) : (index += 2) {
+            const cell = cells.items[index];
+            const cleared = try world.clearCellBlocking(cell.level, cell.x, cell.y, floor_tile);
+            std.debug.assert(cleared != null);
+            _ = try world.addSparseTile(cell.level, cell.x, cell.y, tile, 0, cell.depth);
+        }
+    }
+    assertSparseRuns(world, sparse_count);
 
     try fixture.batch.reserveStorage(window_tile_count, window_tile_count * 6, window_tile_count);
 }
 
-fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, layout: SparseLayout) !suite.RunStats {
     std.debug.assert(!case.usesThreadSystem());
     var fixture: Fixture = undefined;
-    try initFixture(&fixture, allocator, io, item_count);
+    try initFixture(&fixture, allocator, io, item_count, layout);
     defer fixture.deinit();
     // The first frame builds the window's sparse list.
     _ = try fixture.frame(0);

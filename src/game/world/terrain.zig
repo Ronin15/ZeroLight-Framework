@@ -35,8 +35,29 @@ pub const ChunkBits = [max_chunk_cells / 64]u64;
 
 /// Head/next sentinel of a level's link-endpoint lists.
 pub const no_link_endpoint: u32 = std.math.maxInt(u32);
-/// Head/next/prev sentinel of a level's per-chunk sparse tile lists.
+/// Population cap of the world's sparse rows. `addSparseTile` returns
+/// `OutOfMemory` when `sparse_live` reaches it, before any reserve.
 pub const no_sparse_tile: u32 = std.math.maxInt(u32);
+
+pub const TileFlags = packed struct(u8) {
+    walkable: bool = false,
+    blocks_movement: bool = false,
+    blocks_vision: bool = false,
+    reserved: u5 = 0,
+};
+
+pub const SparseTileRow = struct {
+    level_index: u16,
+    cell_index: u32,
+    tile_id: TileId,
+    depth_value: i32,
+    flags: TileFlags,
+};
+
+/// One chunk's sparse rows. Live rows are `[0, rows.len)`. `len == 0` holds no bytes.
+pub const SparseRun = struct {
+    rows: std.MultiArrayList(SparseTileRow) = .{},
+};
 /// `LevelTerrain.floor_layer` of a level with no floor band.
 pub const no_floor_layer: u32 = std.math.maxInt(u32);
 /// Head/tail sentinel of the write chains while a batch is grouped.
@@ -760,7 +781,7 @@ pub inline fn clearBit(words: *ChunkBits, local: usize) void {
 
 /// One level's chunk-owned terrain, every per-chunk directory sized when the level is
 /// created: its dense band list and floor band, composed blocked bits, link-endpoint
-/// heads and counts, and sparse tile heads.
+/// heads and counts, and one sparse-tile run per chunk.
 pub const LevelTerrain = struct {
     /// Dense layer indices of this level's bands in add order; a layer's position
     /// here is its `band`. Append-only.
@@ -778,9 +799,9 @@ pub const LevelTerrain = struct {
     link_heads: []u32 = &.{},
     /// Per chunk, the endpoints in its `link_heads` list.
     link_counts: []u32 = &.{},
-    /// Per chunk, the newest sparse tile row in the chunk, or `no_sparse_tile`; the
-    /// world's sparse rows chain each chunk's tiles both ways.
-    sparse_heads: []u32 = &.{},
+    /// Per chunk, that chunk's sparse rows. Freed with the level, and when the
+    /// chunk's live count returns to 0.
+    sparse_runs: []SparseRun = &.{},
     /// The chunks holding a write while a batch given in any order is grouped
     /// (`WorldSystem.groupDenseCellWrites`), popped in order; empty between batches.
     edit_chunks: OrderedIndexSet = .{},
@@ -796,16 +817,17 @@ pub const LevelTerrain = struct {
         const link_counts = try allocator.alloc(u32, chunk_count);
         errdefer allocator.free(link_counts);
         @memset(link_counts, 0);
-        const sparse_heads = try allocator.alloc(u32, chunk_count);
-        errdefer allocator.free(sparse_heads);
-        @memset(sparse_heads, no_sparse_tile);
+        const sparse_runs = try allocator.alloc(SparseRun, chunk_count);
+        errdefer allocator.free(sparse_runs);
+        // A list's `bytes` is undefined at len 0. Assign each run; do not memset one.
+        for (sparse_runs) |*run| run.* = .{};
         var edit_chunks: OrderedIndexSet = .{};
         _ = try edit_chunks.reserve(allocator, chunk_count);
         return .{
             .blocked = blocked,
             .link_heads = link_heads,
             .link_counts = link_counts,
-            .sparse_heads = sparse_heads,
+            .sparse_runs = sparse_runs,
             .edit_chunks = edit_chunks,
         };
     }
@@ -815,7 +837,8 @@ pub const LevelTerrain = struct {
         self.blocked.deinit(allocator);
         allocator.free(self.link_heads);
         allocator.free(self.link_counts);
-        allocator.free(self.sparse_heads);
+        for (self.sparse_runs) |*run| run.rows.deinit(allocator);
+        allocator.free(self.sparse_runs);
         self.edit_chunks.deinit(allocator);
         self.* = undefined;
     }

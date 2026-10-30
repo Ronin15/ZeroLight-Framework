@@ -405,10 +405,8 @@ fn emitPreparedDrawSpan(
     span: render_prep.DynamicDepthRange,
     fallback_texture: sprite_batch.TextureId,
 ) !void {
-    const sorted_indices = prep.sort_indices.items;
-    const records = prep.records.items;
-    for (sorted_indices[span.start..span.end]) |record_index| {
-        try emitPreparedDraw(batch, records[record_index].draw, fallback_texture);
+    for (prep.records.items[span.start..span.end]) |record| {
+        try emitPreparedDraw(batch, record.draw, fallback_texture);
     }
 }
 

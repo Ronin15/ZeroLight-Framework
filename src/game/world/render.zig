@@ -11,6 +11,7 @@ const RuntimeAssets = @import("../../assets/runtime_assets.zig").RuntimeAssets;
 const Rect = @import("../../render/renderer.zig").Rect;
 const RenderOrder = @import("../../render/renderer.zig").RenderOrder;
 const Renderer = @import("../../render/renderer.zig").Renderer;
+const planTileStoreMerge = @import("../../render/renderer.zig").planTileStoreMerge;
 const TileStoreError = @import("../../render/renderer.zig").TileStoreError;
 const tileStoreBlockElements = @import("../../render/renderer.zig").tileStoreBlockElements;
 const tile_store_max_side = @import("../../render/renderer.zig").tile_store_max_side;
@@ -22,10 +23,11 @@ const VertexColor = @import("../../render/renderer.zig").VertexColor;
 const writeWorldSpriteQuad = @import("../../render/renderer.zig").writeWorldSpriteQuad;
 const TextureId = @import("../../render/resources.zig").TextureId;
 const world_gpu_tiles = @import("gpu_tiles.zig");
+const GpuTileCopyThreads = world_gpu_tiles.GpuTileCopyThreads;
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const log = @import("../../core/logging.zig").game;
 const logging = @import("../../core/logging.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
-const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
 const WorldSystem = @import("system.zig").WorldSystem;
 const TileId = @import("system.zig").TileId;
 const ViewWindow = @import("system.zig").ViewWindow;
@@ -80,26 +82,37 @@ pub const VisibleView = struct {
 };
 
 // One contiguous run of window sparse tiles that share a render depth, as a slice
-// of `SparseWindow.tiles`.
+// of `SparseWindow.rows` in key order.
 const SparseDepthRange = struct {
     depth: i32,
     start: u32,
     count: u32,
 };
 
+/// One copied window sparse tile. After the fill, rows are ordered by depth, then
+/// cell, then tile id.
+pub const SparseWindowTile = struct {
+    depth: i32,
+    cell: u32,
+    tile_id: TileId,
+};
+
 /// The sparse tiles the render window draws: those on the window's levels inside
-/// its tile bounds, ordered by (depth, cell, tile id), with one range per distinct
-/// depth. Rebuilt by the window update when the window moves or `dirty` is set
-/// (a tile added or removed inside the current window, or a removal that moved a
-/// row the list holds); render-only.
+/// its tile bounds, stored in (depth, cell, tile id) order, with one range per
+/// distinct depth. Rebuilt by the window update when the window moves or `dirty`
+/// is set (a tile added or removed inside the current window); render-only.
 pub const SparseWindow = struct {
-    tiles: std.ArrayList(u32) = .empty,
+    rows: std.MultiArrayList(SparseWindowTile) = .{},
+    // Fill scratch: the sort permutation. Cleared once `rows` are in key order.
+    // Capacity stays so a warmed update allocates nothing.
+    sort_index: std.ArrayList(u32) = .empty,
     ranges: std.ArrayList(SparseDepthRange) = .empty,
     dirty: bool = true,
 
     pub fn deinit(self: *SparseWindow, allocator: std.mem.Allocator) void {
         self.ranges.deinit(allocator);
-        self.tiles.deinit(allocator);
+        self.sort_index.deinit(allocator);
+        self.rows.deinit(allocator);
     }
 };
 
@@ -161,7 +174,8 @@ pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chu
 
     // Count, reserve, then commit: an allocation failure changes nothing.
     const tile_count = walkWindowSparseTiles(self, view, null);
-    try self.sparse_window.tiles.ensureTotalCapacity(self.allocator, tile_count);
+    try self.sparse_window.rows.ensureTotalCapacity(self.allocator, tile_count);
+    try self.sparse_window.sort_index.ensureTotalCapacity(self.allocator, tile_count);
     try self.sparse_window.ranges.ensureTotalCapacity(self.allocator, tile_count);
 
     self.render_side = render_side;
@@ -170,37 +184,49 @@ pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chu
     self.sparse_window.dirty = false;
 }
 
-// Counts the sparse tiles on the view's levels inside its tile bounds, appending
-// each to `out` (reserved for them) when given. Walks only the chunks under the
-// tile bounds, never the overscan ring: O(window levels × those chunks + their
-// sparse tiles).
-// SIMD verdict: scalar. A linked-list walk per chunk with a bounds test per tile.
-fn walkWindowSparseTiles(self: *const WorldSystem, view: VisibleView, out: ?*std.ArrayList(u32)) usize {
+// Counts the sparse tiles on the view's levels inside its tile bounds. When
+// `out` is set, appends each hit's depth, cell, and tile id into that window
+// (reserved for them). Walks only the chunks under the tile bounds,
+// never the overscan ring: O(window levels × those chunks + their sparse tiles).
+// SIMD verdict: scalar. An integer bounds test and a variable-length append of hits,
+// not a dense float kernel, so a lane batch would drain into scalar appends.
+fn walkWindowSparseTiles(self: *const WorldSystem, view: VisibleView, out: ?*SparseWindow) usize {
     const levels = renderWindowLevels(self, view.levels.active_level) orelse return 0;
     const geom = self.chunkGeometry();
-    const sparse = self.sparse_tiles.slice();
-    const sparse_cells = sparse.items(.cell_index);
-    const sparse_next = sparse.items(.chunk_next);
-    const tiles = view.window.tiles;
+    const tile_bounds = view.window.tiles;
     const width: u32 = self.width;
-    const min_cx = @as(u32, tiles.min_x) >> geom.shift;
-    const max_cx = (@as(u32, tiles.max_x) - 1) >> geom.shift;
-    const min_cy = @as(u32, tiles.min_y) >> geom.shift;
-    const max_cy = (@as(u32, tiles.max_y) - 1) >> geom.shift;
+    const min_cx = @as(u32, tile_bounds.min_x) >> geom.shift;
+    const max_cx = (@as(u32, tile_bounds.max_x) - 1) >> geom.shift;
+    const min_cy = @as(u32, tile_bounds.min_y) >> geom.shift;
+    const max_cy = (@as(u32, tile_bounds.max_y) - 1) >> geom.shift;
     var count: usize = 0;
+    // Captured once for the gather. `addOneAssumeCapacity` does not move it while
+    // the reserve holds, and each append publishes the new length before the write.
+    var row_slice: std.MultiArrayList(SparseWindowTile).Slice = undefined;
+    if (out) |window| row_slice = window.rows.slice();
     var level = levels.first;
     while (level <= levels.last) : (level += 1) {
         if (!view.levels.window.levelInWindow(view.levels.active_level, @intCast(level), levels.max_level)) continue;
-        const heads = self.level_terrain.items[level].sparse_heads;
+        const runs = self.level_terrain.items[level].sparse_runs;
         var cy = min_cy;
         while (cy <= max_cy) : (cy += 1) {
             var cx = min_cx;
             while (cx <= max_cx) : (cx += 1) {
-                var row = heads[cy * geom.chunks_x + cx];
-                while (row != no_sparse_tile) : (row = sparse_next[row]) {
-                    const cell = sparse_cells[row];
-                    if (!tiles.contains(cell % width, cell / width)) continue;
-                    if (out) |list| list.appendAssumeCapacity(row);
+                const run = runs[cy * geom.chunks_x + cx];
+                if (run.rows.len == 0) continue;
+                const rows = run.rows.slice();
+                const cells = rows.items(.cell_index);
+                const depth_value = rows.items(.depth_value);
+                const tile_id = rows.items(.tile_id);
+                for (cells, 0..) |cell, offset| {
+                    if (!tile_bounds.contains(cell % width, cell / width)) continue;
+                    if (out) |window| {
+                        appendSparseWindowTile(&window.rows, &row_slice, .{
+                            .depth = depth_value[offset],
+                            .cell = cell,
+                            .tile_id = tile_id[offset],
+                        });
+                    }
                     count += 1;
                 }
             }
@@ -209,34 +235,60 @@ fn walkWindowSparseTiles(self: *const WorldSystem, view: VisibleView, out: ?*std
     return count;
 }
 
+fn appendSparseWindowTile(
+    rows: *std.MultiArrayList(SparseWindowTile),
+    row_slice: *std.MultiArrayList(SparseWindowTile).Slice,
+    tile: SparseWindowTile,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, tile);
+}
+
 // Fills the reserved sparse window with the `tile_count` tiles
-// `walkWindowSparseTiles` counted, sorts them by (depth, cell, tile id), and
-// builds one range per distinct depth. Allocation-free; an empty window skips
-// the walk and sort.
+// `walkWindowSparseTiles` counted, sorts a scratch index by (depth, cell, tile id),
+// reorders the columns into that order once, and builds one range per distinct
+// depth. Allocation-free; an empty window skips the walk and sort.
 fn fillWindowSparseTiles(self: *WorldSystem, view: VisibleView, tile_count: usize) void {
-    const tiles = &self.sparse_window.tiles;
-    const ranges = &self.sparse_window.ranges;
-    std.debug.assert(tiles.capacity >= tile_count and ranges.capacity >= tile_count);
-    tiles.clearRetainingCapacity();
-    ranges.clearRetainingCapacity();
+    const window = &self.sparse_window;
+    std.debug.assert(window.rows.capacity >= tile_count);
+    std.debug.assert(window.sort_index.capacity >= tile_count);
+    std.debug.assert(window.ranges.capacity >= tile_count);
+    window.rows.clearRetainingCapacity();
+    window.sort_index.clearRetainingCapacity();
+    window.ranges.clearRetainingCapacity();
     if (tile_count == 0) return;
-    const sparse = self.sparse_tiles.slice();
-    const order = SparseWindowOrder{
-        .depths = sparse.items(.depth_value),
-        .cells = sparse.items(.cell_index),
-        .tile_ids = sparse.items(.tile_id),
-    };
-    _ = walkWindowSparseTiles(self, view, tiles);
-    std.debug.assert(tiles.items.len == tile_count);
-    std.mem.sort(u32, tiles.items, order, SparseWindowOrder.lessThan);
+    const count = walkWindowSparseTiles(self, view, window);
+    std.debug.assert(count == tile_count and window.rows.len == tile_count);
+    // The window count is at most the sparse population, which fits u32.
+    std.debug.assert(tile_count <= std.math.maxInt(u32));
+    const order = window.sort_index.addManyAsSliceAssumeCapacity(tile_count);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
+
+    const columns = window.rows.slice();
+    const depth = columns.items(.depth);
+    const cell = columns.items(.cell);
+    const tile_id = columns.items(.tile_id);
+    // Stable: equal keys keep walk order.
+    std.mem.sort(u32, order, SparseWindowOrder{
+        .depth = depth,
+        .cell = cell,
+        .tile_id = tile_id,
+    }, SparseWindowOrder.lessThan);
+    reorderSparseWindowRows(depth, cell, tile_id, order);
+    window.sort_index.clearRetainingCapacity();
 
     var start: usize = 0;
-    while (start < tiles.items.len) {
-        const depth = order.depths[tiles.items[start]];
+    while (start < depth.len) {
+        const row_depth = depth[start];
         var end = start + 1;
-        while (end < tiles.items.len and order.depths[tiles.items[end]] == depth) : (end += 1) {}
-        // Window tiles index `sparse_tiles`, whose indices fit u32.
-        ranges.appendAssumeCapacity(.{ .depth = depth, .start = @intCast(start), .count = @intCast(end - start) });
+        while (end < depth.len and depth[end] == row_depth) : (end += 1) {}
+        // `start` and the range length are below the window tile count, which fits u32.
+        window.ranges.appendAssumeCapacity(.{
+            .depth = row_depth,
+            .start = @intCast(start),
+            .count = @intCast(end - start),
+        });
         start = end;
     }
 }
@@ -244,16 +296,49 @@ fn fillWindowSparseTiles(self: *WorldSystem, view: VisibleView, tile_count: usiz
 // Draw order of window sparse tiles: depth, then cell, then tile id. Never the
 // tile's index, so removing and moving rows cannot change what draws on top.
 const SparseWindowOrder = struct {
-    depths: []const i32,
-    cells: []const u32,
-    tile_ids: []const TileId,
+    depth: []const i32,
+    cell: []const u32,
+    tile_id: []const TileId,
 
     fn lessThan(self: SparseWindowOrder, lhs: u32, rhs: u32) bool {
-        if (self.depths[lhs] != self.depths[rhs]) return self.depths[lhs] < self.depths[rhs];
-        if (self.cells[lhs] != self.cells[rhs]) return self.cells[lhs] < self.cells[rhs];
-        return self.tile_ids[lhs] < self.tile_ids[rhs];
+        const left: usize = lhs;
+        const right: usize = rhs;
+        if (self.depth[left] != self.depth[right]) return self.depth[left] < self.depth[right];
+        if (self.cell[left] != self.cell[right]) return self.cell[left] < self.cell[right];
+        return self.tile_id[left] < self.tile_id[right];
     }
 };
+
+// `order[i]` is the walk index that belongs at slot i. Each row is written once
+// along its cycle; a finished slot stores its own index.
+fn reorderSparseWindowRows(depth: []i32, cell: []u32, tile_id: []TileId, order: []u32) void {
+    std.debug.assert(depth.len == order.len and cell.len == order.len and tile_id.len == order.len);
+    for (0..order.len) |start| {
+        const start_index: u32 = @intCast(start);
+        if (order[start] == start_index) continue;
+        const held_depth = depth[start];
+        const held_cell = cell[start];
+        const held_tile = tile_id[start];
+        var dest = start;
+        var steps: usize = 0;
+        while (true) {
+            steps += 1;
+            std.debug.assert(steps <= order.len);
+            const src: usize = order[dest];
+            order[dest] = @intCast(dest);
+            if (src == start) {
+                depth[dest] = held_depth;
+                cell[dest] = held_cell;
+                tile_id[dest] = held_tile;
+                break;
+            }
+            depth[dest] = depth[src];
+            cell[dest] = cell[src];
+            tile_id[dest] = tile_id[src];
+            dest = src;
+        }
+    }
+}
 
 // A power-of-two side covering every chunk window a rect of this size touches:
 // its chunk span plus one for alignment and the overscan on both sides, clamped
@@ -470,7 +555,7 @@ fn collectDenseSubmitLayers(self: *WorldSystem, active_level: u16) error{OutOfMe
 /// change marks for a retry. Claims the
 /// store for this frame; the renderer retires it the first frame this is not
 /// called, and the next call re-uploads the window into a new store.
-pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16) TileStoreError!void {
+pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level: u16, threads: ?GpuTileCopyThreads) TileStoreError!void {
     const mirror = &self.gpu_tiles;
     if (mirror.store.isValid() and !renderer.claimTileStore(mirror.store)) resetGpuResidency(self);
     if (self.levelCount() == 0 or self.visible == null) return;
@@ -492,15 +577,17 @@ pub fn syncDenseTileStore(self: *WorldSystem, renderer: *Renderer, active_level:
     }
     if (sync_plan.span_count > 0) {
         try renderer.reserveTileStoreUploads(mirror.store, sync_plan.required_elements, sync_plan.span_count, sync_plan.value_count);
+        if (renderer.pendingTileUpload(mirror.store)) |pending| {
+            try mirror.reserveCopyOps(self.allocator, pending.spans.len, sync_plan.span_count);
+        }
     }
-    commitDenseGpuSync(self, &sync_plan, active_level);
+    commitDenseGpuSync(self, &sync_plan, active_level, renderer, threads);
     if (sync_plan.relayout and sync_plan.span_count == 0) {
         // A new layout with nothing resident leaves the old store unclaimed.
         mirror.store = .invalid;
         mirror.store_side = 0;
     }
     if (sync_plan.layers_changed or !std.meta.eql(old_store, mirror.store)) self.dense_quads_dirty = true;
-    if (sync_plan.span_count > 0) renderer.queueTileStoreUploads(mirror.store, mirror.spans.items, mirror.values.items);
     if (sync_plan.residency_changed and mirror.store.isValid()) renderer.setTileStoreWindow(mirror.store, mirror.window.uniform());
     if (!mirror.resident_bytes_reported and mirror.store.isValid()) {
         mirror.resident_bytes_reported = true;
@@ -571,10 +658,42 @@ fn fitResidentLayers(desired: []const u32, fit: usize, reported: *bool) []const 
 }
 
 /// Applies the sync and, when the resident set moved, rebuilds the resident
-/// layers (deepest first) and their depths from the chain. O(resident layers).
-pub fn commitDenseGpuSync(self: *WorldSystem, sync_plan: *const world_gpu_tiles.SyncPlan, active_level: u16) void {
+/// layers (deepest first) and their depths from the chain. O(resident layers)
+/// plus the value fill. Null `renderer` leaves the batch in the mirror. A pending
+/// batch is filled once into the carried window; otherwise the mirror's values
+/// are adopted. `reserveCopyOps` has already run when a batch is pending.
+pub fn commitDenseGpuSync(
+    self: *WorldSystem,
+    sync_plan: *const world_gpu_tiles.SyncPlan,
+    active_level: u16,
+    renderer: ?*Renderer,
+    threads: ?GpuTileCopyThreads,
+) void {
     const rows = self.dense_layers.slice();
-    self.gpu_tiles.commit(sync_plan, self.chunkGeometry(), rows.items(.store), rows.items(.gpu_slot), rows.items(.render_changed));
+    const geom = self.chunkGeometry();
+    const stores = rows.items(.store);
+    const mirror = &self.gpu_tiles;
+    const carried = if (renderer) |live| live.pendingTileUpload(mirror.store) else null;
+    const batch = if (carried != null and sync_plan.span_count > 0) blk: {
+        const pending = carried.?;
+        mirror.commitStructure(sync_plan, geom, stores, rows.items(.gpu_slot), rows.items(.render_changed));
+        const live = renderer.?;
+        const window = live.prepareCarriedTileMerge();
+        mirror.copy_ops.clearRetainingCapacity();
+        const value_count = planTileStoreMerge(pending.spans, mirror.spans.items, &live.tile_merge_spans, &mirror.copy_ops);
+        std.debug.assert(window.len >= value_count);
+        const filled = mirror.fillUploadValues(window[0..value_count], .ops, pending.values, threads, geom, stores);
+        live.tile_merge_values.items.len = value_count;
+        live.installCarriedTileMerge(mirror.store);
+        break :blk filled;
+    } else blk: {
+        const filled = mirror.commit(sync_plan, geom, stores, rows.items(.gpu_slot), rows.items(.render_changed), threads);
+        if (renderer) |live| {
+            if (sync_plan.span_count > 0) live.adoptFilledUpload(mirror.store, mirror.spans.items, &mirror.values);
+        }
+        break :blk filled;
+    };
+    if (comptime runtime_perf_log.enabled) self.perf.last_gpu_tile_copy_batch = batch;
     // The commit cleared every resident layer's flag; non-resident ones are never set.
     if (sync_plan.edits) self.resident_layers_changed = false;
     self.gpu_resident_levels = .{ .active_level = active_level, .window = self.render_window };
@@ -625,15 +744,17 @@ pub fn submitVisibleSparseSprites(
 // Builds each window sparse sprite of range `range_index` once and hands it to
 // `sink`, a `*Renderer` or a `*SpriteBatch`. Returns the sprites emitted.
 fn emitSparseRange(self: *const WorldSystem, sink: anytype, texture: TextureId, range_index: usize) error{ MissingTileSourceRect, OutOfMemory }!usize {
-    const range = self.sparse_window.ranges.items[range_index];
-    const sparse = self.sparse_tiles.slice();
-    const cells = sparse.items(.cell_index);
-    const tile_ids = sparse.items(.tile_id);
-    for (self.sparse_window.tiles.items[range.start..][0..range.count]) |index| {
-        const cell = cells[index];
+    const window = &self.sparse_window;
+    const range = window.ranges.items[range_index];
+    const rows = window.rows.slice();
+    const start: usize = range.start;
+    const count: usize = range.count;
+    const cells = rows.items(.cell)[start..][0..count];
+    const tile_ids = rows.items(.tile_id)[start..][0..count];
+    for (cells, tile_ids) |cell, tile_id| {
         const sprite = Sprite{
             .texture = texture,
-            .source = self.sourceRect(tile_ids[index]) orelse return error.MissingTileSourceRect,
+            .source = self.sourceRect(tile_id) orelse return error.MissingTileSourceRect,
             .dest = .{
                 .x = @as(f32, @floatFromInt(cell % self.width)) * self.tile_size,
                 .y = @as(f32, @floatFromInt(cell / self.width)) * self.tile_size,
@@ -702,6 +823,7 @@ const TilemapParams = @import("../../render/renderer.zig").TilemapParams;
 const WorldDepth = @import("../render_depth.zig").WorldDepth;
 const invalid_tile_id = @import("system.zig").invalid_tile_id;
 const level_z_step = @import("system.zig").level_z_step;
+const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const TestGpuStore = @import("test_support.zig").TestGpuStore;
 const testWorldMeta = @import("test_support.zig").testWorldMeta;
 const testMinimalSurfaceWorld = @import("test_support.zig").testMinimalSurfaceWorld;
@@ -769,25 +891,31 @@ fn testSparseKeyLessThan(_: void, lhs: TestSparseKey, rhs: TestSparseKey) bool {
     return lhs.tile_id < rhs.tile_id;
 }
 
+fn testPlacedKey(world: *const WorldSystem, level: u16, x: u16, y: u16, tile: TileId, depth: WorldDepth) TestSparseKey {
+    return .{
+        .depth = world.worldZForLevel(level, 0, depth),
+        .cell = world.cellIndex(x, y),
+        .tile_id = tile,
+    };
+}
+
 // The window's sparse tiles as (depth, cell, tile id), in list order, into `out`.
 fn testWindowSparseKeys(world: *const WorldSystem, out: []TestSparseKey) []TestSparseKey {
-    const sparse = world.sparse_tiles.slice();
-    const tiles = world.sparse_window.tiles.items;
-    for (tiles, out[0..tiles.len]) |index, *key| {
-        key.* = .{
-            .depth = sparse.items(.depth_value)[index],
-            .cell = sparse.items(.cell_index)[index],
-            .tile_id = sparse.items(.tile_id)[index],
-        };
+    const rows = world.sparse_window.rows.slice();
+    const depth = rows.items(.depth);
+    const cell = rows.items(.cell);
+    const tile_id = rows.items(.tile_id);
+    const keys = out[0..depth.len];
+    for (depth, cell, tile_id, keys) |row_depth, row_cell, row_tile, *key| {
+        key.* = .{ .depth = row_depth, .cell = row_cell, .tile_id = row_tile };
     }
-    return out[0..tiles.len];
+    return keys;
 }
 
 // Every range is one depth, ranges ascend by depth, and together they cover the
 // window's tiles exactly once in list order.
 fn expectSparseRangesCoverWindow(world: *const WorldSystem) !void {
-    const depths = world.sparse_tiles.items(.depth_value);
-    const tiles = world.sparse_window.tiles.items;
+    const depth = world.sparse_window.rows.items(.depth);
     var next_start: u32 = 0;
     for (0..world.sparseDepthRangeCount()) |range_index| {
         const range = world.sparse_window.ranges.items[range_index];
@@ -795,10 +923,12 @@ fn expectSparseRangesCoverWindow(world: *const WorldSystem) !void {
         try std.testing.expect(range.count > 0);
         if (range_index > 0) try std.testing.expect(world.sparseDepthRangeAt(range_index - 1) < range.depth);
         try std.testing.expectEqual(range.depth, world.sparseDepthRangeAt(range_index));
-        for (tiles[range.start..][0..range.count]) |index| try std.testing.expectEqual(range.depth, depths[index]);
+        const start: usize = range.start;
+        const count: usize = range.count;
+        for (depth[start..][0..count]) |row_depth| try std.testing.expectEqual(range.depth, row_depth);
         next_start += range.count;
     }
-    try std.testing.expectEqual(tiles.len, next_start);
+    try std.testing.expectEqual(depth.len, next_start);
 }
 
 test "the window sparse list holds exactly the window's tiles ordered by depth, then cell, then tile id" {
@@ -886,23 +1016,26 @@ test "a sparse tile added outside the window leaves the list untouched; one insi
     const deco = try world.requireTileByName(&meta, "deco_0");
     _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
     try testShowTiles(&world, 0, 6, 1, 0);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    var keys: [2]TestSparseKey = undefined;
+    const first = testPlacedKey(&world, 0, 1, 1, deco, .obstacle);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{first}, testWindowSparseKeys(&world, &keys));
 
     // Outside: past the tile bounds in an overscan chunk, and below the level window.
     _ = try world.addSparseTile(0, 7, 1, deco, 0, .effect);
     _ = try world.addSparseTile(2, 1, 1, deco, 0, .effect);
     try std.testing.expect(!world.sparse_window.dirty);
     try testShowTiles(&world, 0, 6, 1, 0);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{first}, testWindowSparseKeys(&world, &keys));
     try std.testing.expectEqual(@as(usize, 1), world.sparseDepthRangeCount());
 
-    // Inside, on the level below: listed from the next window update.
+    // Inside, on the level below: listed from the next window update, deepest first.
     _ = try world.addSparseTile(1, 2, 2, deco, 0, .effect);
     try std.testing.expect(world.sparse_window.dirty);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{first}, testWindowSparseKeys(&world, &keys));
     try testShowTiles(&world, 0, 6, 1, 0);
     try std.testing.expect(!world.sparse_window.dirty);
-    try std.testing.expectEqualSlices(u32, &.{ 3, 0 }, world.sparse_window.tiles.items);
+    const below = testPlacedKey(&world, 1, 2, 2, deco, .effect);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{ below, first }, testWindowSparseKeys(&world, &keys));
     try expectSparseRangesCoverWindow(&world);
 }
 
@@ -913,13 +1046,19 @@ test "a render window change under a still camera relists the window's sparse le
     defer world.deinit();
     const deco = try world.requireTileByName(&meta, "deco_0");
     for (0..3) |level| _ = try world.addSparseTile(@intCast(level), 1, 1, deco, 0, .floor);
+    const level_keys = [_]TestSparseKey{
+        testPlacedKey(&world, 0, 1, 1, deco, .floor),
+        testPlacedKey(&world, 1, 1, 1, deco, .floor),
+        testPlacedKey(&world, 2, 1, 1, deco, .floor),
+    };
+    var keys: [3]TestSparseKey = undefined;
     try testShowTiles(&world, 0, 4, 0, 0);
     // Levels 0 and 1, deepest first.
-    try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{ level_keys[1], level_keys[0] }, testWindowSparseKeys(&world, &keys));
 
     world.render_window = .{ .levels_below = 2 };
     try testShowTiles(&world, 0, 4, 0, 0);
-    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 0 }, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{ level_keys[2], level_keys[1], level_keys[0] }, testWindowSparseKeys(&world, &keys));
     try expectSparseRangesCoverWindow(&world);
 }
 
@@ -932,10 +1071,12 @@ test "an active level change under a still camera relists the window's sparse le
     _ = try world.addSparseTile(0, 1, 1, deco, 0, .floor);
     _ = try world.addSparseTile(2, 1, 1, deco, 0, .floor);
     try testShowTiles(&world, 0, 4, 0, 0);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
-    // Level 1 renders levels 1 and 2.
+    var keys: [1]TestSparseKey = undefined;
+    try std.testing.expectEqualSlices(TestSparseKey, &.{testPlacedKey(&world, 0, 1, 1, deco, .floor)}, testWindowSparseKeys(&world, &keys));
+    // Level 1 renders levels 1 and 2. The only hit is level 2; its key tells it
+    // from the level 0 tile the previous window listed.
     try testShowTiles(&world, 0, 4, 0, 1);
-    try std.testing.expectEqualSlices(u32, &.{1}, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{testPlacedKey(&world, 2, 1, 1, deco, .floor)}, testWindowSparseKeys(&world, &keys));
 }
 
 test "an out-of-memory window update leaves the previous window and its sparse list intact (FailingAllocator)" {
@@ -950,7 +1091,9 @@ test "an out-of-memory window update leaves the previous window and its sparse l
         _ = try world.addSparseTile(0, 8 + @as(u16, @intCast(index % 8)), @intCast(index / 8), deco, 0, .effect);
     }
     try testShowTiles(&world, 0, 4, 0, 0);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    var keys: [1]TestSparseKey = undefined;
+    const kept = testPlacedKey(&world, 0, 1, 1, deco, .obstacle);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{kept}, testWindowSparseKeys(&world, &keys));
     const region = world.visibleChunkRegion().?;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -958,7 +1101,7 @@ test "an out-of-memory window update leaves the previous window and its sparse l
     // A pan onto the dense chunks fails: the window and list stay as they were.
     try std.testing.expectError(error.OutOfMemory, testShowTiles(&world, 8, 8, 0, 0));
     try std.testing.expectEqual(region, world.visibleChunkRegion().?);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{kept}, testWindowSparseKeys(&world, &keys));
     try std.testing.expectEqual(@as(usize, 1), world.sparseDepthRangeCount());
 
     // An in-window add that cannot be listed keeps the list dirty for the retry.
@@ -967,7 +1110,7 @@ test "an out-of-memory window update leaves the previous window and its sparse l
     world.allocator = failing.allocator();
     try std.testing.expectError(error.OutOfMemory, testShowTiles(&world, 0, 4, 0, 0));
     try std.testing.expect(world.sparse_window.dirty);
-    try std.testing.expectEqualSlices(u32, &.{0}, world.sparse_window.tiles.items);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{kept}, testWindowSparseKeys(&world, &keys));
 
     world.allocator = std.testing.allocator;
     try testShowTiles(&world, 0, 4, 0, 0);
@@ -1284,6 +1427,7 @@ fn deinitStaticTestRenderer(renderer: *Renderer) void {
     renderer.tile_stores.deinit(allocator);
     renderer.tile_merge_spans.deinit(allocator);
     renderer.tile_merge_values.deinit(allocator);
+    renderer.tile_merge_ops.deinit(allocator);
 }
 
 fn expectStaticTilemapStore(renderer: *const Renderer, store: TileDataId) !void {
@@ -1346,19 +1490,19 @@ test "syncDenseTileStore claims its live store every frame and drops a retired o
 
     // Every sync claims the live store, even one with nothing to upload, and moves
     // its window uniform to the render window.
-    try world.syncDenseTileStore(&renderer, 0);
+    try world.syncDenseTileStore(&renderer, 0, null);
     try std.testing.expect(store.claimed);
     try std.testing.expectEqual([4]u32{ 0, 0, 2, 2 }, store.params.window);
     try std.testing.expect(world.dense_layers.items(.gpu_slot)[layer] != world_gpu_tiles.no_slot);
     store.claimed = false;
-    try world.syncDenseTileStore(&renderer, 0);
+    try world.syncDenseTileStore(&renderer, 0, null);
     try std.testing.expect(store.claimed);
 
     // The renderer retired the store (generation advanced): the next sync drops
     // the stale id and every resident layer, and re-submits the draws.
     store.generation = 2;
     world.dense_quads_dirty = false;
-    try world.syncDenseTileStore(&renderer, 1);
+    try world.syncDenseTileStore(&renderer, 1, null);
     try std.testing.expect(!world.gpu_tiles.store.isValid());
     try std.testing.expectEqual(world_gpu_tiles.no_slot, world.dense_layers.items(.gpu_slot)[layer]);
     try std.testing.expect(world.dense_quads_dirty);
@@ -1395,7 +1539,7 @@ test "a sync whose upload reserve fails keeps residency and change marks, and th
     };
     defer deinitStaticTestRenderer(&renderer);
     const store = try attachFakeTileStore(&renderer, &world);
-    try world.syncDenseTileStore(&renderer, 0);
+    try world.syncDenseTileStore(&renderer, 0, null);
 
     // An edit on the resident layer, then a sync whose upload reserve cannot grow the
     // carried batch: the mirror must not commit, so the edit stays marked.
@@ -1404,19 +1548,148 @@ test "a sync whose upload reserve fails keeps residency and change marks, and th
         var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         renderer.allocator = failing.allocator();
         defer renderer.allocator = allocator;
-        try std.testing.expectError(error.OutOfMemory, world.syncDenseTileStore(&renderer, 0));
+        try std.testing.expectError(error.OutOfMemory, world.syncDenseTileStore(&renderer, 0, null));
     }
     try std.testing.expect(world.resident_layers_changed and world.dense_layers.items(.render_changed)[layer]);
     try std.testing.expect(world.dense_layers.items(.store)[layer].blockChanged(0));
 
     // The retry uploads it: the store's pending batch shows what the mirror holds.
-    try world.syncDenseTileStore(&renderer, 0);
+    try world.syncDenseTileStore(&renderer, 0, null);
     try std.testing.expect(!world.resident_layers_changed);
     var gpu = TestGpuStore{};
     defer gpu.deinit();
     try gpu.apply(store.pending_spans.items, store.pending_values.items);
     try expectGpuStoreMatches(&world, &gpu);
     try std.testing.expectEqual(@as(?TileId, water), testGpuTile(&world, &gpu, layer, 1, 1));
+}
+
+// Resident window with its first upload still pending: a directory longer than one
+// copy range, plus the block of one mixed chunk. A later edit of that block is
+// disjoint from the directory, so a carried fill copies the old span across a
+// range boundary (`items_per_range` is the copy alignment).
+const CarriedPendingUpload = struct {
+    world: WorldSystem,
+    renderer: Renderer,
+    layer: usize,
+    water: TileId,
+
+    fn deinit(self: *CarriedPendingUpload) void {
+        deinitStaticTestRenderer(&self.renderer);
+        self.world.deinit();
+    }
+};
+
+fn initCarriedPendingUpload(meta: *const WorldTilesetMeta) !CarriedPendingUpload {
+    const allocator = std.testing.allocator;
+    var world = WorldSystem{
+        .allocator = allocator,
+        .width = 12,
+        .height = 12,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .render_window = .{ .levels_below = 0 },
+    };
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    const grass = try world.requireTileByName(meta, "grass");
+    const water = try world.requireTileByName(meta, "water_1");
+    const layer = try world.addDenseLayer(try world.addLevel(0), 0, .floor, grass);
+    try testShowWholeWorld(&world, 0);
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    errdefer deinitStaticTestRenderer(&renderer);
+    _ = try attachFakeTileStore(&renderer, &world);
+    _ = try world.setDenseTile(layer, 0, 0, water);
+    try world.syncDenseTileStore(&renderer, 0, null);
+    const pending = renderer.pendingTileUpload(world.gpu_tiles.store);
+    try std.testing.expect(pending != null);
+    var long_span = false;
+    for (pending.?.spans) |span| {
+        if (span.count > world_gpu_tiles.gpu_tile_copy_range_alignment_items) long_span = true;
+    }
+    try std.testing.expect(long_span);
+    return .{ .world = world, .renderer = renderer, .layer = layer, .water = water };
+}
+
+fn expectInstalledUploadMatches(world: *const WorldSystem, renderer: *const Renderer) !void {
+    const store = &renderer.tile_stores.items[0];
+    try std.testing.expect(store.pending_values.items.len > world_gpu_tiles.gpu_tile_copy_range_alignment_items);
+    var long_span = false;
+    for (store.pending_spans.items) |span| {
+        if (span.count > world_gpu_tiles.gpu_tile_copy_range_alignment_items) long_span = true;
+    }
+    try std.testing.expect(long_span);
+    var gpu = TestGpuStore{};
+    defer gpu.deinit();
+    try gpu.apply(store.pending_spans.items, store.pending_values.items);
+    try expectGpuStoreMatches(world, &gpu);
+}
+
+test "serial and threaded uploads of a carried pending span match" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var serial = try initCarriedPendingUpload(&meta);
+    defer serial.deinit();
+    var threaded = try initCarriedPendingUpload(&meta);
+    defer threaded.deinit();
+    // Same chunk as the pending block: a disjoint rewrite, not a new directory word.
+    _ = try serial.world.setDenseTile(serial.layer, 1, 0, serial.water);
+    _ = try threaded.world.setDenseTile(threaded.layer, 1, 0, threaded.water);
+
+    try serial.world.syncDenseTileStore(&serial.renderer, 0, null);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    try threaded.world.syncDenseTileStore(&threaded.renderer, 0, .{
+        .thread_system = &threads,
+        .tuner = &threaded.world.gpu_tile_copy_tuner,
+        .controls = .{ .adaptive = false, .items_per_range = world_gpu_tiles.gpu_tile_copy_range_alignment_items },
+    });
+
+    const serial_store = &serial.renderer.tile_stores.items[0];
+    const threaded_store = &threaded.renderer.tile_stores.items[0];
+    try std.testing.expectEqualSlices(TileStoreSpan, serial_store.pending_spans.items, threaded_store.pending_spans.items);
+    try std.testing.expectEqualSlices(u32, serial_store.pending_values.items, threaded_store.pending_values.items);
+    try expectInstalledUploadMatches(&serial.world, &serial.renderer);
+    try expectInstalledUploadMatches(&threaded.world, &threaded.renderer);
+}
+
+test "a warmed carried sync uploads without allocating (FailingAllocator)" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var upload = try initCarriedPendingUpload(&meta);
+    defer upload.deinit();
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    const copy = GpuTileCopyThreads{
+        .thread_system = &threads,
+        .tuner = &upload.world.gpu_tile_copy_tuner,
+        .controls = .{ .adaptive = false, .items_per_range = world_gpu_tiles.gpu_tile_copy_range_alignment_items },
+    };
+    _ = try upload.world.setDenseTile(upload.layer, 1, 0, upload.water);
+    try upload.world.syncDenseTileStore(&upload.renderer, 0, copy);
+
+    _ = try upload.world.setDenseTile(upload.layer, 2, 0, upload.water);
+    var failing_world = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var failing_renderer = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    upload.world.allocator = failing_world.allocator();
+    upload.renderer.allocator = failing_renderer.allocator();
+    defer upload.world.allocator = allocator;
+    defer upload.renderer.allocator = allocator;
+    try upload.world.syncDenseTileStore(&upload.renderer, 0, copy);
+    try std.testing.expectEqual(@as(usize, 0), failing_world.allocations);
+    try std.testing.expectEqual(@as(usize, 0), failing_renderer.allocations);
+    try expectInstalledUploadMatches(&upload.world, &upload.renderer);
+    try std.testing.expect(!upload.world.resident_layers_changed);
 }
 
 test "a new directory side with nothing resident lets the old store go and re-submits the draws" {
@@ -1451,7 +1724,7 @@ test "a new directory side with nothing resident lets the old store go and re-su
     };
     defer deinitStaticTestRenderer(&renderer);
     const store = try attachFakeTileStore(&renderer, &world);
-    try world.syncDenseTileStore(&renderer, 0);
+    try world.syncDenseTileStore(&renderer, 0, null);
     try std.testing.expect(world.gpu_tiles.store.isValid());
     try std.testing.expectEqual([4]u32{ 0, 0, 1, 1 }, store.params.window);
 
@@ -1459,7 +1732,7 @@ test "a new directory side with nothing resident lets the old store go and re-su
     // so the world stops naming (and claiming) the old store's layout.
     try testShowChunks(&world, 0, 0, 3, 3, 1);
     world.dense_quads_dirty = false;
-    try world.syncDenseTileStore(&renderer, 1);
+    try world.syncDenseTileStore(&renderer, 1, null);
     try std.testing.expect(!world.gpu_tiles.store.isValid());
     try std.testing.expectEqual(world_gpu_tiles.no_slot, world.dense_layers.items(.gpu_slot)[layer]);
     try std.testing.expect(world.dense_quads_dirty);
@@ -1586,39 +1859,176 @@ test "a cleared sparse tile no longer blocks and is not in the window list; an u
     const stone = try world.requireTileByName(&meta, "stone_floor");
     const tunnel = try world.requireTileByName(&meta, "cave_0");
 
-    // Row 0 lies outside the window; the last row lies inside it, so removing row 0
-    // moves an in-window row.
+    // (12, 12) is outside the window, alone in its chunk. (1, 1)'s tree is the first
+    // live row of a window chunk whose later row is also in the window.
     _ = try world.addSparseTile(0, 12, 12, deco, 0, .obstacle);
-    _ = try world.addSparseTile(0, 2, 2, tree, 0, .obstacle);
-    _ = try world.addSparseTile(0, 2, 2, stone, 0, .floor);
-    _ = try world.addSparseTile(1, 3, 1, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, 1, 1, tree, 0, .obstacle);
+    _ = try world.addSparseTile(0, 1, 1, stone, 0, .floor);
+    _ = try world.addSparseTile(0, 2, 2, deco, 0, .effect);
     _ = try world.addSparseTile(0, 5, 6, deco, 0, .effect);
-    _ = try world.addSparseTile(0, 1, 7, tree, 0, .obstacle);
+    _ = try world.addSparseTile(1, 3, 1, deco, 0, .obstacle);
     try testShowTiles(&world, 0, 8, 0, 0);
     var keys_buf: [8]TestSparseKey = undefined;
     var before_buf: [8]TestSparseKey = undefined;
     const before = testWindowSparseKeys(&world, &before_buf);
     try std.testing.expectEqual(@as(usize, 5), before.len);
 
-    // The unrelated removal moves a window row: the list rebuilds, same draw order.
+    // An outside removal moves no window row: the list stays, and is not dirty.
     try std.testing.expect((try world.clearCellBlocking(0, 12, 12, tunnel)) != null);
-    try std.testing.expect(world.sparse_window.dirty);
+    try std.testing.expect(!world.sparse_window.dirty);
     try testShowTiles(&world, 0, 8, 0, 0);
     try std.testing.expectEqualSlices(TestSparseKey, before, testWindowSparseKeys(&world, &keys_buf));
-    try expectSparseRangesCoverWindow(&world);
 
-    // Clearing (2, 2) drops its blocking tree and keeps the walkable decal.
-    try std.testing.expect(world.levelBlocksMovement(0, 2, 2));
-    try std.testing.expect((try world.clearCellBlocking(0, 2, 2, tunnel)) != null);
-    try std.testing.expect(!world.levelBlocksMovement(0, 2, 2));
+    // Clearing (1, 1) swaps the later in-window row onto the cursor. The rebuilt
+    // list drops the tree and keeps the walkable decal, in the same draw order.
+    try std.testing.expect(world.levelBlocksMovement(0, 1, 1));
+    try std.testing.expect((try world.clearCellBlocking(0, 1, 1, tunnel)) != null);
+    try std.testing.expect(!world.levelBlocksMovement(0, 1, 1));
     try std.testing.expect(world.sparse_window.dirty);
     try testShowTiles(&world, 0, 8, 0, 0);
     const after = testWindowSparseKeys(&world, &keys_buf);
-    try std.testing.expectEqual(@as(usize, 4), after.len);
-    const cleared_cell = world.cellIndex(2, 2);
+    const cleared = TestSparseKey{
+        .depth = world.worldZForLevel(0, 0, .obstacle),
+        .cell = world.cellIndex(1, 1),
+        .tile_id = tree,
+    };
+    var expected: [8]TestSparseKey = undefined;
+    var expected_count: usize = 0;
+    for (before) |key| {
+        if (std.meta.eql(key, cleared)) continue;
+        expected[expected_count] = key;
+        expected_count += 1;
+    }
+    try std.testing.expectEqualSlices(TestSparseKey, expected[0..expected_count], after);
+    const cleared_cell = world.cellIndex(1, 1);
     for (after) |key| try std.testing.expect(key.cell != cleared_cell or key.tile_id == stone);
     try expectSparseRangesCoverWindow(&world);
     try expectSparseIndexConsistent(&world);
+
+    // Same chunk: the outside row sits at a lower offset than an in-window row.
+    // Clearing it swaps the row the window already copied. The copy stays, and
+    // the window is not dirty, before the next visibility update.
+    const outside_x: u16 = 10;
+    const inside_x: u16 = 8;
+    const row_y: u16 = 1;
+    const geom = world.chunkGeometry();
+    const chunk = geom.chunkOf(outside_x, row_y);
+    try std.testing.expectEqual(chunk, geom.chunkOf(inside_x, row_y));
+    _ = try world.addSparseTile(0, outside_x, row_y, deco, 0, .obstacle);
+    _ = try world.addSparseTile(0, inside_x, row_y, stone, 0, .floor);
+    const placed = world.level_terrain.items[0].sparse_runs[chunk].rows.items(.cell_index);
+    try std.testing.expectEqual(@as(usize, 2), placed.len);
+    try std.testing.expectEqual(world.cellIndex(outside_x, row_y), placed[0]);
+    try std.testing.expectEqual(world.cellIndex(inside_x, row_y), placed[1]);
+    try testShowTiles(&world, 6, 4, 0, 0);
+    const shown = testWindowSparseKeys(&world, &before_buf);
+    try std.testing.expectEqual(@as(usize, 1), shown.len);
+    const copied = shown[0];
+    try std.testing.expectEqual(testPlacedKey(&world, 0, inside_x, row_y, stone, .floor), copied);
+    try std.testing.expect((try world.clearCellBlocking(0, outside_x, row_y, tunnel)) != null);
+    try std.testing.expectEqual(world.cellIndex(inside_x, row_y), world.level_terrain.items[0].sparse_runs[chunk].rows.items(.cell_index)[0]);
+    try std.testing.expect(!world.sparse_window.dirty);
+    try std.testing.expectEqualSlices(TestSparseKey, &.{copied}, testWindowSparseKeys(&world, &keys_buf));
+    try expectSparseIndexConsistent(&world);
+}
+
+fn expectChunkLiveIndices(world: *const WorldSystem) !void {
+    const geom = world.chunkGeometry();
+    var live: u32 = 0;
+    for (world.level_terrain.items, 0..) |terrain, level_index| {
+        for (terrain.sparse_runs, 0..) |run, chunk_index| {
+            if (run.rows.len == 0) {
+                try std.testing.expectEqual(@as(usize, 0), run.rows.capacity);
+                continue;
+            }
+            const rows = run.rows.slice();
+            const levels = rows.items(.level_index);
+            const cells = rows.items(.cell_index);
+            const chunk: u32 = @intCast(chunk_index);
+            for (levels, cells) |row_level, cell| {
+                try std.testing.expectEqual(@as(u16, @intCast(level_index)), row_level);
+                const x: u16 = @intCast(cell % world.width);
+                const y: u16 = @intCast(cell / world.width);
+                try std.testing.expectEqual(chunk, geom.chunkOf(x, y));
+                live += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(live, world.sparse_live);
+}
+
+test "the window sparse list matches a chunk-ordered walk after interleaved adds and removals" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    const tree_name = "tree_0";
+    const stone_name = "stone_floor";
+    const Spec = struct { level: u16, x: u16, y: u16, blocking: bool, depth: WorldDepth };
+    // Two rows share chunk 0, including a walkable decal on the cleared cell.
+    // (12, 12) sits outside the window the walks compare.
+    const specs = [_]Spec{
+        .{ .level = 0, .x = 1, .y = 1, .blocking = true, .depth = .obstacle },
+        .{ .level = 0, .x = 1, .y = 1, .blocking = false, .depth = .floor },
+        .{ .level = 0, .x = 2, .y = 2, .blocking = true, .depth = .effect },
+        .{ .level = 0, .x = 5, .y = 1, .blocking = true, .depth = .obstacle },
+        .{ .level = 0, .x = 1, .y = 5, .blocking = true, .depth = .floor },
+        .{ .level = 1, .x = 3, .y = 2, .blocking = true, .depth = .effect },
+        .{ .level = 0, .x = 12, .y = 12, .blocking = true, .depth = .obstacle },
+    };
+
+    var ordered = try testSparseWindowWorld(&meta, std.testing.allocator, 2);
+    defer ordered.deinit();
+    var mixed = try testSparseWindowWorld(&meta, std.testing.allocator, 2);
+    defer mixed.deinit();
+    const tree = try ordered.requireTileByName(&meta, tree_name);
+    const stone = try ordered.requireTileByName(&meta, stone_name);
+    const tunnel = try ordered.requireTileByName(&meta, "cave_0");
+    try std.testing.expectEqual(tree, try mixed.requireTileByName(&meta, tree_name));
+    try std.testing.expectEqual(stone, try mixed.requireTileByName(&meta, stone_name));
+
+    var chunk_order: [specs.len]usize = undefined;
+    for (&chunk_order, 0..) |*slot, index| slot.* = index;
+    const order = struct {
+        geom: @TypeOf(ordered.chunkGeometry()),
+        specs: []const Spec,
+    }{ .geom = ordered.chunkGeometry(), .specs = &specs };
+    std.mem.sort(usize, &chunk_order, order, struct {
+        fn lessThan(ctx: @TypeOf(order), lhs: usize, rhs: usize) bool {
+            const a = ctx.specs[lhs];
+            const b = ctx.specs[rhs];
+            if (a.level != b.level) return a.level < b.level;
+            const ca = ctx.geom.chunkOf(a.x, a.y);
+            const cb = ctx.geom.chunkOf(b.x, b.y);
+            if (ca != cb) return ca < cb;
+            if (a.y != b.y) return a.y < b.y;
+            return a.x < b.x;
+        }
+    }.lessThan);
+
+    for (chunk_order) |index| {
+        const spec = specs[index];
+        const tile = if (spec.blocking) tree else stone;
+        _ = try ordered.addSparseTile(spec.level, spec.x, spec.y, tile, 0, spec.depth);
+    }
+    // Reverse of chunk order, so later chunks land first.
+    var step = specs.len;
+    while (step > 0) {
+        step -= 1;
+        const spec = specs[chunk_order[step]];
+        const tile = if (spec.blocking) tree else stone;
+        _ = try mixed.addSparseTile(spec.level, spec.x, spec.y, tile, 0, spec.depth);
+    }
+    try std.testing.expect((try mixed.clearCellBlocking(0, 1, 1, tunnel)) != null);
+    _ = try mixed.addSparseTile(0, 1, 1, tree, 0, .obstacle);
+
+    try testShowTiles(&ordered, 0, 8, 0, 0);
+    try testShowTiles(&mixed, 0, 8, 0, 0);
+    var ordered_buf: [specs.len]TestSparseKey = undefined;
+    var mixed_buf: [specs.len]TestSparseKey = undefined;
+    try std.testing.expectEqualSlices(TestSparseKey, testWindowSparseKeys(&ordered, &ordered_buf), testWindowSparseKeys(&mixed, &mixed_buf));
+    try expectSparseIndexConsistent(&ordered);
+    try expectSparseIndexConsistent(&mixed);
+    try expectChunkLiveIndices(&ordered);
+    try expectChunkLiveIndices(&mixed);
 }
 
 test "dense layer submit order sorts back to front by render depth" {

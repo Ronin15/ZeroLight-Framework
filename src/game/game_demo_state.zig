@@ -553,6 +553,7 @@ pub const GameDemoState = struct {
             context.runtime_assets,
             context.interpolation_alpha,
             camera_rect,
+            context.thread_system,
         );
         if (context.debug_overlay_visible) {
             try self.ai_overlay.draw(&self.data, camera_rect, context.renderer, context.text_service);

@@ -23,7 +23,6 @@ const invalid_tile_id = @import("system.zig").invalid_tile_id;
 const max_chunk_size_tiles = @import("system.zig").max_chunk_size_tiles;
 const world_render = @import("render.zig");
 const world_gpu_tiles = @import("gpu_tiles.zig");
-const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
 const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
 const ChunkWindow = @import("gpu_tiles.zig").ChunkWindow;
 const TileStoreSpan = @import("../../render/renderer.zig").TileStoreSpan;
@@ -142,7 +141,7 @@ pub fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height
 pub fn testSyncGpuTiles(world: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
     if (world.visible == null) try testShowWholeWorld(world, active_level);
     const sync_plan = try world_render.planDenseGpuSync(world, active_level);
-    world_render.commitDenseGpuSync(world, &sync_plan, active_level);
+    world_render.commitDenseGpuSync(world, &sync_plan, active_level, null, null);
     return sync_plan;
 }
 
@@ -198,9 +197,11 @@ pub fn expectGpuStoreMatches(world: *const WorldSystem, gpu: *const TestGpuStore
     };
 }
 
-/// Tile-cell coordinate of sparse tile `index`. Valid until the next sparse tile removal.
-pub fn sparseTileCellCoord(world: *const WorldSystem, index: usize) CellCoord {
-    return cellCoordOf(world, world.sparse_tiles.items(.cell_index)[index]);
+/// Tile-cell coordinate of the sparse row at (`level`, `chunk`, `offset`).
+/// Valid until that row is removed.
+pub fn sparseTileCellCoord(world: *const WorldSystem, level: u16, chunk: u32, offset: usize) CellCoord {
+    const cell = world.level_terrain.items[level].sparse_runs[chunk].rows.items(.cell_index)[offset];
+    return cellCoordOf(world, cell);
 }
 
 /// Blocks holding cells in a `DenseLayerStore` (or a pointer to one): its pool less
@@ -224,29 +225,30 @@ pub fn chunkBlockedCount(bits: anytype, geom: ChunkGeometry, chunk: u32) u32 {
     };
 }
 
-/// Every sparse row is listed exactly once, in its own (level, chunk) list, linked both
-/// ways, and the lists list nothing else.
+/// The sum of the runs' lengths is `sparse_live`, a run holds bytes exactly when
+/// it has a live row, and each live row's level and chunk are the run's.
 pub fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
-    const rows = world.sparse_tiles.slice();
     const geom = world.chunkGeometry();
-    var listed: usize = 0;
+    var live: u32 = 0;
     for (world.level_terrain.items, 0..) |terrain, level| {
-        for (terrain.sparse_heads, 0..) |head, chunk| {
-            var previous: u32 = no_sparse_tile;
-            var row = head;
-            while (row != no_sparse_tile) : (row = rows.items(.chunk_next)[row]) {
-                try std.testing.expect(row < rows.len);
-                try std.testing.expectEqual(level, rows.items(.level_index)[row]);
-                const coord = sparseTileCellCoord(world, row);
-                try std.testing.expectEqual(chunk, geom.chunkOf(coord.x, coord.y));
-                try std.testing.expectEqual(previous, rows.items(.chunk_prev)[row]);
-                previous = row;
-                listed += 1;
-                try std.testing.expect(listed <= rows.len);
+        const level_index: u16 = @intCast(level);
+        for (terrain.sparse_runs, 0..) |run, chunk| {
+            if (run.rows.len == 0) {
+                try std.testing.expectEqual(@as(usize, 0), run.rows.capacity);
+                continue;
+            }
+            const rows = run.rows.slice();
+            const levels = rows.items(.level_index);
+            const chunk_index: u32 = @intCast(chunk);
+            for (levels, 0..) |row_level, offset| {
+                try std.testing.expectEqual(level_index, row_level);
+                const coord = sparseTileCellCoord(world, level_index, chunk_index, offset);
+                try std.testing.expectEqual(chunk_index, geom.chunkOf(coord.x, coord.y));
+                live += 1;
             }
         }
     }
-    try std.testing.expectEqual(rows.len, listed);
+    try std.testing.expectEqual(live, world.sparse_live);
 }
 
 /// Brute-force composed blocked bit: OR over every dense layer on the level, then
@@ -256,10 +258,15 @@ pub fn bruteForceLevelBlocked(world: *const WorldSystem, level: u16, x: u16, y: 
         if (world.denseLayerLevel(layer) != level) continue;
         if (world.flagsFor(world.denseTile(layer, x, y)).blocks_movement) return true;
     }
-    for (world.sparse_tiles.items(.level_index), 0..) |row_level, sparse_index| {
-        if (row_level != level) continue;
-        const cell = sparseTileCellCoord(world, sparse_index);
-        if (cell.x == x and cell.y == y and world.sparse_tiles.items(.flags)[sparse_index].blocks_movement) return true;
+    const target = world.cellIndex(x, y);
+    for (world.level_terrain.items[level].sparse_runs) |run| {
+        if (run.rows.len == 0) continue;
+        const rows = run.rows.slice();
+        const sparse_cells = rows.items(.cell_index);
+        const sparse_flags = rows.items(.flags);
+        for (sparse_cells, sparse_flags) |row_cell, row_flags| {
+            if (row_cell == target and row_flags.blocks_movement) return true;
+        }
     }
     return false;
 }
@@ -314,9 +321,34 @@ test "the demo world paints the same tiles at every chunk edge" {
             try std.testing.expectEqual(demo.denseTile(layer, @intCast(x), @intCast(y)), fixture.denseTile(layer, @intCast(x), @intCast(y)));
         };
     }
-    try std.testing.expectEqual(demo.sparse_tiles.len, fixture.sparse_tiles.len);
-    for (0..demo.sparse_tiles.len) |index| {
-        try std.testing.expectEqual(sparseTileCellCoord(&demo, index), sparseTileCellCoord(&fixture, index));
-        try std.testing.expectEqual(demo.sparse_tiles.items(.flags)[index].blocks_movement, fixture.sparse_tiles.items(.flags)[index].blocks_movement);
+    try std.testing.expectEqual(demo.sparse_live, fixture.sparse_live);
+    const demo_rows = try std.testing.allocator.alloc(SparseProbe, demo.sparse_live);
+    defer std.testing.allocator.free(demo_rows);
+    const fixture_rows = try std.testing.allocator.alloc(SparseProbe, fixture.sparse_live);
+    defer std.testing.allocator.free(fixture_rows);
+    liveSparseProbes(&demo, demo_rows);
+    liveSparseProbes(&fixture, fixture_rows);
+    for (demo_rows, fixture_rows) |demo_row, fixture_row| {
+        try std.testing.expectEqual(demo_row.cell, fixture_row.cell);
+        try std.testing.expectEqual(demo_row.blocks, fixture_row.blocks);
     }
+}
+
+const SparseProbe = struct { cell: CellCoord, blocks: bool };
+
+fn liveSparseProbes(world: *const WorldSystem, out: []SparseProbe) void {
+    var count: usize = 0;
+    for (world.level_terrain.items) |terrain| {
+        for (terrain.sparse_runs) |run| {
+            if (run.rows.len == 0) continue;
+            const rows = run.rows.slice();
+            const cells = rows.items(.cell_index);
+            const flags = rows.items(.flags);
+            for (cells, flags) |cell, flag| {
+                out[count] = .{ .cell = cellCoordOf(world, cell), .blocks = flag.blocks_movement };
+                count += 1;
+            }
+        }
+    }
+    std.debug.assert(count == out.len);
 }

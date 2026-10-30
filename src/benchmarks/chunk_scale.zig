@@ -24,11 +24,13 @@
 //!     chunks. Its sparse-props case (64 chunks at 256², 8 levels) first places 32 blocking
 //!     sparse props in every chunk, so each changed cell's blocked bit also reads them.
 //!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the digs and
-//!     after the refills. Flat. Two more axes at 256² (`GpuSyncDigCode`): variant 0 digs the
-//!     4 cells of the center 2x2 chunks under a 2-, 6-, or 14-chunk window at 8 levels (linear
-//!     in window chunks); variant 1 times the syncs after an untimed batched explosion and
-//!     fill on every one of 2, 8, or 32 resident layers at 128 levels (linear in resident
-//!     layers).
+//!     after the refills. Flat in level size. Two more axes at 256² (`GpuSyncDigCode`): variant
+//!     0 digs the 4 cells of the center 2x2 chunks under a 2-, 6-, or 14-chunk window at 8
+//!     levels (linear in window chunks); variant 1 times the syncs after an untimed batched
+//!     explosion and fill on every one of 2, 8, or 32 resident layers at 128 levels (linear in
+//!     resident layers). Bytes scale with the changed chunks and layers; main is the span
+//!     commit. A fixed case whose output exceeds one aligned range runs on workers. The tuned
+//!     case settles before it is read. `serial-direct` is this job inline.
 //!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down and back,
 //!     each step one level entering (its window directory and 64 mixed blocks) and one
 //!     leaving. Flat.
@@ -45,9 +47,11 @@
 //! `--details` adds both edits' plan and write shapes over the measured steps
 //! (`edit_stages:`) and, for the tuned case, each edit tuner's state (`tuners:`). A fixed
 //! threaded case runs both edits' stages of more than one range on workers.
-//! Single-cell digs and GPU syncs are main-thread work and run serial only. The GPU sync
-//! groups drive `syncDenseTileStore` against a headless renderer whose tile store has no GPU
-//! buffer: they time planning, commit, and the queued upload batch, dropped after each sync.
+//! Single-cell digs and the level-enter and pan GPU syncs are main-thread work and run serial
+//! only. `chunk-scale-gpu-sync-dig` runs the value-fill stage on its serial, fixed, and tuned
+//! cases. The GPU sync groups drive `syncDenseTileStore` against a headless renderer whose
+//! tile store has no GPU buffer: they time planning, the span commit, and the value fill, and
+//! drop the upload batch after each sync.
 //!
 //! The `chunk-scale-nav-*` groups add the nav reaction, with nav over every level of the same
 //! fixture (no render window), built and owned by a `SimulationPipeline`: each change's writer
@@ -94,6 +98,9 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
+const GpuTileCopyThreads = @import("../game/world/gpu_tiles.zig").GpuTileCopyThreads;
+const gpu_tile_copy_range_alignment_items = @import("../game/world/gpu_tiles.zig").gpu_tile_copy_range_alignment_items;
 const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const DigController = @import("../game/dig_controller.zig").DigController;
 const Player = @import("../game/player.zig").Player;
@@ -293,7 +300,6 @@ pub const gpu_sync_dig_group = suite.BenchmarkGroup{
     .item_counts = &gpu_sync_dig_item_counts,
     .runCase = runGpuSyncDigCase,
     .write_workload = writeUploadsWorkload,
-    .cases = &suite.serial_cases,
 };
 
 pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
@@ -378,6 +384,7 @@ fn writeCellsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.Wo
 // The elements a GPU sync group uploaded.
 fn writeUploadsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("uploaded={}", .{stats.output_count});
+    try suite.writeMainShare(writer, stats, stats.output_count);
 }
 
 // A batched edit's cells and chunks; under --details its plan and write stages, their
@@ -632,6 +639,7 @@ const Fixture = struct {
             renderer.tile_stores.deinit(renderer.allocator);
             renderer.tile_merge_spans.deinit(renderer.allocator);
             renderer.tile_merge_values.deinit(renderer.allocator);
+            renderer.tile_merge_ops.deinit(renderer.allocator);
             renderer.batch.deinit();
         }
         self.world.deinit();
@@ -666,9 +674,10 @@ const Fixture = struct {
     }
 
     // One GPU tile sync; returns the elements it uploads and drops the batch.
-    fn syncGpuTiles(self: *Fixture, active_level: u16) !usize {
+    // Null `threads` runs the value fill inline.
+    fn syncGpuTiles(self: *Fixture, active_level: u16, threads: ?GpuTileCopyThreads) !usize {
         const renderer = &self.renderer.?;
-        try self.world.syncDenseTileStore(renderer, active_level);
+        try self.world.syncDenseTileStore(renderer, active_level, threads);
         const store = &renderer.tile_stores.items[0];
         const uploaded = store.pending_values.items.len;
         store.pending_spans.clearRetainingCapacity();
@@ -738,7 +747,11 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, shape: CaseShape) !suite.RunStats {
-    std.debug.assert(!case.usesThreadSystem());
+    if (workload == .gpu_sync_dig) {
+        if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    } else std.debug.assert(!case.usesThreadSystem());
+    var threads: ?ThreadSystem = if (workload == .gpu_sync_dig) try fixtures.initCaseThreads(allocator, io, case) else null;
+    defer if (threads) |*thread_system| thread_system.deinit();
     const resident_layers = shape.resident_layers;
     const window_edge = shape.window_edge;
     const side = shape.side;
@@ -757,7 +770,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
                 try fixture.setCenteredWindow(window_edge);
             }
             try fixture.attachHeadlessTileStore(allocator);
-            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
         },
         .gpu_sync_level_enter => {
             try fixture.setDigWindow();
@@ -768,7 +781,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
                 defer dig.deinit(allocator);
                 try applyDigSquare(&fixture.world, dig.forward_chunks.items, &dig);
             }
-            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1, null);
         },
         .gpu_sync_pan => {
             fixture.world.render_window = .{ .levels_below = fixture.gpu_levels_below };
@@ -783,19 +796,20 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             }
             try fixture.setPanWindow(0);
             try fixture.attachHeadlessTileStore(allocator);
-            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
         },
     }
 
     // The dig's batched edit and its refill, built outside the timed loop.
     var dig: BatchEdit = if (workload == .gpu_sync_dig) try buildDigSquareEdit(allocator, &fixture, fixture.levels - 1, fixture.gpu_dig_square) else .{};
     defer dig.deinit(allocator);
-    for (0..options.warmup_iterations) |_| _ = try runIteration(&fixture, workload, &dig);
+    if (workload == .gpu_sync_dig) return measureGpuSyncDig(io, options, case, item_count, &fixture, &dig, if (threads) |*thread_system| thread_system else null);
+    for (0..options.warmup_iterations) |_| _ = try runIteration(io, &fixture, workload, &dig, null, null);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var uploaded: usize = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        uploaded = try runIteration(&fixture, workload, &dig);
+        uploaded = try runIteration(io, &fixture, workload, &dig, null, null);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), inlineBatch(uploaded, 1));
     }
     var stats = accumulator.finish();
@@ -805,30 +819,140 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     return stats;
 }
 
-// One timed change and its reversal; returns the elements uploaded. `dig` is the dig
-// workload's batched edit (empty for the other workloads).
-fn runIteration(fixture: *Fixture, workload: Workload, dig: *BatchEdit) !usize {
-    return switch (workload) {
-        .gpu_sync_dig => blk: {
-            const square = fixture.gpu_dig_square;
-            try applyDigSquare(&fixture.world, dig.forward_chunks.items, dig);
-            const split = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            try applyDigSquare(&fixture.world, dig.back_chunks.items, dig);
-            const uploaded = split + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            // Each dug cell splits its uniform chunk (its word and a whole block) and the
-            // refill merges it back (its word).
-            if (uploaded != @as(usize, square) * square * (2 + tileStoreBlockElements(default_chunk_size_tiles))) return error.GpuSyncDigUploadCountMismatch;
-            break :blk uploaded;
+// The two syncs of one dig iteration. The headline is the busier fill.
+const CopySample = struct {
+    batches: [2]BatchStats = .{ .{}, .{} },
+    count: usize = 0,
+    off_main_ns: u64 = 0,
+
+    fn add(self: *CopySample, batch: BatchStats) void {
+        std.debug.assert(self.count < self.batches.len);
+        self.batches[self.count] = batch;
+        self.count += 1;
+        self.off_main_ns += offMainNs(batch);
+    }
+
+    fn headline(self: CopySample) BatchStats {
+        var best: BatchStats = .{};
+        for (self.batches[0..self.count]) |batch| {
+            const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
+            const best_on_workers = !best.ran_inline and best.active_worker_threads != 0;
+            if (batch.item_count > best.item_count or (batch.item_count == best.item_count and on_workers and !best_on_workers)) best = batch;
+        }
+        return best;
+    }
+};
+
+fn lastGpuTileCopyBatch(world: *const WorldSystem) BatchStats {
+    if (comptime runtime_perf_log.enabled) return world.perf.last_gpu_tile_copy_batch;
+    return .{};
+}
+
+fn gpuCopyThreads(thread_system: ?*ThreadSystem, world: *WorldSystem, case: suite.BenchmarkCase) ?GpuTileCopyThreads {
+    const threads = thread_system orelse return null;
+    return .{
+        .thread_system = threads,
+        .tuner = &world.gpu_tile_copy_tuner,
+        .controls = .{
+            .adaptive = case.adaptive,
+            .batches_per_participant = case.stageBatchesPerParticipant(),
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = case.stageItemsPerRangeForPartition(gpu_tile_copy_range_alignment_items, gpu_tile_copy_range_alignment_items),
         },
+    };
+}
+
+fn gpuCopySettle(world: *const WorldSystem) suite.TunerSettle {
+    var census = suite.TunerSettle{};
+    census.add("gpu_tile_copy", &world.gpu_tile_copy_tuner);
+    return census;
+}
+
+fn checkGpuTileCopy(case: suite.BenchmarkCase, threads: ?*const ThreadSystem, batch: BatchStats) !void {
+    try suite.checkStageDispatched(case, threads, case.stageItemsPerRangeForPartition(gpu_tile_copy_range_alignment_items, gpu_tile_copy_range_alignment_items), batch);
+}
+
+fn noteGpuTileCopy(world: *const WorldSystem, sample: ?*CopySample) void {
+    const recorded = sample orelse return;
+    recorded.add(lastGpuTileCopyBatch(world));
+}
+
+// One fresh copy tuner, settled before the timed syncs. The digs sit outside that
+// window. `main_ns` is the two syncs minus the fills that ran on workers.
+fn measureGpuSyncDig(
+    io: std.Io,
+    options: suite.Options,
+    case: suite.BenchmarkCase,
+    item_count: usize,
+    fixture: *Fixture,
+    dig: *BatchEdit,
+    thread_system: ?*ThreadSystem,
+) !suite.RunStats {
+    fixture.world.gpu_tile_copy_tuner = AdaptiveWorkTuner.init(.{});
+    const copy = gpuCopyThreads(thread_system, &fixture.world, case);
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.nextSettled(gpuCopySettle(&fixture.world))) {
+        _ = try runGpuSyncDigIteration(io, fixture, dig, copy, null);
+    }
+    const settle = gpuCopySettle(&fixture.world);
+    const tuner_start = suite.TunerStart.of(&fixture.world.gpu_tile_copy_tuner, case);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var uploaded: usize = 0;
+    var main_total: u128 = 0;
+    const thread_ptr: ?*const ThreadSystem = thread_system;
+    for (0..options.iterations) |_| {
+        var sample = CopySample{};
+        const timed = try runGpuSyncDigIteration(io, fixture, dig, copy, &sample);
+        uploaded = timed.uploaded;
+        for (sample.batches[0..sample.count]) |batch| try checkGpuTileCopy(case, thread_ptr, batch);
+        accumulator.record(timed.sync_ns, sample.headline());
+        main_total += timed.sync_ns -| sample.off_main_ns;
+    }
+    var stats = accumulator.finish();
+    stats.output_count = uploaded;
+    stats.items_per_second = suite.itemsPerSecond(uploaded, stats.mean_ns);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&fixture.world.gpu_tile_copy_tuner, tuner_start);
+    }
+    return stats;
+}
+
+// One dig and its refill, each followed by a GPU sync. Returns the elements the two
+// syncs uploaded and their time; the digs are outside that time. A sample records each fill.
+fn runGpuSyncDigIteration(io: std.Io, fixture: *Fixture, dig: *BatchEdit, threads: ?GpuTileCopyThreads, sample: ?*CopySample) !struct { uploaded: usize, sync_ns: u64 } {
+    const square = fixture.gpu_dig_square;
+    var sync_ns: u64 = 0;
+    var uploaded: usize = 0;
+    for ([_][]const DenseChunkWrites{ dig.forward_chunks.items, dig.back_chunks.items }) |chunks| {
+        try applyDigSquare(&fixture.world, chunks, dig);
+        const start_ns = suite.nowNs(io);
+        uploaded += try fixture.syncGpuTiles(fixture.gpuActiveLevel(), threads);
+        noteGpuTileCopy(&fixture.world, sample);
+        sync_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+    }
+    // Each dug cell splits its uniform chunk (its word and a whole block) and the
+    // refill merges it back (its word).
+    if (uploaded != @as(usize, square) * square * (2 + tileStoreBlockElements(default_chunk_size_tiles))) return error.GpuSyncDigUploadCountMismatch;
+    return .{ .uploaded = uploaded, .sync_ns = sync_ns };
+}
+
+// One change and its reversal; returns the elements uploaded. `dig` is the dig
+// workload's batched edit (empty for the other workloads). Level-enter and pan pass null
+// threads: those syncs stay inline. A dig sample records each fill; its time is the syncs.
+fn runIteration(io: std.Io, fixture: *Fixture, workload: Workload, dig: *BatchEdit, threads: ?GpuTileCopyThreads, sample: ?*CopySample) !usize {
+    return switch (workload) {
+        .gpu_sync_dig => (try runGpuSyncDigIteration(io, fixture, dig, threads, sample)).uploaded,
         .gpu_sync_level_enter => blk: {
-            const entered = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-            break :blk entered + try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1);
+            const entered = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
+            break :blk entered + try fixture.syncGpuTiles(fixture.gpuActiveLevel() - 1, null);
         },
         .gpu_sync_pan => blk: {
             try fixture.setPanWindow(1);
-            const panned = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            const panned = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
             try fixture.setPanWindow(0);
-            const uploaded = panned + try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+            const uploaded = panned + try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
             if (uploaded != expectedPanUploads(fixture.pan_window_edge, fixture.gpu_levels_below + 1)) return error.PanUploadCountMismatch;
             break :blk uploaded;
         },
@@ -1276,7 +1400,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // flag their layers; each iteration's sync uploads them outside the timed region.
     try fixture.setDigWindow();
     try fixture.attachHeadlessTileStore(allocator);
-    _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
     var edit = switch (workload) {
         .cave_in => try buildCaveInEdit(allocator, &fixture, region_chunks),
         .explosion_fill => try buildExplosionEdit(allocator, &fixture, region_chunks, 1),
@@ -1285,7 +1409,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // The cave-in region starts carved, so each iteration collapses then re-carves it.
     if (workload == .cave_in) {
         try applyBatch(&fixture.world, edit.back_chunks.items, &edit.events, null);
-        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
     }
 
     const world = &fixture.world;
@@ -1303,7 +1427,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.nextSettled(editTunerSettle(world, &revert_tuners))) {
         _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
-        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
     }
     const settle = editTunerSettle(world, &revert_tuners);
     const terrain_edit_write_tuner_start = suite.TunerStart.of(&world.terrain_edit_write_tuner, case);
@@ -1328,7 +1452,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         write_total += timing.write_ns;
         // Main is everything but the stages that ran on workers.
         main_total += elapsed_ns -| timing.off_main_ns;
-        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the cells written; the
@@ -1373,40 +1497,60 @@ fn expectedBatchSyncUploads(edit: *const BatchEdit) usize {
 // untimed), each followed by the timed GPU sync. Every resident layer is flagged.
 fn runGpuSyncBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: GpuSyncDigConfig) !suite.RunStats {
     std.debug.assert(config.variant == .batched);
-    std.debug.assert(!case.usesThreadSystem());
     std.debug.assert(config.resident_layers + 1 <= config.levels);
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
     var fixture = try buildFixture(allocator, io, config.side, config.levels);
     defer fixture.deinit();
     fixture.gpu_levels_below = config.resident_layers - 1;
     try fixture.setDigWindow();
     try fixture.attachHeadlessTileStore(allocator);
-    _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+    _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel(), null);
     var edit = try buildExplosionEdit(allocator, &fixture, @as(usize, dig_window_chunks) * dig_window_chunks, config.resident_layers);
     defer edit.deinit(allocator);
     const expected_uploads = expectedBatchSyncUploads(&edit);
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads);
+    fixture.world.gpu_tile_copy_tuner = AdaptiveWorkTuner.init(.{});
+    const copy = gpuCopyThreads(if (threads) |*thread_system| thread_system else null, &fixture.world, case);
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.nextSettled(gpuCopySettle(&fixture.world))) {
+        _ = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads, copy, null);
+    }
+    const settle = gpuCopySettle(&fixture.world);
+    const tuner_start = suite.TunerStart.of(&fixture.world.gpu_tile_copy_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
+    const thread_ptr: ?*const ThreadSystem = if (threads) |*thread_system| thread_system else null;
     for (0..options.iterations) |_| {
-        const sync_ns = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads);
-        accumulator.record(sync_ns, inlineBatch(expected_uploads, 1));
+        var sample = CopySample{};
+        const sync_ns = try runGpuSyncBatchIteration(io, &fixture, &edit, expected_uploads, copy, &sample);
+        for (sample.batches[0..sample.count]) |batch| try checkGpuTileCopy(case, thread_ptr, batch);
+        accumulator.record(sync_ns, sample.headline());
+        main_total += sync_ns -| sample.off_main_ns;
     }
     var stats = accumulator.finish();
     // The item count is a case code, so report throughput over the elements uploaded.
     stats.output_count = expected_uploads;
     stats.items_per_second = suite.itemsPerSecond(expected_uploads, stats.mean_ns);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
+        stats.work_tuning = suite.workTuningSummary(&fixture.world.gpu_tile_copy_tuner, tuner_start);
+    }
     return stats;
 }
 
 // One batched change and its reversal, each followed by a GPU sync; returns the two syncs'
-// time and fails unless they uploaded `expected_uploads` elements.
-fn runGpuSyncBatchIteration(io: std.Io, fixture: *Fixture, edit: *BatchEdit, expected_uploads: usize) !u64 {
+// time and fails unless they uploaded `expected_uploads` elements. A sample records each fill.
+fn runGpuSyncBatchIteration(io: std.Io, fixture: *Fixture, edit: *BatchEdit, expected_uploads: usize, threads: ?GpuTileCopyThreads, sample: ?*CopySample) !u64 {
     var sync_ns: u64 = 0;
     var uploaded: usize = 0;
     for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }) |chunks| {
         try applyBatch(&fixture.world, chunks, &edit.events, null);
         const start_ns = suite.nowNs(io);
-        uploaded += try fixture.syncGpuTiles(fixture.gpuActiveLevel());
+        uploaded += try fixture.syncGpuTiles(fixture.gpuActiveLevel(), threads);
+        noteGpuTileCopy(&fixture.world, sample);
         sync_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
     }
     if (uploaded != expected_uploads) return error.GpuSyncBatchUploadCountMismatch;

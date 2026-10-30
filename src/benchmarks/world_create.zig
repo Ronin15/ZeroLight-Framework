@@ -219,7 +219,7 @@ fn checkPhasesMatchInitProcedural(allocator: std.mem.Allocator, io: std.Io, meta
     const same_shape = whole.width == phased.width and whole.height == phased.height and
         whole.tile_size == phased.tile_size and whole.chunk_size_tiles == phased.chunk_size_tiles and
         whole.levelCount() == phased.levelCount() and whole.dense_layers.len == phased.dense_layers.len and
-        whole.sparse_tiles.len == phased.sparse_tiles.len;
+        whole.sparse_live == phased.sparse_live;
     if (!same_shape) return error.WorldCreatePhaseDrift;
     for (0..whole.levelCount()) |level_index| {
         const level: u16 = @intCast(level_index);

@@ -20,7 +20,6 @@ const thread_shared_record_alignment = @import("../../app/thread_system.zig").th
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const world_terrain = @import("terrain.zig");
 const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
-const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
 const WorldSystem = @import("system.zig").WorldSystem;
 const WorldBuildConfig = @import("system.zig").WorldBuildConfig;
 const TileId = @import("system.zig").TileId;
@@ -199,7 +198,7 @@ fn buildProceduralGround(self: *WorldSystem, level: u16, layer_index: usize, ids
     const terrain = &self.level_terrain.items[level];
     std.debug.assert(terrain.bandLayers().len == 1 and terrain.bandLayers()[0] == layer_index);
     // The fill composes from the band alone: the level holds no sparse tile yet.
-    std.debug.assert(std.mem.allEqual(u32, terrain.sparse_heads, no_sparse_tile));
+    for (terrain.sparse_runs) |run| std.debug.assert(run.rows.len == 0);
     const store = &self.dense_layers.items(.store)[layer_index];
     try store.reserveEveryChunk(self.allocator, geom);
     try terrain.blocked.reserveEveryChunk(self.allocator, geom);
@@ -448,7 +447,7 @@ test "procedural world build is identical serial and threaded" {
     try std.testing.expect(threaded.chunkCountPerLevel() > paint_range_alignment_items);
     try std.testing.expect(threaded.chunkCountPerLevel() % paint_range_alignment_items != 0);
 
-    try std.testing.expectEqual(serial.sparse_tiles.len, threaded.sparse_tiles.len);
+    try std.testing.expectEqual(serial.sparse_live, threaded.sparse_live);
     for (0..serial.height) |y| for (0..serial.width) |x| {
         const xi: u16 = @intCast(x);
         const yi: u16 = @intCast(y);

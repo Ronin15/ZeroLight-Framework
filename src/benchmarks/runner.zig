@@ -115,6 +115,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     render_game_prep.offview_group,
     sparse_window.frame_group,
     sparse_window.pan_group,
+    sparse_window.pan_interleaved_group,
+    sparse_window.pan_churned_group,
     sparse_window.add_group,
     scope.cognition_group,
     plane_traversal.group,

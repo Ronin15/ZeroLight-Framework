@@ -21,6 +21,7 @@ const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
 const DenseLayerStore = @import("terrain.zig").DenseLayerStore;
 const TileDataId = @import("../../render/renderer.zig").TileDataId;
 const TileStoreSpan = @import("../../render/renderer.zig").TileStoreSpan;
+const TileUploadOp = @import("../../render/renderer.zig").TileUploadOp;
 const packTileData = @import("../../render/renderer.zig").packTileData;
 const tile_data_pad_cell = @import("../../render/renderer.zig").tile_data_pad_cell;
 const tile_store_max_elements = @import("../../render/renderer.zig").tile_store_max_elements;
@@ -30,6 +31,32 @@ const tile_store_uniform_bit = @import("../../render/renderer.zig").tile_store_u
 const tileStoreBlockElements = @import("../../render/renderer.zig").tileStoreBlockElements;
 const tileStoreUniformWord = @import("../../render/renderer.zig").tileStoreUniformWord;
 const pdqSort = @import("../../core/sort.zig").pdq;
+const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const StageControls = @import("../../app/thread_system.zig").StageControls;
+const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const runStage = @import("../../app/thread_system.zig").runStage;
+
+/// Worker ranges of the upload fill. One cache line of `u32`s, so neighbouring ranges
+/// share at most the line at their boundary. The last range holds the tail.
+pub const gpu_tile_copy_range_alignment_items: usize = 16;
+comptime {
+    std.debug.assert(gpu_tile_copy_range_alignment_items * @sizeOf(u32) == 64);
+}
+
+/// Threading for one upload fill: null at the call runs the job inline.
+pub const GpuTileCopyThreads = struct {
+    thread_system: *ThreadSystem,
+    tuner: *AdaptiveWorkTuner,
+    controls: StageControls = .{},
+};
+
+/// Where `fillUploadValues` reads. `regions` is this sync's spans; `ops` is a carried
+/// merge, with `old_values` for the ops that are not new.
+pub const UploadFillSource = enum { regions, ops };
 
 /// `gpu_slot` of a dense layer that is not resident.
 pub const no_slot: u32 = std.math.maxInt(u32);
@@ -142,6 +169,8 @@ const Region = struct {
     slot: u32,
     // Toroidal word for `directory_word`; level chunk for `block`.
     index: u32,
+    /// Element where this region's values start in the upload stream, after the dst sort.
+    value_at: u32 = 0,
 };
 
 // How one resident chunk's GPU directory word and block must change to match the
@@ -188,9 +217,12 @@ pub const GpuTileMirror = struct {
     // The changed chunks of flagged staying layers, in slot then chunk order.
     plan_edits: std.ArrayList(PlannedEdit) = .empty,
     regions: std.ArrayList(Region) = .empty,
-    /// The last commit's upload batch for `Renderer.queueTileStoreUploads`.
+    /// The last commit's upload spans, dst order. A renderer sync adopts `values`; a sync
+    /// with no renderer leaves both here.
     spans: std.ArrayList(TileStoreSpan) = .empty,
     values: std.ArrayList(u32) = .empty,
+    // Carried-batch value ops (`planTileStoreMerge`). Reserved only while a batch is pending.
+    copy_ops: std.ArrayList(TileUploadOp) = .empty,
     resident_bytes_reported: bool = false,
     width_drop_reported: bool = false,
     window_clip_reported: bool = false,
@@ -211,6 +243,7 @@ pub const GpuTileMirror = struct {
         self.regions.deinit(allocator);
         self.spans.deinit(allocator);
         self.values.deinit(allocator);
+        self.copy_ops.deinit(allocator);
         self.* = undefined;
     }
 
@@ -227,6 +260,13 @@ pub const GpuTileMirror = struct {
         self.regions.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
         self.values.clearRetainingCapacity();
+        self.copy_ops.clearRetainingCapacity();
+    }
+
+    /// Room for one carried merge's ops: `old_spans + 2 * new_spans`. Call before the fill,
+    /// only when a batch is already pending.
+    pub fn reserveCopyOps(self: *GpuTileMirror, allocator: std.mem.Allocator, old_spans: usize, new_spans: usize) error{OutOfMemory}!void {
+        try self.copy_ops.ensureTotalCapacity(allocator, old_spans + 2 * new_spans);
     }
 
     /// Whether the layout describes `store`'s contents: false once a store was
@@ -437,13 +477,11 @@ pub const GpuTileMirror = struct {
     }
 
     /// Applies `sync_plan` (from `plan` with the same inputs, nothing changed since)
-    /// and writes the upload batch into `spans`/`values`, sorted and disjoint, each
-    /// span a whole directory, one word, one link, or one block. Clears the change
-    /// mark of every block it uploads and, after a plan with edits, every resident
-    /// layer's `layer_changed` flag. Allocation-free. Frees come first (evictions,
-    /// chunks leaving, edits), then takes (edits, chunks entering, layers entering),
-    /// then links.
-    pub fn commit(
+    /// through the upload's span list. Does not write values. Clears the change mark
+    /// of every block it uploads and, after a plan with edits, every resident layer's
+    /// `layer_changed` flag. Allocation-free. Frees come first (evictions, chunks
+    /// leaving, edits), then takes (edits, chunks entering, layers entering), then links.
+    pub fn commitStructure(
         self: *GpuTileMirror,
         sync_plan: *const SyncPlan,
         geom: ChunkGeometry,
@@ -541,20 +579,62 @@ pub const GpuTileMirror = struct {
         }
 
         pdqSort(Region, self.regions.items, {}, regionLessThan);
-        const block_cells = geom.blockCells();
-        for (self.regions.items) |region| {
+        var value_at: u32 = 0;
+        for (self.regions.items) |*region| {
+            region.value_at = value_at;
+            value_at += region.count;
             self.spans.appendAssumeCapacity(.{ .dst_element = region.dst, .count = region.count });
-            switch (region.kind) {
-                .directory => self.values.appendSliceAssumeCapacity(self.slotWords(region.slot)),
-                .directory_word, .link => self.values.appendAssumeCapacity(self.slotWords(region.slot)[region.index]),
-                .block => {
-                    const store = &stores[self.slot_layer.items[region.slot]];
-                    packTileData(store.chunkCells(block_cells, region.index).?, self.values.addManyAsSliceAssumeCapacity(block_elements));
-                    store.clearBlockChanged(region.index);
-                },
-            }
+            if (region.kind == .block) stores[self.slot_layer.items[region.slot]].clearBlockChanged(region.index);
         }
+        std.debug.assert(value_at == sync_plan.value_count);
+        std.debug.assert(self.spans.items.len == sync_plan.span_count);
+    }
+
+    /// `commitStructure` plus the fill of `values` to `sync_plan.value_count`. Null
+    /// `threads` runs the fill inline. Allocation-free. The batch is the fill's.
+    pub fn commit(
+        self: *GpuTileMirror,
+        sync_plan: *const SyncPlan,
+        geom: ChunkGeometry,
+        stores: []DenseLayerStore,
+        layer_slots: []u32,
+        layer_changed: []bool,
+        threads: ?GpuTileCopyThreads,
+    ) BatchStats {
+        self.commitStructure(sync_plan, geom, stores, layer_slots, layer_changed);
+        const dest = self.values.addManyAsSliceAssumeCapacity(sync_plan.value_count);
+        const batch = self.fillUploadValues(dest, .regions, &.{}, threads, geom, stores);
         std.debug.assert(self.spans.items.len == sync_plan.span_count and self.values.items.len == sync_plan.value_count);
+        return batch;
+    }
+
+    /// Copies this sync's upload values into `dest`. `source` is the region list, or the
+    /// carried op list plus `old_values`. One `u32` per item; null `threads` runs inline.
+    /// Workers write only `dest`.
+    pub fn fillUploadValues(
+        self: *const GpuTileMirror,
+        dest: []u32,
+        source: UploadFillSource,
+        old_values: []const u32,
+        threads: ?GpuTileCopyThreads,
+        geom: ChunkGeometry,
+        stores: []const DenseLayerStore,
+    ) BatchStats {
+        var job = GpuTileCopyJob{
+            .regions = self.regions.items,
+            .ops = self.copy_ops.items,
+            .from_ops = source == .ops,
+            .old_values = old_values,
+            .dest = dest,
+            .slot_words = self.slot_words.items,
+            .slot_layer = self.slot_layer.items,
+            .side = self.side,
+            .stores = stores,
+            .block_cells = geom.blockCells(),
+            .range_count = 1,
+        };
+        const dispatch = if (threads) |copy| Dispatch.init(copy.thread_system, copy.tuner, copy.controls) else null;
+        return runStage(dispatch, dest.len, gpu_tile_copy_range_alignment_items, &job, &job.range_count, gpuTileCopyJob);
     }
 
     // Drops every slot and the allocator, keeping capacity; no layer stays resident
@@ -767,6 +847,108 @@ fn regionLessThan(_: void, lhs: Region, rhs: Region) bool {
     return lhs.dst < rhs.dst;
 }
 
+const GpuTileCopyJob = struct {
+    regions: []const Region,
+    ops: []const TileUploadOp,
+    from_ops: bool,
+    old_values: []const u32,
+    dest: []u32,
+    slot_words: []const u32,
+    slot_layer: []const u32,
+    side: u32,
+    stores: []const DenseLayerStore,
+    block_cells: usize,
+    range_count: usize,
+};
+
+// SIMD verdict: scalar. A range mixes one-word stores and block copies; the block body is
+// `packTileData` (a memcpy of the cell bytes on little-endian), not a `simd.zig` kernel.
+fn gpuTileCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *const GpuTileCopyJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= job.dest.len);
+    if (job.from_ops) {
+        fillUploadOps(job, range);
+    } else {
+        fillUploadRegions(job, range);
+    }
+}
+
+fn fillUploadRegions(job: *const GpuTileCopyJob, range: ParallelRange) void {
+    const regions = job.regions;
+    var index = std.sort.lowerBound(Region, regions, range.start, regionEndsAtOrBefore);
+    while (index < regions.len and @as(usize, regions[index].value_at) < range.end) : (index += 1) {
+        const region = regions[index];
+        const begin = @as(usize, region.value_at);
+        const end = begin + region.count;
+        const overlap_begin = @max(begin, range.start);
+        const overlap_end = @min(end, range.end);
+        writeRegionOverlap(job, region, overlap_begin - begin, job.dest[overlap_begin..overlap_end]);
+    }
+}
+
+fn fillUploadOps(job: *const GpuTileCopyJob, range: ParallelRange) void {
+    const ops = job.ops;
+    var index = std.sort.lowerBound(TileUploadOp, ops, range.start, opEndsAtOrBefore);
+    while (index < ops.len and @as(usize, ops[index].value_at) < range.end) : (index += 1) {
+        const op = ops[index];
+        const begin = @as(usize, op.value_at);
+        const end = begin + op.count;
+        const overlap_begin = @max(begin, range.start);
+        const overlap_end = @min(end, range.end);
+        const src_offset = overlap_begin - begin;
+        const dest = job.dest[overlap_begin..overlap_end];
+        if (!op.from_new) {
+            const src = @as(usize, op.src_element) + src_offset;
+            @memcpy(dest, job.old_values[src..][0..dest.len]);
+        } else {
+            const region_index = std.sort.lowerBound(Region, job.regions, op.src_element, orderRegionValue);
+            const region = job.regions[region_index];
+            std.debug.assert(region.value_at == op.src_element and region.count == op.count);
+            writeRegionOverlap(job, region, src_offset, dest);
+        }
+    }
+}
+
+// `packTileData` packs two cells into one element. A whole block and an element overlap
+// of it are the same function; a split falls on elements, so it never breaks a pair.
+fn writeRegionOverlap(job: *const GpuTileCopyJob, region: Region, src_offset: usize, dest: []u32) void {
+    if (dest.len == 0) return;
+    const stride = directoryWords(job.side);
+    const words = job.slot_words[@as(usize, region.slot) * stride ..][0..stride];
+    switch (region.kind) {
+        .directory => @memcpy(dest, words[@as(usize, region.index) + src_offset ..][0..dest.len]),
+        .directory_word, .link => {
+            std.debug.assert(src_offset == 0 and dest.len == 1);
+            dest[0] = words[region.index];
+        },
+        .block => {
+            const cells = job.stores[job.slot_layer[region.slot]].chunkCells(job.block_cells, region.index).?;
+            const cell_start = src_offset * 2;
+            const pair_cells = dest.len * 2;
+            if (cell_start + pair_cells <= cells.len) {
+                packTileData(cells[cell_start..][0..pair_cells], dest);
+            } else {
+                packTileData(cells[cell_start..], dest);
+            }
+        },
+    }
+}
+
+fn regionEndsAtOrBefore(start: usize, region: Region) std.math.Order {
+    const end = @as(usize, region.value_at) + region.count;
+    return if (end <= start) .gt else .lt;
+}
+
+fn opEndsAtOrBefore(start: usize, op: TileUploadOp) std.math.Order {
+    const end = @as(usize, op.value_at) + op.count;
+    return if (end <= start) .gt else .lt;
+}
+
+fn orderRegionValue(src: u32, region: Region) std.math.Order {
+    return std.math.order(src, region.value_at);
+}
+
 const TestGpuStore = @import("test_support.zig").TestGpuStore;
 
 // Three layers of 4-cell chunks (16-cell blocks, 8-element blocks) over a
@@ -828,7 +1010,7 @@ const TestLayers = struct {
 
     fn sync(self: *TestLayers, mirror: *GpuTileMirror, desired: ?Residency) !SyncPlan {
         const sync_plan = try mirror.plan(std.testing.allocator, self.geom, &self.stores, &self.slots, self.layerChanged(), desired);
-        mirror.commit(&sync_plan, self.geom, &self.stores, &self.slots, &self.changed);
+        _ = mirror.commit(&sync_plan, self.geom, &self.stores, &self.slots, &self.changed, null);
         try self.gpu.apply(mirror.spans.items, mirror.values.items);
         return sync_plan;
     }
@@ -1052,7 +1234,7 @@ test "an out-of-memory plan leaves residency and window intact (FailingAllocator
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
         const result = mirror.plan(failing.allocator(), layers.geom, &layers.stores, &layers.slots, layers.layerChanged(), residency);
         if (result) |sync_plan| {
-            mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots, &layers.changed);
+            _ = mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots, &layers.changed, null);
             try layers.gpu.apply(mirror.spans.items, mirror.values.items);
             break;
         } else |err| {
@@ -1089,7 +1271,7 @@ test "a warmed pan sync allocates nothing (FailingAllocator)" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     for ([_]Residency{ right, left, right }) |residency| {
         const sync_plan = try mirror.plan(failing.allocator(), layers.geom, &layers.stores, &layers.slots, null, residency);
-        mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots, &layers.changed);
+        _ = mirror.commit(&sync_plan, layers.geom, &layers.stores, &layers.slots, &layers.changed, null);
         try layers.gpu.apply(mirror.spans.items, mirror.values.items);
     }
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -1126,6 +1308,39 @@ test "a changed mixed chunk uploads its whole block once and clears its mark; un
     layers.changed[0] = true;
     try std.testing.expectEqual(@as(usize, 0), (try layers.sync(&mirror, null)).span_count);
     try std.testing.expect(!layers.changed[0]);
+}
+
+test "serial and threaded uploads of mixed blocks match" {
+    // 8x8 cells, one layer, four mixed chunks. A 2x2 window at side 2 is one directory
+    // plus four 8-element blocks (37 elements). items_per_range 16 splits a block.
+    var serial_layers = try TestLayers.init(8, 8);
+    defer serial_layers.deinit();
+    var threaded_layers = try TestLayers.init(8, 8);
+    defer threaded_layers.deinit();
+    try serial_layers.mixEveryChunk(0);
+    try threaded_layers.mixEveryChunk(0);
+    var serial_mirror = GpuTileMirror{};
+    defer serial_mirror.deinit(std.testing.allocator);
+    var threaded_mirror = GpuTileMirror{};
+    defer threaded_mirror.deinit(std.testing.allocator);
+    const residency = Residency{ .layers = &.{0}, .window = testWindow(0, 0, 2, 2), .side = 2 };
+
+    const serial_plan = try serial_mirror.plan(std.testing.allocator, serial_layers.geom, &serial_layers.stores, &serial_layers.slots, null, residency);
+    _ = serial_mirror.commit(&serial_plan, serial_layers.geom, &serial_layers.stores, &serial_layers.slots, &serial_layers.changed, null);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const threaded_plan = try threaded_mirror.plan(std.testing.allocator, threaded_layers.geom, &threaded_layers.stores, &threaded_layers.slots, null, residency);
+    _ = threaded_mirror.commit(&threaded_plan, threaded_layers.geom, &threaded_layers.stores, &threaded_layers.slots, &threaded_layers.changed, .{
+        .thread_system = &threads,
+        .tuner = &tuner,
+        .controls = .{ .adaptive = false, .items_per_range = 16 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 37), serial_mirror.values.items.len);
+    try std.testing.expectEqualSlices(TileStoreSpan, serial_mirror.spans.items, threaded_mirror.spans.items);
+    try std.testing.expectEqualSlices(u32, serial_mirror.values.items, threaded_mirror.values.items);
 }
 
 test "a chunk that re-uniforms at a different tile uploads one word and frees its block" {

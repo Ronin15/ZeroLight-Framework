@@ -228,59 +228,139 @@ const GrowthCopySegments = struct {
     }
 };
 
+/// One run of merged upload values. `from_new` reads the new batch at `src_element`;
+/// otherwise the old pending values. `value_at` is the run's place in the merged stream.
+pub const TileUploadOp = struct {
+    count: u32,
+    from_new: bool,
+    src_element: u32,
+    value_at: u32 = 0,
+};
+
+/// Folds two sorted, disjoint upload batches into spans and value ops, emitting no bytes.
+/// A new span covering an old one drops the old. A new span inside an old one is a head,
+/// the new values, and a tail under the old span. `out_spans` holds `old + new` unused
+/// slots and `out_ops` holds `old + 2 * new`. Returns the merged element count.
+pub fn planTileStoreMerge(
+    old_spans: []const TileStoreSpan,
+    new_spans: []const TileStoreSpan,
+    out_spans: *std.ArrayList(TileStoreSpan),
+    out_ops: *std.ArrayList(TileUploadOp),
+) usize {
+    std.debug.assert(out_spans.capacity - out_spans.items.len >= old_spans.len + new_spans.len);
+    std.debug.assert(out_ops.capacity - out_ops.items.len >= old_spans.len + 2 * new_spans.len);
+    var old_index: usize = 0;
+    var new_index: usize = 0;
+    var old_value: u32 = 0;
+    var new_value: u32 = 0;
+    var out_at: u32 = 0;
+    var open = false;
+    var open_dst: u32 = 0;
+    var open_count: u32 = 0;
+    var open_span_dst: u32 = 0;
+    var open_span_count: u32 = 0;
+    while (open or old_index < old_spans.len or new_index < new_spans.len) {
+        if (!open and old_index < old_spans.len) {
+            const old = old_spans[old_index];
+            open = true;
+            open_dst = old.dst_element;
+            open_count = old.count;
+            open_span_dst = old.dst_element;
+            open_span_count = old.count;
+            old_index += 1;
+        }
+        if (new_index == new_spans.len) {
+            std.debug.assert(open);
+            appendUploadOp(out_ops, false, old_value, open_count, &out_at);
+            old_value += open_count;
+            appendUploadSpan(out_spans, open_span_dst, open_span_count);
+            open = false;
+            continue;
+        }
+        const new = new_spans[new_index];
+        if (!open) {
+            appendUploadSpan(out_spans, new.dst_element, new.count);
+            appendUploadOp(out_ops, true, new_value, new.count, &out_at);
+            new_value += new.count;
+            new_index += 1;
+            continue;
+        }
+        const open_end: u64 = @as(u64, open_dst) + open_count;
+        if (open_end <= new.dst_element) {
+            appendUploadOp(out_ops, false, old_value, open_count, &out_at);
+            old_value += open_count;
+            appendUploadSpan(out_spans, open_span_dst, open_span_count);
+            open = false;
+            continue;
+        }
+        if (new.end() <= open_dst) {
+            appendUploadSpan(out_spans, new.dst_element, new.count);
+            appendUploadOp(out_ops, true, new_value, new.count, &out_at);
+            new_value += new.count;
+            new_index += 1;
+            continue;
+        }
+        const span_end: u64 = @as(u64, open_span_dst) + open_span_count;
+        if (new.dst_element <= open_span_dst and span_end <= new.end() and open_dst == open_span_dst) {
+            old_value += open_span_count;
+            open = false;
+            continue;
+        }
+        std.debug.assert(@as(u64, open_dst) <= new.dst_element and new.end() <= open_end);
+        const head: u32 = new.dst_element - open_dst;
+        appendUploadOp(out_ops, false, old_value, head, &out_at);
+        appendUploadOp(out_ops, true, new_value, new.count, &out_at);
+        const consumed: u32 = @intCast(@as(u64, head) + new.count);
+        old_value += consumed;
+        new_value += new.count;
+        new_index += 1;
+        // A span end fits `u32`: both ends are element offsets inside the store.
+        open_dst = @intCast(new.end());
+        open_count -= consumed;
+        if (open_count == 0) {
+            appendUploadSpan(out_spans, open_span_dst, open_span_count);
+            open = false;
+        }
+    }
+    return out_at;
+}
+
+fn appendUploadOp(out_ops: *std.ArrayList(TileUploadOp), from_new: bool, src: u32, count: u32, out_at: *u32) void {
+    if (count == 0) return;
+    out_ops.appendAssumeCapacity(.{
+        .count = count,
+        .from_new = from_new,
+        .src_element = src,
+        .value_at = out_at.*,
+    });
+    out_at.* += count;
+}
+
+fn appendUploadSpan(out_spans: *std.ArrayList(TileStoreSpan), dst: u32, count: u32) void {
+    if (count == 0) return;
+    out_spans.appendAssumeCapacity(.{ .dst_element = dst, .count = count });
+}
+
 /// Folds a new batch into a store's batch still pending from a skipped frame. Both
 /// are sorted and disjoint, and any old and new span are disjoint or nested: a new
-/// span covering an old one replaces it, and a new span inside an old one patches
-/// the old span's values in place. `out_*` must hold both batches.
+/// span covering an old one replaces it, and a new span inside an old one is a head,
+/// the new values, and a tail of the old span. `out_spans` and `out_ops` must hold
+/// the planner's bounds; `out_values` must hold both batches' values.
 fn mergeTileStoreSpans(
     old_spans: []const TileStoreSpan,
-    old_values: []u32,
+    old_values: []const u32,
     new_spans: []const TileStoreSpan,
     new_values: []const u32,
     out_spans: *std.ArrayList(TileStoreSpan),
     out_values: *std.ArrayList(u32),
+    out_ops: *std.ArrayList(TileUploadOp),
 ) void {
-    std.debug.assert(out_spans.capacity - out_spans.items.len >= old_spans.len + new_spans.len);
     std.debug.assert(out_values.capacity - out_values.items.len >= old_values.len + new_values.len);
-    var old_index: usize = 0;
-    var old_value: usize = 0;
-    var new_index: usize = 0;
-    var new_value: usize = 0;
-    while (old_index < old_spans.len or new_index < new_spans.len) {
-        const take_old = if (new_index == new_spans.len)
-            true
-        else if (old_index == old_spans.len)
-            false
-        else blk: {
-            const old = old_spans[old_index];
-            const new = new_spans[new_index];
-            if (old.end() <= new.dst_element) break :blk true;
-            if (new.end() <= old.dst_element) break :blk false;
-            if (new.dst_element <= old.dst_element and old.end() <= new.end()) {
-                old_value += old.count;
-                old_index += 1;
-                continue;
-            }
-            std.debug.assert(old.dst_element <= new.dst_element and new.end() <= old.end());
-            const patch_start = old_value + (new.dst_element - old.dst_element);
-            @memcpy(old_values[patch_start..][0..new.count], new_values[new_value..][0..new.count]);
-            new_value += new.count;
-            new_index += 1;
-            continue;
-        };
-        if (take_old) {
-            const old = old_spans[old_index];
-            out_spans.appendAssumeCapacity(old);
-            out_values.appendSliceAssumeCapacity(old_values[old_value..][0..old.count]);
-            old_value += old.count;
-            old_index += 1;
-        } else {
-            const new = new_spans[new_index];
-            out_spans.appendAssumeCapacity(new);
-            out_values.appendSliceAssumeCapacity(new_values[new_value..][0..new.count]);
-            new_value += new.count;
-            new_index += 1;
-        }
+    out_ops.clearRetainingCapacity();
+    _ = planTileStoreMerge(old_spans, new_spans, out_spans, out_ops);
+    for (out_ops.items) |op| {
+        const src = if (op.from_new) new_values else old_values;
+        out_values.appendSliceAssumeCapacity(src[op.src_element..][0..op.count]);
     }
 }
 
@@ -439,6 +519,8 @@ pub const Renderer = struct {
     // Grow-only scratch for folding a new batch into one carried from a skipped frame.
     tile_merge_spans: std.ArrayList(TileStoreSpan) = .empty,
     tile_merge_values: std.ArrayList(u32) = .empty,
+    // Ops for the packed merge (`mergeTileStoreSpans`). The game sync plans into the mirror.
+    tile_merge_ops: std.ArrayList(TileUploadOp) = .empty,
     // Pooled transfer buffer holding every store's pending values for one copy pass.
     tile_upload_transfer: ?*c.SDL_GPUTransferBuffer = null,
     tile_upload_transfer_byte_size: u32 = 0,
@@ -562,6 +644,7 @@ pub const Renderer = struct {
         self.tile_store_free.deinit(self.allocator);
         self.tile_merge_spans.deinit(self.allocator);
         self.tile_merge_values.deinit(self.allocator);
+        self.tile_merge_ops.deinit(self.allocator);
         if (self.tile_upload_transfer) |transfer| {
             c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
             self.tile_upload_transfer = null;
@@ -1214,6 +1297,7 @@ pub const Renderer = struct {
         if (store.pending_spans.items.len > 0) {
             try self.tile_merge_spans.ensureTotalCapacity(self.allocator, store.pending_spans.items.len + span_count);
             try self.tile_merge_values.ensureTotalCapacity(self.allocator, store.pending_values.items.len + value_count);
+            try self.tile_merge_ops.ensureTotalCapacity(self.allocator, store.pending_spans.items.len + 2 * span_count);
         }
         if (required_elements > store.element_capacity) try self.growTileStore(store, required_elements);
     }
@@ -1247,7 +1331,44 @@ pub const Renderer = struct {
             values,
             &self.tile_merge_spans,
             &self.tile_merge_values,
+            &self.tile_merge_ops,
         );
+        std.mem.swap(std.ArrayList(TileStoreSpan), &store.pending_spans, &self.tile_merge_spans);
+        std.mem.swap(std.ArrayList(u32), &store.pending_values, &self.tile_merge_values);
+    }
+
+    /// The store's pending upload, or null when it has none. The slices stay valid until
+    /// the next queue, adopt, or install.
+    pub fn pendingTileUpload(self: *const Renderer, id: TileDataId) ?struct { spans: []const TileStoreSpan, values: []const u32 } {
+        const store = self.tileStore(id) orelse return null;
+        if (store.pending_spans.items.len == 0) return null;
+        return .{ .spans = store.pending_spans.items, .values = store.pending_values.items };
+    }
+
+    /// Adopts a filled upload whose pending batch is empty: appends `spans` and swaps
+    /// `values` with the store's pending values. Both lists were reserved by the same
+    /// allocator, and each owner frees the buffer it holds after the swap.
+    pub fn adoptFilledUpload(self: *Renderer, id: TileDataId, spans: []const TileStoreSpan, values: *std.ArrayList(u32)) void {
+        const store = self.tileStore(id).?;
+        std.debug.assert(store.pending_spans.items.len == 0);
+        std.debug.assert(gpu_buffer.storageSpansValid(spans, values.items.len, store.element_capacity));
+        std.debug.assert(store.pending_spans.unusedCapacitySlice().len >= spans.len);
+        store.pending_spans.appendSliceAssumeCapacity(spans);
+        std.mem.swap(std.ArrayList(u32), &store.pending_values, values);
+    }
+
+    /// Clears the carried-merge scratch and returns its reserved value window. The caller
+    /// writes a prefix and sets `tile_merge_values`'s length to that prefix.
+    pub fn prepareCarriedTileMerge(self: *Renderer) []u32 {
+        self.tile_merge_spans.clearRetainingCapacity();
+        self.tile_merge_values.clearRetainingCapacity();
+        return self.tile_merge_values.unusedCapacitySlice();
+    }
+
+    /// Swaps the filled carried merge into the store's pending batch.
+    pub fn installCarriedTileMerge(self: *Renderer, id: TileDataId) void {
+        const store = self.tileStore(id).?;
+        std.debug.assert(gpu_buffer.storageSpansValid(self.tile_merge_spans.items, self.tile_merge_values.items.len, store.element_capacity));
         std.mem.swap(std.ArrayList(TileStoreSpan), &store.pending_spans, &self.tile_merge_spans);
         std.mem.swap(std.ArrayList(u32), &store.pending_values, &self.tile_merge_values);
     }
@@ -2366,7 +2487,7 @@ test "mergeTileStoreSpans replaces covered carried spans and patches nested ones
         .{ .dst_element = 8, .count = 4 },
         .{ .dst_element = 20, .count = 1 },
     };
-    var old_values = [_]u32{ 1, 10, 11, 12, 13, 2 };
+    const old_values = [_]u32{ 1, 10, 11, 12, 13, 2 };
     // New: a whole directory covering element 0, an element inside the carried block,
     // the same single element again, and a disjoint element.
     const new_spans = [_]TileStoreSpan{
@@ -2380,10 +2501,13 @@ test "mergeTileStoreSpans replaces covered carried spans and patches nested ones
     defer out_spans.deinit(allocator);
     var out_values: std.ArrayList(u32) = .empty;
     defer out_values.deinit(allocator);
+    var out_ops: std.ArrayList(TileUploadOp) = .empty;
+    defer out_ops.deinit(allocator);
     try out_spans.ensureTotalCapacity(allocator, old_spans.len + new_spans.len);
     try out_values.ensureTotalCapacity(allocator, old_values.len + new_values.len);
+    try out_ops.ensureTotalCapacity(allocator, old_spans.len + 2 * new_spans.len);
 
-    mergeTileStoreSpans(&old_spans, &old_values, &new_spans, &new_values, &out_spans, &out_values);
+    mergeTileStoreSpans(&old_spans, &old_values, &new_spans, &new_values, &out_spans, &out_values, &out_ops);
 
     try std.testing.expectEqualSlices(TileStoreSpan, &.{
         .{ .dst_element = 0, .count = 4 },
@@ -2490,6 +2614,7 @@ test "queueTileStoreUploads folds a carried batch allocation-free after reserve"
     defer renderer.tile_stores.deinit(allocator);
     defer renderer.tile_merge_spans.deinit(allocator);
     defer renderer.tile_merge_values.deinit(allocator);
+    defer renderer.tile_merge_ops.deinit(allocator);
     // Fake GPU handle: queueing only validates and records, never touches SDL.
     try renderer.tile_stores.append(allocator, .{
         .buffer = @ptrFromInt(0x1000),
@@ -2553,6 +2678,7 @@ fn deinitTileStoreTestRenderer(renderer: *Renderer) void {
     renderer.tile_store_free.deinit(renderer.allocator);
     renderer.tile_merge_spans.deinit(renderer.allocator);
     renderer.tile_merge_values.deinit(renderer.allocator);
+    renderer.tile_merge_ops.deinit(renderer.allocator);
     renderer.batch.deinit();
 }
 

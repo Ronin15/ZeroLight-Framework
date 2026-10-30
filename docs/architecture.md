@@ -104,7 +104,7 @@ Designs start here, then read the live structure below (rules:
     directory over a pool of tile blocks, and per level a `LevelTerrain`
     (growable band list and cached floor layer, a composed movement-blocked
     directory over a pool of bit blocks, per-chunk link-endpoint heads and
-    counts, and per-chunk sparse-tile chain heads), directories sized at level
+    counts, and a per-chunk sparse-tile run), directories sized at level
     create. Its `ChunkGeometry` (u32 sides, u16 chunk edge, shift-based
     `chunkOf`/`localOf`) is the one chunk tiling terrain, nav, and static
     colliders share.
@@ -351,6 +351,8 @@ mirror: `world/gpu_tiles.zig`) runs once per frame in render prep before
 swapchain acquisition: a level entering the window uploads its window directory and
 mixed blocks, a pan across a chunk boundary uploads the entering chunks, a dig
 uploads one element, and everything goes in the frame's one batched copy pass.
+The value fill is a worker stage over that upload's elements; main commits the
+spans and adopts the buffer.
 Store uploads always use `cycle=false`; vertex ring buffers alone use
 `cycle=true` on the final upload. The world holds only a generational
 `TileDataId` and claims the store each sync (`Renderer.claimTileStore`);
@@ -850,13 +852,13 @@ composed movement-blocked bits per chunk
 (OPEN, BLOCKED, or a bit block), so `levelBlocksMovement` is O(1) and a write
 recomposes only its own cell. Level links are append-only and indexed per
 endpoint chunk (per-chunk heads and counts), so `levelChunkLinkEndpoints` (and
-`rampLinkOtherLevel` on it) walks one chunk's endpoints. Sparse tiles chain per
-chunk both ways, so an add or remove is O(1) and a chunk's sparse tiles are one
-walk. A dig or fall carve reserves its growth with
+`rampLinkOtherLevel` on it) walks one chunk's endpoints. Each chunk owns its sparse rows in one list. An add appends when the run has
+spare room and otherwise doubles that chunk only; the last removal frees the
+buffer. The window walk streams that run. A dig or fall carve reserves its growth with
 `reserveDenseCellWrite` (and `reserveLevelLink`) before any mutation, so an OOM
 leaves the step's state intact; a ramp dig also clears its exit cell on the
 level above (`reserveClearCellBlocking`/`clearCellBlocking`: blocking bands to
-the floor tile or empty, blocking sparse tiles unlinked from their chunk's chain,
+the floor tile or empty, blocking sparse tiles removed from their chunk's run,
 O(bands + sparse tiles in the chunk)) and emits its `world_obstacle_changed` with the ramp's
 `world_tile_changed`; a local change costs only the chunks it touches, and
 adding a level costs only its own directories. A dense one-step change (cave-in,

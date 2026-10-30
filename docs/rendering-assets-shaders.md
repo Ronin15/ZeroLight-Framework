@@ -358,16 +358,16 @@ cut.
 **Sparse/dense boundary:** the window update (`setVisibleChunksForWorldRect`,
 which also takes the active level and sets `render_side`) builds the window's
 sparse list: the sparse tiles on the render window's levels, in its chunks
-(through the per-chunk sparse index) and inside its tile bounds, sorted by
-(depth, cell, tile id) with one range per distinct depth. It counts, reserves,
-then fills, so work and memory follow the tiles in the window (O(window levels
-× window chunks + V log V)), never the world's sparse count, level size, or
-depth; an allocation failure leaves the previous window and list in place and
-the next call retries. A still camera or sub-tile pan returns early.
-`addSparseTile` is O(1) and marks the list for rebuild only when the tile lands
-inside the current window; a sparse tile removal (a ramp exit clear) marks it
-when the removed tile is inside the window or the removal moves a listed row to
-a new index. Nothing is listed before a window is set. Dynamic
+(each chunk's own row list, streamed as one run) and inside its tile bounds,
+copied as depth, cell, and tile id and sorted into that order, with one range
+per distinct depth. It counts, reserves, then fills, so work and memory follow
+the tiles in the window (O(window levels × window chunks + V log V)), never the
+world's sparse count, level size, or depth; an allocation failure leaves the
+previous window and list in place and the next call retries. A still camera or
+sub-tile pan returns early. `addSparseTile` appends into that chunk's run, or
+doubles the run when it is full, and marks the list for rebuild only when the
+tile lands inside the current window. A removal marks it only when the removed
+tile is inside the window. Nothing is listed before a window is set. Dynamic
 sparse prep reserves `reserveRenderRecords` (the list's length);
 `sparseDepthRangeCount`/`sparseDepthRangeAt` give the window's sparse depths
 for interleave points, and `submitVisibleSparseRange` submits one range. Draw
@@ -377,13 +377,12 @@ per-entity depth cull (Slice 25E) is separate from this floor window.
 
 ### Dynamic entity collect (Slice 24B)
 
-`render_prep.collectDynamicRecords` walks `movementBodySliceConst()` — not the
-primitive-visual entity list. Chunk columns align on `movement_index` for the
-camera chunk gate; scope tier and pin metadata are not read during collect.
-Drawable rows are gated by a dense `has_primitive_visual` column on the movement
-store (movement-only bodies skip slot resolve). Indices for drawable rows come
-from `DataSystem.renderCollectIndicesForMovement` (one slot read per chunk-pass
-row that carries a primitive visual).
+`render_prep.collectDynamicRecords` walks each visible chunk's drawable run on
+the movement store, for the render window's levels, plus the player row when
+its chunk is inside the camera rect and its level is not. It does not visit
+off-view rows. `dynamicRecordCapacity` and `spriteCommandCapacity` follow those
+visible rows, the player marker, and the live particles, not the world's
+population. Scope tier and pin metadata are not read during collect.
 
 Gates before interpolation and `PreparedDraw` construction (in order):
 

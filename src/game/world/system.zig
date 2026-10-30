@@ -52,6 +52,7 @@ const no_edit_write = @import("terrain.zig").no_edit_write;
 const OrderedIndexSet = @import("../systems/chunk_list_map.zig").OrderedIndexSet;
 
 pub const TileId = @import("terrain.zig").TileId;
+pub const TileFlags = @import("terrain.zig").TileFlags;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
 pub const default_chunk_size_tiles: u16 = 16;
 /// Largest chunk edge. Terrain, nav, and scope share one edge: a power of two in
@@ -102,13 +103,6 @@ pub const level_z_step: i32 = 16;
 comptime {
     std.debug.assert(@bitSizeOf(TileId) == 16);
 }
-
-pub const TileFlags = packed struct(u8) {
-    walkable: bool = false,
-    blocks_movement: bool = false,
-    blocks_vision: bool = false,
-    reserved: u5 = 0,
-};
 
 // Half-open tile bounds of a world rect, clamped to the level.
 const TileBounds = struct {
@@ -181,20 +175,6 @@ const DenseLayerRow = struct {
     render_changed: bool,
 };
 
-const SparseTileRow = struct {
-    level_index: u16,
-    cell_index: u32,
-    tile_id: TileId,
-    depth_value: i32,
-    flags: TileFlags,
-    // The row's neighbours in its chunk's list (`LevelTerrain.sparse_heads`), newest
-    // first, or `no_sparse_tile`, so an add or a removal relinks it in O(1). Row-index
-    // links, not `std.DoublyLinkedList`: std links node pointers, and a swap-remove moves
-    // rows of this MultiArrayList.
-    chunk_next: u32,
-    chunk_prev: u32,
-};
-
 pub const WorldSystem = struct {
     allocator: std.mem.Allocator,
     width: u16,
@@ -249,6 +229,8 @@ pub const WorldSystem = struct {
     // The batched edit's per-stage tuners (`applyDenseCellWrites`).
     terrain_edit_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     terrain_edit_write_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // One GPU tile sync's value fill. Not reset when the store is retired.
+    gpu_tile_copy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The procedural paint's tuner: fresh per world, so the paint is a one-off.
     ground_build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(rebuild_tuner_config),
     // Pools grow geometrically at their reserve seams; the first growth logs once.
@@ -271,8 +253,8 @@ pub const WorldSystem = struct {
     gpu_resident_levels: ?RenderLevels = null,
     gpu_residency_dirty: bool = true,
 
-    // Each row is linked into its (level, chunk) list (`LevelTerrain.sparse_heads`).
-    sparse_tiles: std.MultiArrayList(SparseTileRow) = .{},
+    // Population of sparse rows. Each chunk's rows are `LevelTerrain.sparse_runs`.
+    sparse_live: u32 = 0,
     sparse_window: SparseWindow = .{},
     // The last visibility update's window and levels, null until the first. Until
     // then nothing renders: the GPU store holds no layer and the sparse window holds
@@ -350,19 +332,18 @@ pub const WorldSystem = struct {
     }
 
     /// Kept only with `runtime_perf_log.enabled`: the batched edit's last plan and write
-    /// batches, the procedural paint's batch, and the reserves that grew a dense block or
-    /// composed-bits pool.
+    /// batches, the GPU tile copy batch, the procedural paint's batch, and the reserves that
+    /// grew a dense block or composed-bits pool.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         last_terrain_edit_plan_batch: BatchStats = .{},
         last_terrain_edit_write_batch: BatchStats = .{},
+        last_gpu_tile_copy_batch: BatchStats = .{},
         last_paint_batch: BatchStats = .{},
         terrain_pool_grows: u64 = 0,
     } else struct {};
 
     pub fn deinit(self: *WorldSystem) void {
         self.sparse_window.deinit(self.allocator);
-
-        self.sparse_tiles.deinit(self.allocator);
 
         self.gpu_tiles.deinit(self.allocator);
         self.dense_render.deinit(self.allocator);
@@ -400,7 +381,7 @@ pub const WorldSystem = struct {
     /// sparse tiles (dense tiles draw from the retained static buffer). Read after
     /// `setVisibleChunksForWorldRect`.
     pub fn reserveRenderRecords(self: *const WorldSystem) usize {
-        return self.sparse_window.tiles.items.len;
+        return self.sparse_window.rows.len;
     }
 
     /// Upper bound on dense tilemap composite draws submitted this frame: one per
@@ -2100,7 +2081,12 @@ test "a blocking dense layer add and procedural fills advance the level's conten
         var world = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
         defer world.deinit();
         var blocking_sparse = false;
-        for (0..world.sparse_tiles.len) |index| blocking_sparse = blocking_sparse or world.sparse_tiles.items(.flags)[index].blocks_movement;
+        for (world.level_terrain.items) |terrain| {
+            for (terrain.sparse_runs) |run| {
+                if (run.rows.len == 0) continue;
+                for (run.rows.items(.flags)) |flags| blocking_sparse = blocking_sparse or flags.blocks_movement;
+            }
+        }
         seen_blocking_sparse[@intFromBool(blocking_sparse)] = true;
         try std.testing.expectEqual(@as(u32, 1) + @intFromBool(blocking_sparse), world.level_terrain.items[0].content_revision);
     }
