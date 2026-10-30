@@ -332,14 +332,18 @@ pub const WorldSystem = struct {
     }
 
     /// Kept only with `runtime_perf_log.enabled`: the batched edit's last plan and write
-    /// batches, the GPU tile copy batch, the procedural paint's batch, and the reserves that
-    /// grew a dense block or composed-bits pool.
+    /// batches, the GPU tile copy batch, the procedural paint's batch, the reserves that
+    /// grew a dense block or composed-bits pool, and the last unchanged-view sparse patch
+    /// (edited-run rows, in-window tiles sorted from those runs, window rows spliced).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         last_terrain_edit_plan_batch: BatchStats = .{},
         last_terrain_edit_write_batch: BatchStats = .{},
         last_gpu_tile_copy_batch: BatchStats = .{},
         last_paint_batch: BatchStats = .{},
         terrain_pool_grows: u64 = 0,
+        sparse_patch_run_rows: u64 = 0,
+        sparse_patch_tiles: u64 = 0,
+        sparse_patch_window_rows: u64 = 0,
     } else struct {};
 
     pub fn deinit(self: *WorldSystem) void {

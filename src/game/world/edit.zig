@@ -745,8 +745,8 @@ fn reserveSparseBlockedSlot(self: *WorldSystem, blocked: *ChunkBitsStore, chunk:
 }
 
 // Writes the new row into the run's spare slot. The slot and, when the tile
-// blocks, the composed-bits slot are already reserved. The window dirties only
-// when the new tile is in it.
+// blocks, the composed-bits slot are already reserved. An in-window tile queues
+// its chunk for the window patch; that queue slot is already reserved.
 fn commitSparseRow(
     self: *WorldSystem,
     level: u16,
@@ -771,7 +771,7 @@ fn commitSparseRow(
     });
     self.sparse_live += 1;
     if (flags.blocks_movement) self.level_terrain.items[level].blocked.set(geom, chunk, local_cell, true);
-    if (world_render.sparseTileInWindow(self, level, x, y)) self.sparse_window.dirty = true;
+    if (world_render.sparseTileInWindow(self, level, x, y)) world_render.queueSparseWindowChunk(self, level, chunk);
 }
 
 pub fn addSparseTile(
@@ -802,19 +802,28 @@ pub fn addSparseTile(
     if (self.sparse_live == no_sparse_tile) return error.OutOfMemory;
 
     const run = &self.level_terrain.items[level_index].sparse_runs[chunk];
-    if (run.rows.len < run.rows.capacity) {
-        try reserveSparseBlockedSlot(self, blocked, chunk, local_cell, flags.blocks_movement);
-        commitSparseRow(self, level_index, chunk, cell, tile_id, world_z, flags, x, y, geom, local_cell);
-    } else {
+    const in_window = world_render.sparseTileInWindow(self, level_index, x, y);
+    // A failed later reserve must not leave an empty chunk holding the new buffer.
+    // A chunk that already had rows keeps the grown capacity.
+    var release_empty_run = false;
+    if (run.rows.len == run.rows.capacity) {
         const new_capacity = doubledSparseCapacity(run.rows.capacity) orelse return error.OutOfMemory;
         const was_empty = run.rows.len == 0;
         try run.rows.setCapacity(self.allocator, new_capacity);
-        // A failed composed-bits reserve must not leave an empty chunk holding the
-        // new buffer. A chunk that already had rows keeps the grown capacity.
-        errdefer if (was_empty) run.rows.clearAndFree(self.allocator);
-        try reserveSparseBlockedSlot(self, blocked, chunk, local_cell, flags.blocks_movement);
-        commitSparseRow(self, level_index, chunk, cell, tile_id, world_z, flags, x, y, geom, local_cell);
+        release_empty_run = was_empty;
     }
+    errdefer if (release_empty_run) run.rows.clearAndFree(self.allocator);
+    const was_window_reserved = run.window_reserved;
+    if (in_window) try world_render.reserveSparseWindowChunk(self, level_index, chunk);
+    // Only a slot this call flipped. One already reserved or queued stays.
+    const took_window_slot = run.window_reserved and !was_window_reserved;
+    errdefer if (took_window_slot) {
+        std.debug.assert(self.sparse_window.pending_edits > 0);
+        run.window_reserved = false;
+        self.sparse_window.pending_edits -= 1;
+    };
+    try reserveSparseBlockedSlot(self, blocked, chunk, local_cell, flags.blocks_movement);
+    commitSparseRow(self, level_index, chunk, cell, tile_id, world_z, flags, x, y, geom, local_cell);
     if (!flags.blocks_movement) return null;
     return .{
         .level = level_index,
@@ -855,6 +864,16 @@ pub fn reserveClearCellBlocking(self: *WorldSystem, level_index: u16, x: u16, y:
         render_marks += @intFromBool(self.gpu_tiles.changedChunkIsNew(gpu_slots[layer], chunk_x, chunk_y));
     }
     const needs_slot = terrain.blocked.setNeedsSlot(chunk, geom.localOf(x, y), false);
+    const sparse_run = &terrain.sparse_runs[chunk];
+    const was_window_reserved = sparse_run.window_reserved;
+    try reserveInWindowSparseRemoval(self, level_index, chunk, self.cellIndex(x, y));
+    // Only a slot this call flipped. One already reserved or queued stays.
+    const took_window_slot = sparse_run.window_reserved and !was_window_reserved;
+    errdefer if (took_window_slot) {
+        std.debug.assert(self.sparse_window.pending_edits > 0);
+        sparse_run.window_reserved = false;
+        self.sparse_window.pending_edits -= 1;
+    };
 
     // Fallible growth first; each materialized chunk is recorded for the scope.
     try self.dense_reserved_chunks.ensureUnusedCapacity(self.allocator, block_count + @intFromBool(needs_slot));
@@ -938,17 +957,35 @@ fn clearedBandTile(layer: u32, floor_layer: ?usize, floor_tile: TileId) TileId {
     return if (floor == layer) floor_tile else invalid_tile_id;
 }
 
+// One queue slot when this cell's clear will drop an in-window blocking sparse
+// tile and the chunk is not already queued. Allocation-free when nothing in the
+// window changes.
+fn reserveInWindowSparseRemoval(self: *WorldSystem, level: u16, chunk: u32, cell: u32) error{OutOfMemory}!void {
+    const run = &self.level_terrain.items[level].sparse_runs[chunk];
+    if (run.window_queued or run.window_reserved or run.rows.len == 0) return;
+    const rows = run.rows.slice();
+    const cells = rows.items(.cell_index);
+    const flags = rows.items(.flags);
+    for (cells, flags) |row_cell, row_flags| {
+        if (row_cell != cell or !row_flags.blocks_movement) continue;
+        const coord = cellCoordOf(self, row_cell);
+        if (!world_render.sparseTileInWindow(self, level, coord.x, coord.y)) continue;
+        try world_render.reserveSparseWindowChunk(self, level, chunk);
+        return;
+    }
+}
+
 // Drops the live row at `offset`. The last live row moves onto it. Capacity
-// stays; the caller frees the run at len 0. The window dirties only when the
-// removed tile is in it: a swapped survivor does not change draw order.
-// O(1), allocation-free.
+// stays; the caller frees the run at len 0. An in-window tile queues the chunk;
+// a swapped survivor does not. The queue slot is reserved by
+// `reserveClearCellBlocking`. O(1), allocation-free.
 fn removeSparseTile(self: *WorldSystem, level: u16, chunk: u32, offset: usize) void {
     const run = &self.level_terrain.items[level].sparse_runs[chunk];
     std.debug.assert(offset < run.rows.len);
     std.debug.assert(self.sparse_live > 0);
     const rows = run.rows.slice();
     const removed_coord = cellCoordOf(self, rows.items(.cell_index)[offset]);
-    if (world_render.sparseTileInWindow(self, level, removed_coord.x, removed_coord.y)) self.sparse_window.dirty = true;
+    if (world_render.sparseTileInWindow(self, level, removed_coord.x, removed_coord.y)) world_render.queueSparseWindowChunk(self, level, chunk);
     run.rows.swapRemove(offset);
     self.sparse_live -= 1;
 }
@@ -1550,6 +1587,47 @@ test "addSparseTile reserves its row before publishing it, and a fresh chunk's f
     try std.testing.expectEqual(@as(usize, 4), grown.rows.len);
     try std.testing.expectEqual(@as(usize, 4), grown.rows.capacity);
     try expectSparseIndexConsistent(&world);
+}
+
+test "addSparseTile rolls back a window slot when the row and edited allocs succeed and the next alloc fails (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level = try world.addLevel(0);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    try world.setVisibleChunksForWorldRect(.{
+        .x = 0,
+        .y = 0,
+        .w = world.worldWidthPixels(),
+        .h = world.worldHeightPixels(),
+    }, 0, level);
+    try std.testing.expect(world_render.sparseTileInWindow(&world, level, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), world.sparse_window.edited.capacity);
+    const live = world.sparse_live;
+
+    // Row buffer, then the edited-list slot, then the composed-bits slot. The bits
+    // alloc is the one that fails. The empty run must not keep its buffer, and the
+    // window slot this call took must not stay reserved.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2, .resize_fail_index = 0 });
+    world.allocator = failing.allocator();
+    defer world.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level, 0, 0, deco, 0, .obstacle));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(world.sparse_window.edited.capacity > 0);
+    const run = world.level_terrain.items[level].sparse_runs[0];
+    try std.testing.expect(!run.window_reserved);
+    try std.testing.expectEqual(@as(usize, 0), world.sparse_window.pending_edits);
+    try std.testing.expectEqual(live, world.sparse_live);
+    try std.testing.expectEqual(@as(usize, 0), run.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), run.rows.capacity);
 }
 
 // The sparse rows as sorted (level, cell, tile id) keys, into `out`.

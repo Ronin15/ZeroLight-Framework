@@ -89,27 +89,44 @@ const SparseDepthRange = struct {
     count: u32,
 };
 
-/// One copied window sparse tile. After the fill, rows are ordered by depth, then
-/// cell, then tile id.
+/// One copied window sparse tile. After the fill or a patch, rows are ordered by
+/// depth, then cell, then tile id. `level` is the run the row was copied from.
 pub const SparseWindowTile = struct {
     depth: i32,
     cell: u32,
     tile_id: TileId,
+    level: u16,
+};
+
+// One chunk whose sparse run the next unchanged-view update patches into `rows`.
+const SparseWindowEdit = struct {
+    level: u16,
+    chunk: u32,
 };
 
 /// The sparse tiles the render window draws: those on the window's levels inside
 /// its tile bounds, stored in (depth, cell, tile id) order, with one range per
-/// distinct depth. Rebuilt by the window update when the window moves or `dirty`
-/// is set (a tile added or removed inside the current window); render-only.
+/// distinct depth. A view change rebuilds the list. An in-window add or removal
+/// queues that chunk in `edited`, and the next unchanged-view update patches the
+/// chunk's run into the sorted rows. Render-only.
 pub const SparseWindow = struct {
     rows: std.MultiArrayList(SparseWindowTile) = .{},
     // Fill scratch: the sort permutation. Cleared once `rows` are in key order.
     // Capacity stays so a warmed update allocates nothing.
     sort_index: std.ArrayList(u32) = .empty,
     ranges: std.ArrayList(SparseDepthRange) = .empty,
+    // In-window tiles of the queued chunks, sorted at the patch. Capacity stays
+    // with the last window so a warmed patch allocates nothing.
+    patch_tiles: std.ArrayList(SparseWindowTile) = .empty,
+    edited: std.ArrayList(SparseWindowEdit) = .empty,
+    // Slots `reserveSparseWindowChunk` has ensured and `queueSparseWindowChunk`
+    // has not appended yet. Several reserves may precede their commits.
+    pending_edits: usize = 0,
     dirty: bool = true,
 
     pub fn deinit(self: *SparseWindow, allocator: std.mem.Allocator) void {
+        self.edited.deinit(allocator);
+        self.patch_tiles.deinit(allocator);
         self.ranges.deinit(allocator);
         self.sort_index.deinit(allocator);
         self.rows.deinit(allocator);
@@ -153,23 +170,37 @@ pub const DenseRenderScratch = struct {
 };
 
 /// Sets the render chunk window, the GPU directory side for the rect's size, and
-/// the active level it renders around, and rebuilds the window's sparse list.
-/// O(1) when the window, level, and `render_window` are unchanged and no tile was
-/// added inside the window; otherwise O(window levels × window chunks + V log V)
-/// for the V sparse
-/// tiles in the window, never depending on the world's sparse count, level size,
-/// or depth. Out of memory leaves the window and its sparse list as they were and
-/// the next call retries.
+/// the active level it renders around, and updates the window's sparse list.
+/// O(1) when the window, level, and `render_window` are unchanged and no in-window
+/// tile was added or removed. That same view with queued chunks patches those
+/// chunks' runs into the sorted rows: the edited runs are read and spliced, and
+/// the other chunks are not walked or sorted. A view change recounts and sorts,
+/// O(window levels × window chunks + V log V) for the V sparse tiles in the
+/// window, never the world's sparse count, level size, or depth. Out of memory
+/// leaves the window and its sparse list as they were and the next call retries.
 pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16, active_level: u16) error{OutOfMemory}!void {
     if (self.levelCount() == 0) return;
+    // A rebuild or a clean return leaves the last patch's counts unset.
+    if (comptime runtime_perf_log.enabled) {
+        self.perf.sparse_patch_run_rows = 0;
+        self.perf.sparse_patch_tiles = 0;
+        self.perf.sparse_patch_window_rows = 0;
+    }
     const render_side = renderSideForRect(self, rect, overscan_chunks);
     const view = VisibleView{
         .window = self.viewWindowForWorldRect(rect, overscan_chunks),
         .levels = .{ .active_level = active_level, .window = self.render_window },
     };
-    if (!self.sparse_window.dirty and self.visible != null and std.meta.eql(self.visible.?, view)) {
-        self.render_side = render_side;
-        return;
+    if (self.visible != null and std.meta.eql(self.visible.?, view)) {
+        if (!self.sparse_window.dirty) {
+            self.render_side = render_side;
+            return;
+        }
+        if (self.sparse_window.edited.items.len != 0) {
+            try patchWindowSparseTiles(self, view);
+            self.render_side = render_side;
+            return;
+        }
     }
 
     // Count, reserve, then commit: an allocation failure changes nothing.
@@ -177,11 +208,12 @@ pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chu
     try self.sparse_window.rows.ensureTotalCapacity(self.allocator, tile_count);
     try self.sparse_window.sort_index.ensureTotalCapacity(self.allocator, tile_count);
     try self.sparse_window.ranges.ensureTotalCapacity(self.allocator, tile_count);
+    try self.sparse_window.patch_tiles.ensureTotalCapacity(self.allocator, tile_count);
 
     self.render_side = render_side;
     self.visible = view;
     fillWindowSparseTiles(self, view, tile_count);
-    self.sparse_window.dirty = false;
+    clearSparseWindowEdits(self);
 }
 
 // Counts the sparse tiles on the view's levels inside its tile bounds. When
@@ -225,6 +257,8 @@ fn walkWindowSparseTiles(self: *const WorldSystem, view: VisibleView, out: ?*Spa
                             .depth = depth_value[offset],
                             .cell = cell,
                             .tile_id = tile_id[offset],
+                            // Level indices are u16; the window loop widens them.
+                            .level = @intCast(level),
                         });
                     }
                     count += 1;
@@ -269,28 +303,16 @@ fn fillWindowSparseTiles(self: *WorldSystem, view: VisibleView, tile_count: usiz
     const depth = columns.items(.depth);
     const cell = columns.items(.cell);
     const tile_id = columns.items(.tile_id);
+    const level = columns.items(.level);
     // Stable: equal keys keep walk order.
     std.mem.sort(u32, order, SparseWindowOrder{
         .depth = depth,
         .cell = cell,
         .tile_id = tile_id,
     }, SparseWindowOrder.lessThan);
-    reorderSparseWindowRows(depth, cell, tile_id, order);
+    reorderSparseWindowRows(depth, cell, tile_id, level, order);
     window.sort_index.clearRetainingCapacity();
-
-    var start: usize = 0;
-    while (start < depth.len) {
-        const row_depth = depth[start];
-        var end = start + 1;
-        while (end < depth.len and depth[end] == row_depth) : (end += 1) {}
-        // `start` and the range length are below the window tile count, which fits u32.
-        window.ranges.appendAssumeCapacity(.{
-            .depth = row_depth,
-            .start = @intCast(start),
-            .count = @intCast(end - start),
-        });
-        start = end;
-    }
+    writeSparseDepthRanges(window, depth);
 }
 
 // Draw order of window sparse tiles: depth, then cell, then tile id. Never the
@@ -311,14 +333,15 @@ const SparseWindowOrder = struct {
 
 // `order[i]` is the walk index that belongs at slot i. Each row is written once
 // along its cycle; a finished slot stores its own index.
-fn reorderSparseWindowRows(depth: []i32, cell: []u32, tile_id: []TileId, order: []u32) void {
-    std.debug.assert(depth.len == order.len and cell.len == order.len and tile_id.len == order.len);
+fn reorderSparseWindowRows(depth: []i32, cell: []u32, tile_id: []TileId, level: []u16, order: []u32) void {
+    std.debug.assert(depth.len == order.len and cell.len == order.len and tile_id.len == order.len and level.len == order.len);
     for (0..order.len) |start| {
         const start_index: u32 = @intCast(start);
         if (order[start] == start_index) continue;
         const held_depth = depth[start];
         const held_cell = cell[start];
         const held_tile = tile_id[start];
+        const held_level = level[start];
         var dest = start;
         var steps: usize = 0;
         while (true) {
@@ -330,14 +353,276 @@ fn reorderSparseWindowRows(depth: []i32, cell: []u32, tile_id: []TileId, order: 
                 depth[dest] = held_depth;
                 cell[dest] = held_cell;
                 tile_id[dest] = held_tile;
+                level[dest] = held_level;
                 break;
             }
             depth[dest] = depth[src];
             cell[dest] = cell[src];
             tile_id[dest] = tile_id[src];
+            level[dest] = level[src];
             dest = src;
         }
     }
+}
+
+// One range per distinct depth of `depth`, which is in draw order. `ranges` is
+// reserved for at least `depth.len` entries. Allocation-free.
+fn writeSparseDepthRanges(window: *SparseWindow, depth: []const i32) void {
+    window.ranges.clearRetainingCapacity();
+    var start: usize = 0;
+    while (start < depth.len) {
+        const row_depth = depth[start];
+        var end = start + 1;
+        while (end < depth.len and depth[end] == row_depth) : (end += 1) {}
+        // `start` and the range length are below the window tile count, which fits u32.
+        window.ranges.appendAssumeCapacity(.{
+            .depth = row_depth,
+            .start = @intCast(start),
+            .count = @intCast(end - start),
+        });
+        start = end;
+    }
+}
+
+fn sparseWindowEditLessThan(_: void, lhs: SparseWindowEdit, rhs: SparseWindowEdit) bool {
+    if (lhs.level != rhs.level) return lhs.level < rhs.level;
+    return lhs.chunk < rhs.chunk;
+}
+
+fn orderSparseWindowEdit(key: SparseWindowEdit, item: SparseWindowEdit) std.math.Order {
+    if (key.level != item.level) return std.math.order(key.level, item.level);
+    return std.math.order(key.chunk, item.chunk);
+}
+
+// `edited` is sorted by level, then chunk.
+fn sparseWindowEditListed(edited: []const SparseWindowEdit, level: u16, chunk: u32) bool {
+    const key = SparseWindowEdit{ .level = level, .chunk = chunk };
+    const index = std.sort.lowerBound(SparseWindowEdit, edited, key, orderSparseWindowEdit);
+    if (index >= edited.len) return false;
+    const found = edited[index];
+    return found.level == level and found.chunk == chunk;
+}
+
+fn sparseWindowTileLessThan(_: void, lhs: SparseWindowTile, rhs: SparseWindowTile) bool {
+    if (lhs.depth != rhs.depth) return lhs.depth < rhs.depth;
+    if (lhs.cell != rhs.cell) return lhs.cell < rhs.cell;
+    return lhs.tile_id < rhs.tile_id;
+}
+
+// Reserves one `edited` slot for `chunk` when it is not already reserved or
+// queued. Several chunks may be reserved before any of them is queued. An
+// in-window edit that is already queued reserves nothing.
+pub fn reserveSparseWindowChunk(self: *WorldSystem, level: u16, chunk: u32) error{OutOfMemory}!void {
+    const run = &self.level_terrain.items[level].sparse_runs[chunk];
+    if (run.window_queued or run.window_reserved) return;
+    const window = &self.sparse_window;
+    const needed = window.edited.items.len + window.pending_edits + 1;
+    try window.edited.ensureTotalCapacity(self.allocator, needed);
+    window.pending_edits += 1;
+    run.window_reserved = true;
+}
+
+// Records `chunk` for the next unchanged-view patch. The slot is reserved.
+// A second edit of a queued chunk does not append again: the patch re-reads
+// the run.
+pub fn queueSparseWindowChunk(self: *WorldSystem, level: u16, chunk: u32) void {
+    const run = &self.level_terrain.items[level].sparse_runs[chunk];
+    if (run.window_queued) return;
+    const window = &self.sparse_window;
+    std.debug.assert(run.window_reserved and window.pending_edits > 0);
+    window.pending_edits -= 1;
+    run.window_reserved = false;
+    window.edited.appendAssumeCapacity(.{ .level = level, .chunk = chunk });
+    run.window_queued = true;
+    window.dirty = true;
+}
+
+fn clearSparseWindowEdits(self: *WorldSystem) void {
+    const window = &self.sparse_window;
+    for (window.edited.items) |edit| {
+        self.level_terrain.items[edit.level].sparse_runs[edit.chunk].window_queued = false;
+    }
+    window.edited.clearRetainingCapacity();
+    window.dirty = false;
+}
+
+// In-window tiles of one queued chunk. Tiles outside the view's tile bounds
+// stay out, the same filter as the full walk.
+fn countChunkWindowTiles(self: *const WorldSystem, view: VisibleView, level: u16, chunk: u32) usize {
+    const run = self.level_terrain.items[level].sparse_runs[chunk];
+    if (run.rows.len == 0) return 0;
+    const cells = run.rows.items(.cell_index);
+    const bounds = view.window.tiles;
+    const width: u32 = self.width;
+    var count: usize = 0;
+    for (cells) |cell| {
+        if (bounds.contains(cell % width, cell / width)) count += 1;
+    }
+    return count;
+}
+
+fn appendChunkWindowTiles(self: *const WorldSystem, view: VisibleView, level: u16, chunk: u32, out: *std.ArrayList(SparseWindowTile)) void {
+    const run = self.level_terrain.items[level].sparse_runs[chunk];
+    if (run.rows.len == 0) return;
+    const rows = run.rows.slice();
+    const cells = rows.items(.cell_index);
+    const depth = rows.items(.depth_value);
+    const tile_id = rows.items(.tile_id);
+    const bounds = view.window.tiles;
+    const width: u32 = self.width;
+    for (cells, 0..) |cell, offset| {
+        if (!bounds.contains(cell % width, cell / width)) continue;
+        out.appendAssumeCapacity(.{
+            .depth = depth[offset],
+            .cell = cell,
+            .tile_id = tile_id[offset],
+            .level = level,
+        });
+    }
+}
+
+// Rows whose (level, chunk) is queued. `edited` is sorted by level, then chunk.
+fn countEditedWindowRows(self: *const WorldSystem, edited: []const SparseWindowEdit) usize {
+    const columns = self.sparse_window.rows.slice();
+    const cells = columns.items(.cell);
+    const levels = columns.items(.level);
+    const geom = self.chunkGeometry();
+    var count: usize = 0;
+    for (levels, cells) |level, cell| {
+        if (sparseWindowEditListed(edited, level, geom.chunkOfCell(cell))) count += 1;
+    }
+    return count;
+}
+
+// Packs rows that are not in `edited` to the front, in their current order.
+// `edited` is sorted. Returns nothing; the kept prefix length is `keep`.
+fn compactKeptWindowRows(self: *WorldSystem, edited: []const SparseWindowEdit, keep: usize) void {
+    const columns = self.sparse_window.rows.slice();
+    const depth = columns.items(.depth);
+    const cell = columns.items(.cell);
+    const tile_id = columns.items(.tile_id);
+    const level = columns.items(.level);
+    const geom = self.chunkGeometry();
+    var write: usize = 0;
+    for (0..depth.len) |read| {
+        if (sparseWindowEditListed(edited, level[read], geom.chunkOfCell(cell[read]))) continue;
+        if (write != read) {
+            depth[write] = depth[read];
+            cell[write] = cell[read];
+            tile_id[write] = tile_id[read];
+            level[write] = level[read];
+        }
+        write += 1;
+    }
+    std.debug.assert(write == keep);
+}
+
+fn keptBeforePatch(depth: []const i32, cell: []const u32, tile_id: []const TileId, index: usize, tile: SparseWindowTile) bool {
+    if (depth[index] != tile.depth) return depth[index] < tile.depth;
+    if (cell[index] != tile.cell) return cell[index] < tile.cell;
+    return tile_id[index] < tile.tile_id;
+}
+
+fn copyWindowRow(dst: usize, src: usize, depth: []i32, cell: []u32, tile_id: []TileId, level: []u16) void {
+    depth[dst] = depth[src];
+    cell[dst] = cell[src];
+    tile_id[dst] = tile_id[src];
+    level[dst] = level[src];
+}
+
+fn writeWindowRow(index: usize, tile: SparseWindowTile, depth: []i32, cell: []u32, tile_id: []TileId, level: []u16) void {
+    depth[index] = tile.depth;
+    cell[index] = tile.cell;
+    tile_id[index] = tile.tile_id;
+    level[index] = tile.level;
+}
+
+// Merges the kept prefix of `columns` with `patch` (both in draw order) into
+// `columns`, back to front, so a write never lands on an unread kept row.
+// `columns` already has length `keep + patch.len`.
+fn mergePatchedWindowRows(columns: std.MultiArrayList(SparseWindowTile).Slice, patch: []const SparseWindowTile, keep: usize) void {
+    const depth = columns.items(.depth);
+    const cell = columns.items(.cell);
+    const tile_id = columns.items(.tile_id);
+    const level = columns.items(.level);
+    var kept_left = keep;
+    var patch_left = patch.len;
+    var dest = keep + patch.len;
+    while (kept_left > 0 or patch_left > 0) {
+        std.debug.assert(dest == kept_left + patch_left);
+        dest -= 1;
+        const take_kept = patch_left == 0 or (kept_left != 0 and !keptBeforePatch(depth, cell, tile_id, kept_left - 1, patch[patch_left - 1]));
+        if (take_kept) {
+            kept_left -= 1;
+            if (dest != kept_left) copyWindowRow(dest, kept_left, depth, cell, tile_id, level);
+        } else {
+            patch_left -= 1;
+            writeWindowRow(dest, patch[patch_left], depth, cell, tile_id, level);
+        }
+    }
+    std.debug.assert(dest == 0);
+}
+
+// Splices each queued chunk's current in-window run into the sorted rows.
+// Reserves first: a failure leaves the rows, ranges, and queue as they were.
+// SIMD verdict: scalar. An integer membership test and a merge of two sorted
+// key runs, not a dense float kernel.
+fn patchWindowSparseTiles(self: *WorldSystem, view: VisibleView) error{OutOfMemory}!void {
+    const window = &self.sparse_window;
+    const edited = window.edited.items;
+    std.debug.assert(edited.len != 0);
+    pdqSort(SparseWindowEdit, edited, {}, sparseWindowEditLessThan);
+
+    var new_count: usize = 0;
+    var run_rows: usize = 0;
+    for (edited) |edit| {
+        run_rows += self.level_terrain.items[edit.level].sparse_runs[edit.chunk].rows.len;
+        new_count += countChunkWindowTiles(self, view, edit.level, edit.chunk);
+    }
+    // An empty list has no allocation; do not slice it.
+    const old_len = window.rows.len;
+    const drop = if (old_len == 0) 0 else countEditedWindowRows(self, edited);
+    std.debug.assert(drop <= old_len);
+    const keep = old_len - drop;
+    const final_count = keep + new_count;
+
+    try window.patch_tiles.ensureTotalCapacity(self.allocator, new_count);
+    try window.rows.ensureTotalCapacity(self.allocator, final_count);
+    try window.ranges.ensureTotalCapacity(self.allocator, final_count);
+
+    if (final_count == 0) {
+        window.rows.clearRetainingCapacity();
+        window.ranges.clearRetainingCapacity();
+        window.patch_tiles.clearRetainingCapacity();
+        clearSparseWindowEdits(self);
+        noteSparsePatch(self, run_rows, new_count, old_len);
+        return;
+    }
+
+    window.patch_tiles.clearRetainingCapacity();
+    for (edited) |edit| appendChunkWindowTiles(self, view, edit.level, edit.chunk, &window.patch_tiles);
+    std.debug.assert(window.patch_tiles.items.len == new_count);
+    pdqSort(SparseWindowTile, window.patch_tiles.items, {}, sparseWindowTileLessThan);
+
+    if (old_len != 0) compactKeptWindowRows(self, edited, keep);
+    // The merge writes every slot before a read of the grown tail. `keep` rows
+    // already sit at the front, and `keep <= final_count`.
+    std.debug.assert(window.rows.capacity >= final_count);
+    window.rows.len = final_count;
+    mergePatchedWindowRows(window.rows.slice(), window.patch_tiles.items, keep);
+    writeSparseDepthRanges(window, window.rows.items(.depth));
+    window.patch_tiles.clearRetainingCapacity();
+    clearSparseWindowEdits(self);
+    noteSparsePatch(self, run_rows, new_count, old_len);
+}
+
+// Edited-run rows read, in-window tiles sorted from them, and window rows the splice walked.
+// Zero when this build has no perf counters. A view change leaves them at zero.
+fn noteSparsePatch(self: *WorldSystem, run_rows: usize, patch_tiles: usize, window_rows: usize) void {
+    if (comptime !runtime_perf_log.enabled) return;
+    self.perf.sparse_patch_run_rows = run_rows;
+    self.perf.sparse_patch_tiles = patch_tiles;
+    self.perf.sparse_patch_window_rows = window_rows;
 }
 
 // A power-of-two side covering every chunk window a rect of this size touches:
@@ -1041,6 +1326,267 @@ test "a sparse tile added outside the window leaves the list untouched; one insi
     const below = testPlacedKey(&world, 1, 2, 2, deco, .effect);
     try std.testing.expectEqualSlices(TestSparseKey, &.{ below, first }, testWindowSparseKeys(&world, &keys));
     try expectSparseRangesCoverWindow(&world);
+}
+
+// One window row. `level` is the column, never a depth threshold.
+const TestWindowRow = struct {
+    depth: i32,
+    cell: u32,
+    tile_id: TileId,
+    level: u16,
+};
+
+fn testWindowRowLessThan(_: void, lhs: TestWindowRow, rhs: TestWindowRow) bool {
+    if (lhs.depth != rhs.depth) return lhs.depth < rhs.depth;
+    if (lhs.cell != rhs.cell) return lhs.cell < rhs.cell;
+    return lhs.tile_id < rhs.tile_id;
+}
+
+fn testPlacedRow(world: *const WorldSystem, level: u16, x: u16, y: u16, tile: TileId, depth: WorldDepth) TestWindowRow {
+    return .{
+        .depth = world.worldZForLevel(level, 0, depth),
+        .cell = world.cellIndex(x, y),
+        .tile_id = tile,
+        .level = level,
+    };
+}
+
+fn testWindowRows(world: *const WorldSystem, out: []TestWindowRow) []TestWindowRow {
+    const rows = world.sparse_window.rows.slice();
+    const depth = rows.items(.depth);
+    const cell = rows.items(.cell);
+    const tile_id = rows.items(.tile_id);
+    const level = rows.items(.level);
+    const keys = out[0..depth.len];
+    for (depth, cell, tile_id, level, keys) |row_depth, row_cell, row_tile, row_level, *key| {
+        key.* = .{ .depth = row_depth, .cell = row_cell, .tile_id = row_tile, .level = row_level };
+    }
+    return keys;
+}
+
+fn testRowChunk(world: *const WorldSystem, row: TestWindowRow) u32 {
+    return world.chunkGeometry().chunkOfCell(row.cell);
+}
+
+const TestWindowRun = struct { level: u16, chunk: u32 };
+
+// Rows whose (level, chunk) is not in `runs`, in list order. `level` is the column.
+fn testRowsOutside(world: *const WorldSystem, rows: []const TestWindowRow, runs: []const TestWindowRun, out: []TestWindowRow) []TestWindowRow {
+    var count: usize = 0;
+    for (rows) |row| {
+        const chunk = testRowChunk(world, row);
+        var edited = false;
+        for (runs) |run| edited = edited or (run.level == row.level and run.chunk == chunk);
+        if (edited) continue;
+        out[count] = row;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+fn testRowsInRun(world: *const WorldSystem, rows: []const TestWindowRow, level: u16, chunk: u32, out: []TestWindowRow) []TestWindowRow {
+    var count: usize = 0;
+    for (rows) |row| {
+        if (row.level != level or testRowChunk(world, row) != chunk) continue;
+        out[count] = row;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+fn testWindowRowsEqual(lhs: []const TestWindowRow, rhs: []const TestWindowRow) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (left.depth != right.depth or left.cell != right.cell or left.tile_id != right.tile_id or left.level != right.level) return false;
+    }
+    return true;
+}
+
+fn expectWindowRowsSorted(rows: []const TestWindowRow) !void {
+    for (rows[1..], 0..) |row, index| try std.testing.expect(!testWindowRowLessThan({}, row, rows[index]));
+}
+
+fn expectWindowCellLevel(rows: []const TestWindowRow, cell: u32, level: u16) !void {
+    var found = false;
+    for (rows) |row| {
+        if (row.cell != cell) continue;
+        try std.testing.expectEqual(level, row.level);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "an in-window add or removal patches that chunk into the window sparse list and leaves the other chunks' rows" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 2);
+    defer world.deinit();
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const stone = try world.requireTileByName(&meta, "stone_floor");
+    const tunnel = try world.requireTileByName(&meta, "cave_0");
+    const geom = world.chunkGeometry();
+    // Tiles [0, 6). Chunk 1 straddles that edge: (5, 1) is inside, (6, 1) is not.
+    const chunk_0 = geom.chunkOf(1, 1);
+    const chunk_1 = geom.chunkOf(5, 1);
+    const chunk_other = geom.chunkOf(1, 5);
+    try std.testing.expect(chunk_0 != chunk_1 and chunk_0 != chunk_other);
+
+    _ = try world.addSparseTile(0, 1, 1, tree, 0, .obstacle);
+    _ = try world.addSparseTile(0, 1, 1, stone, 0, .floor);
+    _ = try world.addSparseTile(0, 2, 2, stone, 0, .effect);
+    _ = try world.addSparseTile(0, 5, 1, tree, 0, .marker);
+    _ = try world.addSparseTile(0, 4, 1, stone, 0, .floor);
+    _ = try world.addSparseTile(0, 6, 1, tree, 0, .obstacle);
+    _ = try world.addSparseTile(0, 1, 5, stone, 0, .floor);
+    _ = try world.addSparseTile(1, 1, 2, stone, 0, .obstacle);
+
+    const tile_px = world.tile_size;
+    const rect = Rect{
+        .x = 0,
+        .y = 0,
+        .w = @as(f32, @floatFromInt(6)) * tile_px,
+        .h = @as(f32, @floatFromInt(6)) * tile_px,
+    };
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    var stored: [16]TestWindowRow = undefined;
+    const before = testWindowRows(&world, &stored);
+    try std.testing.expectEqual(@as(usize, 7), before.len);
+    var outside = false;
+    for (before) |row| outside = outside or row.cell == world.cellIndex(6, 1);
+    try std.testing.expect(!outside);
+
+    // Add in chunk 1. The list stays until the window update, then that chunk's
+    // rows include the new tile and still exclude the out-of-bounds row.
+    _ = try world.addSparseTile(0, 5, 2, stone, 0, .effect);
+    try std.testing.expect(world.sparse_window.dirty);
+    var held: [16]TestWindowRow = undefined;
+    try std.testing.expectEqualSlices(TestWindowRow, before, testWindowRows(&world, &held));
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    try std.testing.expect(!world.sparse_window.dirty);
+    var after_buf: [16]TestWindowRow = undefined;
+    const after_add = testWindowRows(&world, &after_buf);
+    var other_buf: [16]TestWindowRow = undefined;
+    var other_now: [16]TestWindowRow = undefined;
+    var chunk_buf: [8]TestWindowRow = undefined;
+    var chunk_now: [8]TestWindowRow = undefined;
+    var expected_buf: [8]TestWindowRow = undefined;
+    const level_0_chunk_1 = [_]TestWindowRun{.{ .level = 0, .chunk = chunk_1 }};
+    try std.testing.expectEqualSlices(TestWindowRow, testRowsOutside(&world, before, &level_0_chunk_1, &other_buf), testRowsOutside(&world, after_add, &level_0_chunk_1, &other_now));
+    const chunk_keys = testRowsInRun(&world, after_add, 0, chunk_1, &chunk_buf);
+    expected_buf[0] = testPlacedRow(&world, 0, 4, 1, stone, .floor);
+    expected_buf[1] = testPlacedRow(&world, 0, 5, 1, tree, .marker);
+    expected_buf[2] = testPlacedRow(&world, 0, 5, 2, stone, .effect);
+    std.mem.sort(TestWindowRow, expected_buf[0..3], {}, testWindowRowLessThan);
+    try std.testing.expectEqualSlices(TestWindowRow, expected_buf[0..3], chunk_keys);
+    try expectWindowRowsSorted(after_add);
+    try expectSparseRangesCoverWindow(&world);
+
+    // Removal in chunk 0 drops the blocking tile and keeps the walkable decal.
+    // Level 1's row in the same chunk index stays with the other chunks.
+    const after_add_copy = after_add;
+    try std.testing.expect((try world.clearCellBlocking(0, 1, 1, tunnel)) != null);
+    try std.testing.expect(world.sparse_window.dirty);
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    try std.testing.expect(!world.sparse_window.dirty);
+    var removed_buf: [16]TestWindowRow = undefined;
+    const after_remove = testWindowRows(&world, &removed_buf);
+    const level_0_chunk_0 = [_]TestWindowRun{.{ .level = 0, .chunk = chunk_0 }};
+    try std.testing.expectEqualSlices(TestWindowRow, testRowsOutside(&world, after_add_copy, &level_0_chunk_0, &other_buf), testRowsOutside(&world, after_remove, &level_0_chunk_0, &other_now));
+    const removed_chunk = testRowsInRun(&world, after_remove, 0, chunk_0, &chunk_buf);
+    expected_buf[0] = testPlacedRow(&world, 0, 1, 1, stone, .floor);
+    expected_buf[1] = testPlacedRow(&world, 0, 2, 2, stone, .effect);
+    std.mem.sort(TestWindowRow, expected_buf[0..2], {}, testWindowRowLessThan);
+    try std.testing.expectEqualSlices(TestWindowRow, expected_buf[0..2], removed_chunk);
+    try expectWindowRowsSorted(after_remove);
+    try expectSparseRangesCoverWindow(&world);
+
+    // One update patches both an add and a removal in chunk 1 from that run.
+    const after_remove_copy = after_remove;
+    _ = try world.addSparseTile(0, 4, 2, tree, 0, .obstacle);
+    try std.testing.expect((try world.clearCellBlocking(0, 5, 1, tunnel)) != null);
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    var combined_buf: [16]TestWindowRow = undefined;
+    const combined = testWindowRows(&world, &combined_buf);
+    try std.testing.expectEqualSlices(TestWindowRow, testRowsOutside(&world, after_remove_copy, &level_0_chunk_1, &other_buf), testRowsOutside(&world, combined, &level_0_chunk_1, &other_now));
+    const combined_chunk = testRowsInRun(&world, combined, 0, chunk_1, &chunk_buf);
+    expected_buf[0] = testPlacedRow(&world, 0, 4, 1, stone, .floor);
+    expected_buf[1] = testPlacedRow(&world, 0, 4, 2, tree, .obstacle);
+    expected_buf[2] = testPlacedRow(&world, 0, 5, 2, stone, .effect);
+    std.mem.sort(TestWindowRow, expected_buf[0..3], {}, testWindowRowLessThan);
+    try std.testing.expectEqualSlices(TestWindowRow, expected_buf[0..3], combined_chunk);
+    for (combined) |row| try std.testing.expect(row.cell != world.cellIndex(6, 1));
+    try expectWindowRowsSorted(combined);
+    try expectSparseRangesCoverWindow(&world);
+
+    // A level-1 add in chunk 0. The new row's level column is 1, and level 0's
+    // rows in that chunk index stay. Depth is not how the row's level is known.
+    var saved: [16]TestWindowRow = undefined;
+    const combined_saved = saved[0..combined.len];
+    @memcpy(combined_saved, combined);
+    const level_1_cell = world.cellIndex(1, 3);
+    _ = try world.addSparseTile(1, 1, 3, stone, 0, .obstacle);
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    var level_buf: [16]TestWindowRow = undefined;
+    const after_level = testWindowRows(&world, &level_buf);
+    try expectWindowCellLevel(after_level, level_1_cell, 1);
+    try std.testing.expectEqualSlices(TestWindowRow, testRowsInRun(&world, combined_saved, 0, chunk_0, &chunk_buf), testRowsInRun(&world, after_level, 0, chunk_0, &chunk_now));
+    try expectWindowRowsSorted(after_level);
+
+    // A later patch of level 0's same chunk index keeps that level-1 row.
+    const after_level_saved = saved[0..after_level.len];
+    @memcpy(after_level_saved, after_level);
+    _ = try world.addSparseTile(0, 3, 1, stone, 0, .effect);
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    var kept_buf: [16]TestWindowRow = undefined;
+    const after_level_0 = testWindowRows(&world, &kept_buf);
+    try expectWindowCellLevel(after_level_0, level_1_cell, 1);
+    try std.testing.expectEqualSlices(TestWindowRow, testRowsInRun(&world, after_level_saved, 1, chunk_0, &chunk_buf), testRowsInRun(&world, after_level_0, 1, chunk_0, &chunk_now));
+    try std.testing.expect(!testWindowRowsEqual(testRowsInRun(&world, after_level_saved, 0, chunk_0, &other_buf), testRowsInRun(&world, after_level_0, 0, chunk_0, &other_now)));
+    try expectWindowRowsSorted(after_level_0);
+
+    // One update adds in one chunk and removes in another. Both runs change.
+    // Every other run's keys stay in order.
+    const before_two = saved[0..after_level_0.len];
+    @memcpy(before_two, after_level_0);
+    _ = try world.addSparseTile(0, 2, 5, tree, 0, .obstacle);
+    try std.testing.expect((try world.clearCellBlocking(0, 4, 2, tunnel)) != null);
+    try world.setVisibleChunksForWorldRect(rect, 0, 0);
+    var two_buf: [16]TestWindowRow = undefined;
+    const after_two = testWindowRows(&world, &two_buf);
+    const two_runs = [_]TestWindowRun{
+        .{ .level = 0, .chunk = chunk_other },
+        .{ .level = 0, .chunk = chunk_1 },
+    };
+    try std.testing.expect(!testWindowRowsEqual(testRowsInRun(&world, before_two, 0, chunk_other, &chunk_buf), testRowsInRun(&world, after_two, 0, chunk_other, &chunk_now)));
+    try std.testing.expect(!testWindowRowsEqual(testRowsInRun(&world, before_two, 0, chunk_1, &other_buf), testRowsInRun(&world, after_two, 0, chunk_1, &other_now)));
+    try std.testing.expectEqualSlices(TestWindowRow, testRowsOutside(&world, before_two, &two_runs, &level_buf), testRowsOutside(&world, after_two, &two_runs, &kept_buf));
+    try expectWindowRowsSorted(after_two);
+    try expectSparseRangesCoverWindow(&world);
+}
+
+test "an in-window reserved chunk queues with no allocation (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try testSparseWindowWorld(&meta, std.testing.allocator, 1);
+    defer world.deinit();
+    try testShowTiles(&world, 0, 4, 0, 0);
+    const level: u16 = 0;
+    const chunk: u32 = 0;
+    try reserveSparseWindowChunk(&world, level, chunk);
+    try std.testing.expect(world.level_terrain.items[level].sparse_runs[chunk].window_reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    world.allocator = failing.allocator();
+    defer world.allocator = std.testing.allocator;
+    queueSparseWindowChunk(&world, level, chunk);
+    const run = world.level_terrain.items[level].sparse_runs[chunk];
+    try std.testing.expect(run.window_queued);
+    try std.testing.expect(!run.window_reserved);
+    try std.testing.expectEqual(@as(usize, 1), world.sparse_window.edited.items.len);
+    try std.testing.expectEqual(level, world.sparse_window.edited.items[0].level);
+    try std.testing.expectEqual(chunk, world.sparse_window.edited.items[0].chunk);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "a render window change under a still camera relists the window's sparse levels" {

@@ -57,6 +57,10 @@ pub const SparseTileRow = struct {
 /// One chunk's sparse rows. Live rows are `[0, rows.len)`. `len == 0` holds no bytes.
 pub const SparseRun = struct {
     rows: std.MultiArrayList(SparseTileRow) = .{},
+    /// A queue slot is reserved for the render window's sparse-list patch.
+    window_reserved: bool = false,
+    /// Queued for that patch. Cleared when the patch or a full window rebuild commits.
+    window_queued: bool = false,
 };
 /// `LevelTerrain.floor_layer` of a level with no floor band.
 pub const no_floor_layer: u32 = std.math.maxInt(u32);

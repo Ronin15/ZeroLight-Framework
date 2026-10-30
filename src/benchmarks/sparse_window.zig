@@ -15,8 +15,13 @@
 //!   - `render-sparse-window-pan-interleaved`: that same cell list shuffled with a fixed seed.
 //!   - `render-sparse-window-pan-churned`: chunk order, then an untimed clear and re-add of
 //!     every other blocking tile, so the timed pan sees the same set.
-//!   - `render-sparse-window-add`: one sparse tile added outside the window, then a frame.
-//!     Today's cell placement. The untimed reset drops that tile from its run.
+//!   - `render-sparse-window-add`: outside, one sparse tile added outside the window, then a
+//!     frame. Today's cell placement. The untimed reset drops that tile from its run, and the
+//!     add fails the case if the window goes dirty. In-window, one tile in a single chunk of
+//!     the fixed window, then that same frame. Pass shape, asserted from the patch counters:
+//!     the edited run plus the sorted-list splice, flat in the world's sparse count outside
+//!     that window. The order is derived, not measured: O(edited-run rows + P log P + V).
+//!     V is the dense splice, not a recount of window chunks.
 //! Fixtures build once per case outside the timed loop. Sparse prep is main-thread work, so
 //! the groups run serial only.
 
@@ -66,6 +71,30 @@ const added_tile_y: u16 = 1500;
 
 const sparse_tile_counts = [_]usize{ 1_000, 16_000, 256_000 };
 
+const AddKind = enum(u8) { outside, in_window };
+
+// `kind` is the high digit, so an outside count stays the sparse-tile count.
+const AddCode = suite.ItemCode(struct { kind: AddKind, tiles: usize }, &.{6});
+
+const add_item_counts = blk: {
+    const kinds = [_]AddKind{ .outside, .in_window };
+    var counts: [kinds.len * sparse_tile_counts.len]usize = undefined;
+    var index: usize = 0;
+    for (kinds) |kind| {
+        for (sparse_tile_counts) |tiles| {
+            counts[index] = AddCode.of(.{ .kind = kind, .tiles = tiles });
+            index += 1;
+        }
+    }
+    break :blk counts;
+};
+
+comptime {
+    std.debug.assert(add_item_counts[0] == sparse_tile_counts[0]);
+    std.debug.assert(add_item_counts[1] == sparse_tile_counts[1]);
+    std.debug.assert(add_item_counts[2] == sparse_tile_counts[2]);
+}
+
 pub const frame_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-frame",
     .item_label = "sparse tiles in the world",
@@ -104,34 +133,45 @@ pub const pan_churned_group = suite.BenchmarkGroup{
 
 pub const add_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-add",
-    .item_label = "sparse tiles in the world",
-    .item_counts = &sparse_tile_counts,
+    .item_label = AddCode.label,
+    .describe_item = AddCode.describe,
+    .item_counts = &add_item_counts,
     .runCase = runAddCase,
     .write_workload = writeSparseWorkload,
     .cases = &suite.serial_cases,
 };
 
-const Workload = enum { frame, pan, add };
+const Workload = enum { frame, pan, add_outside, add_in_window };
 
 fn runFrameCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .frame, .insertion);
+    return runCase(allocator, io, options, case, item_count, item_count, .frame, .insertion);
 }
 
 fn runPanCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .pan, .chunk_ordered);
+    return runCase(allocator, io, options, case, item_count, item_count, .pan, .chunk_ordered);
 }
 
 fn runPanInterleavedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .pan, .interleaved);
+    return runCase(allocator, io, options, case, item_count, item_count, .pan, .interleaved);
 }
 
 fn runPanChurnedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .pan, .churned);
+    return runCase(allocator, io, options, case, item_count, item_count, .pan, .churned);
 }
 
 fn runAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .add, .insertion);
+    const add = try AddCode.decode(item_count);
+    const workload: Workload = switch (add.kind) {
+        .outside => .add_outside,
+        .in_window => .add_in_window,
+    };
+    return runCase(allocator, io, options, case, item_count, add.tiles, workload, .insertion);
 }
+
+// Empty cell of the window block's top-left chunk: inside the camera, off the
+// block, so the untimed clear drops only the tile this case added.
+const in_window_add_x: u16 = window_block_x & ~@as(u16, default_chunk_size_tiles - 1);
+const in_window_add_y: u16 = window_block_y & ~@as(u16, default_chunk_size_tiles - 1);
 
 const Fixture = struct {
     world: WorldSystem,
@@ -163,15 +203,19 @@ const Fixture = struct {
     // One frame's sparse prep for the camera `step_chunks` right of its start:
     // window update, depth range walk, and submit. Returns the sprites submitted.
     fn frame(self: *Fixture, step_chunks: i32) !usize {
+        return self.frameExpect(step_chunks, window_tile_count);
+    }
+
+    fn frameExpect(self: *Fixture, step_chunks: i32, expect_tiles: usize) !usize {
         const world = &self.world;
         self.batch.beginFrame();
         try world.setVisibleChunksForWorldRect(self.cameraRect(step_chunks), overscan_chunks, active_level);
-        if (world.reserveRenderRecords() != window_tile_count) return error.WindowSparseCountMismatch;
+        if (world.reserveRenderRecords() != expect_tiles) return error.WindowSparseCountMismatch;
         var submitted: usize = 0;
         for (0..world.sparseDepthRangeCount()) |range_index| {
             submitted += try world.submitVisibleSparseSprites(&self.batch, self.texture, range_index);
         }
-        if (submitted != window_tile_count) return error.WindowSparseSubmitMismatch;
+        if (submitted != expect_tiles) return error.WindowSparseSubmitMismatch;
         return submitted;
     }
 
@@ -182,11 +226,55 @@ const Fixture = struct {
         if (self.world.sparse_window.dirty) return error.OutsideAddDirtiedWindow;
     }
 
+    // One in-window tile, one queued chunk, fixed camera. The run is that chunk's
+    // rows; outside tiles sit in other chunks, so the run and the list stay within
+    // the window's tiles plus this one.
+    fn addInWindowTile(self: *Fixture) !struct { run_rows: usize, window_rows: usize } {
+        const world = &self.world;
+        const event = try world.addSparseTile(active_level, in_window_add_x, in_window_add_y, self.added_tile, 0, .marker);
+        if (event == null) return error.AddedTileBlocksMovement;
+        const window = &world.sparse_window;
+        if (!window.dirty or window.edited.items.len != 1) return error.InWindowPatchNotOneChunk;
+        const edit = window.edited.items[0];
+        const geom = world.chunkGeometry();
+        if (edit.level != active_level or edit.chunk != geom.chunkOf(in_window_add_x, in_window_add_y)) return error.InWindowPatchNotOneChunk;
+        const run_rows = world.level_terrain.items[edit.level].sparse_runs[edit.chunk].rows.len;
+        const window_rows = window.rows.len;
+        if (run_rows == 0 or run_rows > window_tile_count + 1) return error.PatchRunGrewWithOutsideTiles;
+        if (window_rows == 0 or window_rows > window_tile_count + 1) return error.PatchSpliceGrewWithOutsideTiles;
+        return .{ .run_rows = run_rows, .window_rows = window_rows };
+    }
+
+    // The patch read that one run, sorted its in-window tiles, and spliced the
+    // window list. A recount of window chunks does not match the run.
+    fn expectInWindowPatch(self: *const Fixture, run_rows: usize, window_rows: usize) !void {
+        const perf = self.world.perf;
+        if (perf.sparse_patch_run_rows != @as(u64, run_rows)) return error.PatchRunNotEditedChunk;
+        if (perf.sparse_patch_tiles != @as(u64, run_rows)) return error.PatchTilesNotEditedRun;
+        if (perf.sparse_patch_window_rows != @as(u64, window_rows)) return error.PatchSpliceNotWindowRows;
+    }
+
     // Drops the tile `addOutsideTile` wrote through the production clear.
     fn dropAddedTile(self: *Fixture) !void {
-        const cleared = try self.world.clearCellBlocking(added_tile_level, added_tile_x, added_tile_y, self.floor_tile);
+        try self.dropTile(added_tile_level, added_tile_x, added_tile_y);
+    }
+
+    fn dropInWindowTile(self: *Fixture) !void {
+        try self.dropTile(active_level, in_window_add_x, in_window_add_y);
+    }
+
+    fn dropTile(self: *Fixture, level: u16, x: u16, y: u16) !void {
+        const cleared = try self.world.clearCellBlocking(level, x, y, self.floor_tile);
         if (cleared == null) return error.AddedTileIndexMismatch;
         if (@as(usize, self.world.sparse_live) != self.sparse_count) return error.AddedTileCountMismatch;
+    }
+
+    fn resetAdd(self: *Fixture, workload: Workload) !void {
+        switch (workload) {
+            .add_outside => try self.dropAddedTile(),
+            .add_in_window => try self.dropInWindowTile(),
+            .frame, .pan => {},
+        }
     }
 };
 
@@ -324,17 +412,17 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
     try fixture.batch.reserveStorage(window_tile_count, window_tile_count * 6, window_tile_count);
 }
 
-fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, layout: SparseLayout) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, sparse_count: usize, workload: Workload, layout: SparseLayout) !suite.RunStats {
     std.debug.assert(!case.usesThreadSystem());
     var fixture: Fixture = undefined;
-    try initFixture(&fixture, allocator, io, item_count, layout);
+    try initFixture(&fixture, allocator, io, sparse_count, layout);
     defer fixture.deinit();
     // The first frame builds the window's sparse list.
     _ = try fixture.frame(0);
 
     for (0..options.warmup_iterations) |_| {
         _ = try runIteration(&fixture, workload);
-        if (workload == .add) try fixture.dropAddedTile();
+        try fixture.resetAdd(workload);
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var submitted: usize = 0;
@@ -342,7 +430,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const start_ns = suite.nowNs(io);
         submitted = try runIteration(&fixture, workload);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), inlineBatch(submitted, 1));
-        if (workload == .add) try fixture.dropAddedTile();
+        try fixture.resetAdd(workload);
     }
     var stats = accumulator.finish();
     // The item count is the world's sparse tile count, so report throughput over the
@@ -357,9 +445,15 @@ fn runIteration(fixture: *Fixture, workload: Workload) !usize {
     return switch (workload) {
         .frame => fixture.frame(0),
         .pan => (try fixture.frame(1)) + try fixture.frame(0),
-        .add => blk: {
+        .add_outside => blk: {
             try fixture.addOutsideTile();
             break :blk fixture.frame(0);
+        },
+        .add_in_window => blk: {
+            const patch = try fixture.addInWindowTile();
+            const submitted = try fixture.frameExpect(0, window_tile_count + 1);
+            try fixture.expectInWindowPatch(patch.run_rows, patch.window_rows);
+            break :blk submitted;
         },
     };
 }
