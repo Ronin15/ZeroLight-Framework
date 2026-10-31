@@ -17,7 +17,7 @@ inheritSkills: false
 prompt_mode: full
 agents_md: true
 model: inherit
-effort: high
+effort: medium
 color: green
 ---
 
