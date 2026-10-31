@@ -3522,9 +3522,11 @@ test "collision trigger store growing rebuild under every allocation failure lea
     var small: [100]u256 = undefined;
     try rebuildKeys(&store, testThreads(&thread_system), testRunKeys(&small, 0, 0), 2);
     // More pages than the first rebuild's slabs, a height-2 tree, and levels past the table end.
+    // The pairs share two entities. A distinct entity per pair would allocate one list each,
+    // and the sweep would repeat this rebuild once per pair.
     var keys: [64 * 62 + 1 + 300]u256 = undefined;
-    _ = testRunKeys(keys[0 .. 64 * 62 + 1], 2, 0);
-    _ = testRunKeys(keys[64 * 62 + 1 ..], 30, 0);
+    for (keys[0 .. 64 * 62 + 1], 0..) |*key, index| key.* = testKey(2, @intCast(index), 0, 1);
+    for (keys[64 * 62 + 1 ..], 0..) |*key, index| key.* = testKey(30, @intCast(index), 0, 1);
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
