@@ -515,7 +515,8 @@ pub const MovementBodyStore = struct {
         const row = self.rows.slice();
         row.items(.drawable_run)[index] = no_drawable;
         row.items(.drawable_slot)[index] = no_drawable;
-        if (run.rows.len == 0) self.releaseRun(run_index);
+        // A reservation is a link that has not run yet. Releasing here drops that destination from `run_of`.
+        if (run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
     }
 
     pub fn placeDrawable(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
@@ -851,4 +852,34 @@ test "set copies the pose into the drawable run and refreshRunPose copies it aft
     store.refreshRunPose(run_index);
     try std.testing.expectEqual(@as(f32, 9), store.drawableRunSlice(run_index).position_x[0]);
     try std.testing.expectEqual(@as(i32, 10), store.drawableRunSlice(run_index).position_z[0]);
+}
+
+test "relink keeps a reserved drawable run when its last occupant leaves first" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const leaving = try EntityId.init(0, 1);
+    const entering = try EntityId.init(1, 1);
+    const leaving_index: usize = try store.append(std.testing.allocator, leaving, .{});
+    const entering_index: usize = try store.append(std.testing.allocator, entering, .{});
+    store.setScopeMetadata(leaving_index, .{ .chunk = .{ .x = 0, .y = 0 }, .level = 0 });
+    store.setScopeMetadata(entering_index, .{ .chunk = .{ .x = 1, .y = 0 }, .level = 0 });
+    try store.setHasPrimitiveVisual(std.testing.allocator, leaving_index, true);
+    try store.setHasPrimitiveVisual(std.testing.allocator, entering_index, true);
+
+    // Same order as deriveChunks: every destination is reserved, then the leaver relinks first.
+    try store.reserveDrawableDestination(std.testing.allocator, 0, 1, 0);
+    try store.reserveDrawableDestination(std.testing.allocator, 0, 0, 0);
+    store.relinkReservedDrawable(leaving_index, 0, 1, 0);
+    store.relinkReservedDrawable(entering_index, 0, 0, 0);
+
+    const entered = store.drawableRunIndex(0, 0, 0).?;
+    const departed = store.drawableRunIndex(0, 1, 0).?;
+    try std.testing.expectEqual(@as(usize, 1), store.drawableRunLength(entered));
+    try std.testing.expectEqual(@as(usize, 1), store.drawableRunLength(departed));
+    try std.testing.expect(store.drawableRunSlice(entered).entity[0].eql(entering));
+    try std.testing.expect(store.drawableRunSlice(departed).entity[0].eql(leaving));
+    try std.testing.expectEqual(entered, store.rows.slice().items(.drawable_run)[entering_index]);
+    try std.testing.expectEqual(departed, store.rows.slice().items(.drawable_run)[leaving_index]);
+    try std.testing.expectEqual(@as(u32, 0), store.runs.items[entered].reserved_extra);
+    try std.testing.expectEqual(@as(u32, 0), store.runs.items[departed].reserved_extra);
 }
