@@ -5,15 +5,17 @@ description: >-
 tools:
   - read_file
   - search_replace
-  - write
   - grep
   - list_dir
   - run_terminal_command
 disallowedTools:
   - spawn_subagent
+  - search_tool
+  - use_tool
 injectDefaultTools: false
 discoverSkills: false
 inheritSkills: false
+mcpInheritance: none
 prompt_mode: full
 agents_md: true
 model: inherit
@@ -30,8 +32,8 @@ section shape.
 
 ## Workflow
 
-Read the sources the prompt names and the lines a claim cites, then write.
-Do not survey a module past those lines.
+Read the sources the prompt names and the lines a claim cites, then edit
+with `search_replace`. Do not survey a module past those lines.
 
 1. Gather the sources the prompt names: the landings' commit bodies (their
    "Doc notes"), uncommitted slice edits, and the reports it cites in

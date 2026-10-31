@@ -53,11 +53,12 @@ finishes, or a review routes the next one, the main session rewrites the file.
   the first line says so and names the line ranges to read. The prompt
   states the slice pass. An open how is the specialist's decision. The
   prompt does not choose it or tour the module.
-- **Implement** prompt: the design plan's path and only its overrides. The
-  plan lists the exact test and bench commands, and the values the new test
-  asserts. The implementer runs those commands. That result is the proof.
-  A stated fix with no plan is the prompt, and that prompt carries the same
-  commands and values. Every command it names exercises the changed code.
+- **Implement** prompt: the design plan's path and only its overrides. It
+  does not name files to read. The plan lists the exact test and bench
+  commands, and the values the new test asserts. The implementer runs those
+  commands. That result is the proof. A stated fix with no plan is the
+  prompt, and that prompt carries the same commands and values. Every
+  command it names exercises the changed code.
 - **Review** prompt: the files and the report path. It does not name the
   plan or the landing.
 - Agents cite a loaded rule by name. They do not open it again and do not
@@ -123,6 +124,10 @@ Validation cadence and modes: `build-validation.md`.
 ## Grok Tooling (`.grok/`)
 
 - Agent names stay stable. Spawn them with `subagent_type` set to that name.
+- A specialist does not receive the `write` tool. It creates a plan, review,
+  or landing with `search_replace` (an empty `old_string` creates the file).
+  The shell does not write those files. `search_tool` and `use_tool` are
+  `zig-debug-specialist` only.
 - Plans, reviews, and landing reports go in `.grok/reports/` (gitignored).
   Design writes the plan, review writes the report, and `zig-specialist`
   writes `<topic>-landing.md`, each to the path the prompt names.

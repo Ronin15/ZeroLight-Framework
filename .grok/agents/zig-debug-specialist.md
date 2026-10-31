@@ -5,7 +5,6 @@ description: >-
 tools:
   - read_file
   - search_replace
-  - write
   - grep
   - list_dir
   - run_terminal_command

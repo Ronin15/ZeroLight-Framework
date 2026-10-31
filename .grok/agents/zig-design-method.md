@@ -54,7 +54,7 @@ to the next. Cite the rule for the step. Do not restate it.
 6. **Budgets.** `budgets-capacities.md`: class, sizing, growth, degradation.
 7. **Proof.** `tests-benchmarks.md`. The exact commands, looked up once
    from the test names in the files you read and from
-   `tools/bench_ab.py --list`: each `zig build test -Dtest-filter=… --summary all`,
+   `tools/bench_ab.py --list` filtered to that group's lines: each `zig build test -Dtest-filter=… --summary all`,
    the ThreadSanitizer command when the change is threaded, and each
    `tools/bench_ab.py` line with its group, case, and `--items`. "No bench"
    when none runs. The implementer runs those lines and does not look them up.
