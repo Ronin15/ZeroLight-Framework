@@ -20,7 +20,7 @@ mcpInheritance: none
 prompt_mode: full
 agents_md: true
 model: grok-4.7-build-fast
-effort: high
+effort: xhigh
 color: purple
 ---
 

@@ -19,7 +19,7 @@ mcpInheritance: none
 prompt_mode: full
 agents_md: true
 model: inherit
-effort: medium
+effort: high
 color: blue
 ---
 
