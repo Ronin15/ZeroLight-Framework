@@ -36,8 +36,9 @@ the step.
    rejected alternative. A part that fails the cost model is replaced.
 2. **Results.** Where each result is stored and who shares it.
 3. **The data.** What each hot loop reads and writes, in its read order
-   (`memory-performance.md` § Data-oriented design). A changed order lists
-   every consumer.
+   (`memory-performance.md` § Data-oriented design). A copy or permutation
+   of a `std.MultiArrayList` names its column streams (§ Dense SoA storage).
+   A changed order lists every consumer.
 4. **The loops.** One row per loop the change adds or whose cost, placement,
    or access order changes. Otherwise one line. Columns: `file:line`; what
    it scales with; workers or main, and the stage pattern it copies or why

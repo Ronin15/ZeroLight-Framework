@@ -45,8 +45,9 @@ is the plan's.
 5. Run `zig build check` while editing, and `zig build test-compile` after
    a test body changes. Then run the commands the plan lists. That result
    is the proof.
-6. A hot loop the plan names that fails `memory-performance.md`
-   § Data-oriented design goes back to design. Optimize and re-measure the
+6. A copy or permutation of a `std.MultiArrayList` is the column streams
+   in `memory-performance.md` § Dense SoA storage. A hot loop the plan
+   names that fails § Data-oriented design goes back to design. Optimize and re-measure the
    hot-path cause the prompt names. A replan follows when that re-measure
    still misses and the counters show the structure is the cost, or the
    prompt says the structure failed.

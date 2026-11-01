@@ -95,6 +95,10 @@
 - Call `rows.slice()` once per stage, function, or accessor, never
   `rows.items(.field)` in a loop; per-row helpers take const column slices from
   the caller and never call `.slice()`.
+- A hot copy or permutation of the list streams those column slices across
+  the range (`dest[i] = src[perm[i]]` for each column). Several columns may
+  share the loop when each is sliced once. `get` or `set` of the whole row
+  in that loop walks every column per item and fails § Data-oriented design.
 - Hot gather loops capture the row slice once and add rows on it, never
   `appendAssumeCapacity`; a per-row store append reserves one row, then
   appends assuming capacity, never reserves `n` and then appends (both

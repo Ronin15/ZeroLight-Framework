@@ -71,7 +71,14 @@ finishes, or a review routes the next one, the main session rewrites the file.
   finding with a stated local fix goes to `zig-specialist`, an open choice to
   design. A High structural data-layout finding in new code is fixed in its
   landing. Any finding not fixed becomes a checklist item in its owning slice
-  (`file:line`, failure scenario, pass condition).
+  (`file:line`, failure scenario, pass condition). Each High carries the
+  source tag from `zig-review-specialist`. A `rule-gap` is shown to the
+  owner as that one sentence; on approval it lands in the named rule, with
+  a cite in the named step, in the workflow commit. The code fix still goes
+  to `zig-specialist` in the landing. A `missed-rule` whose rule line is
+  already cited by another High in the merged list is shown as one cite at
+  the step that skipped it; on approval that cite lands in the same workflow
+  commit. A single `missed-rule`, and every `defect`, is the code fix only.
 - **Debug** (`zig-debug-specialist`) for failures. Its prompt is the failing
   command and the first error block. **Docs** (`docs-specialist`) write a
   slice's docs commit once its programming is done, from the code as landed;

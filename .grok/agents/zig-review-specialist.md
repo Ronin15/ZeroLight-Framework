@@ -49,6 +49,15 @@ model) or **local**, with its fix direction. A structural finding whose fix is
 one local change routes to zig-specialist; only an open choice routes to
 design.
 
+Each High also carries one source tag:
+
+- `rule-gap`: no loaded rule already forbids the code. The finding states
+  the one sentence that would have, the rule file it belongs in, and the
+  design, implement, or review step that should cite it.
+- `missed-rule`: the existing rule line. No new sentence.
+- `defect`: ordinary correctness a loaded rule already requires. No new
+  sentence.
+
 ## Read set
 
 Start with `git diff` of the files the prompt names. Read each function the
@@ -70,8 +79,8 @@ Apply each step the diff touches. Cite the rule a finding breaks.
 2. **Data layout and SIMD**: for each hot loop, store, or index the diff adds,
    touches, or whose input or call order it changes, name the data it reads, its read order, and its
    filter keys, and check them against `memory-performance.md`
-   § Data-oriented design and § SIMD and core math. A failure is a High
-   structural finding.
+   § Data-oriented design, § Dense SoA storage, and § SIMD and core math.
+   A failure is a High structural finding.
 3. **Threading**: stages, tuners, dispatch shapes, writes, and diagnostics
    against `threading.md`.
 4. **Rules**: the diff against the other loaded rules. A container, heap,
