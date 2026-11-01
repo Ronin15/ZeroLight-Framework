@@ -1300,11 +1300,11 @@ test "collect dynamic records after structural growth stays within reserve and a
 
     // The capacity formulas track the live grown population, not a stale snapshot.
     try std.testing.expectEqual(
-        data.primitiveVisualSliceConst().entities.len + 1 + particles.activeCount(),
+        data.primitive_visuals.sliceConst().entities.len + 1 + particles.activeCount(),
         dynamicRecordCapacity(scene),
     );
     try std.testing.expectEqual(
-        world.reserveRenderRecords() + data.primitiveVisualSliceConst().entities.len + 1 +
+        world.reserveRenderRecords() + data.primitive_visuals.sliceConst().entities.len + 1 +
             particles.activeCount() + Renderer.k_stacked_state_ui_headroom,
         spriteCommandCapacity(scene),
     );

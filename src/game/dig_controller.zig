@@ -361,7 +361,7 @@ pub const DigController = struct {
     };
 
     /// The plane stage's preflight, before any write. Decides every traversal in commit
-    /// order (the player, then each gathered NPC entry in AI row order) from the
+    /// order (the player, then each gathered NPC entry in movement-row order) from the
     /// classification the entry carries, re-judging only an entry whose hole or landing
     /// an earlier traversal this step carves, and groups the landing carves by (level,
     /// chunk) for the commit's batched write (`WorldSystem.groupDenseCellWrites`), each at
@@ -843,6 +843,7 @@ fn addCellEntryNpcOnLevel(data: *DataSystem, from: CellCoord, to: CellCoord, wor
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     if (world_level) |level| try data.setWorldLevel(npc, level);
     try data.setSimulationTier(npc, .locomotion);

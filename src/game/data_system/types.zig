@@ -274,6 +274,8 @@ pub const MovementBodySlice = struct {
     has_collision_bounds: []const bool,
     /// Whether the entity carries an `AiAgent`; read-only here.
     has_ai_agent: []const bool,
+    /// Mirror of `world_level` presence, written only at the commit seam; read-only here.
+    has_world_level: []const bool,
 };
 
 pub const ConstMovementBodySlice = struct {
@@ -297,6 +299,8 @@ pub const ConstMovementBodySlice = struct {
     has_collision_bounds: []const bool,
     /// Whether the entity carries an `AiAgent`; read-only here.
     has_ai_agent: []const bool,
+    /// Mirror of `world_level` presence, written only at the commit seam; read-only here.
+    has_world_level: []const bool,
 };
 
 /// Dense simulation-scope columns in lockstep with the movement store rows
@@ -386,14 +390,6 @@ pub const BodyLevelFaction = struct {
     movement_body: usize,
     level: ?u16 = null,
     faction: ?Faction = null,
-};
-
-/// Dense movement + primitive-visual row indices from a single entity slot resolve, so
-/// the plane-entry gather does one lookup, not a separate movement and visual lookup per
-/// entity.
-pub const MovementVisualDenseIndices = struct {
-    movement: usize,
-    visual: usize,
 };
 
 /// Dense movement + steering-agent row indices from a single entity slot resolve.

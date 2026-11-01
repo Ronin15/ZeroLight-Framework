@@ -29,7 +29,6 @@ const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
 const AssetReference = types.AssetReference;
 const ConstAssetReferenceSlice = types.ConstAssetReferenceSlice;
 const BodyLevelFaction = types.BodyLevelFaction;
-const MovementVisualDenseIndices = types.MovementVisualDenseIndices;
 const MovementSteeringDenseIndices = types.MovementSteeringDenseIndices;
 const CollisionBounds = types.CollisionBounds;
 const ConstCollisionBoundsSlice = types.ConstCollisionBoundsSlice;
@@ -575,6 +574,13 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.movement_body_index) |index| {
             self.movement_bodies.set(@intCast(index), body);
+            // A failed create leaves the row without its world-level mirror. This upsert is the retry.
+            // The flag follows a successful sync, same as the create path.
+            if (slot.world_level_index) |world_level_index| {
+                const level = self.world_levels.get(@intCast(world_level_index));
+                try self.syncScopeLevelFromWorldLevel(id, level);
+                self.movement_bodies.setHasWorldLevel(index, true);
+            }
             return;
         }
 
@@ -614,6 +620,7 @@ pub const DataSystem = struct {
         if (slot.world_level_index) |world_level_index| {
             const level = self.world_levels.get(@intCast(world_level_index));
             try self.syncScopeLevelFromWorldLevel(id, level);
+            self.movement_bodies.setHasWorldLevel(dense_index, true);
         }
         // An existing body write does not change static membership. A new body can.
         self.syncDynamicBounds(id);
@@ -706,22 +713,6 @@ pub const DataSystem = struct {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.primitive_visual_index orelse return null;
         return self.primitive_visuals.get(@intCast(dense_index));
-    }
-
-    pub fn primitiveVisualSliceConst(self: *const DataSystem) ConstPrimitiveVisualSlice {
-        return self.primitive_visuals.sliceConst();
-    }
-
-    /// One slot resolve → dense movement + visual row indices for the plane-entry gather.
-    /// Null if the entity is missing either component (or is not alive).
-    pub fn movementVisualDenseIndices(self: *const DataSystem, id: EntityId) ?MovementVisualDenseIndices {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const movement = slot.movement_body_index orelse return null;
-        const visual = slot.primitive_visual_index orelse return null;
-        return .{
-            .movement = @intCast(movement),
-            .visual = @intCast(visual),
-        };
     }
 
     /// One slot resolve → dense movement + steering-agent indices for steering select.
@@ -910,6 +901,9 @@ pub const DataSystem = struct {
             slot.addComponent(.world_level);
         }
         try self.syncScopeLevelFromWorldLevel(id, level);
+        if (slot.movement_body_index) |movement_index| {
+            self.movement_bodies.setHasWorldLevel(@intCast(movement_index), true);
+        }
     }
 
     pub fn worldLevelConst(self: *const DataSystem, id: EntityId) ?u16 {
@@ -1403,6 +1397,7 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.bounds_size_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.has_collision_bounds.len);
     try std.testing.expectEqual(slice.entities.len, slice.has_ai_agent.len);
+    try std.testing.expectEqual(slice.entities.len, slice.has_world_level.len);
 }
 
 fn expectPrimitiveVisualColumnsAligned(slice: ConstPrimitiveVisualSlice) !void {
@@ -1466,10 +1461,6 @@ fn expectWorldLevelColumnsAligned(slice: ConstWorldLevelSlice) !void {
 }
 
 const data_test_support = @import("test_support.zig");
-
-fn primitiveVisualDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
-    return data_test_support.rowOf(data, id, "primitive_visual_index");
-}
 
 fn collisionBoundsDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
     return data_test_support.rowOf(data, id, "collision_bounds_index");
@@ -2334,27 +2325,6 @@ test "a static obstacle resolves only for a live slot with body, bounds, and a s
     try std.testing.expect(data.staticObstacle(reused, refreshed).?.entity.eql(reused));
 }
 
-test "movementVisualDenseIndices resolves both rows from one slot lookup" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, testBody(1));
-    try std.testing.expect(data.movementVisualDenseIndices(entity) == null);
-
-    try data.setPrimitiveVisual(entity, .{
-        .size = .{ .x = 16, .y = 16 },
-        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-    });
-    const indices = data.movementVisualDenseIndices(entity).?;
-    try std.testing.expectEqual(@as(usize, 0), indices.movement);
-    try std.testing.expectEqual(@as(usize, 0), indices.visual);
-    try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, indices.movement);
-    try std.testing.expectEqual(primitiveVisualDenseIndex(&data, entity).?, indices.visual);
-    try std.testing.expect(data.movementVisualDenseIndices(EntityId.invalid) == null);
-}
-
 test "movementSteeringDenseIndices resolves both rows from one slot lookup" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2383,6 +2353,7 @@ fn expectBoundsAndAiMirrored(data: *const DataSystem, id: EntityId) !void {
     try std.testing.expectEqual(bounds.size.x, movement.bounds_size_x[row]);
     try std.testing.expectEqual(bounds.size.y, movement.bounds_size_y[row]);
     try std.testing.expectEqual(data.hasComponents(id, component_masks.ai_agent), movement.has_ai_agent[row]);
+    try std.testing.expectEqual(data.worldLevelConst(id) != null, movement.has_world_level[row]);
 }
 
 test "movement rows mirror collision bounds and AI membership through bounds set, movement append, AI append, and destroy" {
@@ -2393,12 +2364,15 @@ test "movement rows mirror collision bounds and AI membership through bounds set
     const early = try data.createEntity();
     try data.setCollisionBounds(early, .{ .offset = .{ .x = 2, .y = 3 }, .size = .{ .x = 10, .y = 12 } });
     try data.setAiAgent(early, .{});
+    try data.setWorldLevel(early, 3);
     try data.setMovementBody(early, testBody(1));
     try expectBoundsAndAiMirrored(&data, early);
 
     // Body first: the bounds append, the bounds rewrite, and the AI append each write the row.
     const late = try data.createEntity();
     try data.setMovementBody(late, testBody(2));
+    try expectBoundsAndAiMirrored(&data, late);
+    try data.setWorldLevel(late, 1);
     try expectBoundsAndAiMirrored(&data, late);
     try data.setCollisionBounds(late, .{ .size = .{ .x = 4, .y = 5 } });
     try expectBoundsAndAiMirrored(&data, late);
@@ -2490,6 +2464,61 @@ test "setMovementBody keeps the level-0 run size and color when the level-2 reta
     return error.TestUnexpectedResult;
 }
 
+test "movement rows mirror world level after a retried setMovementBody" {
+    const color_r: f32 = 0.25;
+    const color_g: f32 = 0.5;
+    const color_b: f32 = 0.75;
+    const color_a: f32 = 1;
+    const visual: PrimitiveVisual = .{
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = color_r, .g = color_g, .b = color_b, .a = color_a },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+
+    // `placeDrawable` links level 0 and the mirror writes this size and color. The next
+    // allocation is the level-3 retarget. An earlier failure has no mirrored run.
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        const entity = try data.createEntity();
+        try data.setPrimitiveVisual(entity, visual);
+        try data.setWorldLevel(entity, 3);
+
+        const original = data.allocator;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        data.allocator = failing.allocator();
+        defer data.allocator = original;
+
+        if (data.setMovementBody(entity, .{})) |_| {
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+
+        const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0) orelse continue;
+        const run = data.movement_bodies.drawableRunSlice(run_index);
+        const mirrored = run.entity.len == 1 and run.entity[0].eql(entity) and
+            run.size_x[0] == 16 and run.size_y[0] == 16 and
+            run.color_r[0] == color_r and run.color_g[0] == color_g and
+            run.color_b[0] == color_b and run.color_a[0] == color_a;
+        if (!mirrored) continue;
+        if (data.movement_bodies.drawableRunIndex(3, 0, 0) != null) continue;
+
+        try std.testing.expectEqual(@as(?u16, 3), data.worldLevelConst(entity));
+        try std.testing.expect(!data.movementBodySliceConst().has_world_level[0]);
+        try std.testing.expectEqual(@as(u16, 0), data.scopeColumnsSliceConst().level[0]);
+
+        data.allocator = original;
+        try data.setMovementBody(entity, .{});
+        try std.testing.expect(data.movementBodySliceConst().has_world_level[0]);
+        try std.testing.expectEqual(@as(u16, 3), data.scopeColumnsSliceConst().level[0]);
+        try std.testing.expectEqual(@as(?u16, 3), data.worldLevelConst(entity));
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "movement body columns can be loaded directly through simd helpers" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2542,7 +2571,7 @@ test "destroying an entity removes every attached data row" {
     try std.testing.expect(try data.destroyEntity(entity));
     try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.facings.len());
-    try std.testing.expectEqual(@as(usize, 0), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.primitive_visuals.sliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.assetReferenceSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.collisionResponseSliceConst().entities.len);
@@ -2562,7 +2591,7 @@ test "primitive visual store is columnar and compact after removal" {
 
     try std.testing.expect(try data.destroyEntity(second));
 
-    const slice = data.primitiveVisualSliceConst();
+    const slice = data.primitive_visuals.sliceConst();
     try expectPrimitiveVisualColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
     for (slice.entities, 0..) |entity, index| {
@@ -3003,7 +3032,7 @@ test "structural commands prevalidate movement and primitive visuals before muta
     };
     try std.testing.expectError(error.InvalidPrimitiveVisual, data.applyStructuralCommands(&visual_commands));
     try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(existing).?.size.x);
-    try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 1), data.primitive_visuals.sliceConst().entities.len);
 }
 
 test "structural commands reserve capacity before mutating" {
@@ -3034,7 +3063,7 @@ test "structural commands reserve capacity before mutating" {
     try std.testing.expectError(error.OutOfMemory, data.preflightStructuralCommands(commands.items, &scratch));
     try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 0), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.primitive_visuals.sliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.collisionBoundsSliceConst().entities.len);
 }
 
@@ -3097,7 +3126,7 @@ test "structural command preflight counts duplicate component sets once" {
     var preparer = NullStructuralCommitPreparer{};
     const stats = try data.applyStructuralCommandsPrepared(&commands, &scratch, &preparer, &sink);
     try std.testing.expectEqual(@as(usize, 2), stats.components_set);
-    try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 1), data.primitive_visuals.sliceConst().entities.len);
     try std.testing.expectEqual(@as(f32, 32), data.primitiveVisualConst(target).?.size.x);
 }
 

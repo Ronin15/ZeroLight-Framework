@@ -38,7 +38,6 @@ pub const ConstPrimitiveVisualSlice = @import("data_system/types.zig").ConstPrim
 pub const AssetReference = @import("data_system/types.zig").AssetReference;
 pub const ConstAssetReferenceSlice = @import("data_system/types.zig").ConstAssetReferenceSlice;
 pub const DrawableRunColumns = @import("data_system/movement.zig").DrawableRunColumns;
-pub const MovementVisualDenseIndices = @import("data_system/types.zig").MovementVisualDenseIndices;
 pub const MovementSteeringDenseIndices = @import("data_system/types.zig").MovementSteeringDenseIndices;
 pub const CollisionBounds = @import("data_system/types.zig").CollisionBounds;
 pub const CollisionBoundsCommand = @import("data_system/types.zig").CollisionBoundsCommand;

@@ -2,8 +2,8 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Plane traversal's per-agent cell-entry gather. One pass over the AI rows finds each
-//! agent that entered a new cell this step and either stands where it could change
+//! Plane traversal's per-agent cell-entry gather. One pass over the movement rows finds
+//! each agent that entered a new cell this step and either stands where it could change
 //! plane (a ramp-link cell, or a hole with a level below) or lacks `world_level`, and
 //! classifies that cell on the worker: the ramp's other level or the fall's target, the
 //! landing floor layer, and whether the landing needs a carve. The player is never an
@@ -11,7 +11,7 @@
 //! path. The dig controller's reserve and commit then visit only those entries, at O(1)
 //! each. Each range writes at most one entry per row into its own window of one
 //! item-capacity buffer; the main thread compacts the windows in range order, which is
-//! AI row order.
+//! movement-row order.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
@@ -122,9 +122,9 @@ pub const PlaneEntrySystem = struct {
     reserved_items: usize = 0,
     config: PlaneEntryConfig = .{},
     tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    /// Set by the first gather whose AI rows exceeded the reservation and grew the windows
-    /// on the main thread before dispatch, which warns once: the population seam's reserve
-    /// is short of the live AI rows.
+    /// Set by the first gather whose movement rows exceeded the reservation and grew the
+    /// windows on the main thread before dispatch, which warns once: the population seam's
+    /// reserve is short of the live movement rows.
     windows_growth_logged: bool = false,
     // The gather's last batch and the gathers that grew the windows, kept only with
     // `runtime_perf_log.enabled`.
@@ -145,8 +145,8 @@ pub const PlaneEntrySystem = struct {
         self.* = undefined;
     }
 
-    /// Sizes the windows to `capacity` AI rows and the tallies to every partition of
-    /// them, so a gather within it allocates nothing. Grow-only; the pipeline's
+    /// Sizes the windows to `capacity` movement rows and the tallies to every partition
+    /// of them, so a gather within it allocates nothing. Grow-only; the pipeline's
     /// population seam re-runs it.
     pub fn reserve(self: *PlaneEntrySystem, capacity: usize) error{OutOfMemory}!void {
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
@@ -155,11 +155,11 @@ pub const PlaneEntrySystem = struct {
         std.debug.assert(self.entries.capacity >= self.reserved_items);
     }
 
-    /// This step's entries in AI row order, read from `data` and `world` without
+    /// This step's entries in movement-row order, read from `data` and `world` without
     /// writing either, each classified by `planeTarget` with `tunnel_tile` as the
     /// landing floor; `player` is never an entry. Serial when `thread_system` is null;
     /// otherwise dispatched per `config` with the system's tuner. Valid until the next
-    /// `gather`. An AI row count past the reservation grows the windows first
+    /// `gather`. A movement-row count past the reservation grows the windows first
     /// (counted); an OOM there returns before anything is written.
     pub fn gather(
         self: *PlaneEntrySystem,
@@ -171,30 +171,32 @@ pub const PlaneEntrySystem = struct {
     ) error{OutOfMemory}![]const PlaneEntry {
         if (comptime runtime_perf_log.enabled) self.perf.last_batch = .{};
         self.entries.clearRetainingCapacity();
-        const ai = data.aiAgentSliceConst();
-        const item_count = ai.entities.len;
+        const movement = data.movementBodySliceConst();
+        const scope = data.scopeColumnsSliceConst();
+        const item_count = movement.entities.len;
         if (item_count == 0) return self.entries.items;
         if (item_count > self.reserved_items) try self.growWindows(item_count);
         std.debug.assert(self.entries.capacity >= item_count);
 
-        const movement = data.movementBodySliceConst();
-        const visuals = data.primitiveVisualSliceConst();
-        const scope = data.scopeColumnsSliceConst();
         var job = PlaneEntryJob{
             .input = .{
-                .data = data,
                 .world = world,
-                .player = player,
-                .entities = ai.entities,
+                .tunnel_tile = tunnel_tile,
+                .entities = movement.entities,
                 .previous_x = movement.previous_x,
                 .previous_y = movement.previous_y,
                 .position_x = movement.position_x,
                 .position_y = movement.position_y,
-                .size_x = visuals.size_x,
-                .size_y = visuals.size_y,
+                .bounds_offset_x = movement.bounds_offset_x,
+                .bounds_offset_y = movement.bounds_offset_y,
+                .bounds_size_x = movement.bounds_size_x,
+                .bounds_size_y = movement.bounds_size_y,
+                .has_collision_bounds = movement.has_collision_bounds,
+                .has_ai_agent = movement.has_ai_agent,
+                .has_world_level = movement.has_world_level,
                 .tier = scope.tier,
                 .scope_level = scope.level,
-                .tunnel_tile = tunnel_tile,
+                .excluded_row = data.movementBodyDenseIndex(player) orelse std.math.maxInt(usize),
             },
             .entries = undefined,
             .tallies = undefined,
@@ -237,7 +239,7 @@ pub const PlaneEntrySystem = struct {
         if (self.windows_growth_logged) return;
         self.windows_growth_logged = true;
         if (comptime logging.enabled(.warn)) logging.game.warn(
-            "plane entry gather: {d} AI rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
+            "plane entry gather: {d} movement rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
             .{ needed, target },
         );
     }
@@ -245,19 +247,23 @@ pub const PlaneEntrySystem = struct {
 
 // The columns one gather reads, captured once per gather.
 const GatherInput = struct {
-    data: *const DataSystem,
     world: *const WorldSystem,
-    player: EntityId,
+    tunnel_tile: TileId,
     entities: []const EntityId,
     previous_x: []const f32,
     previous_y: []const f32,
     position_x: []const f32,
     position_y: []const f32,
-    size_x: []const f32,
-    size_y: []const f32,
+    bounds_offset_x: []const f32,
+    bounds_offset_y: []const f32,
+    bounds_size_x: []const f32,
+    bounds_size_y: []const f32,
+    has_collision_bounds: []const bool,
+    has_ai_agent: []const bool,
+    has_world_level: []const bool,
     tier: []const SimulationTier,
     scope_level: []const u16,
-    tunnel_tile: TileId,
+    excluded_row: usize,
 };
 
 const PlaneEntryJob = struct {
@@ -285,12 +291,14 @@ const LaneCellEntries = struct {
     cell_y: simd.Int4,
 };
 
-// SIMD twin of `cellEntryScalar`, same operation order.
+// SIMD twin of `cellEntryScalar`, same operation order. Center is position + offset + size * 0.5.
 fn laneCellEntries(
     previous_x: simd.Float4,
     previous_y: simd.Float4,
     position_x: simd.Float4,
     position_y: simd.Float4,
+    offset_x: simd.Float4,
+    offset_y: simd.Float4,
     size_x: simd.Float4,
     size_y: simd.Float4,
     world: *const WorldSystem,
@@ -298,99 +306,75 @@ fn laneCellEntries(
     const half = simd.splatFloat4(0.5);
     const half_x = simd.mulFloat4(size_x, half);
     const half_y = simd.mulFloat4(size_y, half);
-    const previous = world.cellContaining4(simd.addFloat4(previous_x, half_x), simd.addFloat4(previous_y, half_y));
-    const current = world.cellContaining4(simd.addFloat4(position_x, half_x), simd.addFloat4(position_y, half_y));
+    const previous = world.cellContaining4(simd.addFloat4(simd.addFloat4(previous_x, offset_x), half_x), simd.addFloat4(simd.addFloat4(previous_y, offset_y), half_y));
+    const current = world.cellContaining4(simd.addFloat4(simd.addFloat4(position_x, offset_x), half_x), simd.addFloat4(simd.addFloat4(position_y, offset_y), half_y));
     const moved = (current.x != previous.x) | (current.y != previous.y);
     return .{ .entered = previous.inside & current.inside & moved, .cell_x = current.x, .cell_y = current.y };
 }
 
 // The cell a body entered this step, or null when either center is off-world or both
-// lie in one cell.
+// lie in one cell. Center is position + offset + size * 0.5.
 fn cellEntryScalar(
     world: *const WorldSystem,
     previous_x: f32,
     previous_y: f32,
     position_x: f32,
     position_y: f32,
+    offset_x: f32,
+    offset_y: f32,
     size_x: f32,
     size_y: f32,
 ) ?CellCoord {
     const half_x = size_x * 0.5;
     const half_y = size_y * 0.5;
-    const previous = world.cellContaining(previous_x + half_x, previous_y + half_y) orelse return null;
-    const current = world.cellContaining(position_x + half_x, position_y + half_y) orelse return null;
+    const previous = world.cellContaining((previous_x + offset_x) + half_x, (previous_y + offset_y) + half_y) orelse return null;
+    const current = world.cellContaining((position_x + offset_x) + half_x, (position_y + offset_y) + half_y) orelse return null;
     if (previous.x == current.x and previous.y == current.y) return null;
     return .{ .x = current.x, .y = current.y };
 }
 
-// Rows `[start, end)` into `window` (at most one entry per row); returns the count.
-// Blocks of `lane_count` rows resolve their dense rows per lane, gather the columns,
-// and run the cell test in lanes; only entered lanes reach the scalar `classify`. The
-// tail runs `gatherRangeScalar`.
+// Movement rows `[start, end)` into `window` (at most one entry per row); returns the count.
+// A lane batch whose mask is empty loads no floats. The tail is the same kernel with fewer
+// than `lane_count` rows. Only an entered masked lane reaches `classify`.
 fn gatherRange(input: *const GatherInput, start: usize, end: usize, window: []PlaneEntry) usize {
+    std.debug.assert(start <= end);
+    std.debug.assert(end <= input.entities.len);
     std.debug.assert(window.len >= end - start);
     var count: usize = 0;
     var row = start;
-    const vector_end = start + simd.vectorizedEnd(end - start);
-    while (row < vector_end) : (row += simd.lane_count) {
-        var movement_rows: [simd.lane_count]usize = @splat(0);
-        var visual_rows: [simd.lane_count]usize = @splat(0);
-        var active: [simd.lane_count]bool = @splat(false);
-        var any_active = false;
+    while (row < end) : (row += simd.lane_count) {
+        const live = end - row;
+        var mask: simd.Mask4 = @splat(false);
+        // Scalar per live lane: bool and `SimulationTier` have no lane load.
         inline for (0..simd.lane_count) |lane| {
-            if (input.data.movementVisualDenseIndices(input.entities[row + lane])) |rows| {
-                if (input.tier[rows.movement].allowsMovement()) {
-                    movement_rows[lane] = rows.movement;
-                    visual_rows[lane] = rows.visual;
-                    active[lane] = true;
-                    any_active = true;
+            if (lane < live) {
+                const index = row + lane;
+                if (input.has_ai_agent[index] and input.has_collision_bounds[index] and input.tier[index].allowsMovement() and index != input.excluded_row) {
+                    mask[lane] = true;
                 }
             }
         }
-        // An active lane implies non-empty columns, so inactive lanes' row 0 is valid.
-        if (!any_active) continue;
+        if (simd.maskBits(mask) == 0) continue;
         const lanes = laneCellEntries(
-            simd.gatherFloat4(input.previous_x, movement_rows),
-            simd.gatherFloat4(input.previous_y, movement_rows),
-            simd.gatherFloat4(input.position_x, movement_rows),
-            simd.gatherFloat4(input.position_y, movement_rows),
-            simd.gatherFloat4(input.size_x, visual_rows),
-            simd.gatherFloat4(input.size_y, visual_rows),
+            simd.loadFloat4Lanes(input.previous_x[row..], live),
+            simd.loadFloat4Lanes(input.previous_y[row..], live),
+            simd.loadFloat4Lanes(input.position_x[row..], live),
+            simd.loadFloat4Lanes(input.position_y[row..], live),
+            simd.loadFloat4Lanes(input.bounds_offset_x[row..], live),
+            simd.loadFloat4Lanes(input.bounds_offset_y[row..], live),
+            simd.loadFloat4Lanes(input.bounds_size_x[row..], live),
+            simd.loadFloat4Lanes(input.bounds_size_y[row..], live),
             input.world,
         );
         inline for (0..simd.lane_count) |lane| {
-            if (active[lane] and lanes.entered[lane]) {
+            if (lane < live and mask[lane] and lanes.entered[lane]) {
                 // Inside the grid, so each lane cell fits `u16`.
                 const cell = CellCoord{ .x = @intCast(lanes.cell_x[lane]), .y = @intCast(lanes.cell_y[lane]) };
-                if (classify(input, input.entities[row + lane], movement_rows[lane], cell)) |entry| {
+                if (classify(input, row + lane, cell)) |entry| {
                     window[count] = entry;
                     count += 1;
                 }
             }
-        }
-    }
-    return count + gatherRangeScalar(input, row, end, window[count..]);
-}
-
-// Scalar twin of `gatherRange`: the per-row cell test through `cellEntryScalar`.
-fn gatherRangeScalar(input: *const GatherInput, start: usize, end: usize, window: []PlaneEntry) usize {
-    std.debug.assert(window.len >= end - start);
-    var count: usize = 0;
-    for (input.entities[start..end]) |entity| {
-        const rows = input.data.movementVisualDenseIndices(entity) orelse continue;
-        if (!input.tier[rows.movement].allowsMovement()) continue;
-        const cell = cellEntryScalar(
-            input.world,
-            input.previous_x[rows.movement],
-            input.previous_y[rows.movement],
-            input.position_x[rows.movement],
-            input.position_y[rows.movement],
-            input.size_x[rows.visual],
-            input.size_y[rows.visual],
-        ) orelse continue;
-        if (classify(input, entity, rows.movement, cell)) |entry| {
-            window[count] = entry;
-            count += 1;
         }
     }
     return count;
@@ -401,14 +385,20 @@ fn gatherRangeScalar(input: *const GatherInput, start: usize, end: usize, window
 // no-ops in the commit. Judged against the step's pre-commit world: the commit adds no
 // links and never empties a floor, so this is a superset of its traversals, and the
 // commit re-judges only an entry whose cell or landing an earlier carve this step
-// touched. The player traverses on its own path, so it is never an entry.
-fn classify(input: *const GatherInput, entity: EntityId, movement_row: usize, cell: CellCoord) ?PlaneEntry {
-    if (entity.eql(input.player)) return null;
-    const world_level = input.data.worldLevelConst(entity);
-    const level = world_level orelse input.scope_level[movement_row];
+// touched. The level is the scope level, which matches `world_level` when that
+// component is present.
+fn classify(input: *const GatherInput, movement_row: usize, cell: CellCoord) ?PlaneEntry {
+    const has_world_level = input.has_world_level[movement_row];
+    const level = input.scope_level[movement_row];
     const target = planeTarget(input.world, level, cell, input.tunnel_tile);
-    if (target.action == .attach and world_level != null) return null;
-    return .{ .entity = entity, .target = target, .cell = cell, .level = level, .needs_world_level = world_level == null };
+    if (target.action == .attach and has_world_level) return null;
+    return .{
+        .entity = input.entities[movement_row],
+        .target = target,
+        .cell = cell,
+        .level = level,
+        .needs_world_level = !has_world_level,
+    };
 }
 
 // ---- Tests ------------------------------------------------------------------
@@ -431,13 +421,14 @@ const test_side: u16 = 8;
 const test_levels: usize = 3;
 
 // One agent of the parity population. `world_level` null leaves the component off;
-// `visual` false leaves the visual off.
+// `visual` false leaves the visual off; `bounds` false leaves collision bounds off.
 const TestAgent = struct {
     from: [2]f32,
     to: [2]f32,
     world_level: ?u16 = 0,
     tier: SimulationTier = .locomotion,
     visual: bool = true,
+    bounds: bool = true,
 };
 
 // Agent kinds of the parity population, by `index % agent_kind_count`, on row
@@ -464,8 +455,8 @@ fn parityAgent(index: usize) TestAgent {
         4 => .{ .from = .{ cellPos(5), row }, .to = .{ cellPos(6), row }, .world_level = 1 },
         // Dormant over a hole: no entry.
         5 => .{ .from = .{ cellPos(3), row }, .to = .{ cellPos(4), row }, .tier = .dormant },
-        // No visual over a hole: no entry.
-        6 => .{ .from = .{ cellPos(3), row }, .to = .{ cellPos(4), row }, .visual = false },
+        // No collision bounds over a hole: no entry.
+        6 => .{ .from = .{ cellPos(3), row }, .to = .{ cellPos(4), row }, .visual = true, .bounds = false },
         // Plain crossing without world_level: entry, attaches only.
         7 => .{ .from = .{ cellPos(1), row }, .to = .{ cellPos(2), row }, .world_level = null },
         // Hole entry without world_level: entry, attaches and falls.
@@ -528,6 +519,7 @@ const TestFixture = struct {
             .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
+        if (agent.bounds) try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = test_tile, .y = test_tile } });
         try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
         if (agent.world_level) |level| try data.setWorldLevel(npc, level);
         // Set before the positions: a non-moving tier snaps previous to current.
@@ -604,7 +596,7 @@ fn runParityStage(population: usize, thread_system: *ThreadSystem, config: Plane
     var system = PlaneEntrySystem.init(std.testing.allocator);
     defer system.deinit();
     system.config = config;
-    try system.reserve(population);
+    try system.reserve(fixture.data.movementBodySliceConst().entities.len);
     const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), thread_system);
     if (want) |expected| try std.testing.expectEqualSlices(PlaneEntry, expected, entries);
 
@@ -621,7 +613,7 @@ fn runParityStage(population: usize, thread_system: *ThreadSystem, config: Plane
 
 test "plane entry gather: serial, inline, and threaded entries and stage results match across range sizes and worker counts" {
     const allocator = std.testing.allocator;
-    // Not a multiple of the lane count, so every block shape and a scalar tail run.
+    // Not a multiple of the lane count, so the masked tail runs.
     const population: usize = agent_kind_count * 7;
     try std.testing.expect(population % simd.lane_count != 0);
 
@@ -633,7 +625,7 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     const serial_entries = try serial_system.gather(&serial_fixture.data, &serial_fixture.world, serial_fixture.player.entity, try testTunnelTile(&serial_fixture.meta), null);
     try std.testing.expectEqual(entries_per_kind_set * (population / agent_kind_count), serial_entries.len);
     for (serial_entries, 0..) |entry, index| {
-        // AI row order: kinds 2, 4, 7, 8 of each set.
+        // Movement-row order: kinds 2, 4, 7, 8 of each set.
         const agent_index = index / entries_per_kind_set * agent_kind_count + switch (index % entries_per_kind_set) {
             0 => @as(usize, 2),
             1 => 4,
@@ -708,11 +700,14 @@ test "plane entry SIMD blocks match the scalar entry test" {
             columns[4][lane] = case.size;
             columns[5][lane] = case.size;
         }
+        const zero = simd.splatFloat4(0);
         const lanes = laneCellEntries(
             simd.loadFloat4(&columns[0]),
             simd.loadFloat4(&columns[1]),
             simd.loadFloat4(&columns[2]),
             simd.loadFloat4(&columns[3]),
+            zero,
+            zero,
             simd.loadFloat4(&columns[4]),
             simd.loadFloat4(&columns[5]),
             &world,
@@ -721,7 +716,7 @@ test "plane entry SIMD blocks match the scalar entry test" {
         const cell_x = simd.toIntArray(lanes.cell_x);
         const cell_y = simd.toIntArray(lanes.cell_y);
         for (cases[block..][0..simd.lane_count], 0..) |case, lane| {
-            const want = cellEntryScalar(&world, case.previous[0], case.previous[1], case.current[0], case.current[1], case.size, case.size);
+            const want = cellEntryScalar(&world, case.previous[0], case.previous[1], case.current[0], case.current[1], 0, 0, case.size, case.size);
             try std.testing.expectEqual(want != null, entered[lane]);
             if (want) |cell| {
                 try std.testing.expectEqual(@as(i32, cell.x), cell_x[lane]);
@@ -730,35 +725,107 @@ test "plane entry SIMD blocks match the scalar entry test" {
         }
     }
 
-    // Whole rows: the SIMD range against the scalar range over the parity population.
-    const population = agent_kind_count * simd.lane_count * 2;
+    // Size 0 and offset 0 stay in one cell. The same positions with offset x -20 enter cell x 2.
+    const previous_x: [simd.lane_count]f32 = @splat(70);
+    const previous_y: [simd.lane_count]f32 = @splat(40);
+    const position_x: [simd.lane_count]f32 = @splat(90);
+    const position_y: [simd.lane_count]f32 = @splat(40);
+    var offset_x: [simd.lane_count]f32 = @splat(0);
+    const offset_y: [simd.lane_count]f32 = @splat(0);
+    const size_x: [simd.lane_count]f32 = @splat(0);
+    const size_y: [simd.lane_count]f32 = @splat(0);
+    offset_x[1] = -20;
+    const shifted = laneCellEntries(
+        simd.loadFloat4(&previous_x),
+        simd.loadFloat4(&previous_y),
+        simd.loadFloat4(&position_x),
+        simd.loadFloat4(&position_y),
+        simd.loadFloat4(&offset_x),
+        simd.loadFloat4(&offset_y),
+        simd.loadFloat4(&size_x),
+        simd.loadFloat4(&size_y),
+        &world,
+    );
+    const shifted_entered: [simd.lane_count]bool = shifted.entered;
+    const shifted_cell_x = simd.toIntArray(shifted.cell_x);
+    const shifted_cell_y = simd.toIntArray(shifted.cell_y);
+    try std.testing.expect(!shifted_entered[0]);
+    try std.testing.expect(shifted_entered[1]);
+    try std.testing.expectEqual(@as(i32, 2), shifted_cell_x[1]);
+    for (0..simd.lane_count) |lane| {
+        const want = cellEntryScalar(&world, previous_x[lane], previous_y[lane], position_x[lane], position_y[lane], offset_x[lane], offset_y[lane], size_x[lane], size_y[lane]);
+        try std.testing.expectEqual(want != null, shifted_entered[lane]);
+        if (want) |cell| {
+            try std.testing.expectEqual(@as(i32, cell.x), shifted_cell_x[lane]);
+            try std.testing.expectEqual(@as(i32, cell.y), shifted_cell_y[lane]);
+        }
+    }
+}
+
+test "plane entry gather reads the collision-bounds center and emits in movement-row order" {
     var fixture: TestFixture = undefined;
-    try fixture.init(population);
+    try fixture.init(0);
     defer fixture.deinit();
-    const movement = fixture.data.movementBodySliceConst();
-    const visuals = fixture.data.primitiveVisualSliceConst();
-    const scope = fixture.data.scopeColumnsSliceConst();
-    const input = GatherInput{
-        .data = &fixture.data,
-        .world = &fixture.world,
-        .player = fixture.player.entity,
-        .entities = fixture.data.aiAgentSliceConst().entities,
-        .previous_x = movement.previous_x,
-        .previous_y = movement.previous_y,
-        .position_x = movement.position_x,
-        .position_y = movement.position_y,
-        .size_x = visuals.size_x,
-        .size_y = visuals.size_y,
-        .tier = scope.tier,
-        .scope_level = scope.level,
-        .tunnel_tile = try testTunnelTile(&fixture.meta),
-    };
-    var simd_window: [population]PlaneEntry = undefined;
-    var scalar_window: [population]PlaneEntry = undefined;
-    const simd_count = gatherRange(&input, 0, population, &simd_window);
-    const scalar_count = gatherRangeScalar(&input, 0, population, &scalar_window);
-    try std.testing.expect(simd_count > 0);
-    try std.testing.expectEqualSlices(PlaneEntry, scalar_window[0..scalar_count], simd_window[0..simd_count]);
+    const data = &fixture.data;
+    const tile: f32 = 32;
+
+    // No AI yet. Its center is the bounds box, so it enters the level-0 hole at (4, 0).
+    const bounds = try data.createEntity();
+    try data.setMovementBody(bounds, .{});
+    try data.setCollisionBounds(bounds, .{ .offset = .{}, .size = .{ .x = tile, .y = tile } });
+    try data.setWorldLevel(bounds, 0);
+    try data.setSimulationTier(bounds, .locomotion);
+    const bounds_body = data.movementBodyPtr(bounds).?;
+    bounds_body.previous_x.* = 96;
+    bounds_body.previous_y.* = 0;
+    bounds_body.position_x.* = 128;
+    bounds_body.position_y.* = 0;
+
+    // AI immediately, no world_level. The offset, not the position, enters cell (2, 0).
+    const offset = try data.createEntity();
+    try data.setMovementBody(offset, .{});
+    try data.setAiAgent(offset, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setCollisionBounds(offset, .{ .offset = .{ .x = -20, .y = 0 }, .size = .{ .x = 1, .y = 1 } });
+    try data.setSimulationTier(offset, .locomotion);
+    const offset_body = data.movementBodyPtr(offset).?;
+    offset_body.previous_x.* = 70;
+    offset_body.previous_y.* = 0;
+    offset_body.position_x.* = 90;
+    offset_body.position_y.* = 0;
+
+    // Visual size would enter (4, 0); no collision bounds, so it is not a candidate.
+    const visual_only = try data.createEntity();
+    try data.setMovementBody(visual_only, .{});
+    try data.setPrimitiveVisual(visual_only, .{
+        .size = .{ .x = tile, .y = tile },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(visual_only, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(visual_only, 0);
+    try data.setSimulationTier(visual_only, .locomotion);
+    const visual_body = data.movementBodyPtr(visual_only).?;
+    visual_body.previous_x.* = 96;
+    visual_body.previous_y.* = 0;
+    visual_body.position_x.* = 128;
+    visual_body.position_y.* = 0;
+
+    try data.setAiAgent(bounds, .{ .active_behavior = .wander, .gain_pursue = 0 });
+
+    var system = PlaneEntrySystem.init(std.testing.allocator);
+    defer system.deinit();
+    const entries = try system.gather(data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), null);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expect(entries[0].entity.eql(bounds));
+    try std.testing.expectEqual(PlaneAction.fall, entries[0].target.action);
+    try std.testing.expectEqual(CellCoord{ .x = 4, .y = 0 }, entries[0].cell);
+    try std.testing.expect(!entries[0].needs_world_level);
+    try std.testing.expect(entries[1].entity.eql(offset));
+    try std.testing.expectEqual(PlaneAction.attach, entries[1].target.action);
+    try std.testing.expectEqual(CellCoord{ .x = 2, .y = 0 }, entries[1].cell);
+    try std.testing.expect(entries[1].needs_world_level);
+    try std.testing.expect(!entries[0].entity.eql(visual_only));
+    try std.testing.expect(!entries[1].entity.eql(visual_only));
 }
 
 test "plane entry gather never yields the player, even as an AI agent; the stage traverses it once on its own path" {
@@ -769,11 +836,12 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
     defer fixture.deinit();
     const data = &fixture.data;
     const player = fixture.player.entity;
-    // The first AI row, so it sits in a SIMD block with three NPCs; the fourth NPC is
-    // the scalar tail.
+    // The first movement row, so it sits in a lane batch with three NPCs; the fourth
+    // NPC is the masked tail. Exclusion is the row, not a missing box.
     try data.setAiAgent(player, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setSimulationTier(player, .locomotion);
     const player_size = data.primitiveVisualConst(player).?.size;
+    try data.setCollisionBounds(player, .{ .offset = .{}, .size = player_size });
+    try data.setSimulationTier(player, .locomotion);
     try std.testing.expect(player_size.x <= test_tile and player_size.y <= test_tile);
     // Enters the level-0 hole at (4,1).
     const body = data.movementBodyPtr(player).?;
@@ -825,7 +893,7 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
     defer threads.deinit();
     var system = PlaneEntrySystem.init(allocator);
     defer system.deinit();
-    try system.reserve(population);
+    try system.reserve(fixture.data.movementBodySliceConst().entities.len);
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_thread_allocator = threads.allocator;

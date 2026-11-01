@@ -262,6 +262,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
             .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
+        try data.setCollisionBounds(entity, .{ .offset = .{}, .size = .{ .x = tile_size, .y = tile_size } });
         try data.setAiAgent(entity, .{ .active_behavior = .wander, .gain_pursue = 0 });
         try data.setWorldLevel(entity, 0);
         try data.setSimulationTier(entity, .locomotion);
@@ -290,7 +291,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
     try dig.reservePlaneScratch(allocator, plane_budget);
     var plane_entry = PlaneEntrySystem.init(allocator);
     errdefer plane_entry.deinit();
-    try plane_entry.reserve(agent_count);
+    try plane_entry.reserve(agent_count + 1);
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&world);

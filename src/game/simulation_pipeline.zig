@@ -2101,6 +2101,7 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(npc, 0);
     try data.setSimulationTier(npc, .locomotion);
@@ -2183,6 +2184,7 @@ test "pipeline update after reserve allocates nothing on frame streams with dig,
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(npc, 0);
     try data.setSimulationTier(npc, .locomotion);
@@ -4246,6 +4248,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try data.setCollisionBounds(dormant_npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(dormant_npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(dormant_npc, 0);
     // Tier must be set before overwriting position: setSimulationTier snaps
@@ -4270,6 +4273,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try data.setCollisionBounds(active_npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(active_npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(active_npc, 0);
     try data.setSimulationTier(active_npc, .locomotion);
@@ -5062,6 +5066,7 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
             .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
+        try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
         try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
         try data.setWorldLevel(npc, 0);
         try data.setSimulationTier(npc, .locomotion);
@@ -5160,6 +5165,7 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(npc, 0);
     try data.setSimulationTier(npc, .locomotion);
@@ -5235,6 +5241,7 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
             .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
+        try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
         try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
         try data.setSimulationTier(npc, .locomotion);
         try std.testing.expect(data.worldLevelConst(npc) == null);
@@ -5292,6 +5299,7 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
             .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
+        try data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
         try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
         try data.setWorldLevel(npc, 0);
         try data.setSimulationTier(npc, .locomotion);
@@ -7430,6 +7438,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
             const npc = try fixture.data.createEntity();
             try fixture.data.setMovementBody(npc, .{});
             try fixture.data.setPrimitiveVisual(npc, growth_npc_visual);
+            try fixture.data.setCollisionBounds(npc, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
             try fixture.data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
             try fixture.data.setWorldLevel(npc, 0);
             try fixture.data.setSimulationTier(npc, .locomotion);
@@ -7470,7 +7479,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
         .sim_view = fullWorldSimView(&fixture.world),
     });
     try fixture.pipeline.stagePlaneTraversal(&step);
-    // The gather's windows were short of the AI rows too: grown on main, then dispatched.
+    // The gather's windows were short of the movement rows too: grown on main, then dispatched.
     try std.testing.expect(fixture.pipeline.plane_entry.windows_growth_logged);
     try std.testing.expect(fixture.pipeline.plane_entry.reserved_items >= npc_count);
     try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);

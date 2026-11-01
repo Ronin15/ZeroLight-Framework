@@ -72,6 +72,9 @@ const MovementBodyRow = struct {
     bounds_size_y: f32 = 0,
     has_collision_bounds: bool = false,
     has_ai_agent: bool = false,
+    // Mirror of `world_level` presence, written only at the commit seam; destroy drops the
+    // movement row first, so it is not cleared.
+    has_world_level: bool = false,
     tier: SimulationTier,
     chunk_x: i32,
     chunk_y: i32,
@@ -316,6 +319,10 @@ pub const MovementBodyStore = struct {
         self.rows.slice().items(.has_ai_agent)[index] = has_agent;
     }
 
+    pub fn setHasWorldLevel(self: *MovementBodyStore, index: usize, has_level: bool) void {
+        self.rows.slice().items(.has_world_level)[index] = has_level;
+    }
+
     pub fn aiRowAt(self: *const MovementBodyStore, index: usize) u32 {
         return self.rows.slice().items(.ai_row)[index];
     }
@@ -499,6 +506,7 @@ pub const MovementBodyStore = struct {
             .bounds_size_y = s.items(.bounds_size_y),
             .has_collision_bounds = s.items(.has_collision_bounds),
             .has_ai_agent = s.items(.has_ai_agent),
+            .has_world_level = s.items(.has_world_level),
         };
     }
 
@@ -521,6 +529,7 @@ pub const MovementBodyStore = struct {
             .bounds_size_y = s.items(.bounds_size_y),
             .has_collision_bounds = s.items(.has_collision_bounds),
             .has_ai_agent = s.items(.has_ai_agent),
+            .has_world_level = s.items(.has_world_level),
         };
     }
 
