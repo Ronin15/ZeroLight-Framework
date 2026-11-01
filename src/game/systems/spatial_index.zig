@@ -139,6 +139,20 @@ const Grid = struct {
     }
 };
 
+/// The cell grid an index build installs for `geometry` at `configured_cell_size`.
+pub fn cellGrid(geometry: IndexGeometry, configured_cell_size: f32) struct {
+    cell_size: f32,
+    cells_x: u32,
+    cells_y: u32,
+} {
+    const grid = Grid.of(geometry, configured_cell_size);
+    return .{
+        .cell_size = grid.cell_size,
+        .cells_x = grid.cells_x,
+        .cells_y = grid.cells_y,
+    };
+}
+
 pub const SpatialIndexConfig = struct {
     /// World-unit side of one cell, finite and positive; the effective cell is the nearest
     /// whole fraction of a chunk's width. A query's scan radius in cells derives from it.

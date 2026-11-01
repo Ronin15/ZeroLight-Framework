@@ -177,6 +177,9 @@ const DenseLayerRow = struct {
 
 pub const WorldSystem = struct {
     allocator: std.mem.Allocator,
+    // When this world shares a movement store, its id is distinct and set before the grid
+    // is installed. 0 is that store's first grid.
+    stagger_world: u32 = 0,
     width: u16,
     height: u16,
     tile_size: f32,

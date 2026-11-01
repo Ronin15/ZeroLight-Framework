@@ -34,6 +34,12 @@
 //! fewest-most, `ns/call=` mean, `ran=`, `threaded=`), and every tuner, by field path, whose
 //! probe windows, demotions, restores, or shift skips changed over the measured steps.
 //!
+//! The measured sample is whole stagger cycles: requested iterations round up to a multiple
+//! of `cognition_stagger_n` (0 stays 0) and warmup does not. `thinking_step=` is that
+//! window's per-step AI-row min-max, and `ai_step=` / `steering_step=` the per-step
+//! `pipeline_ai` / `pipeline_steering` wall min-max. On item `1024008001024` the stagger
+//! balance pass is that minimum not 0 and that maximum not the whole halo.
+//!
 //! Every case runs the same pre-measure steps (the warmup plus the adaptive settle limit), so
 //! the serial and tuned cases measure the same simulated state. The tuned case then reports
 //! whether every `GameDemoState` tuner its measured steps ran had settled when measurement
@@ -44,7 +50,10 @@
 //! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
 //! side and in level count at a fixed population, every row advances at its tier and the cost
 //! per advancing row stays flat; flat in inert rows; `stacked` separation checks and samples
-//! per thinking row flat in levels, since a query reads only its own level. Asserts check
+//! per thinking row flat in levels, since a query reads only its own level. On
+//! `1024008001024` (spread, 1,024 agents, the base side and level count) `thinking_step`'s
+//! minimum is not 0 and its maximum is not the whole halo (the step's AI rows plus its
+//! stagger skips). Asserts check
 //! the committed population and that every step finishes; on `stacked`, separation checks
 //! per thinking row within `check_bound=`, the most rows of one level any query's scan box
 //! holds at the measured steps' index input (the pre-measure snapshot, each row widened by
@@ -80,6 +89,7 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const data_test_support = @import("../game/data_system/test_support.zig");
 const forEachTunerIn = @import("../game/simulation_pipeline_test_support.zig").forEachTunerIn;
 const pinTunersIn = @import("../game/simulation_pipeline_test_support.zig").pinTunersIn;
+const cognition_stagger_n = @import("../game/simulation_scope.zig").cognition_stagger_n;
 const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_phase;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
 const separation_radius = @import("../game/systems/ai.zig").separation_radius;
@@ -119,6 +129,9 @@ fn baseWith(comptime overrides: anytype) usize {
     inline for (@typeInfo(@TypeOf(overrides)).@"struct".field_names) |name| @field(fields, name) = @field(overrides, name);
     return StepCode.of(fields);
 }
+
+// Spread, 1,024 agents, base side and level count.
+const stagger_balance_item: usize = baseWith(.{ .population = 1_024 });
 
 const item_counts = [_]usize{
     baseWith(.{ .population = 1_024 }),
@@ -554,6 +567,17 @@ const CellSpanRecord = struct {
 // The `stacked` pass shape per config: separation checks per thinking row within the most
 // rows of one level any query's scan box holds, and that bound below the query's check
 // budget, so a query that also reads other levels fails it.
+// Spread at 1,024 agents on the base world (`1024008001024`): thinking stays off zero and
+// off the whole cognition halo. Other items are not this shape (`stacked` thinks every row).
+fn checkStaggerBalance(item_count: usize, summary: *const suite.ProductionStepSummary) !void {
+    if (item_count != stagger_balance_item or summary.measured_steps == 0) return;
+    const halo = summary.metrics.get(.scope_ai_stage_entities) + summary.metrics.get(.scope_stagger_skips);
+    if (summary.thinking_min != 0 and summary.thinking_max != halo) return;
+    std.debug.print("production-step: stagger thinking_step={}-{} halo={}\n", .{ summary.thinking_min, summary.thinking_max, halo });
+    if (summary.thinking_min == 0) return error.StaggerThinkingEmpty;
+    return error.StaggerThinkingIsTheHalo;
+}
+
 fn checkStackedSeparation(allocator: std.mem.Allocator, summary: *suite.ProductionStepSummary, fields: StepFields, record: *const CellSpanRecord) !void {
     const scan_radius: u32 = @intCast(cellScanRadius(separation_radius, record.cell_size));
     const bound = try record.oneLevelBoxBound(allocator, fields.levels, scan_radius);
@@ -647,6 +671,12 @@ const Census = struct {
     bench_batch_shapes: std.enums.EnumArray(BenchBatchStage, BatchShape) = .initFill(.{}),
     bench_stage_wall_ns: std.enums.EnumArray(BenchTiming, u128) = .initFill(0),
     metrics: std.enums.EnumArray(Metric, u128) = .initFill(0),
+    thinking_min: u64 = std.math.maxInt(u64),
+    thinking_max: u64 = 0,
+    ai_wall_min_ns: u64 = std.math.maxInt(u64),
+    ai_wall_max_ns: u64 = 0,
+    steering_wall_min_ns: u64 = std.math.maxInt(u64),
+    steering_wall_max_ns: u64 = 0,
 
     // One stage's step: whether it ran, and its off-main time when every call ran on workers.
     fn addBatch(calls: u64, threaded_calls: u64, total_duration_ns: u64, recorded: *usize, threaded: *usize, off_main: *u128) u64 {
@@ -684,6 +714,15 @@ const Census = struct {
             self.bench_batch_shapes.getPtr(stage).add(batch);
         }
         for (std.meta.tags(Metric)) |metric| self.metrics.getPtr(metric).* += log.metrics[@backingInt(metric)];
+        const thinking = log.metrics[@backingInt(Metric.scope_ai_stage_entities)];
+        self.thinking_min = @min(self.thinking_min, thinking);
+        self.thinking_max = @max(self.thinking_max, thinking);
+        const ai_wall_ns = log.timings[@backingInt(Timing.pipeline_ai)].total_ns;
+        self.ai_wall_min_ns = @min(self.ai_wall_min_ns, ai_wall_ns);
+        self.ai_wall_max_ns = @max(self.ai_wall_max_ns, ai_wall_ns);
+        const steering_wall_ns = log.timings[@backingInt(Timing.pipeline_steering)].total_ns;
+        self.steering_wall_min_ns = @min(self.steering_wall_min_ns, steering_wall_ns);
+        self.steering_wall_max_ns = @max(self.steering_wall_max_ns, steering_wall_ns);
         self.main_ns += step_ns -| off_main_ns;
         self.untimed_ns += step_ns -| timed_ns;
     }
@@ -707,6 +746,12 @@ const Census = struct {
             summary.bench_batch_recorded_steps.set(stage, self.bench_batch_recorded_steps.get(stage));
         }
         for (std.meta.tags(Metric)) |metric| summary.metrics.set(metric, @intCast(self.metrics.get(metric) / steps));
+        summary.thinking_min = self.thinking_min;
+        summary.thinking_max = self.thinking_max;
+        summary.ai_wall_min_ns = self.ai_wall_min_ns;
+        summary.ai_wall_max_ns = self.ai_wall_max_ns;
+        summary.steering_wall_min_ns = self.steering_wall_min_ns;
+        summary.steering_wall_max_ns = self.steering_wall_max_ns;
         return summary;
     }
 
@@ -823,6 +868,15 @@ const TunerCensus = struct {
     };
 };
 
+// Requested iterations rounded up to a whole stagger cycle. Zero stays zero; warmup is not rounded.
+fn measuredStepCount(requested: usize) usize {
+    if (requested == 0) return 0;
+    const cycle: usize = cognition_stagger_n;
+    const remainder = requested % cycle;
+    if (remainder == 0) return requested;
+    return requested + (cycle - remainder);
+}
+
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const fields = try StepCode.decode(item_count);
@@ -901,11 +955,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     else
         null;
     defer if (span_record) |*record| record.deinit(allocator);
-    for (0..options.iterations) |iteration| {
+    const measured_steps = measuredStepCount(options.iterations);
+    for (0..measured_steps) |iteration| {
         const step_ns = try step.run();
         accumulator.record(step_ns, .{});
         census.add(&step.perf_log, &step.step_batches, step_ns);
-        if (span_record) |*record| if (iteration + 1 < options.iterations) record.widen(&state.data);
+        if (span_record) |*record| if (iteration + 1 < measured_steps) record.widen(&state.data);
     }
     if (options.details) {
         std.debug.print("  census production-step {} {s}:\n", .{ item_count, case.name });
@@ -921,6 +976,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         try record.expectRowsUnchanged(&state.data);
         try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
     }
+    try checkStaggerBalance(item_count, &stats.production_step.?);
     if (case.adaptive) stats.tuner_settle = settle.measured();
     if (threads.workerThreadCount() > 0) try checkPinnedDispatch(&step, &stats.details);
     return stats;
@@ -1028,6 +1084,14 @@ fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.
         summary.metrics.get(.scope_kinematic_entities),
         summary.metrics.get(.scope_dormant_entities),
         summary.metrics.get(.scope_ai_stage_entities),
+    });
+    try writer.print(" thinking_step={}-{} ai_step={f}-{f} steering_step={f}-{f}", .{
+        summary.thinking_min,
+        summary.thinking_max,
+        suite.formatDuration(summary.ai_wall_min_ns),
+        suite.formatDuration(summary.ai_wall_max_ns),
+        suite.formatDuration(summary.steering_wall_min_ns),
+        suite.formatDuration(summary.steering_wall_max_ns),
     });
     const thinking: f64 = @floatFromInt(@max(summary.metrics.get(.scope_ai_stage_entities), 1));
     try writer.print(" separation_per_thinking={d:.2}/{d:.2}", .{

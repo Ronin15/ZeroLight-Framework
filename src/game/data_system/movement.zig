@@ -23,6 +23,7 @@ const hotStoreCapacity = types.hotStoreCapacity;
 const EntitySimulationMetadata = @import("../simulation_scope.zig").EntitySimulationMetadata;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
+const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 
 pub fn validateMovementBody(body: MovementBody) !void {
@@ -31,6 +32,25 @@ pub fn validateMovementBody(body: MovementBody) !void {
     if (!std.math.isFinite(body.velocity.x) or !std.math.isFinite(body.velocity.y)) return error.InvalidMovementBody;
     if (!std.math.isFinite(body.speed) or body.speed < 0) return error.InvalidMovementBody;
 }
+
+const ArrivalCount = struct {
+    next: u32,
+    live: u32,
+};
+
+const ArrivalHold = struct {
+    world: u32 = 0,
+    key: u128 = 0,
+    held: bool = false,
+};
+
+const OtherStaggerWorld = struct {
+    cell_size: f32 = 0,
+    cells_x: u32 = 0,
+    cells_y: u32 = 0,
+    arrivals: std.AutoHashMapUnmanaged(u128, ArrivalCount) = .empty,
+    level_origins: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+};
 
 const MovementBodyRow = struct {
     entity: EntityId,
@@ -56,6 +76,9 @@ const MovementBodyRow = struct {
     chunk_y: i32,
     level: u16,
     stagger_phase: u8,
+    // Set once `commitStagger` or a named phase write lands. Unset rows still hold the
+    // append placeholder `dense_index % cognition_stagger_n`.
+    stagger_settled: bool = false,
     always_active: bool,
     // Index of this row's drawable run, and its slot in that run. `no_drawable` is none.
     drawable_run: u32 = no_drawable,
@@ -173,6 +196,18 @@ pub const MovementBodyStore = struct {
     free_runs: std.ArrayList(u32) = .empty,
     run_of: std.AutoHashMapUnmanaged(u128, u32) = .empty,
     pose_epoch: u32 = 0,
+    // A key is one cell that still has a live holder. It leaves when `live` hits 0.
+    // The level origin stays until that world is released.
+    arrivals: std.AutoHashMapUnmanaged(u128, ArrivalCount) = .empty,
+    // Next origin for a level's first AI arrival in a cell. Absent means 0.
+    level_origins: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+    cell_size: f32 = 0,
+    cells_x: u32 = 0,
+    cells_y: u32 = 0,
+    // Cold, one per movement row, swap-removed with it. The fixed step reads `stagger_phase` only.
+    arrival_holds: std.ArrayList(ArrivalHold) = .empty,
+    // Every world id but 0: its own grid and arrival maps. Id 0 uses the fields above.
+    other_worlds: std.AutoHashMapUnmanaged(u32, OtherStaggerWorld) = .empty,
 
     pub fn len(self: *const MovementBodyStore) usize {
         return self.rows.len;
@@ -198,8 +233,11 @@ pub const MovementBodyStore = struct {
             .chunk_y = 0,
             .level = 0,
             .stagger_phase = @intCast(index % cognition_stagger_n),
+            .stagger_settled = false,
             .always_active = false,
         });
+        self.arrival_holds.appendAssumeCapacity(.{});
+        std.debug.assert(self.arrival_holds.items.len == self.rows.len);
         return index;
     }
 
@@ -294,6 +332,100 @@ pub const MovementBodyStore = struct {
         s.items(.always_active)[index] = metadata.always_active;
     }
 
+    pub fn markStaggerSettled(self: *MovementBodyStore, index: usize) void {
+        self.rows.slice().items(.stagger_settled)[index] = true;
+    }
+
+    /// Stores the index build's cell grid on world 0. The same scalars are a no-op. Different scalars
+    /// with arrivals or level origins already recorded assert: residues were counted on the previous grid.
+    pub fn setStaggerCellGrid(self: *MovementBodyStore, cell_size: f32, cells_x: u32, cells_y: u32) void {
+        installStaggerScalars(&self.cell_size, &self.cells_x, &self.cells_y, self.arrivals.count(), self.level_origins.count(), cell_size, cells_x, cells_y);
+    }
+
+    /// Installs `world_id`'s cell grid. Id 0 is `setStaggerCellGrid` and allocates nothing.
+    /// Any other id get-or-puts its own record (the only allocation) and applies the same
+    /// scalar rule to that record. A failed put inserts nothing.
+    pub fn setStaggerWorldGrid(self: *MovementBodyStore, allocator: std.mem.Allocator, world_id: u32, cell_size: f32, cells_x: u32, cells_y: u32) !void {
+        if (world_id == 0) {
+            self.setStaggerCellGrid(cell_size, cells_x, cells_y);
+            return;
+        }
+        const gop = try self.other_worlds.getOrPut(allocator, world_id);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const world = gop.value_ptr;
+        installStaggerScalars(&world.cell_size, &world.cells_x, &world.cells_y, world.arrivals.count(), world.level_origins.count(), cell_size, cells_x, cells_y);
+    }
+
+    /// Reserves one new arrival key and one level origin per structural AI arrival on world 0.
+    /// The commit inserts at most that many; cells that already have a residue insert none.
+    pub fn ensureStaggerMapCapacity(self: *MovementBodyStore, allocator: std.mem.Allocator, additional: usize) !void {
+        try ensureStaggerMaps(allocator, &self.level_origins, &self.arrivals, additional);
+    }
+
+    fn ensureStaggerMaps(
+        allocator: std.mem.Allocator,
+        level_origins: *std.AutoHashMapUnmanaged(u16, u32),
+        arrivals: *std.AutoHashMapUnmanaged(u128, ArrivalCount),
+        additional: usize,
+    ) !void {
+        if (additional == 0) return;
+        const slots: u32 = @intCast(additional);
+        try level_origins.ensureUnusedCapacity(allocator, slots);
+        try arrivals.ensureUnusedCapacity(allocator, slots);
+    }
+
+    /// True when a commit would read the row: the grid is installed and the phase is not settled.
+    pub fn staggerCommitOpen(self: *const MovementBodyStore, index: usize) bool {
+        if (self.cells_x == 0 or self.cells_y == 0) return false;
+        return !self.rows.slice().items(.stagger_settled)[index];
+    }
+
+    /// Settles an AI row `index` on `world_id`'s grid. A missing grid, a settled row, or a row
+    /// with no AI does nothing: no AI row keeps its placeholder and takes no residue. The first
+    /// AI body in a cell takes the level origin; later bodies take that cell's next residue.
+    /// `assume_capacity` puts a new level origin and arrival key into capacity already reserved.
+    /// Otherwise those two slots are reserved before either put. A failed reserve inserts neither
+    /// key and does not advance the origin. A residue also records the row's hold.
+    pub fn commitStagger(self: *MovementBodyStore, allocator: std.mem.Allocator, world_id: u32, index: usize, level: u16, has_ai: bool, assume_capacity: bool) !void {
+        const grid = self.staggerWorldMaps(world_id) orelse return;
+        if (self.rows.slice().items(.stagger_settled)[index]) return;
+        if (!has_ai) return;
+        const s = self.rows.slice();
+        const cell_x = math.worldPosToCell(s.items(.previous_x)[index], grid.cell_size, grid.cells_x);
+        const cell_y = math.worldPosToCell(s.items(.previous_y)[index], grid.cell_size, grid.cells_y);
+        const key: u128 = (@as(u128, level) << 64) | (@as(u128, cell_x) << 32) | cell_y;
+        const phase = try nextStaggerResidue(allocator, grid.level_origins, grid.arrivals, level, key, assume_capacity);
+        const row = self.rows.slice();
+        row.items(.stagger_phase)[index] = phase;
+        row.items(.stagger_settled)[index] = true;
+        self.arrival_holds.items[index] = .{ .world = world_id, .key = key, .held = true };
+    }
+
+    fn nextStaggerResidue(
+        allocator: std.mem.Allocator,
+        level_origins: *std.AutoHashMapUnmanaged(u16, u32),
+        arrivals: *std.AutoHashMapUnmanaged(u128, ArrivalCount),
+        level: u16,
+        key: u128,
+        assume_capacity: bool,
+    ) !u8 {
+        if (arrivals.getPtr(key)) |count| {
+            const phase: u8 = @intCast(count.next % cognition_stagger_n);
+            count.next += 1;
+            count.live += 1;
+            return phase;
+        }
+        if (!assume_capacity) try ensureStaggerMaps(allocator, level_origins, arrivals, 1);
+        const level_gop = level_origins.getOrPutAssumeCapacity(level);
+        if (!level_gop.found_existing) level_gop.value_ptr.* = 0;
+        const origin = level_gop.value_ptr.*;
+        const cell_gop = arrivals.getOrPutAssumeCapacity(key);
+        std.debug.assert(!cell_gop.found_existing);
+        cell_gop.value_ptr.* = .{ .next = origin + 1, .live = 1 };
+        level_gop.value_ptr.* = origin + 1;
+        return @intCast(origin % cognition_stagger_n);
+    }
+
     pub fn setTier(self: *MovementBodyStore, index: usize, tier: SimulationTier) void {
         self.rows.slice().items(.tier)[index] = tier;
     }
@@ -311,6 +443,10 @@ pub const MovementBodyStore = struct {
     }
 
     pub fn removeAt(self: *MovementBodyStore, index: usize) ?EntityId {
+        std.debug.assert(self.arrival_holds.items.len == self.rows.len);
+        const hold = self.arrival_holds.items[index];
+        if (hold.held) self.dropArrivalHold(hold);
+        _ = self.arrival_holds.swapRemove(index);
         const s = self.rows.slice();
         const last = self.rows.len - 1;
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
@@ -390,6 +526,14 @@ pub const MovementBodyStore = struct {
 
     pub fn clearRetainingCapacity(self: *MovementBodyStore) void {
         self.rows.clearRetainingCapacity();
+        self.arrival_holds.clearRetainingCapacity();
+        self.arrivals.clearRetainingCapacity();
+        self.level_origins.clearRetainingCapacity();
+        var worlds = self.other_worlds.iterator();
+        while (worlds.next()) |entry| {
+            entry.value_ptr.arrivals.clearRetainingCapacity();
+            entry.value_ptr.level_origins.clearRetainingCapacity();
+        }
         self.run_of.clearRetainingCapacity();
         self.free_runs.clearRetainingCapacity();
         self.pose_epoch = 0;
@@ -408,8 +552,38 @@ pub const MovementBodyStore = struct {
         self.runs.deinit(allocator);
         self.free_runs.deinit(allocator);
         self.run_of.deinit(allocator);
+        self.arrival_holds.deinit(allocator);
+        var worlds = self.other_worlds.iterator();
+        while (worlds.next()) |entry| {
+            entry.value_ptr.arrivals.deinit(allocator);
+            entry.value_ptr.level_origins.deinit(allocator);
+        }
+        self.other_worlds.deinit(allocator);
+        self.arrivals.deinit(allocator);
+        self.level_origins.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = .{};
+    }
+
+    /// Frees `world_id`'s arrival map and level origins. A live hold for that id still owns a
+    /// key: the caller destroys those rows first so `removeAt` drops the claims. Id 0's maps
+    /// are left empty; any other id's record is removed. Rows that did not hold this id stay.
+    pub fn releaseStaggerWorld(self: *MovementBodyStore, allocator: std.mem.Allocator, world_id: u32) void {
+        for (self.arrival_holds.items) |hold| {
+            std.debug.assert(!(hold.held and hold.world == world_id));
+        }
+        if (world_id == 0) {
+            self.arrivals.deinit(allocator);
+            self.level_origins.deinit(allocator);
+            self.arrivals = .empty;
+            self.level_origins = .empty;
+            return;
+        }
+        if (self.other_worlds.fetchRemove(world_id)) |removed| {
+            var world = removed.value;
+            world.arrivals.deinit(allocator);
+            world.level_origins.deinit(allocator);
+        }
     }
 
     pub fn bumpPoseEpoch(self: *MovementBodyStore) void {
@@ -737,9 +911,69 @@ pub const MovementBodyStore = struct {
     }
 
     pub fn ensureCapacity(self: *MovementBodyStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
+        const slots = hotStoreCapacity(capacity);
+        try self.rows.ensureTotalCapacity(allocator, slots);
+        try self.arrival_holds.ensureTotalCapacity(allocator, slots);
+    }
+
+    fn staggerWorldMaps(self: *MovementBodyStore, world_id: u32) ?struct {
+        cell_size: f32,
+        cells_x: u32,
+        cells_y: u32,
+        arrivals: *std.AutoHashMapUnmanaged(u128, ArrivalCount),
+        level_origins: *std.AutoHashMapUnmanaged(u16, u32),
+    } {
+        if (world_id == 0) {
+            if (self.cells_x == 0 or self.cells_y == 0) return null;
+            return .{
+                .cell_size = self.cell_size,
+                .cells_x = self.cells_x,
+                .cells_y = self.cells_y,
+                .arrivals = &self.arrivals,
+                .level_origins = &self.level_origins,
+            };
+        }
+        const world = self.other_worlds.getPtr(world_id) orelse return null;
+        if (world.cells_x == 0 or world.cells_y == 0) return null;
+        return .{
+            .cell_size = world.cell_size,
+            .cells_x = world.cells_x,
+            .cells_y = world.cells_y,
+            .arrivals = &world.arrivals,
+            .level_origins = &world.level_origins,
+        };
+    }
+
+    fn dropArrivalHold(self: *MovementBodyStore, hold: ArrivalHold) void {
+        const arrivals = if (hold.world == 0)
+            &self.arrivals
+        else
+            &self.other_worlds.getPtr(hold.world).?.arrivals;
+        const count = arrivals.getPtr(hold.key).?;
+        std.debug.assert(count.live > 0);
+        count.live -= 1;
+        if (count.live == 0) std.debug.assert(arrivals.remove(hold.key));
     }
 };
+
+fn installStaggerScalars(
+    cell_size: *f32,
+    cells_x: *u32,
+    cells_y: *u32,
+    arrivals_count: u32,
+    origins_count: u32,
+    new_cell_size: f32,
+    new_cells_x: u32,
+    new_cells_y: u32,
+) void {
+    std.debug.assert(std.math.isFinite(new_cell_size) and new_cell_size > 0);
+    std.debug.assert(new_cells_x != 0 and new_cells_y != 0);
+    if (cell_size.* == new_cell_size and cells_x.* == new_cells_x and cells_y.* == new_cells_y) return;
+    std.debug.assert(arrivals_count == 0 and origins_count == 0);
+    cell_size.* = new_cell_size;
+    cells_x.* = new_cells_x;
+    cells_y.* = new_cells_y;
+}
 
 test "simd range helpers cover movement body vector and scalar tail counts" {
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(@as(usize, 0)));

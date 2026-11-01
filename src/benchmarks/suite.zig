@@ -597,6 +597,14 @@ pub const ProductionStepSummary = struct {
     bench_batch_threaded_steps: std.enums.EnumArray(PerfBenchBatchStage, usize) = .initFill(0),
     bench_batch_recorded_steps: std.enums.EnumArray(PerfBenchBatchStage, usize) = .initFill(0),
     metrics: std.enums.EnumArray(PerfMetric, u64) = .initFill(0),
+    // Per-step min and max over the measured window, which is whole stagger cycles:
+    // AI rows that ran, and the pipeline AI and steering stage walls.
+    thinking_min: u64 = 0,
+    thinking_max: u64 = 0,
+    ai_wall_min_ns: u64 = 0,
+    ai_wall_max_ns: u64 = 0,
+    steering_wall_min_ns: u64 = 0,
+    steering_wall_max_ns: u64 = 0,
     // A per-level shape's separation check bound per query and the most cells any row
     // crossed on one axis over the steps it covers.
     separation_check_bound: ?usize = null,

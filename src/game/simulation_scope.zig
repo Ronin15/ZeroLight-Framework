@@ -150,11 +150,13 @@ pub const EntitySimulationMetadata = struct {
     /// and writes any other value; a read returns the row's level.
     level: ?u16 = null,
     /// Which step within the stagger cycle this entity runs cognition, below
-    /// `cognition_stagger_n`. Assigned at movement-body append as
-    /// dense_index % cognition_stagger_n: stable per entity, preserved by
-    /// setSimulationTier, but not index-correlated after swap-remove churn. A
-    /// setSimulationMetadata write keeps the row's phase at `keep_stagger_phase` (the
-    /// default) and writes any other value; a read returns the row's phase.
+    /// `cognition_stagger_n`. The first AI arrival in a `(level, cell)` takes that
+    /// level's next origin and later arrivals take the cell's next residue. The append
+    /// stripe `dense_index % cognition_stagger_n` is only the unsettled placeholder.
+    /// `keep_stagger_phase` and `setSimulationTier` keep the stored phase; `removeAt`
+    /// does not reassign. A setSimulationMetadata write keeps the row's phase at
+    /// `keep_stagger_phase` (the default) and writes any other value; a read returns
+    /// the row's phase.
     stagger_phase: u8 = keep_stagger_phase,
     /// When true, the cognition-halo tier policy never demotes this entity
     /// regardless of its distance from the camera. Use for bosses, scripted

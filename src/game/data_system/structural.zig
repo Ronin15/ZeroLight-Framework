@@ -368,9 +368,11 @@ fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                const inserting_body = self.movementBodyDenseIndex(set.entity) == null;
                 try self.setMovementBody(set.entity, set.body);
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .movement_body, was_static_navigation_obstacle);
+                if (inserting_body) try self.commitReservedStaggerPhase(set.entity);
             },
             .set_facing => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -428,9 +430,11 @@ fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                const adding_ai = !self.hasComponents(set.entity, componentMask(.ai_agent));
                 try self.setAiAgent(set.entity, set.agent);
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .ai_agent, was_static_navigation_obstacle);
+                if (adding_ai) try self.commitReservedStaggerPhase(set.entity);
             },
             .set_steering_agent => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -536,6 +540,7 @@ pub fn preflightStructuralCommands(
 
     var projection = StructuralCapacityProjection.init(self);
     var structural_event_count: usize = 0;
+    var stagger_arrivals: usize = 0;
 
     // Preflight simulates the command stream against projected liveness and
     // masks so capacity and event reservations match what commit will do.
@@ -544,6 +549,7 @@ pub fn preflightStructuralCommands(
             .create_entity => |template| {
                 try projection.createSlot();
                 try projection.addTemplate(template);
+                if (template.movement_body != null and template.ai_agent != null) stagger_arrivals += 1;
                 structural_event_count = try addCapacity(structural_event_count, 1 + templateComponentCount(template));
             },
             .destroy_entity => |entity| {
@@ -555,13 +561,23 @@ pub fn preflightStructuralCommands(
                     state.destroy();
                 }
             },
-            .set_movement_body => |set| try preflightSetComponent(self, set.entity, .movement_body, scratch, &projection, &structural_event_count),
+            .set_movement_body => |set| {
+                const state = try scratch.projectedState(self, set.entity);
+                const inserts_ai_arrival = state.alive and !state.hasComponent(.movement_body) and state.hasComponent(.ai_agent);
+                try preflightSetComponent(self, set.entity, .movement_body, scratch, &projection, &structural_event_count);
+                if (inserts_ai_arrival) stagger_arrivals += 1;
+            },
             .set_facing => |set| try preflightSetComponent(self, set.entity, .facing, scratch, &projection, &structural_event_count),
             .set_primitive_visual => |set| try preflightSetComponent(self, set.entity, .primitive_visual, scratch, &projection, &structural_event_count),
             .set_asset_reference => |set| try preflightSetComponent(self, set.entity, .asset_reference, scratch, &projection, &structural_event_count),
             .set_collision_bounds => |set| try preflightSetComponent(self, set.entity, .collision_bounds, scratch, &projection, &structural_event_count),
             .set_collision_response => |set| try preflightSetComponent(self, set.entity, .collision_response, scratch, &projection, &structural_event_count),
-            .set_ai_agent => |set| try preflightSetComponent(self, set.entity, .ai_agent, scratch, &projection, &structural_event_count),
+            .set_ai_agent => |set| {
+                const state = try scratch.projectedState(self, set.entity);
+                const adds_ai_arrival = state.alive and state.hasComponent(.movement_body) and !state.hasComponent(.ai_agent);
+                try preflightSetComponent(self, set.entity, .ai_agent, scratch, &projection, &structural_event_count);
+                if (adds_ai_arrival) stagger_arrivals += 1;
+            },
             .set_steering_agent => |set| try preflightSetComponent(self, set.entity, .steering_agent, scratch, &projection, &structural_event_count),
             .set_world_level => |set| try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count),
             .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
@@ -584,6 +600,11 @@ pub fn preflightStructuralCommands(
         .structural_event_count = structural_event_count,
     };
     try reserveStructuralPlanCapacity(self, plan);
+    // Upper bound: one new arrival key and one level origin per AI arrival this commit
+    // settles. The commit puts into that capacity. Without a grid the commit does not insert.
+    if (stagger_arrivals != 0 and self.movement_bodies.cells_x != 0 and self.movement_bodies.cells_y != 0) {
+        try self.movement_bodies.ensureStaggerMapCapacity(self.allocator, stagger_arrivals);
+    }
     return plan;
 }
 
@@ -762,6 +783,9 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
     if (template.destructible) |destructible| {
         try self.setDestructible(entity, destructible);
         components_set += 1;
+    }
+    if (template.movement_body != null and template.ai_agent != null) {
+        try self.commitReservedStaggerPhase(entity);
     }
     return components_set;
 }

@@ -68,6 +68,9 @@ const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
 const world_system = @import("world/system.zig");
 const WorldSystem = @import("world/system.zig").WorldSystem;
+const IndexGeometry = @import("systems/spatial_index.zig").IndexGeometry;
+const SpatialIndexConfig = @import("systems/spatial_index.zig").SpatialIndexConfig;
+const cellGrid = @import("systems/spatial_index.zig").cellGrid;
 const c = @import("../platform/sdl.zig").c;
 
 /// Smallest demo patch that still covers dig/nav tests (cells through 7x7).
@@ -363,6 +366,8 @@ pub const GameDemoState = struct {
         const archetype_catalog = try ai_archetypes.load(asset_store, allocator);
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
+        const stagger_grid = cellGrid(IndexGeometry.ofWorld(&world), (SpatialIndexConfig{}).cell_size);
+        try data.setStaggerWorldGrid(world.stagger_world, stagger_grid.cell_size, stagger_grid.cells_x, stagger_grid.cells_y);
         const player = try Player.spawn(&data);
         try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
         try data.setCollisionResponse(player.entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
@@ -458,6 +463,7 @@ pub const GameDemoState = struct {
         self.allocator.free(self.test_squares);
         self.scene_prep.deinit();
         self.particles.deinit();
+        self.data.releaseStaggerWorld(self.world.stagger_world);
         self.world.deinit();
         self.pipeline.deinit();
         self.simulation_frame.deinit();
@@ -942,21 +948,26 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         if (spec.perception) |perception| try data.setAiPerception(e, perception);
         if (spec.memory) |memory| try data.setAiMemory(e, memory);
         if (spec.affect) |affect| try data.setAiAffect(e, affect);
+        try placeSpawnedMover(data, world, e);
         break :blk e;
     };
 
-    try placeSpawnedMover(data, world, entity);
+    if (spec.use_template) try placeSpawnedMover(data, world, entity);
     return entity;
 }
 
 /// Places a just-created movement row on its `world_level` (the surface without one): its
 /// render z at that level's base and its scope metadata (cognition tier, the chunk under its
-/// position, that level, not `always_active`). Returns `error.InvalidEntity` for a row with
-/// no movement body.
+/// position, that level, not `always_active`). Commits the cell residue first; the metadata
+/// write omits the phase so the keep path preserves it. Returns `error.InvalidEntity` for a
+/// row with no movement body.
 pub fn placeSpawnedMover(data: *DataSystem, world: *const WorldSystem, entity: EntityId) !void {
     const body = data.movementBodyPtr(entity) orelse return error.InvalidEntity;
     const level = data.worldLevelConst(entity) orelse 0;
     body.snapZ(world.levelBaseZ(level));
+    const stagger_grid = cellGrid(IndexGeometry.ofWorld(world), (SpatialIndexConfig{}).cell_size);
+    try data.setStaggerWorldGrid(world.stagger_world, stagger_grid.cell_size, stagger_grid.cells_x, stagger_grid.cells_y);
+    try data.commitStaggerPhaseForWorld(entity, world.stagger_world);
     try data.setSimulationMetadata(entity, .{
         .tier = .cognition,
         .chunk = world.chunkCoordForWorldPos(body.position_x.*, body.position_y.*),
@@ -1273,6 +1284,84 @@ fn commitStaticPositionsForTest(demo: *GameDemoState, threads: *ThreadSystem, en
 }
 
 const data_test_support = @import("data_system/test_support.zig");
+
+test "a direct stagger spawn that cannot reserve its arrival key leaves no entity or map entry" {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+
+    const spec = DemoSpawnSpec{
+        .position = .{ .x = 1, .y = 1 },
+        .velocity = .{},
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .depth = .actor,
+        .behavior = .{},
+    };
+    const warm = try data.createEntity();
+    try data.setMovementBody(warm, .{
+        .position = spec.position,
+        .previous_position = spec.position,
+        .velocity = spec.velocity,
+        .speed = spec.speed,
+    });
+    try data.setPrimitiveVisual(warm, .{
+        .size = spec.size,
+        .color = spec.color,
+        .depth = spec.depth,
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+        .marker_depth_band = .marker,
+        .marker_length = 0,
+        .marker_depth = 0,
+        .marker_margin = 0,
+    });
+    try data.setAssetReference(warm, demoCharacterAssetReference(0));
+    try data.setCollisionBounds(warm, .{ .size = spec.size });
+    try data.setCollisionResponse(warm, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 });
+    try data.setWorldLevel(warm, spec.world_level);
+    try data.setFaction(warm, spec.faction);
+    try data.setAiAgent(warm, spec.behavior.?);
+    try data.setSteeringAgent(warm, demoSteeringAgent(spec.size));
+    try std.testing.expect(try data.destroyEntity(warm));
+
+    const alloc = failing.allocator();
+    try data.movement_bodies.ensureCapacity(alloc, 1);
+    try data.primitive_visuals.ensureCapacity(alloc, 1);
+    try data.asset_refs.ensureCapacity(alloc, 1);
+    try data.collision_bounds.ensureCapacity(alloc, 1);
+    try data.collision_responses.ensureCapacity(alloc, 1);
+    try data.world_levels.ensureCapacity(alloc, 1);
+    try data.factions.ensureCapacity(alloc, 1);
+    try data.ai_agents.ensureCapacity(alloc, 1);
+    try data.steering_agents.ensureCapacity(alloc, 1);
+    // The removal records this row. setMovementBody also reserves two ids before its append.
+    const allow_need = data.collision_allow_records.items.len + 2;
+    if (data.collision_allow_records.capacity < allow_need) {
+        try data.collision_allow_records.ensureTotalCapacity(alloc, allow_need);
+    }
+
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, spawnDemoMover(&data, &world, spec, 0));
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.len());
+    try std.testing.expect(!data.slots.items[0].alive);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.level_origins.count());
+    try std.testing.expect(data.movement_bodies.level_origins.capacity() > 0);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.capacity());
+}
 
 test "GameDemoState owns test_squares via its own allocator field, not DataSystem's" {
     var demo = try initDemoForTest(std.testing.allocator);

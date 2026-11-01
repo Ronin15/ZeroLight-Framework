@@ -272,9 +272,11 @@ pub const DataSystem = struct {
     }
 
     /// Writes the full scope metadata for an entity into its dense scope row, keeping the
-    /// row's stagger phase when `metadata.stagger_phase` is `keep_stagger_phase`. The level
-    /// comes from the entity's `world_level` row when it has one, and a supplied level must
-    /// match it; without one, a `null` level keeps the row's.
+    /// row's stagger phase when `metadata.stagger_phase` is `keep_stagger_phase`. A named
+    /// phase settles the row and does not change arrival counts, so a later
+    /// `commitStaggerPhase` leaves it. The level comes from the entity's `world_level` row
+    /// when it has one, and a supplied level must match it; without one, a `null` level
+    /// keeps the row's.
     /// Requires a movement body; returns error.InvalidEntity otherwise, and
     /// error.InvalidStaggerPhase for any other phase not below `cognition_stagger_n`.
     pub fn setSimulationMetadata(self: *DataSystem, id: EntityId, metadata: EntitySimulationMetadata) !void {
@@ -283,7 +285,8 @@ pub const DataSystem = struct {
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
         const stored = self.movement_bodies.scopeMetadataAt(di);
         var resolved = metadata;
-        if (resolved.stagger_phase == keep_stagger_phase) resolved.stagger_phase = stored.stagger_phase;
+        const names_phase = resolved.stagger_phase != keep_stagger_phase;
+        if (!names_phase) resolved.stagger_phase = stored.stagger_phase;
         std.debug.assert(resolved.stagger_phase < cognition_stagger_n);
         if (slot.world_level_index) |world_level_index| {
             const world_level = self.world_levels.get(@intCast(world_level_index));
@@ -304,11 +307,85 @@ pub const DataSystem = struct {
             staged.chunk = stored.chunk;
             staged.level = stored.level;
             self.movement_bodies.setScopeMetadata(di, staged);
+            if (names_phase) self.movement_bodies.markStaggerSettled(di);
             try self.movement_bodies.retargetDrawable(self.allocator, di, new_level, metadata.chunk.x, metadata.chunk.y);
         }
         self.movement_bodies.setScopeMetadata(di, resolved);
+        if (names_phase) self.movement_bodies.markStaggerSettled(di);
         try self.movement_bodies.reserveDrawableNeighborLevels(self.allocator, di);
         self.snapInterpolationIfStill(di, metadata.tier);
+    }
+
+    /// Installs the spatial index's cell grid. The same scalars are a no-op.
+    pub fn setStaggerCellGrid(self: *DataSystem, cell_size: f32, cells_x: u32, cells_y: u32) void {
+        self.movement_bodies.setStaggerCellGrid(cell_size, cells_x, cells_y);
+    }
+
+    /// Installs world `world_id`'s cell grid. Id 0 is `setStaggerCellGrid`. Any other id keeps
+    /// its own grid and arrival maps. The same scalars are a no-op. Different scalars assert
+    /// when that id already has arrivals or level origins.
+    pub fn setStaggerWorldGrid(self: *DataSystem, world_id: u32, cell_size: f32, cells_x: u32, cells_y: u32) !void {
+        try self.movement_bodies.setStaggerWorldGrid(self.allocator, world_id, cell_size, cells_x, cells_y);
+    }
+
+    /// Destroys every row that holds `world_id`'s residue so `removeAt` drops the claim, then
+    /// frees that id's arrival map and level origins. Other ids' rows and phases stay. A failed
+    /// reserve leaves every row and both maps.
+    pub fn releaseStaggerWorld(self: *DataSystem, world_id: u32) void {
+        var holders: usize = 0;
+        for (self.movement_bodies.arrival_holds.items) |hold| {
+            if (hold.held and hold.world == world_id) holders += 1;
+        }
+        if (holders != 0) {
+            const need = self.collision_allow_records.items.len + holders * 2;
+            self.collision_allow_records.ensureTotalCapacity(self.allocator, need) catch return;
+            var index: usize = 0;
+            while (index < self.movement_bodies.arrival_holds.items.len) {
+                const hold = self.movement_bodies.arrival_holds.items[index];
+                if (!hold.held or hold.world != world_id) {
+                    index += 1;
+                    continue;
+                }
+                const entity = self.movement_bodies.sliceConst().entities[index];
+                // Two allow records per holder were reserved above, so the removal cannot allocate.
+                const removed = self.destroyEntity(entity) catch unreachable; // lint:allow catch-unreachable: collision-allow records were reserved for every holder
+                std.debug.assert(removed);
+            }
+        }
+        self.movement_bodies.releaseStaggerWorld(self.allocator, world_id);
+    }
+
+    /// Settles `id`'s stagger phase from its cell's AI arrival residue. Returns immediately
+    /// when `id` has no movement row, the phase is already settled, no cell grid is
+    /// installed, or the row has no AI. A row with no AI stays unsettled and takes no residue.
+    /// A new cell reserves its level origin and arrival key before either put; `OutOfMemory`
+    /// leaves the row unsettled and inserts neither key.
+    pub fn commitStaggerPhase(self: *DataSystem, id: EntityId) !void {
+        try self.commitStaggerPhaseMode(id, false);
+    }
+
+    /// `commitStaggerPhase` for a structural commit whose preflight reserved one arrival
+    /// key and one level origin per AI create. The put does not allocate.
+    pub fn commitReservedStaggerPhase(self: *DataSystem, id: EntityId) !void {
+        try self.commitStaggerPhaseMode(id, true);
+    }
+
+    /// `commitStaggerPhase` against world `world_id`'s grid. Id 0 is that function. Any other
+    /// id reserves its own slots. A missing grid settles nothing.
+    pub fn commitStaggerPhaseForWorld(self: *DataSystem, id: EntityId, world_id: u32) !void {
+        if (world_id == 0) return self.commitStaggerPhase(id);
+        const slot = self.resolveSlot(id) orelse return;
+        const index: usize = slot.movement_body_index orelse return;
+        const level = self.worldLevelConst(id) orelse 0;
+        try self.movement_bodies.commitStagger(self.allocator, world_id, index, level, slot.ai_agent_index != null, false);
+    }
+
+    fn commitStaggerPhaseMode(self: *DataSystem, id: EntityId, assume_capacity: bool) !void {
+        const slot = self.resolveSlot(id) orelse return;
+        const index: usize = slot.movement_body_index orelse return;
+        if (!self.movement_bodies.staggerCommitOpen(index)) return;
+        const level = self.worldLevelConst(id) orelse 0;
+        try self.movement_bodies.commitStagger(self.allocator, 0, index, level, slot.ai_agent_index != null, assume_capacity);
     }
 
     /// Changes an entity's simulation tier while preserving chunk, stagger_phase,
@@ -1456,7 +1533,7 @@ test "a simulation metadata write keeps the row's stagger phase and level unless
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
-    // Movement row 1's append-assigned phase is 1 % cognition_stagger_n.
+    // No grid is installed, so row 1 keeps the unsettled append placeholder, not a cell residue.
     try data.setMovementBody(try data.createEntity(), .{});
     const entity = try data.createEntity();
     try data.setMovementBody(entity, .{});
@@ -1478,6 +1555,302 @@ test "a simulation metadata write keeps the row's stagger phase and level unless
 
     try std.testing.expectError(error.InvalidStaggerPhase, data.setSimulationMetadata(entity, .{ .stagger_phase = cognition_stagger_n }));
     try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
+}
+
+fn createStaggerBody(data: *DataSystem, x: f32, y: f32, level: u16, ai: bool) !EntityId {
+    const commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = .{
+                .position = .{ .x = x, .y = y },
+                .previous_position = .{ .x = x, .y = y },
+            },
+            .world_level = level,
+            .ai_agent = if (ai) @as(?AiAgent, .{}) else null,
+        } },
+    };
+    _ = try data.applyStructuralCommands(&commands);
+    const entities = data.movementBodySliceConst().entities;
+    return entities[entities.len - 1];
+}
+
+test "stagger phases in one cell stay spread when the spawn period shares a factor with cognition_stagger_n" {
+    const n: usize = cognition_stagger_n;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+
+    var cell0: [cognition_stagger_n]EntityId = undefined;
+    var cell0_count: usize = 0;
+    for (0..n * n) |i| {
+        // One inert at the same cell, between two AI arrivals, must not skip a residue.
+        if (i == n) _ = try createStaggerBody(&data, 0, 0, 0, false);
+        const x = @as(f32, @floatFromInt(i % n)) * 32;
+        const entity = try createStaggerBody(&data, x, 0, 0, true);
+        if (i % n == 0) {
+            cell0[cell0_count] = entity;
+            cell0_count += 1;
+        }
+    }
+    try std.testing.expectEqual(n, cell0_count);
+    for (cell0, 0..) |entity, phase| {
+        try std.testing.expectEqual(@as(u8, @intCast(phase)), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
+    }
+
+    var levels = DataSystem.init(std.testing.allocator);
+    defer levels.deinit();
+    levels.setStaggerCellGrid(32, 8, 8);
+    const level_period = 2 * n;
+    var level0: [cognition_stagger_n]EntityId = undefined;
+    var level0_count: usize = 0;
+    for (0..32) |i| {
+        const entity = try createStaggerBody(&levels, 0, 0, @intCast(i % level_period), true);
+        if (i % level_period == 0) {
+            level0[level0_count] = entity;
+            level0_count += 1;
+        }
+    }
+    try std.testing.expectEqual(n, level0_count);
+    for (level0, 0..) |entity, phase| {
+        try std.testing.expectEqual(@as(u8, @intCast(phase)), data_test_support.simulationMetadata(&levels, entity).?.stagger_phase);
+    }
+
+    const phase1 = cell0[1];
+    try std.testing.expect(try data.destroyEntity(cell0[0]));
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+    const next = try createStaggerBody(&data, 0, 0, 0, true);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, next).?.stagger_phase);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+
+    try data.setSimulationMetadata(phase1, .{});
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+    try data.setSimulationMetadata(phase1, .{ .stagger_phase = 3 });
+    try data.commitStaggerPhase(phase1);
+    try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+    try data.setSimulationMetadata(phase1, .{});
+    try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+
+    var singles = DataSystem.init(std.testing.allocator);
+    defer singles.deinit();
+    singles.setStaggerCellGrid(32, 8, 8);
+    for (0..2 * cognition_stagger_n) |i| {
+        const x = @as(f32, @floatFromInt(i)) * 32;
+        const entity = try createStaggerBody(&singles, x, 0, 0, true);
+        try std.testing.expectEqual(@as(u8, @intCast(i % cognition_stagger_n)), data_test_support.simulationMetadata(&singles, entity).?.stagger_phase);
+    }
+}
+
+fn staggerAiCreate(x: f32, y: f32) StructuralCommand {
+    return .{ .create_entity = .{
+        .movement_body = .{
+            .position = .{ .x = x, .y = y },
+            .previous_position = .{ .x = x, .y = y },
+        },
+        .world_level = 0,
+        .ai_agent = .{},
+    } };
+}
+
+test "a stagger batch of two new cells leaves no entity or map entry when the second key cannot allocate" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+
+    // Warm every store the batch touches while the grid is off, so the stagger maps
+    // stay empty. The armed allocation is then the arrival table, after the level-origin table.
+    var scratch = structural.StructuralPlanScratch.init(failing.allocator());
+    defer scratch.deinit();
+    var preparer = structural.NullStructuralCommitPreparer{};
+    var sink = structural.NullStructuralChangeSink{};
+    const batch = [_]StructuralCommand{
+        staggerAiCreate(0, 0),
+        staggerAiCreate(32, 0),
+    };
+    _ = try data.applyStructuralCommandsPrepared(&batch, &scratch, &preparer, &sink);
+    const created = data.movementBodySliceConst().entities;
+    const first = created[0];
+    const second = created[1];
+    try std.testing.expect(try data.destroyEntity(first));
+    try std.testing.expect(try data.destroyEntity(second));
+    data.collision_allow_records.clearRetainingCapacity();
+    const allow_need = batch.len * 2;
+    if (data.collision_allow_records.capacity < allow_need) {
+        try data.collision_allow_records.ensureTotalCapacity(failing.allocator(), allow_need);
+    }
+
+    data.setStaggerCellGrid(32, 8, 8);
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, data.applyStructuralCommandsPrepared(&batch, &scratch, &preparer, &sink));
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.len());
+    try std.testing.expect(!data.isAlive(first));
+    try std.testing.expect(!data.isAlive(second));
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.level_origins.count());
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.count());
+    try std.testing.expect(data.movement_bodies.level_origins.capacity() > 0);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.capacity());
+}
+
+test "a second stagger arrival in a cell that already has a residue allocates nothing" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+
+    const first = try createStaggerBody(&data, 0, 0, 0, true);
+    const second = try createStaggerBody(&data, 0, 0, 0, true);
+    data.setStaggerCellGrid(32, 8, 8);
+    try data.commitStaggerPhase(first);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, first).?.stagger_phase);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try data.commitStaggerPhase(second);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, second).?.stagger_phase);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "a stagger cell drops its arrival key when its last holder is destroyed" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+
+    const phase0 = try createStaggerBody(&data, 0, 0, 0, true);
+    const phase1 = try createStaggerBody(&data, 0, 0, 0, true);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, phase0).?.stagger_phase);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+
+    try std.testing.expect(try data.destroyEntity(phase0));
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, phase1).?.stagger_phase);
+    const phase2 = try createStaggerBody(&data, 0, 0, 0, true);
+    try std.testing.expectEqual(@as(u8, 2), data_test_support.simulationMetadata(&data, phase2).?.stagger_phase);
+
+    try std.testing.expect(try data.destroyEntity(phase1));
+    try std.testing.expect(try data.destroyEntity(phase2));
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.level_origins.get(0).?);
+
+    const again = try createStaggerBody(&data, 0, 0, 0, true);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, again).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 2), data.movement_bodies.level_origins.get(0).?);
+}
+
+test "a second stagger world keeps its own cell grid and releases without touching world 0" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+    try data.setStaggerWorldGrid(1, 16, 4, 4);
+
+    const world0 = try createStaggerBody(&data, 0, 0, 0, true);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+    const phase0 = data_test_support.simulationMetadata(&data, world0).?.stagger_phase;
+
+    const direct = try data.createEntity();
+    try data.setMovementBody(direct, .{
+        .position = .{ .x = 49, .y = 0 },
+        .previous_position = .{ .x = 49, .y = 0 },
+    });
+    try data.setAiAgent(direct, .{});
+    try data.commitStaggerPhaseForWorld(direct, 1);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, direct).?.stagger_phase);
+    const world1 = data.movement_bodies.other_worlds.getPtr(1).?;
+    try std.testing.expect(world1.arrivals.get(@as(u128, 3) << 32) != null);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+
+    data.releaseStaggerWorld(1);
+    try std.testing.expect(!data.isAlive(direct));
+    try std.testing.expect(data.movement_bodies.other_worlds.getPtr(1) == null);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(phase0, data_test_support.simulationMetadata(&data, world0).?.stagger_phase);
+    try data.setStaggerWorldGrid(1, 8, 2, 2);
+}
+
+test "a structural set that first completes an unsettled AI arrival takes the cell residue" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+
+    const early = try data.createEntity();
+    const later = try data.createEntity();
+    const bodies = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = early, .body = .{
+            .position = .{ .x = 0, .y = 0 },
+            .previous_position = .{ .x = 0, .y = 0 },
+        } } },
+        .{ .set_movement_body = .{ .entity = later, .body = .{
+            .position = .{ .x = 0, .y = 0 },
+            .previous_position = .{ .x = 0, .y = 0 },
+        } } },
+    };
+    _ = try data.applyStructuralCommands(&bodies);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.count());
+    try std.testing.expect(!data.movement_bodies.rows.slice().items(.stagger_settled)[1]);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, later).?.stagger_phase);
+
+    const add_ai = [_]StructuralCommand{
+        .{ .set_ai_agent = .{ .entity = later, .agent = .{} } },
+    };
+    _ = try data.applyStructuralCommands(&add_ai);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, later).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+
+    const ai_first = try data.createEntity();
+    try data.setAiAgent(ai_first, .{});
+    const add_body = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = ai_first, .body = .{
+            .position = .{ .x = 0, .y = 0 },
+            .previous_position = .{ .x = 0, .y = 0 },
+        } } },
+    };
+    _ = try data.applyStructuralCommands(&add_body);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, ai_first).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+}
+
+test "a reserved stagger batch of two new cells puts both phases without allocating" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+
+    var scratch = structural.StructuralPlanScratch.init(failing.allocator());
+    defer scratch.deinit();
+    var preparer = structural.NullStructuralCommitPreparer{};
+    var sink = structural.NullStructuralChangeSink{};
+    const batch = [_]StructuralCommand{
+        staggerAiCreate(0, 0),
+        staggerAiCreate(32, 0),
+    };
+    _ = try data.applyStructuralCommandsPrepared(&batch, &scratch, &preparer, &sink);
+    const warmed = data.movementBodySliceConst().entities;
+    const first = warmed[0];
+    const second = warmed[1];
+    try std.testing.expect(try data.destroyEntity(first));
+    try std.testing.expect(try data.destroyEntity(second));
+    data.collision_allow_records.clearRetainingCapacity();
+    const allow_need = batch.len * 2;
+    if (data.collision_allow_records.capacity < allow_need) {
+        try data.collision_allow_records.ensureTotalCapacity(failing.allocator(), allow_need);
+    }
+
+    data.setStaggerCellGrid(32, 8, 8);
+    try data.movement_bodies.ensureStaggerMapCapacity(failing.allocator(), batch.len);
+    failing.allocations = 0;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    _ = try data.applyStructuralCommandsPrepared(&batch, &scratch, &preparer, &sink);
+    const created = data.movementBodySliceConst().entities;
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, created[0]).?.stagger_phase);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, created[1]).?.stagger_phase);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "a simulation metadata write takes the level from the entity's world level row" {
