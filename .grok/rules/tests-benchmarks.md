@@ -78,8 +78,9 @@ The standard Zig layout; every change, plan, and review follows it.
   named in its prompt.
 - A landing's before/after runs once, after its code is done: the base
   commit against the tree in Debug (ReleaseFast only per `build-validation.md`), one run per
-  side (`tools/bench_ab.py`). A case more than 10% slower is rerun alone with
-  3 reps; a review fix reruns only the cases it touches. When the change
+  side (`tools/bench_ab.py`). A production-path case more than 10% slower is
+  rerun alone with 3 reps. A control is reported from its one run. A review
+  fix reruns only the cases it touches. When the change
   alters a bench's fixture or input order, the base code also runs on the new
   fixture; the like-for-like gap is the code's.
 - A threaded stage's bench reports its main-thread share, and main's time per

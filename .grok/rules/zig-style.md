@@ -22,17 +22,24 @@
   and any `pub` export whose doc asserts a contract nothing references.
 - No `_mod` suffixes or double names (`thread.ThreadSystem`); never rename
   SDL/C, build-option, or `std.Build` names.
-- Use `std` before writing your own: containers, heaps (`std.PriorityQueue`),
-  bitsets (`std.bit_set`), sorts, searches, hashing, and parsing. Write your
-  own only when std has no API for the job or a bench shows it beats std on a
-  hot path, stating that reason at the site; code duplicating std without it
-  is replaced with the std version in a change that touches its file, and
-  found elsewhere becomes a slice item.
+- Use the Zig standard library before writing your own: containers, heaps
+  (`std.PriorityQueue`), bitsets (`std.bit_set`), sorts, searches, hashing,
+  and parsing. Write your own only when the Zig standard library has no API
+  for the job or a bench shows it beats that library on a hot path. The bench
+  win is a one-line comment at the site naming that bench. Without that
+  comment, code duplicating the Zig standard library is replaced with the
+  library version in a change that touches its file, and found elsewhere
+  becomes a slice item.
+- Use the shared code in this repo before writing your own: `src/core/math.zig`,
+  `src/core/simd.zig`, `src/core/sort.zig` (`pdq`, `insertion`),
+  `src/core/rng.zig`, `src/core/logging.zig`, and
+  `src/game/systems/spatial_index.zig` (`SpatialIndexSystem`).
 - Sorts on a production path use `src/core/sort.zig` (`pdq`, `insertion`):
-  std's sorts swap through `std.mem.swap`, a per-byte loop (measured). A stable
-  `std.mem.sort` whose comparator is a total order moves to `pdq`; where ties
-  are possible it keeps `std.mem.sort`, or uses `insertion` when the input is
-  small and bounded. Test, bench, and cold one-off sorts keep std.
+  the Zig standard library's sorts swap through `std.mem.swap`, a per-byte
+  loop (measured). A stable `std.mem.sort` whose comparator is a total order
+  moves to `pdq`; where ties are possible it keeps `std.mem.sort`, or uses
+  `insertion` when the input is small and bounded. Test, bench, and cold
+  one-off sorts keep the Zig standard library.
 - Current spellings (`idiom-lint` enforces most):
   - `std.ArrayList` (unmanaged, `.empty`), never `std.ArrayListUnmanaged` or
     managed constructors; `std.array_list.Aligned`, never

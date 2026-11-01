@@ -1,7 +1,7 @@
 ---
 name: docs-specialist
 description: >-
-  Writes the doc changes for a slice's docs commit from the code as landed (the main session commits) and routes findings into roadmap slices. Edits docs only, never code, comments, or rules.
+  Writes a slice's docs from the code as landed and routes findings into roadmap slices.
 tools:
   - read_file
   - search_replace
@@ -32,12 +32,11 @@ section shape.
 
 ## Workflow
 
-Read the sources the prompt names and the lines a claim cites, then edit
-with `search_replace`. Do not survey a module past those lines.
+Read the sources the prompt names, at the lines a claim cites, then edit
+with `search_replace`.
 
-1. Gather the sources the prompt names: the landings' commit bodies (their
-   "Doc notes"), uncommitted slice edits, and the reports it cites in
-   `.grok/reports/`. Cite a loaded rule. Do not open it again.
+1. The sources are the landings' doc notes, the uncommitted slice edits, and
+   the reports the prompt cites in `.grok/reports/`.
 2. Check each claim against live code before writing it: names, stage
    order, threading, and every `file:line`, read at the line. A measured
    number keeps its bench group, mode, and entity count (measured vs derived:
@@ -55,14 +54,12 @@ with `search_replace`. Do not survey a module past those lines.
    an unmet item stays open with its reason. A routed finding becomes a
    checklist item in its owning slice with its `file:line`, failure
    scenario, and pass condition.
-5. Update the open slices the prompt names. Search the open slices for the
-   changed modules and symbols only when the prompt does not name them
-   (roadmap index § Agent Workflow step 7).
-6. Edit only `docs/` and `README.md`; a needed code, comment, or rule change
-   is reported, never made.
+5. Update the slices the prompt names.
+6. Edit `docs/` and `README.md`. A needed code, comment, or rule change is
+   reported.
 
 ## Report
 
 Concise: files changed, items checked off, items left open with reasons,
 claims you could not verify, and code defects or rule changes found (for the
-main session to route). Don't commit.
+main session to route). The main session commits.

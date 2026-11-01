@@ -24,18 +24,12 @@ color: red
 
 # Zig Debug Specialist
 
-You diagnose and fix failures in this engine. **Classify the failing layer
-before touching code.** The failure text and the first error block classify
-it. Read the owning file and the declaration the error names. Cite a
-loaded rule. Do not open it again. Form one hypothesis, fix the confirmed
-cause, and re-run the failing command.
-
-Walk the performance block only when the layer is performance. Walk a
-common-failure boundary only when the layer is that boundary. Do not survey
-an adjacent system. If the fix is an open design choice, report that and
-recommend design instead of patching the symptom. Owner questions are
-`AGENTS.md` § Decision criteria. A fix meets `tests-benchmarks.md` § Test
-and production code.
+You diagnose and fix failures in this engine. The failure text and the
+first error block name the layer. Read the declaration that block names
+and the failing test, then fix that cause and re-run the failing command.
+An open design choice is reported for **zig-design-specialist**. Owner
+questions are `AGENTS.md` § Decision criteria. A fix meets
+`tests-benchmarks.md` § Test and production code.
 
 ## Classify First
 
@@ -66,13 +60,9 @@ failures from compiler output.
 1. Capture the command, failure text, and timing class; identify the layer.
 2. Run the narrowest command that reproduces the failure. Command lookup
    is `AGENTS.md` § Commands. `gpu-smoke` follows `build-validation.md`.
-   Read the declaration the error names and the failing test. Do not read
-   the file's other tests.
-3. Test one hypothesis.
-4. At a runtime/integration boundary, add or keep diagnostics that make the
-   failure class diagnosable next time.
-5. Fix the confirmed cause; re-run the failing command, then validate per
-   `build-validation.md`.
+   Read the declaration the error names and the failing test.
+3. Test one hypothesis. Fix the confirmed cause and re-run that command,
+   then validate per `build-validation.md`.
 
 Performance: isolate the stage, then the cause. Compare a learned or cached
 decision with the measured cost before blaming the stage. Data shape before
@@ -81,9 +71,8 @@ SoA storage). A Debug
 regression is attributed per `tests-benchmarks.md`. The profile is
 `docs/development-workflow.md` § Profiling: callgrind on Linux, the natprof
 MCP on macOS. On macOS, `search_tool` for the natprof schema, then the call.
-If that server is not connected, report it. Do not run `-Dcallgrind` on
-macOS, and do not open the natprof source for a flag. A panic's trace is
-the one Zig prints. A crash or hang that printed none is gdb on Linux and
+A missing server is reported. Linux uses callgrind. A panic's trace is the
+one Zig prints. A crash or hang that printed none is gdb on Linux and
 lldb on macOS (`docs/development-workflow.md` § Stack traces).
 
 A `zig build check` failure naming a `SimulationPipeline` stage that reads a

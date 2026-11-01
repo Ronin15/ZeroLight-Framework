@@ -52,7 +52,7 @@
   reserve and commit in separate functions, the proof covers the success
   branch: reserve, arm the allocator to fail, assert the push completes.
 - Behavior gates compare a stored logical limit, never physical `.capacity`
-  (std rounds it up, so the two drift); assign the limit only after its reserve
+  (the Zig standard library rounds it up, so the two drift); assign the limit only after its reserve
   succeeds, and `std.debug.assert(list.capacity >= limit)`. A `.capacity` read
   that only picks `appendAssumeCapacity` vs `append` with identical results is
   not a gate.

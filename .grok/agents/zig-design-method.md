@@ -1,19 +1,17 @@
 # Big-feature design
 
-Read this only when the prompt is a new owner or a big feature. A decision
-inside an existing owner does not open this file.
+Read this when the prompt is a new owner or a big feature.
 
 ## Grounding
 
 - Start from the files, declarations, and cost-model questions the prompt
-  names. Read the `docs/architecture.md` heading that covers them, and stop
-  at the next heading of the same level. Read
-  `docs/simulation-tiers-and-pipeline.md` only when the change touches frame
-  streams, events, or structural commands, and stop the same way. Cite a
-  loaded rule. Do not open it again. Do not read the roadmap index,
-  track files, or every rule up front. For a slice, the slice file's goal
-  and architecture notes are the fixed inputs. For a landing of a planned
-  slice, the earlier plan and the live code the landing changes.
+  names. Read the `docs/architecture.md` heading that covers them, through
+  the next heading of the same level. Read
+  `docs/simulation-tiers-and-pipeline.md` when the change touches frame
+  streams, events, or structural commands, through the next heading. For a
+  slice, the slice file's goal and architecture notes are the fixed inputs.
+  For a landing of a planned slice, the earlier plan and the live code the
+  landing changes.
 - A slice's Goal and Architecture notes are fixed inputs: design how, never
   what. A goal that conflicts with the rules or the code is a question for the
   owner, not a redesign of the goal.
@@ -30,8 +28,8 @@ inside an existing owner does not open this file.
 Use this path when the change adds a stored result, a hot loop, a pass, or
 a budget. Read the prompt's files first. Write the plan once the chosen
 design is decided. A step with nothing new is one line citing where it is
-settled. Do not keep reading to fill it. Each step's answer is the input
-to the next. Cite the rule for the step. Do not restate it.
+settled. Each step's answer is the input to the next. Cite the rule for
+the step.
 
 1. **The work.** Goal, scope, call flow, and the cost-model table
    (`engine-design.md` § Cost model). One chosen design. One line per
@@ -54,27 +52,28 @@ to the next. Cite the rule for the step. Do not restate it.
 6. **Budgets.** `budgets-capacities.md`: class, sizing, growth, degradation.
 7. **Proof.** `tests-benchmarks.md`. The exact commands, looked up once
    from the test names in the files you read and from
-   `tools/bench_ab.py --list` filtered to that group's lines: each `zig build test -Dtest-filter=… --summary all`,
+   one `tools/bench_ab.py --list` piped to that group's lines: each `zig build test -Dtest-filter=… --summary all`, with filter words shared by the new test and the existing tests of that behavior,
    the ThreadSanitizer command when the change is threaded, and each
    `tools/bench_ab.py` line with its group, case, and `--items`. "No bench"
-   when none runs. The implementer runs those lines and does not look them up.
+   when none runs. The implementer runs those lines.
 8. **Pre-implementation check.** The live lines the plan cites
    (`engine-design.md` § Cost model, last bullet).
-9. **Std and handoff.** `zig-style.md` for each new container, or why std
-   cannot serve. Files, doc notes, and the steps. Each step names the
-   function, the file, and the change. The implementer executes this plan.
+9. **Zig standard library and handoff.** `zig-style.md` for each new
+   container and for math, SIMD, sort, RNG, logging, and neighbor queries,
+   or why the Zig standard library or that shared code cannot serve. Files,
+   doc notes, and the steps. Each step names the
+   function, its `file:line`, and the change. The implementer executes this plan.
 
 ## Checks
 
-Check the finished plan against the rules already loaded for the steps it
-cites. A failure goes back to the step it came from and is fixed there. Do
-not open those rule files again. Owner questions are `AGENTS.md`
-§ Decision criteria. A rule that blocks the design the cost model
-says is right gets a proposed edit (`engine-design.md`); never bend the
-design or the rule silently.
+Check the finished plan against the loaded rules for the steps it cites.
+A failure goes back to the step it came from and is fixed there. Owner
+questions are `AGENTS.md` § Decision criteria. A rule that blocks the
+design the cost model says is right gets a proposed edit
+(`engine-design.md`).
 
-Every invariant stated, no restated code, no essays; the design and its steps
-never go into the slice file. Follow-ups are listed in the plan as proposed
-checklist items for an owning slice, or a proposed new slice for the owner
-(roadmap index § Standard slice section shape); an item you cannot plan fully
-is an open question. Cite an existing **Deferred By Owner** entry, never add one.
+The plan states every invariant. The design and its steps stay in the plan.
+Follow-ups are proposed checklist items for an owning slice, or a proposed
+new slice for the owner (roadmap index § Standard slice section shape). An
+item you cannot plan fully is an open question. Cite an existing
+**Deferred By Owner** entry.

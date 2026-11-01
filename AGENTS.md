@@ -40,8 +40,8 @@ Non-trivial Zig design, implementation, review, and debugging goes through the
 spawn prompt is the child's whole task. Trivial work (a local fix in 1-2 files,
 no design question) may be done inline. The main session coordinates.
 Specialists own the design and the code. It keeps each unit on the agreed
-goal and order. Its check is that the result still matches that goal: the
-slice pass and the named plan. It does not design the change or walk the
+goal and order. Its check is the slice pass, the named plan, and the
+landing's cited lines. It does not design the change or walk the
 module. It calls out a needed direction change to the owner and reports.
 Before it starts or continues a unit, it reads `.grok/reports/handoffs.md`.
 That file names the next unit, the specialist, and the sources. When a unit
@@ -51,18 +51,14 @@ finishes, or a review routes the next one, the main session rewrites the file.
   questions, and the plan path. The specialist checks those lines. A
   hypothesis in the prompt is labelled one. When the owner already exists,
   the first line says so and names the line ranges to read. The prompt
-  states the slice pass. An open how is the specialist's decision. The
-  prompt does not choose it or tour the module.
-- **Implement** prompt: the design plan's path and only its overrides. It
-  does not name files to read. The plan lists the exact test and bench
-  commands, and the values the new test asserts. The implementer runs those
-  commands. That result is the proof. A stated fix with no plan is the
-  prompt, and that prompt carries the same commands and values. Every
-  command it names exercises the changed code.
-- **Review** prompt: the files and the report path. It does not name the
-  plan or the landing.
-- Agents cite a loaded rule by name. They do not open it again and do not
-  restate it. A repeated constraint belongs in `.grok/rules/`.
+  states the slice pass. An open how is the specialist's decision.
+- **Implement** prompt: the design plan's path and its overrides. The plan
+  lists the exact test and bench commands, and the values the new test
+  asserts. The implementer runs those commands. That result is the proof.
+  A stated fix with no plan is the prompt, and that prompt carries the same
+  commands and values. Every command it names exercises the changed code.
+- **Review** prompt: the files and the report path.
+- A repeated constraint belongs in `.grok/rules/`.
 - **Design** (`zig-design-specialist`) only when a design is open or the
   structure fails the cost model, right before implementation. A known fix or
   a call already made goes straight to `zig-specialist`.
