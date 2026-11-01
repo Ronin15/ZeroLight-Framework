@@ -180,7 +180,7 @@ fn stageBatches(stage: Timing) StageBatches {
         .pipeline_spatial_index => .{ .logged = &.{.spatial_index_build}, .bench = &.{ .spatial_index_bucket, .spatial_index_link } },
         .pipeline_perception => .{ .bench = &.{ .perception_gather, .perception } },
         .pipeline_ai_memory => .{ .bench = &.{ .ai_memory_gather, .ai_memory_order, .ai_memory_visible, .ai_memory_decay } },
-        .pipeline_ai_affect => .{ .bench = &.{.affect} },
+        .pipeline_ai_affect => .{ .bench = &.{ .affect_gather, .affect } },
         .pipeline_ai => .{ .bench = &.{ .ai_gather, .ai_separation, .ai_intent } },
         .pipeline_path_goals => .{ .bench = &.{ .path_goal_scan, .path_goal_project } },
         .pipeline_steering => .{ .bench = &.{ .steering_agents, .steering_select_resolve, .steering_select_claim, .steering_directions, .steering, .steering_intent_order_place, .steering_intent_order_sort } },

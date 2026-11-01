@@ -14,12 +14,12 @@
 //! trigger: rising fires when the bit is clear and the value reaches threshold, falling when
 //! it is set and the value drops below threshold - `ai_affect_threshold_hysteresis`.
 //!
-//! The main thread packs each row's signals into `AffectGatherRow` scratch. The compute pass
-//! runs one drive column at a time, four rows per lane group gathered by their
-//! `AiAffectStore` index, with a scalar tail. Workers write only their rows' `crossing_bits`;
-//! after the join the main thread applies the per-step cap and emits crossings in (gather row,
-//! drive declaration) order (`emitCrossingEvents`), partition-independent with no event
-//! scratch or sort.
+//! The gather runs on workers in windows. Main compacts in range order, then the appraisal
+//! runs. The compute pass runs one drive column at a time, four rows per lane group gathered
+//! by their `AiAffectStore` index, with a scalar tail. Workers write only `crossing_bits` in
+//! the appraisal; after the join the main thread applies the per-step cap and emits crossings
+//! in (gather row, drive declaration) order (`emitCrossingEvents`), partition-independent
+//! with no event scratch or sort.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
@@ -33,7 +33,17 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
+const ConstAiMemorySlice = @import("../data_system.zig").ConstAiMemorySlice;
+const ConstPerceptionSlice = @import("../data_system.zig").ConstPerceptionSlice;
+const no_component_row = @import("../data_system/types.zig").no_component_row;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
@@ -46,6 +56,18 @@ const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const affect_events_per_row_max = @import("../simulation.zig").affect_events_per_row_max;
 
 pub const affect_range_alignment_items: usize = movement_range_alignment_items;
+
+comptime {
+    for (@typeInfo(AffectGatherRow).@"struct".field_types) |Column| {
+        std.debug.assert(affect_range_alignment_items * @sizeOf(Column) >= thread_shared_record_alignment);
+    }
+}
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const affect_gather_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = affect_range_alignment_items,
+    .smallest_range_items = affect_range_alignment_items,
+};
 
 const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
@@ -86,14 +108,16 @@ pub const AffectConfig = struct {
 pub const AffectStats = struct {
     perf: Perf = .{},
 
-    /// The stage batch, kept only with `runtime_perf_log.enabled`.
-    pub const Perf = if (runtime_perf_log.enabled) struct { batch: BatchStats = .{} } else struct {};
+    /// The stage batches, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        gather_batch: BatchStats = .{},
+        batch: BatchStats = .{},
+    } else struct {};
 };
 
-// Packed, contiguous per-row gather scratch (mirrors PerceptionGatherRow):
-// resolved once per row during the branchy gather pass, then read by the
-// vectorized compute pass with plain contiguous loads. `crossing_bits` is the
-// one column the workers write.
+// Packed per-row gather scratch. The gather streams each column into the row's
+// window; the compute pass reads them contiguously. `crossing_bits` is the one
+// column the appraisal's workers write.
 const AffectGatherRow = struct {
     entity: EntityId,
     // This row's own index into DataSystem.ai_affects -- scattered, gathered
@@ -113,6 +137,11 @@ const AffectGatherRow = struct {
     // `final_nearest_threat_*` columns (a u8 column would put four ranges on
     // one line).
     crossing_bits: u32,
+};
+
+// Kept rows in one gather range's window.
+const AffectRangeTally = struct {
+    kept: usize = 0,
 };
 
 // A crossed and a rising bit per drive must fit the row word; widen
@@ -137,44 +166,39 @@ fn risingBit(drive: AiAffectDrive) u32 {
     return crossedBit(drive) << affect_events_per_row_max;
 }
 
-fn appendAffectGatherRow(
-    rows: *std.MultiArrayList(AffectGatherRow),
-    row_slice: *std.MultiArrayList(AffectGatherRow).Slice,
-    row: AffectGatherRow,
-) void {
-    _ = rows.addOneAssumeCapacity();
-    row_slice.len = rows.len;
-    row_slice.set(rows.len - 1, row);
-}
-
 pub const AffectSystem = struct {
     allocator: std.mem.Allocator,
-    // Gathered work memory (main-thread only; workers read only copies in
-    // job context, except their own rows' `crossing_bits`).
+    // Ranges write their windows; main compacts. The appraisal's workers write
+    // only their rows' `crossing_bits`.
     rows: std.MultiArrayList(AffectGatherRow) = .{},
+    range_tallies: SlotList(AffectRangeTally) = .empty,
     /// Once-only flag for the emit-cap drop warn. The pipeline's derived share makes a
     /// drop impossible by construction; the cap and `dropped_events` stay as the
     /// shared-frame safety net.
     dropped_events_warned: bool = false,
+    gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(affect_gather_tuner_config),
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
-    /// Sizes the gather rows (including the per-row crossing bits) for `pop`
-    /// agents; no partition-sized scratch exists, so `update`
-    /// allocates nothing after this under any `items_per_range`. Grow-only;
-    /// re-run by the pipeline's population seam.
+    /// Sizes the gather windows and the range tallies (`maxRangeCount`, every
+    /// partition the tuner can pick) for `pop` agents, so `update` allocates
+    /// nothing after this under any `items_per_range`. Grow-only; re-run by
+    /// the pipeline's population seam.
     pub fn reserve(self: *AffectSystem, pop: usize) !void {
         if (pop == 0) return;
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(pop));
+        try self.range_tallies.ensureTotalCapacity(self.allocator, maxRangeCount(hotStoreCapacity(pop), affect_range_alignment_items));
     }
 
     pub fn init(allocator: std.mem.Allocator) AffectSystem {
         return .{
             .allocator = allocator,
+            .gather_tuner = AdaptiveWorkTuner.init(affect_gather_tuner_config),
             .compute_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
     pub fn deinit(self: *AffectSystem) void {
+        self.range_tallies.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -187,9 +211,16 @@ pub const AffectSystem = struct {
         thread_system: *ThreadSystem,
         config: AffectConfig,
     ) !AffectStats {
-        try self.gatherScopedIndices(ai_agents, data, config.scope_dense_indices);
+        const perception_slice = data.aiPerceptionSliceConst();
+        const memory_slice = data.aiMemorySliceConst();
+        const gather_batch = try self.gatherAffectData(.{
+            .ai_agents = ai_agents,
+            .perception_slice = perception_slice,
+            .memory_slice = memory_slice,
+            .scope_dense_indices = config.scope_dense_indices,
+        }, thread_system, config);
         const count = self.rows.len;
-        if (count == 0) return .{};
+        if (count == 0) return .{ .perf = if (comptime runtime_perf_log.enabled) .{ .gather_batch = gather_batch } else .{} };
 
         const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
@@ -202,7 +233,7 @@ pub const AffectSystem = struct {
         const batch = compute.run(selection, count, affect_range_alignment_items, &job, affectRangeJob);
 
         try self.emitCrossingEvents(events, config.max_events_per_step);
-        return .{ .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{} };
+        return .{ .perf = if (comptime runtime_perf_log.enabled) .{ .gather_batch = gather_batch, .batch = batch } else .{} };
     }
 
     fn buildJobContext(self: *AffectSystem, data: *DataSystem, range_count: usize) AffectJobContext {
@@ -222,61 +253,45 @@ pub const AffectSystem = struct {
         };
     }
 
-    // Population-domain contract with ai_memory.zig/perception.zig: walks
-    // scope_dense_indices (or every ai agent), keeping only rows that carry
-    // both AiAgent and AiAffect. AiPerception/AiMemory are each resolved with
-    // `orelse` -- a missing one packs a "no signal" default rather than
-    // excluding the row, since fatigue's own input (AiAgent.active_behavior) needs
-    // neither.
-    fn gatherScopedIndices(
-        self: *AffectSystem,
-        ai_agents: ConstAiAgentSlice,
-        data: *const DataSystem,
-        scope_dense_indices: ?[]const u32,
-    ) !void {
+    // Think rows on workers under `gather_tuner`: each range writes its window, then main
+    // compacts in range order. A row without affect is skipped; a missing perception or
+    // memory packs no-signal defaults.
+    fn gatherAffectData(self: *AffectSystem, inputs: AffectGatherInputs, thread_system: *ThreadSystem, config: AffectConfig) !BatchStats {
+        const n = try self.prepareGather(inputs);
+        if (n == 0) return .{};
+        const gather = Dispatch.init(thread_system, &self.gather_tuner, .{
+            .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
+        });
+        const selection = gather.select(n, affect_range_alignment_items);
+        try self.prepareRangeTallies(selection.range_count);
+        var context = AffectGatherContext{
+            .inputs = inputs,
+            .rows = self.rows.slice(),
+            .items_per_range = selection.items_per_range,
+            .tallies = self.range_tallies.items,
+        };
+        const batch = gather.run(selection, n, affect_range_alignment_items, &context, gatherAffectJob);
+        compactRowWindows(AffectGatherRow, AffectRangeTally, &self.rows, context.tallies, selection.items_per_range);
+        return batch;
+    }
+
+    // One window slot per think row before dispatch; returns the count.
+    fn prepareGather(self: *AffectSystem, inputs: AffectGatherInputs) !usize {
         self.rows.clearRetainingCapacity();
-        const n = if (scope_dense_indices) |idx| idx.len else ai_agents.entities.len;
-        if (n == 0) return;
+        const n = inputs.rowCount();
+        if (n == 0) return 0;
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+        setRowCount(AffectGatherRow, &self.rows, n);
+        return n;
+    }
 
-        const perception_slice = data.aiPerceptionSliceConst();
-        const memory_slice = data.aiMemorySliceConst();
-
-        var row_slice = self.rows.slice();
-        var k: usize = 0;
-        while (k < n) : (k += 1) {
-            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
-            const ent = ai_agents.entities[i];
-            const affect_index = data.aiAffectDenseIndex(ent) orelse continue;
-
-            var target_visible_f: f32 = 0;
-            var nearest_threat_dist: f32 = no_perception_dist;
-            var vision_range: f32 = no_perception_vision_range;
-            var heard_stimulus_f: f32 = 0;
-            if (data.aiPerceptionDenseIndex(ent)) |perception_index| {
-                target_visible_f = if (perception_slice.target_visible[perception_index]) 1 else 0;
-                nearest_threat_dist = perception_slice.nearest_threat_dist[perception_index];
-                vision_range = perception_slice.vision_range[perception_index];
-                heard_stimulus_f = if (perception_slice.heard_stimulus[perception_index]) 1 else 0;
-            }
-
-            var familiarity: f32 = no_memory_familiarity;
-            if (data.aiMemoryDenseIndex(ent)) |memory_index| {
-                familiarity = memory_slice.familiarity[memory_index];
-            }
-
-            appendAffectGatherRow(&self.rows, &row_slice, .{
-                .entity = ent,
-                .affect_dense_index = @intCast(affect_index),
-                .target_visible_f = target_visible_f,
-                .nearest_threat_dist = nearest_threat_dist,
-                .vision_range = vision_range,
-                .heard_stimulus_f = heard_stimulus_f,
-                .familiarity = familiarity,
-                .behavior_exertion_f = if (ai_agents.behaviors[i] == .pursue or ai_agents.behaviors[i] == .flee) 1 else 0,
-                .crossing_bits = 0,
-            });
-        }
+    // `range_count` zeroed tallies before dispatch; grow-only past `reserve`.
+    fn prepareRangeTallies(self: *AffectSystem, range_count: usize) !void {
+        try self.range_tallies.ensureTotalCapacity(self.allocator, range_count);
+        setSlotCount(AffectRangeTally, &self.range_tallies, range_count);
     }
 
     /// Main-thread crossing emit after the parallel/serial compute pass:
@@ -337,6 +352,85 @@ pub const AffectSystem = struct {
         }
     }
 };
+
+// One step's affect gather inputs, read-only on every range.
+const AffectGatherInputs = struct {
+    ai_agents: ConstAiAgentSlice,
+    perception_slice: ConstPerceptionSlice,
+    memory_slice: ConstAiMemorySlice,
+    scope_dense_indices: ?[]const u32,
+
+    fn rowCount(self: *const AffectGatherInputs) usize {
+        return if (self.scope_dense_indices) |indices| indices.len else self.ai_agents.entities.len;
+    }
+};
+
+const AffectGatherContext = struct {
+    inputs: AffectGatherInputs,
+    // `inputs.rowCount()` window slots: range r's kept rows from `r * items_per_range`.
+    rows: std.MultiArrayList(AffectGatherRow).Slice,
+    items_per_range: usize,
+    tallies: []PaddedSlot(AffectRangeTally),
+};
+
+fn gatherAffectJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *AffectGatherContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.tallies.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.rows.len and range.end <= job.inputs.rowCount());
+
+    const agents = job.inputs.ai_agents;
+    const affect_rows = agents.affect_row;
+    const entities_in = agents.entities;
+    const behaviors = agents.behaviors;
+    const perception_rows = agents.perception_row;
+    const memory_rows = agents.memory_row;
+    const scope = job.inputs.scope_dense_indices;
+    const target_visible_in = job.inputs.perception_slice.target_visible;
+    const threat_dist_in = job.inputs.perception_slice.nearest_threat_dist;
+    const vision_range_in = job.inputs.perception_slice.vision_range;
+    const heard_in = job.inputs.perception_slice.heard_stimulus;
+    const familiarity_in = job.inputs.memory_slice.familiarity;
+
+    const gathered = job.rows;
+    const entity = gathered.items(.entity);
+    const affect_dense_index = gathered.items(.affect_dense_index);
+    const target_visible_f = gathered.items(.target_visible_f);
+    const nearest_threat_dist = gathered.items(.nearest_threat_dist);
+    const vision_range = gathered.items(.vision_range);
+    const heard_stimulus_f = gathered.items(.heard_stimulus_f);
+    const familiarity = gathered.items(.familiarity);
+    const behavior_exertion_f = gathered.items(.behavior_exertion_f);
+    const crossing_bits = gathered.items(.crossing_bits);
+
+    var kept: usize = 0;
+    for (range.start..range.end) |k| {
+        const i: usize = if (scope) |indices| indices[k] else k;
+        if (affect_rows[i] == no_component_row) continue;
+        const behavior = behaviors[i];
+        const perception_row = perception_rows[i];
+        const memory_row = memory_rows[i];
+        const dest = range.start + kept;
+        entity[dest] = entities_in[i];
+        affect_dense_index[dest] = affect_rows[i];
+        if (perception_row == no_component_row) {
+            target_visible_f[dest] = 0;
+            nearest_threat_dist[dest] = no_perception_dist;
+            vision_range[dest] = no_perception_vision_range;
+            heard_stimulus_f[dest] = 0;
+        } else {
+            target_visible_f[dest] = if (target_visible_in[perception_row]) 1 else 0;
+            nearest_threat_dist[dest] = threat_dist_in[perception_row];
+            vision_range[dest] = vision_range_in[perception_row];
+            heard_stimulus_f[dest] = if (heard_in[perception_row]) 1 else 0;
+        }
+        familiarity[dest] = if (memory_row == no_component_row) no_memory_familiarity else familiarity_in[memory_row];
+        behavior_exertion_f[dest] = if (behavior == .pursue or behavior == .flee) 1 else 0;
+        crossing_bits[dest] = 0;
+        kept += 1;
+    }
+    job.tallies[range.index].value.kept = kept;
+}
 
 const AffectJobContext = struct {
     entities: []const EntityId,
@@ -1042,6 +1136,136 @@ test "serial and threaded updates are byte-identical" {
     try testing.expectEqualSlices(SimulationEvent, events_a.mergedItems(), events_b.mergedItems());
 }
 
+test "serial and threaded affect gathers match when an affect row is skipped" {
+    var data_serial = DataSystem.init(testing.allocator);
+    defer data_serial.deinit();
+    var data_threaded = DataSystem.init(testing.allocator);
+    defer data_threaded.deinit();
+
+    var entities_serial: [20]EntityId = undefined;
+    var entities_threaded: [20]EntityId = undefined;
+    for ([_]*DataSystem{ &data_serial, &data_threaded }, [_]*[20]EntityId{ &entities_serial, &entities_threaded }) |data, entities| {
+        for (entities, 0..) |*entity, agent| entity.* = try skippedAffectAgent(data, agent);
+    }
+
+    const identity = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
+    defer threads.deinit();
+
+    var sys_serial = AffectSystem.init(testing.allocator);
+    defer sys_serial.deinit();
+    var sys_threaded = AffectSystem.init(testing.allocator);
+    defer sys_threaded.deinit();
+    var events_serial = SimulationEvents.init(testing.allocator);
+    defer events_serial.deinit();
+    var events_threaded = SimulationEvents.init(testing.allocator);
+    defer events_threaded.deinit();
+
+    _ = try updateInline(&sys_serial, data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{ .scope_dense_indices = &identity });
+    _ = try sys_threaded.update(data_threaded.aiAgentSliceConst(), &data_threaded, &events_threaded, &threads, .{
+        .scope_dense_indices = &identity,
+        .items_per_range = affect_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    try expectSkippedAffectGather(&sys_serial, &data_serial, &events_serial, &entities_serial);
+    try expectSkippedAffectGather(&sys_threaded, &data_threaded, &events_threaded, &entities_threaded);
+    const slice_serial = data_serial.aiAffectSliceConst();
+    const slice_threaded = data_threaded.aiAffectSliceConst();
+    try testing.expectEqualSlices(f32, slice_serial.fear, slice_threaded.fear);
+    try testing.expectEqualSlices(f32, slice_serial.curiosity, slice_threaded.curiosity);
+    try testing.expectEqualSlices(f32, slice_serial.aggression, slice_threaded.aggression);
+    try testing.expectEqualSlices(f32, slice_serial.fatigue, slice_threaded.fatigue);
+    try testing.expectEqualSlices(u8, slice_serial.above_threshold_mask, slice_threaded.above_threshold_mask);
+    try testing.expectEqualSlices(SimulationEvent, events_serial.mergedItems(), events_threaded.mergedItems());
+
+    var scope_serial = DataSystem.init(testing.allocator);
+    defer scope_serial.deinit();
+    var scope_threaded = DataSystem.init(testing.allocator);
+    defer scope_threaded.deinit();
+    var scope_entities_serial: [3]EntityId = undefined;
+    var scope_entities_threaded: [3]EntityId = undefined;
+    for ([_]*DataSystem{ &scope_serial, &scope_threaded }, [_]*[3]EntityId{ &scope_entities_serial, &scope_entities_threaded }) |data, entities| {
+        entities[0] = try data.createEntity();
+        try data.setAiAgent(entities[0], .{});
+        entities[1] = try addAgentWithAffect(data, .{}, .{});
+        entities[2] = try addAgentWithAffect(data, .{}, .{});
+    }
+    const scope_order = [_]u32{ 2, 0, 1 };
+    events_serial.clearRetainingCapacity();
+    events_threaded.clearRetainingCapacity();
+    _ = try updateInline(&sys_serial, scope_serial.aiAgentSliceConst(), &scope_serial, &events_serial, .{ .scope_dense_indices = &scope_order });
+    _ = try sys_threaded.update(scope_threaded.aiAgentSliceConst(), &scope_threaded, &events_threaded, &threads, .{
+        .scope_dense_indices = &scope_order,
+        .items_per_range = affect_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try testing.expectEqual(@as(usize, 2), sys_serial.rows.len);
+    try testing.expectEqual(@as(usize, 2), sys_threaded.rows.len);
+    const serial_rows = sys_serial.rows.slice().items(.entity);
+    const threaded_rows = sys_threaded.rows.slice().items(.entity);
+    try testing.expect(serial_rows[0].eql(scope_entities_serial[2]));
+    try testing.expect(serial_rows[1].eql(scope_entities_serial[1]));
+    try testing.expect(threaded_rows[0].eql(scope_entities_threaded[2]));
+    try testing.expect(threaded_rows[1].eql(scope_entities_threaded[1]));
+}
+
+fn skippedAffectAgent(data: *DataSystem, agent: usize) !EntityId {
+    if (agent == 0 or agent == 16) {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{});
+        return entity;
+    }
+    if (agent == 1) {
+        return addAgentWithAffect(data, .{ .active_behavior = .pursue }, .{
+            .baseline_fatigue = 0,
+            .decay_rate_fatigue = 0.5,
+            .fatigue = 0,
+        });
+    }
+    if (agent == 2) {
+        const entity = try addAgentWithAffect(data, .{}, .{ .decay_rate_curiosity = 0.5, .curiosity = 0 });
+        try data.setAiPerception(entity, .{ .target_visible = false, .heard_stimulus = true, .vision_range = 100 });
+        return entity;
+    }
+    if (agent == 3) {
+        const entity = try addAgentWithAffect(data, .{}, .{ .decay_rate_curiosity = 0.5, .curiosity = 0 });
+        try data.setAiMemory(entity, .{ .familiarity = 0 });
+        return entity;
+    }
+    return addAgentWithAffect(data, .{ .active_behavior = .wander }, .{});
+}
+
+fn expectSkippedAffectGather(system: *AffectSystem, data: *const DataSystem, events: *SimulationEvents, entities: *const [20]EntityId) !void {
+    try testing.expectEqual(@as(usize, 18), system.rows.len);
+    const gathered = system.rows.slice().items(.entity);
+    var kept: usize = 0;
+    for (entities, 0..) |entity, agent| {
+        if (agent == 0 or agent == 16) {
+            try testing.expect(data_test_support.aiAffect(data, entity) == null);
+            continue;
+        }
+        try testing.expect(gathered[kept].eql(entity));
+        kept += 1;
+    }
+    try testing.expectEqual(@as(usize, 18), kept);
+    const pursue = data_test_support.aiAffect(data, entities[1]).?;
+    try testing.expectApproxEqAbs(@as(f32, 0.025), pursue.fatigue, 1e-6);
+    try testing.expectEqual(@as(f32, 0), pursue.fear);
+    try testing.expectEqual(@as(f32, 0), pursue.curiosity);
+    try testing.expectEqual(@as(f32, 0), pursue.aggression);
+    const heard = data_test_support.aiAffect(data, entities[2]).?;
+    try testing.expectApproxEqAbs(@as(f32, 0.1), heard.curiosity, 1e-6);
+    try testing.expectEqual(@as(f32, 0), heard.fear);
+    const novel = data_test_support.aiAffect(data, entities[3]).?;
+    try testing.expectApproxEqAbs(@as(f32, 0.025), novel.curiosity, 1e-6);
+    try testing.expectEqual(@as(f32, 0), novel.fear);
+    try testing.expectEqual(@as(f32, 0), data_test_support.aiAffect(data, entities[4]).?.fatigue);
+    try testing.expectEqual(@as(usize, 0), events.mergedItems().len);
+}
+
 test "serial and threaded emit identical order and cap membership when different drives cross across ranges" {
 
     // 20 agents span two ranges at items_per_range=16: [0,16) and [16,20).
@@ -1164,12 +1388,11 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
 
 test "after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
 
-    // The only reserved store is the gather rows (crossing bits
-    // included), so `reserve` alone (no warm step) covers the tuner's 64-item
-    // initial profile and the 16-item alignment floor on the real multi-worker
-    // path. Every row crosses fear on step 1. 96 rows put 32 in the 64-item
-    // partition's second range, which the old per-range event slots (reserved
-    // for 16 rows past slot 0) grew in-stage.
+    // `reserve` sizes the gather windows and the range tallies, so it alone
+    // (no warm step) covers the 64-item partition and the 16-item alignment
+    // floor on the real multi-worker path. Every row crosses fear on step 1.
+    // 96 rows put 32 in the 64-item partition's second range, which the old
+    // per-range event slots (reserved for 16 rows past slot 0) grew in-stage.
     const row_total: usize = 96;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -1246,6 +1469,8 @@ test "threaded update records one sample into the compute tuner" {
     try testing.expectEqual(@as(usize, 64), sys.rows.len);
     try testing.expectEqual(@as(usize, 1), sys.compute_tuner.sample_count);
     try testing.expect(sys.compute_tuner.last_request != null);
+    try testing.expectEqual(@as(usize, 1), sys.gather_tuner.sample_count);
+    try testing.expect(sys.gather_tuner.last_request != null);
 }
 
 test "crossings are emitted in (gather row, drive declaration) order, not entity-index order" {

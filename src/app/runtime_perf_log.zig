@@ -253,6 +253,8 @@ pub const BenchBatchStage = enum {
     ai_memory_order,
     ai_memory_visible,
     ai_memory_decay,
+    // The think-row gather, then the appraisal.
+    affect_gather,
     affect,
     // AI's think-row gather, separation, and intent passes.
     ai_gather,

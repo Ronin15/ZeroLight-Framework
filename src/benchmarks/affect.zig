@@ -7,8 +7,9 @@
 //! `AiPerception` and `AiMemory` with a visible hostile and low familiarity in its hot
 //! columns, set at fixture creation; nothing is injected per step. Both groups print
 //! `processed=` (rows appraised) and `threshold_crossings=`; `--details` adds `main=` with
-//! `main_per_item=` (per processed row), flat across sizes. Asserts also check a fixed
-//! threaded case dispatches the appraisal to workers.
+//! `main_per_item=` (per processed row), flat across sizes, and `gather=` (`inline`, or
+//! workers and ranges; an unthreaded gather also prints `tuned=`). `main` is the time
+//! outside both. A fixed threaded case dispatches the gather and the appraisal.
 //! - `ai-affect`: every agent, the think set in store order. Pass shape: time linear in
 //!   agents; asserts check every agent is appraised each step.
 //! - `ai-affect-shuffled`: the same step over a stride shuffle of every agent as the think
@@ -102,15 +103,18 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer threads.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(suite.tunerSettled(&system.compute_tuner))) {
+    while (warm.nextSettled(suite.TunerSettle.of(AffectSystem, &system))) {
         fixture.events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, think_set, &threads, case);
     }
+    const settle = suite.TunerSettle.of(AffectSystem, &system);
+    const gather_tuner_start = suite.TunerStart.of(&system.gather_tuner, case);
     const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AffectStats{};
     var main_total: u128 = 0;
+    var shapes = suite.StageShapes(2){};
     for (0..options.iterations) |_| {
         fixture.events.clearRetainingCapacity();
         const start_ns = suite.nowNs(io);
@@ -118,8 +122,9 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.perf.batch);
-        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(affect_range_alignment_items), last_stats.perf.batch);
-        main_total += elapsed_ns -| offMainNs(last_stats.perf.batch);
+        shapes.add(.{ last_stats.perf.gather_batch, last_stats.perf.batch });
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(affect_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.batch));
     }
 
     std.debug.assert(options.iterations == 0 or system.rows.len == item_count);
@@ -127,8 +132,11 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = system.rows.len;
     stats.output_count = fixture.events.stats.affect_threshold_crossed;
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
     if (case.adaptive) {
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&system.gather_tuner, gather_tuner_start);
     }
     return stats;
 }
@@ -146,9 +154,16 @@ fn runOnce(system: *AffectSystem, fixture: *Fixture, think_set: ?[]const u32, th
     });
 }
 
-// `main` is the time outside the appraisal's worker dispatch, also per processed row.
+// `splice_batch` is the gather and `main` the time outside both stages, also per processed row.
 fn writeAffectWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("processed={} threshold_crossings={}", .{ stats.candidate_pairs, stats.output_count });
     if (view == .summary) return;
     try suite.writeMainShare(writer, stats, stats.candidate_pairs);
+    if (stats.splice_batch) |gather| {
+        try writer.writeAll(" gather=");
+        try suite.writeStageShape(writer, gather);
+        if (gather.threaded_batches == 0) {
+            if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
+        }
+    }
 }

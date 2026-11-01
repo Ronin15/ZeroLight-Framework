@@ -635,6 +635,7 @@ pub const SimulationPipelineStats = struct {
             perf.recordBenchBatch(.ai_memory_order, ai_memory_stats.perf.order_batch);
             perf.recordBenchBatch(.ai_memory_visible, ai_memory_stats.perf.visible_batch);
             perf.recordBenchBatch(.ai_memory_decay, ai_memory_stats.perf.batch);
+            perf.recordBenchBatch(.affect_gather, affect_stats.perf.gather_batch);
             perf.recordBenchBatch(.affect, affect_stats.perf.batch);
         }
 
