@@ -15,6 +15,8 @@ const CollisionResponseMobility = types.CollisionResponseMobility;
 const CollisionResponse = types.CollisionResponse;
 const ConstCollisionResponseSlice = types.ConstCollisionResponseSlice;
 const hotStoreCapacity = types.hotStoreCapacity;
+const no_component_row = types.no_component_row;
+const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 
 pub fn validateCollisionBounds(bounds: CollisionBounds) !void {
     if (!std.math.isFinite(bounds.offset.x) or !std.math.isFinite(bounds.offset.y)) return error.InvalidCollisionBounds;
@@ -35,6 +37,10 @@ const CollisionBoundsRow = struct {
     offset_y: f32,
     size_x: f32,
     size_y: f32,
+    // `no_component_row` until a movement body is linked. Tier is dormant until then,
+    // so a bounds row with no body is not a collider.
+    movement_row: u32 = no_component_row,
+    tier: SimulationTier = .dormant,
 };
 
 const CollisionResponseRow = struct {
@@ -153,7 +159,21 @@ pub const CollisionBoundsStore = struct {
             .offset_y = s.items(.offset_y),
             .size_x = s.items(.size_x),
             .size_y = s.items(.size_y),
+            .movement_row = s.items(.movement_row),
+            .tier = s.items(.tier),
         };
+    }
+
+    pub fn setMovementRow(self: *CollisionBoundsStore, index: usize, movement_row: u32) void {
+        self.rows.slice().items(.movement_row)[index] = movement_row;
+    }
+
+    pub fn setTier(self: *CollisionBoundsStore, index: usize, tier: SimulationTier) void {
+        self.rows.slice().items(.tier)[index] = tier;
+    }
+
+    pub fn movementRowAt(self: *const CollisionBoundsStore, index: usize) u32 {
+        return self.rows.slice().items(.movement_row)[index];
     }
 
     pub fn clearRetainingCapacity(self: *CollisionBoundsStore) void {

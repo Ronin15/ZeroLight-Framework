@@ -22,9 +22,16 @@ const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const simd = @import("../../core/simd.zig");
 const math = @import("../../core/math.zig");
+const pdqSort = @import("../../core/sort.zig").pdq;
+const logging = @import("../../core/logging.zig");
+const banded_sort = @import("banded_sort.zig");
+const BandOffsets = banded_sort.BandOffsets;
+const no_component_row = @import("../data_system/types.zig").no_component_row;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const JobFn = @import("../../app/thread_system.zig").JobFn;
+const RoundDispatch = @import("../../app/thread_system.zig").RoundDispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -32,10 +39,13 @@ const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
+
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const PrimitiveVisual = @import("../data_system.zig").PrimitiveVisual;
 const EntityId = @import("../data_system.zig").EntityId;
+const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
+const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const HotI32Slice = @import("../data_system.zig").HotI32Slice;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -55,6 +65,11 @@ const every_cognition_phase = @import("spatial_index.zig").every_cognition_phase
 /// Cache-line range alignment for the scope passes, matching the other hot stages
 /// so worker ranges land on aligned SoA boundaries.
 pub const scope_range_alignment_items: usize = movement_range_alignment_items;
+
+/// Think place, sort, and pack write 1-byte columns. A range of this many items
+/// spans one cache line of those columns. Other scope stages stay on
+/// `scope_range_alignment_items`.
+const think_column_alignment: usize = 64;
 
 /// Per-step threading knobs for the scope passes. Mirrors the other systems:
 /// null `items_per_range` + `adaptive` lets each pass train its own tuner; an
@@ -131,11 +146,30 @@ pub const SimulationScopeSystem = struct {
     ai_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     cognition_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     tier_policy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // Place and sort are different passes, so they do not share a tuner.
+    think_order_place_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    think_order_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    think_pack_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    think_keys: ThinkKeyList = .empty,
+    think_staging: ThinkKeyList = .empty,
+    think_offsets: SlotList(BandOffsets) = .empty,
+    pack_stamp: std.ArrayList(u32) = .empty,
+    pack_stamp_id: u32 = 1,
+    pack_holes: IndexList = .empty,
+    pack_outside: IndexList = .empty,
+    // Run bounds from the last `orderThinkPhases`. Empty until that pass.
+    aa_begin: u32 = 0,
+    aa_halo_end: u32 = 0,
+    aa_end: u32 = 0,
+    phase_begin: [4]u32 = @splat(0),
+    phase_halo_end: [4]u32 = @splat(0),
+    phase_end: [4]u32 = @splat(0),
+    think_scratch_grow_logged: bool = false,
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: the last think set's indexed halo entities
-    /// whose stagger_phase did not match its step, and the last AI gather's cognition
-    /// entities excluded because their chunk is outside the halo.
+    /// whose stagger_phase did not match its step, and the out-of-halo suffixes of the
+    /// think-set runs (`publishRunBounds`).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         stagger_skips: usize = 0,
         chunk_filtered_entities: usize = 0,
@@ -150,10 +184,19 @@ pub const SimulationScopeSystem = struct {
             .ai_gather_tuner = AdaptiveWorkTuner.init(.{}),
             .cognition_tuner = AdaptiveWorkTuner.init(.{}),
             .tier_policy_tuner = AdaptiveWorkTuner.init(.{}),
+            .think_order_place_tuner = AdaptiveWorkTuner.init(.{}),
+            .think_order_tuner = AdaptiveWorkTuner.init(.{}),
+            .think_pack_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
     pub fn deinit(self: *SimulationScopeSystem) void {
+        self.pack_outside.deinit(self.allocator);
+        self.pack_holes.deinit(self.allocator);
+        self.pack_stamp.deinit(self.allocator);
+        self.think_offsets.deinit(self.allocator);
+        self.think_staging.deinit(self.allocator);
+        self.think_keys.deinit(self.allocator);
         self.range_tallies.deinit(self.allocator);
         self.scope_tier_commands.deinit(self.allocator);
         self.chunk_changes.deinit(self.allocator);
@@ -174,6 +217,12 @@ pub const SimulationScopeSystem = struct {
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
         try self.chunk_changes.ensureTotalCapacity(self.allocator, capacity);
         try self.range_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, scope_range_alignment_items));
+        try self.think_keys.ensureTotalCapacity(self.allocator, capacity);
+        try self.think_staging.ensureTotalCapacity(self.allocator, capacity);
+        try self.think_offsets.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, scope_range_alignment_items));
+        try self.pack_stamp.ensureTotalCapacity(self.allocator, capacity);
+        try self.pack_holes.ensureTotalCapacity(self.allocator, capacity);
+        try self.pack_outside.ensureTotalCapacity(self.allocator, capacity);
     }
 
     /// Increment the step counter. Call once at the top of each fixed step.
@@ -292,7 +341,6 @@ pub const SimulationScopeSystem = struct {
         if (data.tierCount(.dormant) + data.tierCount(.kinematic) == 0) return .{ .indices = null };
 
         const bounds = data.collisionBoundsSliceConst();
-        const scope = data.scopeColumnsSliceConst();
         const selection = thread_system.selectBatchProfile(&self.collision_gather_tuner, .{
             .item_count = n,
             .items_per_range = config.items_per_range,
@@ -303,10 +351,8 @@ pub const SimulationScopeSystem = struct {
         });
         try self.prepareRangeWindows(u32, &self.collision_indices, n, selection.range_count);
         var context = CollisionGatherContext{
-            .data = data,
             .dynamic_ids = dynamic_ids,
-            .bounds_entities = bounds.entities,
-            .tier = scope.tier,
+            .tier = bounds.tier,
             .out = self.collision_indices.items,
             .items_per_range = selection.items_per_range,
             .tallies = self.range_tallies.items,
@@ -321,10 +367,356 @@ pub const SimulationScopeSystem = struct {
         return .{ .indices = if (merged.any_excluded) self.collision_indices.items else null, .perf = scopeBatchPerf(batch) };
     }
 
+    // ---- Think-set phase order ------------------------------------------------
+
+    /// The spatial-index cell grid the think key's chunk and local cell come from.
+    pub const ThinkCellGrid = struct {
+        cell_size: f32,
+        cells_x: u32,
+        cells_y: u32,
+        cells_per_chunk: u32,
+    };
+
+    /// Orders every AI row into an always-active run and one run per stagger phase, cell-major
+    /// within each run, and publishes those bounds. One place dispatch and one sort dispatch.
+    /// Grows scratch on this thread before either dispatch; workers do not allocate.
+    pub fn orderThinkPhases(
+        self: *SimulationScopeSystem,
+        data: *DataSystem,
+        cognition_region: ?ActiveRegion,
+        grid: ThinkCellGrid,
+        thread_system: *ThreadSystem,
+        config: ScopeConfig,
+    ) !void {
+        const n = data.ai_agents.len();
+        if (n == 0) {
+            self.clearThinkRuns();
+            return;
+        }
+        const grew = try data.ai_agents.prepareOrderImage(data.allocator, n);
+        try self.ensureThinkScratch(n);
+        if (grew) self.noteThinkScratchGrow(n);
+        const splitters = self.sampleThinkSplitters(data, cognition_region, grid, n);
+        self.think_keys.items.len = n;
+        self.think_staging.items.len = n;
+        const place_items = blk: {
+            const selection = thread_system.selectBatchProfile(&self.think_order_place_tuner, .{
+                .item_count = n,
+                .items_per_range = config.items_per_range,
+                .batches_per_participant = config.batches_per_participant,
+                .max_worker_threads = config.max_worker_threads,
+                .range_alignment_items = think_column_alignment,
+                .adaptive = config.adaptive,
+            });
+            try self.prepareThinkOffsets(selection.range_count);
+            var place_job = ThinkPlaceJob{
+                .data = data,
+                .region = cognition_region,
+                .grid = grid,
+                .splitters = splitters,
+                .keys = self.think_keys.items,
+                .staging = self.think_staging.items,
+                .items_per_range = selection.items_per_range,
+                .offsets = self.think_offsets.items,
+            };
+            _ = thread_system.parallelForWithOptions(n, &place_job, thinkPlaceJob, .{
+                .max_worker_threads = selection.worker_threads,
+                .range_alignment_items = think_column_alignment,
+                .adaptive_tuner = selection.active_tuner,
+                .selected_profile = selection.profile,
+            });
+            break :blk selection.items_per_range;
+        };
+        var starts: [banded_sort.band_count + 1]u32 = @splat(0);
+        for (self.think_offsets.items) |slot| {
+            for (&starts, slot.value.offsets) |*start, offset| start.* += offset;
+        }
+        {
+            const selection = thread_system.selectBatchProfile(&self.think_order_tuner, .{
+                .item_count = n,
+                .items_per_range = config.items_per_range,
+                .batches_per_participant = config.batches_per_participant,
+                .max_worker_threads = config.max_worker_threads,
+                .range_alignment_items = think_column_alignment,
+                .adaptive = config.adaptive,
+            });
+            var sort_job = ThinkSortJob{
+                .source = .{
+                    .staging = self.think_staging.items,
+                    .band_offsets = self.think_offsets.items,
+                    .window_stride = place_items,
+                },
+                .keys = self.think_keys.items,
+                .starts = starts,
+                .agents = &data.ai_agents,
+                .range_count = selection.range_count,
+            };
+            _ = thread_system.parallelForWithOptions(n, &sort_job, thinkSortJob, .{
+                .max_worker_threads = selection.worker_threads,
+                .range_alignment_items = think_column_alignment,
+                .adaptive_tuner = selection.active_tuner,
+                .selected_profile = selection.profile,
+            });
+        }
+        data.ai_agents.publishOrderImage();
+        data.retieAiRows();
+        self.publishRunBounds(data, cognition_region);
+    }
+
+    /// Packs `ai_cognition_indices` into one span of the same entities, in that order, and
+    /// packs the perception, memory, and affect rows those agents name to the same order.
+    pub fn packThinkSpan(
+        self: *SimulationScopeSystem,
+        data: *DataSystem,
+        thread_system: *ThreadSystem,
+        config: ScopeConfig,
+    ) !void {
+        const n = self.ai_cognition_indices.items.len;
+        if (n == 0) return;
+        const grew = try data.ai_agents.ensureOrderImage(data.allocator, n);
+        const perception_grew = try data.ai_perceptions.ensurePackImage(data.allocator, n);
+        const memory_grew = try data.ai_memories.ensurePackImage(data.allocator, n);
+        const affect_grew = try data.ai_affects.ensurePackImage(data.allocator, n);
+        try self.ensureThinkScratch(data.ai_agents.len());
+        if (grew or perception_grew or memory_grew or affect_grew) self.noteThinkScratchGrow(n);
+        // The image fill and the prefix copies are rounds of this pack. One sample.
+        var rounds = RoundDispatch.beginAligned(Dispatch.init(thread_system, &self.think_pack_tuner, .{
+            .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
+        }), n, think_column_alignment);
+        const items_per_range = rounds.selection.?.items_per_range;
+        var copy_job = ThinkPackJob{
+            .agents = &data.ai_agents,
+            .perm = self.ai_cognition_indices.items,
+            .items_per_range = items_per_range,
+        };
+        var copy = ThinkCopy{ .rounds = &rounds, .items_per_range = items_per_range };
+        copy.dispatch(n, &copy_job, thinkPackJob);
+        try self.installThinkSpan(data, n, &copy);
+        _ = rounds.finish(n);
+    }
+
+    fn clearThinkRuns(self: *SimulationScopeSystem) void {
+        self.aa_begin = 0;
+        self.aa_halo_end = 0;
+        self.aa_end = 0;
+        self.phase_begin = @splat(0);
+        self.phase_halo_end = @splat(0);
+        self.phase_end = @splat(0);
+        if (comptime runtime_perf_log.enabled) self.perf.chunk_filtered_entities = 0;
+    }
+
+    fn ensureThinkScratch(self: *SimulationScopeSystem, count: usize) !void {
+        const before = self.think_keys.capacity;
+        try self.think_keys.ensureTotalCapacity(self.allocator, count);
+        try self.think_staging.ensureTotalCapacity(self.allocator, count);
+        try self.pack_stamp.ensureTotalCapacity(self.allocator, count);
+        try self.pack_holes.ensureTotalCapacity(self.allocator, count);
+        try self.pack_outside.ensureTotalCapacity(self.allocator, count);
+        if (self.think_keys.capacity > before) self.noteThinkScratchGrow(count);
+    }
+
+    fn noteThinkScratchGrow(self: *SimulationScopeSystem, count: usize) void {
+        if (self.think_scratch_grow_logged) return;
+        self.think_scratch_grow_logged = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn("think-set scratch grew to {d} rows", .{count});
+    }
+
+    fn prepareThinkOffsets(self: *SimulationScopeSystem, range_count: usize) !void {
+        try self.think_offsets.ensureTotalCapacityPrecise(self.allocator, range_count);
+        setSlotCount(BandOffsets, &self.think_offsets, range_count);
+    }
+
+    fn sampleThinkSplitters(self: *SimulationScopeSystem, data: *const DataSystem, region: ?ActiveRegion, grid: ThinkCellGrid, n: usize) ThinkSort.Splitters {
+        _ = self;
+        var samples: [banded_sort.splitter_sample_count]u128 = undefined;
+        const count = banded_sort.sampleCount(n);
+        const agents = data.aiAgentSliceConst();
+        const movement = data.movementBodySliceConst();
+        const scope = data.scopeColumnsSliceConst();
+        for (samples[0..count], 0..) |*sample, index| {
+            const row = banded_sort.sampleSlot(index, n);
+            sample.* = thinkKeyAt(agents, movement, scope, region, grid, row);
+        }
+        return ThinkSort.splittersFromSamples(samples[0..count]);
+    }
+
+    fn publishRunBounds(self: *SimulationScopeSystem, data: *const DataSystem, region: ?ActiveRegion) void {
+        const ai = data.aiAgentSliceConst();
+        const n: u32 = @intCast(ai.entities.len);
+        var i: u32 = 0;
+        self.aa_begin = 0;
+        while (i < n and ai.always_active[i] and rowInHalo(ai.tier[i], true, ai.chunk_x[i], ai.chunk_y[i], region)) : (i += 1) {}
+        self.aa_halo_end = i;
+        while (i < n and ai.always_active[i]) : (i += 1) {}
+        self.aa_end = i;
+        for (0..4) |phase| {
+            const phase_id: u8 = @intCast(phase);
+            self.phase_begin[phase] = i;
+            while (i < n and !ai.always_active[i] and ai.stagger_phase[i] == phase_id and rowInHalo(ai.tier[i], false, ai.chunk_x[i], ai.chunk_y[i], region)) : (i += 1) {}
+            self.phase_halo_end[phase] = i;
+            while (i < n and !ai.always_active[i] and ai.stagger_phase[i] == phase_id) : (i += 1) {}
+            self.phase_end[phase] = i;
+        }
+        if (comptime runtime_perf_log.enabled) {
+            // The in-halo prefixes are the gather. The suffixes are the rows the halo drops.
+            var out_of_halo: usize = @intCast(self.aa_end - self.aa_halo_end);
+            for (0..4) |phase| out_of_halo += @intCast(self.phase_end[phase] - self.phase_halo_end[phase]);
+            self.perf.chunk_filtered_entities = out_of_halo;
+        }
+    }
+
+    fn haloCount(self: *const SimulationScopeSystem) usize {
+        var n: usize = self.aa_halo_end - self.aa_begin;
+        for (0..4) |phase| n += self.phase_halo_end[phase] - self.phase_begin[phase];
+        return n;
+    }
+
+    fn installThinkSpan(self: *SimulationScopeSystem, data: *DataSystem, n: usize, copy: *ThinkCopy) !void {
+        const sources = self.ai_cognition_indices.items[0..n];
+        const ai_len = data.ai_agents.len();
+        try self.ensureThinkScratch(ai_len);
+        self.growStamp(ai_len);
+        const stamp = self.bumpStamp();
+        for (sources) |source| self.pack_stamp.items[source] = stamp;
+        self.pack_holes.clearRetainingCapacity();
+        self.pack_outside.clearRetainingCapacity();
+        var hole_i: u32 = 0;
+        while (hole_i < n) : (hole_i += 1) {
+            if (self.pack_stamp.items[hole_i] != stamp) self.pack_holes.appendAssumeCapacity(hole_i);
+        }
+        for (sources) |source| {
+            if (source >= n) self.pack_outside.appendAssumeCapacity(source);
+        }
+        std.debug.assert(self.pack_holes.items.len == self.pack_outside.items.len);
+        const moved = self.pack_holes.items.len;
+        if (moved > 0) {
+            var scatter = ThinkScatterJob{
+                .agents = &data.ai_agents,
+                .dest_index = self.pack_outside.items,
+                .src_index = self.pack_holes.items,
+                .items_per_range = copy.items_per_range,
+            };
+            copy.dispatch(moved, &scatter, thinkScatterJob);
+        }
+        var apply = ThinkApplyJob{
+            .agents = &data.ai_agents,
+            .items_per_range = copy.items_per_range,
+        };
+        copy.dispatch(n, &apply, thinkApplyJob);
+        data.retieAiRows();
+        for (sources, 0..) |_, k| sources[k] = @intCast(k);
+        try self.packOptionalColumn(data, n, .perception, copy);
+        try self.packOptionalColumn(data, n, .memory, copy);
+        try self.packOptionalColumn(data, n, .affect, copy);
+    }
+
+    fn growStamp(self: *SimulationScopeSystem, len: usize) void {
+        if (self.pack_stamp.items.len >= len) return;
+        const old = self.pack_stamp.items.len;
+        self.pack_stamp.items.len = len;
+        @memset(self.pack_stamp.items[old..], 0);
+    }
+
+    fn bumpStamp(self: *SimulationScopeSystem) u32 {
+        self.pack_stamp_id +%= 1;
+        if (self.pack_stamp_id == 0) {
+            @memset(self.pack_stamp.items, 0);
+            self.pack_stamp_id = 1;
+        }
+        return self.pack_stamp_id;
+    }
+
+    fn packOptionalColumn(self: *SimulationScopeSystem, data: *DataSystem, n: usize, column: DataSystem.PackedColumn, copy: *ThinkCopy) !void {
+        const agents = data.aiAgentSliceConst();
+        self.pack_holes.clearRetainingCapacity();
+        for (0..n) |k| {
+            const row = switch (column) {
+                .perception => agents.perception_row[k],
+                .memory => agents.memory_row[k],
+                .affect => agents.affect_row[k],
+            };
+            if (row != no_component_row) self.pack_holes.appendAssumeCapacity(row);
+        }
+        const listed = self.pack_holes.items.len;
+        if (listed == 0) return;
+        const store_len: usize = switch (column) {
+            .perception => data.ai_perceptions.len(),
+            .memory => data.ai_memories.len(),
+            .affect => data.ai_affects.len(),
+        };
+        // Size for the store before the slice is captured. `installOptionalRows` ensures
+        // the same count; a later grow would free this slice under the stamp walk.
+        const outside_before = self.pack_outside.capacity;
+        try self.pack_outside.ensureTotalCapacity(self.allocator, @max(store_len, listed));
+        if (self.pack_outside.capacity > outside_before) self.noteThinkScratchGrow(store_len);
+        self.pack_outside.clearRetainingCapacity();
+        self.pack_outside.appendSliceAssumeCapacity(self.pack_holes.items);
+        const old_sources = self.pack_outside.items;
+        var image = OptionalPackJob{
+            .data = data,
+            .column = column,
+            .mode = .to_image,
+            .perm = old_sources,
+            .items_per_range = copy.items_per_range,
+        };
+        copy.dispatch(listed, &image, optionalPackJob);
+        try self.installOptionalRows(data, old_sources, column, copy);
+    }
+
+    fn installOptionalRows(self: *SimulationScopeSystem, data: *DataSystem, sources: []const u32, column: DataSystem.PackedColumn, copy: *ThinkCopy) !void {
+        const n = sources.len;
+        const store_len: usize = switch (column) {
+            .perception => data.ai_perceptions.len(),
+            .memory => data.ai_memories.len(),
+            .affect => data.ai_affects.len(),
+        };
+        try self.ensureThinkScratch(@max(store_len, n));
+        self.growStamp(store_len);
+        const stamp = self.bumpStamp();
+        for (sources) |source| self.pack_stamp.items[source] = stamp;
+        self.pack_holes.clearRetainingCapacity();
+        var hole_i: u32 = 0;
+        while (hole_i < n) : (hole_i += 1) {
+            if (self.pack_stamp.items[hole_i] != stamp) self.pack_holes.appendAssumeCapacity(hole_i);
+        }
+        if (self.think_keys.items.len < n) self.think_keys.items.len = n;
+        var outside_count: usize = 0;
+        for (sources) |source| {
+            if (source >= n) {
+                self.think_keys.items[outside_count].source = source;
+                outside_count += 1;
+            }
+        }
+        std.debug.assert(outside_count == self.pack_holes.items.len);
+        if (outside_count > 0) {
+            var scatter = OptionalPackJob{
+                .data = data,
+                .column = column,
+                .mode = .scatter,
+                .holes = self.pack_holes.items,
+                .slots = self.think_keys.items,
+                .items_per_range = copy.items_per_range,
+            };
+            copy.dispatch(outside_count, &scatter, optionalPackJob);
+        }
+        var apply = OptionalPackJob{
+            .data = data,
+            .column = column,
+            .mode = .from_image,
+            .items_per_range = copy.items_per_range,
+        };
+        copy.dispatch(n, &apply, optionalPackJob);
+        for (0..outside_count) |j| data.retiePackedRow(column, self.think_keys.items[j].source);
+        for (0..n) |k| data.retiePackedRow(column, @intCast(k));
+    }
+
     // ---- AI halo gather and think set (threaded compactions) -----------------
 
-    /// Builds this step's AI halo: cognition tier inside `cognition_region` (every
-    /// cognition-tier row when null), `always_active` included.
+    /// Builds this step's AI halo from the phase runs `orderThinkPhases` published:
+    /// the always-active in-halo prefix and each phase's in-halo prefix.
     pub fn gatherAiPopulations(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
@@ -332,15 +724,15 @@ pub const SimulationScopeSystem = struct {
         thread_system: *ThreadSystem,
         config: ScopeConfig,
     ) !AiPopulationGatherResult {
-        const ai = data.aiAgentSliceConst();
-        const n = ai.entities.len;
+        _ = data;
+        _ = cognition_region;
+        const n = self.haloCount();
         self.perf = .{};
         if (n == 0) {
             self.ai_halo_indices.clearRetainingCapacity();
             return .{ .halo = self.ai_halo_indices.items };
         }
 
-        const scope = data.scopeColumnsSliceConst();
         const selection = thread_system.selectBatchProfile(&self.ai_gather_tuner, .{
             .item_count = n,
             .items_per_range = config.items_per_range,
@@ -351,10 +743,10 @@ pub const SimulationScopeSystem = struct {
         });
         try self.prepareRangeWindows(u32, &self.ai_halo_indices, n, selection.range_count);
         var context = AiGatherContext{
-            .data = data,
-            .ai_entities = ai.entities,
-            .scope = scope,
-            .cognition_region = cognition_region,
+            .aa_begin = self.aa_begin,
+            .aa_halo_end = self.aa_halo_end,
+            .phase_begin = self.phase_begin,
+            .phase_halo_end = self.phase_halo_end,
             .item_count = n,
             .out = self.ai_halo_indices.items,
             .items_per_range = selection.items_per_range,
@@ -366,8 +758,7 @@ pub const SimulationScopeSystem = struct {
             .adaptive_tuner = selection.active_tuner,
             .selected_profile = selection.profile,
         });
-        const merged = compactIndexWindows(&self.ai_halo_indices, self.range_tallies.items, selection.items_per_range);
-        if (comptime runtime_perf_log.enabled) self.perf.chunk_filtered_entities = merged.perf.chunk_filtered;
+        _ = compactIndexWindows(&self.ai_halo_indices, self.range_tallies.items, selection.items_per_range);
         return .{ .halo = self.ai_halo_indices.items, .perf = scopeBatchPerf(batch) };
     }
 
@@ -727,10 +1118,261 @@ fn scanTierPolicy(
     return count;
 }
 
+const ThinkKey = struct {
+    key: u128,
+    source: u32,
+};
+
+fn thinkKeyOf(item: ThinkKey) u128 {
+    return item.key;
+}
+
+const ThinkSort = banded_sort.BandedSort(ThinkKey, thinkKeyOf);
+const ThinkKeyList = std.ArrayList(ThinkKey);
+
+fn thinkKeyLess(_: void, lhs: ThinkKey, rhs: ThinkKey) bool {
+    return lhs.key < rhs.key;
+}
+
+fn rowInHalo(tier: SimulationTier, always_active: bool, chunk_x: i32, chunk_y: i32, region: ?ActiveRegion) bool {
+    if (!tier.allowsCognition()) return false;
+    if (always_active) return true;
+    if (region) |active| return active.containsChunk(.{ .x = chunk_x, .y = chunk_y });
+    return true;
+}
+
+fn packThinkKey(always_active: bool, phase: u8, in_halo: bool, level: u16, chunk_x: u32, chunk_y: u32, local_x: u32, local_y: u32, faction: u32, entity: u32) u128 {
+    const aa_bit: u128 = if (always_active) 0 else 1;
+    const phase_bits: u128 = if (always_active) 0 else phase;
+    const halo_bit: u128 = if (in_halo) 0 else 1;
+    return (aa_bit << 127) | (phase_bits << 125) | (halo_bit << 124) |
+        (@as(u128, level) << 108) | (@as(u128, chunk_y & 0x7fff_ffff) << 77) | (@as(u128, chunk_x & 0x7fff_ffff) << 46) |
+        (@as(u128, local_y) << 40) | (@as(u128, local_x) << 34) | (@as(u128, faction) << 32) | entity;
+}
+
+fn cellParts(grid: SimulationScopeSystem.ThinkCellGrid, x: f32, y: f32) struct { chunk_x: u32, chunk_y: u32, local_x: u32, local_y: u32 } {
+    const cx = math.worldPosToCell(x, grid.cell_size, grid.cells_x);
+    const cy = math.worldPosToCell(y, grid.cell_size, grid.cells_y);
+    const per = if (grid.cells_per_chunk == 0) 1 else grid.cells_per_chunk;
+    return .{ .chunk_x = cx / per, .chunk_y = cy / per, .local_x = cx % per, .local_y = cy % per };
+}
+
+fn thinkKeyAt(agents: ConstAiAgentSlice, movement: ConstMovementBodySlice, scope: ConstScopeColumnsSlice, region: ?ActiveRegion, grid: SimulationScopeSystem.ThinkCellGrid, row: usize) u128 {
+    const linked = agents.movement_row[row];
+    const tier = if (linked == no_component_row) agents.tier[row] else scope.tier[linked];
+    const always_active = if (linked == no_component_row) agents.always_active[row] else scope.always_active[linked];
+    const phase = if (linked == no_component_row) agents.stagger_phase[row] else scope.stagger_phase[linked];
+    const level = if (linked == no_component_row) agents.level[row] else scope.level[linked];
+    const chunk_x = if (linked == no_component_row) agents.chunk_x[row] else scope.chunk_x[linked];
+    const chunk_y = if (linked == no_component_row) agents.chunk_y[row] else scope.chunk_y[linked];
+    const previous_x = if (linked == no_component_row) agents.previous_x[row] else movement.previous_x[linked];
+    const previous_y = if (linked == no_component_row) agents.previous_y[row] else movement.previous_y[linked];
+    const cell = cellParts(grid, previous_x, previous_y);
+    return packThinkKey(always_active, phase, rowInHalo(tier, always_active, chunk_x, chunk_y, region), level, cell.chunk_x, cell.chunk_y, cell.local_x, cell.local_y, @intCast(@backingInt(agents.faction[row])), agents.entities[row].index);
+}
+
+const ThinkPlaceJob = struct {
+    data: *DataSystem,
+    region: ?ActiveRegion,
+    grid: SimulationScopeSystem.ThinkCellGrid,
+    splitters: ThinkSort.Splitters,
+    keys: []ThinkKey,
+    staging: []ThinkKey,
+    items_per_range: usize,
+    offsets: []PaddedSlot(BandOffsets),
+};
+
+fn thinkPlaceJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ThinkPlaceJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.offsets.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.keys.len and range.end <= job.staging.len);
+    const writable = job.data.ai_agents.rows.slice();
+    const movement = job.data.movementBodySliceConst();
+    const scope = job.data.scopeColumnsSliceConst();
+    const movement_row = writable.items(.movement_row);
+    const level = writable.items(.level);
+    const chunk_x = writable.items(.chunk_x);
+    const chunk_y = writable.items(.chunk_y);
+    const tier = writable.items(.tier);
+    const phase = writable.items(.stagger_phase);
+    const always_active = writable.items(.always_active);
+    const previous_x = writable.items(.previous_x);
+    const previous_y = writable.items(.previous_y);
+    const velocity_x = writable.items(.velocity_x);
+    const velocity_y = writable.items(.velocity_y);
+    for (range.start..range.end) |i| {
+        const linked = movement_row[i];
+        if (linked == no_component_row) continue;
+        level[i] = scope.level[linked];
+        chunk_x[i] = scope.chunk_x[linked];
+        chunk_y[i] = scope.chunk_y[linked];
+        tier[i] = scope.tier[linked];
+        phase[i] = scope.stagger_phase[linked];
+        always_active[i] = scope.always_active[linked];
+        previous_x[i] = movement.previous_x[linked];
+        previous_y[i] = movement.previous_y[linked];
+        velocity_x[i] = movement.velocity_x[linked];
+        velocity_y[i] = movement.velocity_y[linked];
+    }
+    var i = range.start;
+    while (i < range.end) {
+        const count = @min(simd.lane_count, range.end - i);
+        const cell_x = simd.worldPosToCell4(simd.loadFloat4Lanes(previous_x[i..], count), job.grid.cell_size, job.grid.cells_x);
+        const cell_y = simd.worldPosToCell4(simd.loadFloat4Lanes(previous_y[i..], count), job.grid.cell_size, job.grid.cells_y);
+        const per: u32 = if (job.grid.cells_per_chunk == 0) 1 else job.grid.cells_per_chunk;
+        const factions = writable.items(.faction);
+        const entities = writable.items(.entity);
+        inline for (0..simd.lane_count) |lane| {
+            if (lane < count) {
+                const row = i + lane;
+                const cx: u32 = @intCast(cell_x[lane]);
+                const cy: u32 = @intCast(cell_y[lane]);
+                const in_halo = rowInHalo(tier[row], always_active[row], chunk_x[row], chunk_y[row], job.region);
+                job.keys[row] = .{
+                    .key = packThinkKey(always_active[row], phase[row], in_halo, level[row], cx / per, cy / per, cx % per, cy % per, @intCast(@backingInt(factions[row])), entities[row].index),
+                    .source = @intCast(row),
+                };
+            }
+        }
+        i += count;
+    }
+    job.offsets[range.index].value = ThinkSort.placeByBand(&job.splitters, job.keys[range.start..range.end], job.staging[range.start..range.end]);
+}
+
+const ThinkSortJob = struct {
+    source: ThinkSort.WindowSource,
+    keys: []ThinkKey,
+    starts: [banded_sort.band_count + 1]u32,
+    agents: *@import("../data_system/agents.zig").AiAgentStore,
+    range_count: usize,
+};
+
+fn thinkSourceAt(keys: []ThinkKey, index: usize) usize {
+    // `source` is a row index stored as u32.
+    return @intCast(keys[index].source);
+}
+
+fn thinkSlotAt(keys: []const ThinkKey, index: usize) usize {
+    return @intCast(keys[index].source);
+}
+
+fn thinkSortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ThinkSortJob = @ptrCast(@alignCast(context));
+    const total = job.starts[banded_sort.band_count];
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.end <= total and total <= job.keys.len);
+    var spans: [banded_sort.band_count][2]usize = undefined;
+    var span_count: usize = 0;
+    var owned = banded_sort.OwnedBands.init(&job.starts, range.start, range.end);
+    while (owned.next()) |band| {
+        const start: usize = job.starts[band];
+        const end: usize = job.starts[band + 1];
+        const gathered = ThinkSort.gatherBand(job.keys[start..end], band, .{job.source});
+        std.debug.assert(gathered == end - start);
+        pdqSort(ThinkKey, job.keys[start..end], {}, thinkKeyLess);
+        spans[span_count] = .{ start, end };
+        span_count += 1;
+    }
+    if (span_count == 0) return;
+    job.agents.writeOrderSpans(spans[0..span_count], job.keys, thinkSourceAt);
+}
+
+const ThinkPackJob = struct {
+    agents: *@import("../data_system/agents.zig").AiAgentStore,
+    perm: []const u32,
+    items_per_range: usize,
+};
+
+fn thinkPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ThinkPackJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.perm.len);
+    job.agents.writeOrderImage(range.start, range.end, job.perm);
+}
+
+const ThinkScatterJob = struct {
+    agents: *@import("../data_system/agents.zig").AiAgentStore,
+    dest_index: []const u32,
+    src_index: []const u32,
+    items_per_range: usize,
+};
+
+fn thinkScatterJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ThinkScatterJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.dest_index.len and range.end <= job.src_index.len);
+    job.agents.scatterRows(range.start, range.end, job.dest_index, job.src_index, u32Index, u32Index);
+}
+
+const ThinkApplyJob = struct {
+    agents: *@import("../data_system/agents.zig").AiAgentStore,
+    items_per_range: usize,
+};
+
+fn thinkApplyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ThinkApplyJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.end <= job.agents.len());
+    job.agents.copyOrderToRows(range.start, range.end);
+}
+
+const OptionalPackMode = enum { to_image, scatter, from_image };
+
+const OptionalPackJob = struct {
+    data: *DataSystem,
+    column: DataSystem.PackedColumn,
+    mode: OptionalPackMode,
+    perm: []const u32 = &.{},
+    holes: []const u32 = &.{},
+    slots: []const ThinkKey = &.{},
+    items_per_range: usize,
+};
+
+fn optionalPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *OptionalPackJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end);
+    switch (job.mode) {
+        .to_image => {
+            std.debug.assert(range.end <= job.perm.len);
+            switch (job.column) {
+                .perception => job.data.ai_perceptions.copyToPack(range.start, range.end, job.perm),
+                .memory => job.data.ai_memories.copyToPack(range.start, range.end, job.perm),
+                .affect => job.data.ai_affects.copyToPack(range.start, range.end, job.perm),
+            }
+        },
+        .scatter => {
+            std.debug.assert(range.end <= job.holes.len and range.end <= job.slots.len);
+            switch (job.column) {
+                .perception => job.data.ai_perceptions.scatterRows(range.start, range.end, job.slots, job.holes, thinkSlotAt, u32Index),
+                .memory => job.data.ai_memories.scatterRows(range.start, range.end, job.slots, job.holes, thinkSlotAt, u32Index),
+                .affect => job.data.ai_affects.scatterRows(range.start, range.end, job.slots, job.holes, thinkSlotAt, u32Index),
+            }
+        },
+        .from_image => switch (job.column) {
+            .perception => job.data.ai_perceptions.copyPackToRows(range.start, range.end),
+            .memory => job.data.ai_memories.copyPackToRows(range.start, range.end),
+            .affect => job.data.ai_affects.copyPackToRows(range.start, range.end),
+        },
+    }
+}
+
+const u32Index = @import("../data_system/types.zig").u32Index;
+
+const ThinkCopy = struct {
+    rounds: *RoundDispatch,
+    items_per_range: usize,
+
+    fn dispatch(self: *ThinkCopy, item_count: usize, context: *anyopaque, job_fn: JobFn) void {
+        if (item_count == 0) return;
+        var range_count: usize = 0;
+        self.rounds.run(item_count, context, &range_count, job_fn);
+    }
+};
+
 const CollisionGatherContext = struct {
-    data: *const DataSystem,
     dynamic_ids: []const u32,
-    bounds_entities: []const EntityId,
     tier: []const SimulationTier,
     /// Item-count output; range r writes only its own `[range.start, range.end)` window.
     out: []u32,
@@ -755,8 +1397,7 @@ fn collisionGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) vo
     var tally: GatherTally = .{};
     for (range.start..range.end) |i| {
         const bounds_index = job.dynamic_ids[i];
-        const di = job.data.movementBodyDenseIndex(job.bounds_entities[bounds_index]) orelse continue;
-        if (job.tier[di].allowsCollision()) {
+        if (job.tier[bounds_index].allowsCollision()) {
             window[tally.count] = bounds_index;
             tally.count += 1;
         } else {
@@ -767,41 +1408,37 @@ fn collisionGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) vo
 }
 
 const AiGatherContext = struct {
-    data: *const DataSystem,
-    ai_entities: []const EntityId,
-    scope: ConstScopeColumnsSlice,
-    cognition_region: ?ActiveRegion,
+    aa_begin: u32,
+    aa_halo_end: u32,
+    phase_begin: [4]u32,
+    phase_halo_end: [4]u32,
     item_count: usize,
     /// Item-count output; range r writes only its own `[range.start, range.end)` window.
     out: []u32,
     items_per_range: usize,
     tallies: []GatherTallySlot,
+
+    fn rowAt(self: *const AiGatherContext, item: usize) u32 {
+        const aa: usize = self.aa_halo_end - self.aa_begin;
+        if (item < aa) return self.aa_begin + @as(u32, @intCast(item));
+        var cursor = aa;
+        for (0..4) |phase| {
+            const count: usize = self.phase_halo_end[phase] - self.phase_begin[phase];
+            if (item < cursor + count) return self.phase_begin[phase] + @as(u32, @intCast(item - cursor));
+            cursor += count;
+        }
+        unreachable;
+    }
 };
 
 fn aiGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiGatherContext = @ptrCast(@alignCast(context));
-    // Window asserts plus range.end vs the candidate count this job walks.
     assertRangeWindow(range, job.items_per_range, job.tallies.len, job.out.len);
     std.debug.assert(range.end <= job.item_count);
     const window = job.out[range.start..range.end];
     var tally: GatherTally = .{};
-    const scope = job.scope;
     for (range.start..range.end) |i| {
-        const ent = job.ai_entities[i];
-        const di = job.data.movementBodyDenseIndex(ent) orelse continue;
-        if (!scope.tier[di].allowsCognition()) continue;
-        if (scope.always_active[di]) {
-            window[tally.count] = @intCast(i);
-            tally.count += 1;
-            continue;
-        }
-        if (job.cognition_region) |region| {
-            if (!region.containsChunk(.{ .x = scope.chunk_x[di], .y = scope.chunk_y[di] })) {
-                if (comptime runtime_perf_log.enabled) tally.perf.chunk_filtered += 1;
-                continue;
-            }
-        }
-        window[tally.count] = @intCast(i);
+        window[tally.count] = job.rowAt(i);
         tally.count += 1;
     }
     job.tallies[range.index].value = tally;
@@ -868,9 +1505,14 @@ fn inlineThreads() !ThreadSystem {
     return ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
 }
 
-fn gatherAiInline(sys: *SimulationScopeSystem, data: *const DataSystem, region: ?ActiveRegion) !AiPopulationGatherResult {
+fn testThinkGrid() SimulationScopeSystem.ThinkCellGrid {
+    return .{ .cell_size = 32, .cells_x = 4096, .cells_y = 4096, .cells_per_chunk = 8 };
+}
+
+fn gatherAiInline(sys: *SimulationScopeSystem, data: *DataSystem, region: ?ActiveRegion) !AiPopulationGatherResult {
     var threads = try inlineThreads();
     defer threads.deinit();
+    try sys.orderThinkPhases(data, region, testThinkGrid(), &threads, .{});
     return sys.gatherAiPopulations(data, region, &threads, .{});
 }
 
@@ -1670,6 +2312,7 @@ test "threaded ai gather and think set match serial" {
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
     const serial = try gatherAiInline(&serial_sys, &data, region);
+    try threaded_sys.orderThinkPhases(&data, region, testThinkGrid(), &threads, fixed);
     const threaded = try threaded_sys.gatherAiPopulations(&data, region, &threads, fixed);
     try std.testing.expectEqualSlices(u32, serial.halo, threaded.halo);
 
@@ -1759,6 +2402,7 @@ test "real worker threads match serial across every scope pass" {
 
     // AI gather, then the think set over its index.
     const ai_serial = try gatherAiInline(&serial_sys, &data, region);
+    try threaded_sys.orderThinkPhases(&data, region, testThinkGrid(), &threads, fixed);
     const ai_threaded = try threaded_sys.gatherAiPopulations(&data, region, &threads, fixed);
     try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_threaded.halo);
     var index = try testHaloIndex(&data, ai_serial.halo);
@@ -1834,6 +2478,7 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
     // step's shape (data does not change afterward, so re-running is identical).
     const warm_collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expect(warm_collision.indices != null);
+    try sys.orderThinkPhases(&data, ai_region, testThinkGrid(), &threads, .{});
     const warm_ai = try sys.gatherAiPopulations(&data, ai_region, &threads, .{});
     try std.testing.expect(warm_ai.halo.len > 0);
     var index = try testHaloIndex(&data, warm_ai.halo);
@@ -1917,6 +2562,7 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
     try sys.reserve(population);
+    try sys.orderThinkPhases(&data, ai_region, testThinkGrid(), &threads, .{});
     var stream = RangeOutputStream(StructuralCommand).init(allocator);
     defer stream.deinit();
     try stream.reserve(maxRangeCount(population, scope_range_alignment_items), population);
@@ -1993,6 +2639,7 @@ test "scope reserve makes the first single-range threaded gathers and tier polic
     var reference_sys = SimulationScopeSystem.init(allocator);
     defer reference_sys.deinit();
     var index = try testHaloIndex(&data, (try gatherAiInline(&reference_sys, &data, ai_region)).halo);
+    try sys.orderThinkPhases(&data, ai_region, testThinkGrid(), &threads, .{});
     defer index.deinit();
     const view = index.view();
 
@@ -2177,12 +2824,13 @@ test "the think set reads the phases the index was built with" {
     try fillDenseCognitionPopulation(&data, 40);
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
-    var index = try testHaloIndex(&data, null);
+    const halo = (try gatherAiInline(&sys, &data, null)).halo;
+    var index = try testHaloIndex(&data, halo);
     defer index.deinit();
     const view = index.view();
     var expected: std.ArrayList(u32) = .empty;
     defer expected.deinit(allocator);
-    try bruteForceThinkSet(&data, view, (try gatherAiInline(&sys, &data, null)).halo, 1, true, &expected);
+    try bruteForceThinkSet(&data, view, halo, 1, true, &expected);
     // Every agent moves to phase 1 after the build: the think set keeps the built phases.
     for (data.aiAgentSliceConst().entities) |entity| try data.setSimulationMetadata(entity, .{ .tier = .cognition, .stagger_phase = 1 });
     try std.testing.expect(expected.items.len < 40);
@@ -2222,4 +2870,283 @@ test "after reserve, the threaded think set at 32- then 16-item ranges allocates
         try std.testing.expectEqualSlices(u32, serial.cognition, threaded.cognition);
     }
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+}
+
+fn phaseRunIsCellMajor(data: *const DataSystem, region: ?ActiveRegion, begin: u32, end: u32) !void {
+    if (end <= begin) return;
+    const agents = data.aiAgentSliceConst();
+    const movement = data.movementBodySliceConst();
+    const scope = data.scopeColumnsSliceConst();
+    var previous = thinkKeyAt(agents, movement, scope, region, testThinkGrid(), begin);
+    var row = begin + 1;
+    while (row < end) : (row += 1) {
+        const key = thinkKeyAt(agents, movement, scope, region, testThinkGrid(), row);
+        try std.testing.expect(previous <= key);
+        previous = key;
+    }
+}
+
+test "think set phase runs are contiguous and cell-major" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+    var spawned: [4]EntityId = undefined;
+    for (&spawned) |*entity| {
+        entity.* = try data.createEntity();
+        try data.setMovementBody(entity.*, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 } });
+        try data.setAiAgent(entity.*, .{});
+        try data.commitStaggerPhase(entity.*);
+    }
+    var phases = [_]bool{ false, false, false, false };
+    for (spawned) |entity| {
+        const phase = data.movement_bodies.scopeMetadataAt(data.movementBodyDenseIndex(entity).?).stagger_phase;
+        try std.testing.expect(phase < 4);
+        phases[phase] = true;
+    }
+    for (phases) |present| try std.testing.expect(present);
+
+    const outside = try data.createEntity();
+    try data.setMovementBody(outside, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 } });
+    try data.setAiAgent(outside, .{});
+    try data.setSimulationMetadata(outside, .{ .tier = .cognition, .chunk = .{ .x = 30, .y = 30 }, .stagger_phase = 2 });
+    const boss = try data.createEntity();
+    try data.setMovementBody(boss, .{ .position = .{ .x = 64, .y = 64 }, .previous_position = .{ .x = 64, .y = 64 } });
+    try data.setAiAgent(boss, .{});
+    try data.setSimulationMetadata(boss, .{ .tier = .cognition, .chunk = .{ .x = 40, .y = 40 }, .stagger_phase = 1, .always_active = true });
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    try sys.orderThinkPhases(&data, region, testThinkGrid(), &threads, .{});
+
+    const agents = data.aiAgentSliceConst();
+    var row: u32 = 0;
+    var aa_count: usize = 0;
+    while (row < agents.entities.len) : (row += 1) {
+        if (!agents.always_active[row]) continue;
+        aa_count += 1;
+        try std.testing.expect(row >= sys.aa_begin and row < sys.aa_end);
+    }
+    try std.testing.expectEqual(@as(usize, sys.aa_end - sys.aa_begin), aa_count);
+    for (0..4) |phase| {
+        const phase_id: u8 = @intCast(phase);
+        var phase_count: usize = 0;
+        row = 0;
+        while (row < agents.entities.len) : (row += 1) {
+            if (agents.always_active[row] or agents.stagger_phase[row] != phase_id) continue;
+            phase_count += 1;
+            try std.testing.expect(row >= sys.phase_begin[phase] and row < sys.phase_end[phase]);
+        }
+        try std.testing.expectEqual(@as(usize, sys.phase_end[phase] - sys.phase_begin[phase]), phase_count);
+        try phaseRunIsCellMajor(&data, region, sys.phase_begin[phase], sys.phase_end[phase]);
+    }
+    try phaseRunIsCellMajor(&data, region, sys.aa_begin, sys.aa_end);
+
+    const halo = (try sys.gatherAiPopulations(&data, region, &threads, .{})).halo;
+    var cursor: usize = 0;
+    const aa_len: usize = sys.aa_halo_end - sys.aa_begin;
+    for (0..aa_len) |i| try std.testing.expectEqual(sys.aa_begin + @as(u32, @intCast(i)), halo[cursor + i]);
+    cursor = aa_len;
+    for (0..4) |phase| {
+        const count: usize = sys.phase_halo_end[phase] - sys.phase_begin[phase];
+        for (0..count) |i| try std.testing.expectEqual(sys.phase_begin[phase] + @as(u32, @intCast(i)), halo[cursor + i]);
+        cursor += count;
+    }
+    try std.testing.expectEqual(cursor, halo.len);
+    for (halo) |index| try std.testing.expect(!agents.entities[index].eql(outside));
+}
+
+test "a packed think span keeps the think set's entity order" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    try fillDenseCognitionPopulation(&data, 12);
+    const boss = try data.createEntity();
+    try data.setMovementBody(boss, .{ .position = .{ .x = 10, .y = 10 }, .previous_position = .{ .x = 10, .y = 10 } });
+    try data.setAiAgent(boss, .{});
+    try data.setSimulationMetadata(boss, .{ .tier = .cognition, .always_active = true, .stagger_phase = 2 });
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    const halo = (try sys.gatherAiPopulations(&data, null, &threads, .{})).halo;
+    var index = try testHaloIndex(&data, halo);
+    defer index.deinit();
+    const before = try compactCognitionInline(&sys, &index.view(), 0, false);
+    var entities: std.ArrayList(EntityId) = .empty;
+    defer entities.deinit(allocator);
+    const agents_before = data.aiAgentSliceConst();
+    try entities.ensureTotalCapacity(allocator, before.cognition.len);
+    for (before.cognition) |ai_row| entities.appendAssumeCapacity(agents_before.entities[ai_row]);
+    try sys.packThinkSpan(&data, &threads, .{});
+    const span = sys.ai_cognition_indices.items;
+    try std.testing.expectEqual(entities.items.len, span.len);
+    const agents = data.aiAgentSliceConst();
+    for (span, entities.items, 0..) |ai_row, entity, k| {
+        try std.testing.expectEqual(@as(u32, @intCast(k)), ai_row);
+        try std.testing.expect(agents.entities[ai_row].eql(entity));
+    }
+}
+
+test "optional pack keeps listed rows when the component store outgrows the ai scratch" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const thinker_count = 2;
+    var thinkers: [thinker_count]EntityId = undefined;
+    for (&thinkers) |*entity| {
+        entity.* = try data.createEntity();
+        try data.setMovementBody(entity.*, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(entity.*, .{});
+        try data.setAiPerception(entity.*, .{});
+    }
+    // Perception rows with no AI row, past the scratch grown from the AI count.
+    for (0..200) |_| {
+        const extra = try data.createEntity();
+        try data.setAiPerception(extra, .{});
+    }
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    try std.testing.expect(data.ai_perceptions.len() > sys.pack_outside.capacity);
+    const halo = (try sys.gatherAiPopulations(&data, null, &threads, .{})).halo;
+    var index = try testHaloIndex(&data, halo);
+    defer index.deinit();
+    const before = try compactCognitionInline(&sys, &index.view(), 0, false);
+    var expected: std.ArrayList(EntityId) = .empty;
+    defer expected.deinit(allocator);
+    const agents_before = data.aiAgentSliceConst();
+    const perception_before = data.aiPerceptionSliceConst();
+    for (before.cognition) |ai_row| {
+        const perception_row = agents_before.perception_row[ai_row];
+        if (perception_row == no_component_row) continue;
+        try expected.append(allocator, perception_before.entities[perception_row]);
+    }
+    try std.testing.expectEqual(@as(usize, thinker_count), expected.items.len);
+    try sys.packThinkSpan(&data, &threads, .{});
+    const packed_rows = data.aiPerceptionSliceConst();
+    for (expected.items, 0..) |entity, k| try std.testing.expect(packed_rows.entities[k].eql(entity));
+}
+
+test "threaded think order matches serial" {
+    const allocator = std.testing.allocator;
+    var serial_data = DataSystem.init(allocator);
+    defer serial_data.deinit();
+    var threaded_data = DataSystem.init(allocator);
+    defer threaded_data.deinit();
+    try fillCognitionPopulation(&serial_data, 24);
+    try fillCognitionPopulation(&threaded_data, 24);
+    var inline_threads = try inlineThreads();
+    defer inline_threads.deinit();
+    var workers = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer workers.deinit();
+    var serial_sys = SimulationScopeSystem.init(allocator);
+    defer serial_sys.deinit();
+    var threaded_sys = SimulationScopeSystem.init(allocator);
+    defer threaded_sys.deinit();
+    const fixed = ScopeConfig{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
+    try serial_sys.orderThinkPhases(&serial_data, null, testThinkGrid(), &inline_threads, .{});
+    try threaded_sys.orderThinkPhases(&threaded_data, null, testThinkGrid(), &workers, fixed);
+    try std.testing.expectEqualSlices(EntityId, serial_data.aiAgentSliceConst().entities, threaded_data.aiAgentSliceConst().entities);
+    const serial_halo = (try serial_sys.gatherAiPopulations(&serial_data, null, &inline_threads, .{})).halo;
+    var serial_index = try testHaloIndex(&serial_data, serial_halo);
+    defer serial_index.deinit();
+    const threaded_halo = (try threaded_sys.gatherAiPopulations(&threaded_data, null, &workers, fixed)).halo;
+    var threaded_index = try testHaloIndex(&threaded_data, threaded_halo);
+    defer threaded_index.deinit();
+    const serial_think = try compactCognitionInline(&serial_sys, &serial_index.view(), 0, false);
+    const threaded_think = try compactCognitionInline(&threaded_sys, &threaded_index.view(), 0, false);
+    try std.testing.expectEqual(serial_think.cognition.len, threaded_think.cognition.len);
+    const serial_rows = serial_data.aiAgentSliceConst().entities;
+    const threaded_rows = threaded_data.aiAgentSliceConst().entities;
+    for (serial_think.cognition, threaded_think.cognition) |serial_row, threaded_row| {
+        try std.testing.expect(serial_rows[serial_row].eql(threaded_rows[threaded_row]));
+    }
+    try serial_sys.packThinkSpan(&serial_data, &inline_threads, .{});
+    try threaded_sys.packThinkSpan(&threaded_data, &workers, fixed);
+    try std.testing.expectEqualSlices(EntityId, serial_data.aiAgentSliceConst().entities[0..serial_think.cognition.len], threaded_data.aiAgentSliceConst().entities[0..threaded_think.cognition.len]);
+}
+
+test "threaded think order allocates nothing after reserve" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    try fillDenseCognitionPopulation(&data, 20);
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    try sys.reserve(64);
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    const halo = (try sys.gatherAiPopulations(&data, null, &threads, .{})).halo;
+    var index = try testHaloIndex(&data, halo);
+    defer index.deinit();
+    _ = try compactCognitionInline(&sys, &index.view(), 0, false);
+    try sys.packThinkSpan(&data, &threads, .{});
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const failing_allocator = failing.allocator();
+    const saved_data = data.allocator;
+    const saved_sys = sys.allocator;
+    const saved_threads = threads.allocator;
+    data.allocator = failing_allocator;
+    sys.allocator = failing_allocator;
+    threads.allocator = failing_allocator;
+    defer {
+        data.allocator = saved_data;
+        sys.allocator = saved_sys;
+        threads.allocator = saved_threads;
+    }
+    try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    _ = try sys.gatherAiPopulations(&data, null, &threads, .{});
+    _ = try compactCognitionInline(&sys, &index.view(), 0, false);
+    try sys.packThinkSpan(&data, &threads, .{});
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "collision gather filters on the bounds tier column" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const first = try data.createEntity();
+    try data.setMovementBody(first, .{ .position = .{ .x = 1, .y = 1 } });
+    try data.setCollisionBounds(first, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setSimulationTier(first, .locomotion);
+    const dropped = try data.createEntity();
+    try data.setMovementBody(dropped, .{ .position = .{ .x = 8, .y = 8 } });
+    try data.setCollisionBounds(dropped, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setSimulationTier(dropped, .kinematic);
+    const second = try data.createEntity();
+    try data.setMovementBody(second, .{ .position = .{ .x = 16, .y = 16 } });
+    try data.setCollisionBounds(second, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setSimulationTier(second, .locomotion);
+    const dropped_movement = data.movementBodyDenseIndex(dropped).?;
+    var dropped_bounds: usize = 0;
+    for (data.collisionBoundsSliceConst().entities, 0..) |bounds_entity, index| {
+        if (bounds_entity.eql(dropped)) dropped_bounds = index;
+    }
+    // Movement-scope tier now allows collision; the bounds column stays kinematic.
+    data.movement_bodies.setTier(dropped_movement, .locomotion);
+    try std.testing.expect(data.collisionBoundsSliceConst().tier[dropped_bounds] != data.scopeColumnsSliceConst().tier[dropped_movement]);
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    const list = (try gatherCollisionInline(&sys, &data)).?;
+    const bounds = data.collisionBoundsSliceConst();
+    try std.testing.expect(!bounds.tier[dropped_bounds].allowsCollision());
+    var expect_ids: [2]u32 = undefined;
+    var count: usize = 0;
+    for (data.collision_bounds.dynamic_ids.items) |bounds_index| {
+        if (!bounds.tier[bounds_index].allowsCollision()) continue;
+        expect_ids[count] = bounds_index;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualSlices(u32, expect_ids[0..count], list);
+    for (list) |bounds_index| try std.testing.expect(bounds_index != @as(u32, @intCast(dropped_bounds)));
 }

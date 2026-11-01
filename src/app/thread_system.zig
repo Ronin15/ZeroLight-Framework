@@ -2369,10 +2369,12 @@ pub fn offMainNs(batch: BatchStats) u64 {
 /// (no per-round tuner record; a round of one range runs inline), and `finish` records the
 /// summed rounds into the tuner once, at the step's item count and the selected profile, so
 /// the tuner judges one sample per step. With no dispatch each round runs inline as one range.
-/// Rounds use range alignment 1.
+/// `begin` uses range alignment 1. `beginAligned` uses the caller's alignment for the select
+/// and every round.
 pub const RoundDispatch = struct {
     dispatch: ?Dispatch,
     selection: ?BatchSelection = null,
+    range_alignment_items: usize = 1,
     // The rounds folded into one.
     total: BatchStats = .{},
     /// Dispatch time of the rounds that ran on workers, and of those that ran inline.
@@ -2383,8 +2385,16 @@ pub const RoundDispatch = struct {
     round_items_max: usize = 0,
 
     pub fn begin(dispatch: ?Dispatch, step_items: usize) RoundDispatch {
-        var rounds = RoundDispatch{ .dispatch = dispatch };
-        if (dispatch) |stage| rounds.selection = stage.select(@max(step_items, 1), 1);
+        return beginAligned(dispatch, step_items, 1);
+    }
+
+    /// `begin` at `range_alignment_items`. A zero alignment selects and runs at 1.
+    pub fn beginAligned(dispatch: ?Dispatch, step_items: usize, range_alignment_items: usize) RoundDispatch {
+        var rounds = RoundDispatch{
+            .dispatch = dispatch,
+            .range_alignment_items = @max(range_alignment_items, 1),
+        };
+        if (dispatch) |stage| rounds.selection = stage.select(@max(step_items, 1), rounds.range_alignment_items);
         return rounds;
     }
 
@@ -2403,7 +2413,7 @@ pub const RoundDispatch = struct {
                 .items_per_range = stage.items_per_range,
                 .batches_per_participant = stage.batches_per_participant,
                 .max_worker_threads = stage.max_worker_threads,
-                .range_alignment_items = 1,
+                .range_alignment_items = self.range_alignment_items,
                 .selected_profile = selection.profile,
             });
         } else blk: {
@@ -2431,7 +2441,7 @@ pub const RoundDispatch = struct {
             .item_count = @max(step_items, 1),
             .range_count = self.total.range_count,
             .items_per_range = selection.profile.items_per_range,
-            .range_alignment_items = 1,
+            .range_alignment_items = self.range_alignment_items,
             .available_worker_threads = self.total.available_worker_threads,
             .active_worker_threads = selection.profile.worker_threads,
             .main_thread_ranges = self.total.main_thread_ranges,

@@ -70,6 +70,7 @@ const AffectRow = struct {
 
 pub const AiAffectStore = struct {
     rows: std.MultiArrayList(AffectRow) = .{},
+    pack_image: std.MultiArrayList(AffectRow) = .{},
 
     pub fn len(self: *const AiAffectStore) usize {
         return self.rows.len;
@@ -210,8 +211,32 @@ pub const AiAffectStore = struct {
     }
 
     pub fn deinit(self: *AiAffectStore, allocator: std.mem.Allocator) void {
+        self.pack_image.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = .{};
+    }
+
+    pub fn ensurePackImage(self: *AiAffectStore, allocator: std.mem.Allocator, count: usize) !bool {
+        return types.ensureGeometricImage(AffectRow, &self.pack_image, allocator, count);
+    }
+
+    /// `[start, end)` of `pack_image` from `rows[perm[i]]`, one pass per column.
+    pub fn copyToPack(self: *AiAffectStore, start: usize, end: usize, perm: []const u32) void {
+        types.copyPermutedColumns(AffectRow, &self.pack_image, &self.rows, start, end, perm, types.u32Index);
+    }
+
+    /// `[start, end)` of `rows` from the same indices of `pack_image`.
+    pub fn copyPackToRows(self: *AiAffectStore, start: usize, end: usize) void {
+        types.copyColumnRange(AffectRow, &self.rows, &self.pack_image, start, end);
+    }
+
+    /// `rows[dest[j]] = rows[src[j]]` for pair index `j` in `[start, end)`.
+    pub fn scatterRows(self: *AiAffectStore, start: usize, end: usize, dest: anytype, src: anytype, comptime destAt: fn (@TypeOf(dest), usize) usize, comptime srcAt: fn (@TypeOf(src), usize) usize) void {
+        types.scatterColumns(AffectRow, &self.rows, start, end, dest, src, destAt, srcAt);
+    }
+
+    pub fn entityAt(self: *const AiAffectStore, index: usize) EntityId {
+        return self.rows.slice().items(.entity)[index];
     }
 
     fn ensureCapacityForOne(self: *AiAffectStore, allocator: std.mem.Allocator) !void {

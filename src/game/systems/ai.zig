@@ -45,6 +45,7 @@ const DataSystem = @import("../data_system.zig").DataSystem;
 const max_ai_memory_staleness = @import("../data_system.zig").max_ai_memory_staleness;
 const ai_memory_ring_capacity = @import("../data_system.zig").ai_memory_ring_capacity;
 const EntityId = @import("../data_system.zig").EntityId;
+const no_component_row = @import("../data_system/types.zig").no_component_row;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const Faction = @import("../data_system.zig").Faction;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -592,27 +593,28 @@ const AiGatherInputs = struct {
         return if (self.scope_dense_indices) |indices| indices.len else self.ai_slice.entities.len;
     }
 
-    // Think row `k`'s gather row, every column arbitration reads, or null without a movement
-    // body. Scalar per row: dense-index lookups into the movement, faction, level,
-    // perception, memory, and affect stores, with skips; threaded in windows.
+    // Think row `k`'s gather row, or null without a movement body. Reads that row's
+    // position, faction, and level columns and the perception, memory, and affect rows
+    // it names. Scalar per row; threaded in windows.
     fn gatherRow(self: *const AiGatherInputs, k: usize) ?AiGatherRow {
         const i: usize = if (self.scope_dense_indices) |indices| indices[k] else k;
         const ent = self.ai_slice.entities[i];
-        const mi = self.data.movementBodyDenseIndex(ent) orelse return null;
-        const maybe_faction = self.data.factionConst(ent);
-        const ent_faction = maybe_faction orelse .neutral;
+        if (self.ai_slice.movement_row[i] == no_component_row) return null;
+        const ent_faction = self.ai_slice.faction[i];
 
         // See AiConfig.focus_target's doc comment: only an explicit opt-in,
         // never populated for a row with no pursue gain at all.
         const gain_pursue = self.ai_slice.gain_pursues[i];
         const has_focus = self.focus_target != null and gain_pursue > 0;
+        const pos_x = self.ai_slice.previous_x[i];
+        const pos_y = self.ai_slice.previous_y[i];
 
         var row = AiGatherRow{
             .entity = ent,
-            .pos_x = self.movement.previous_x[mi],
-            .pos_y = self.movement.previous_y[mi],
+            .pos_x = pos_x,
+            .pos_y = pos_y,
             .faction = ent_faction,
-            .level = self.data.worldLevelConst(ent) orelse 0,
+            .level = self.ai_slice.level[i],
             .wander_amplitude = self.ai_slice.wander_amplitudes[i],
             .gains = .{
                 .wander = self.ai_slice.gain_wanders[i],
@@ -653,11 +655,12 @@ const AiGatherInputs = struct {
             .sep_x = 0,
             .sep_y = 0,
             .cohere = .{},
-            .resolved = .{ .goal_x = self.movement.previous_x[mi], .goal_y = self.movement.previous_y[mi] },
+            .resolved = .{ .goal_x = pos_x, .goal_y = pos_y },
         };
 
         if (self.perception_slice) |perception| {
-            if (self.data.aiPerceptionDenseIndex(ent)) |pidx| {
+            const pidx = self.ai_slice.perception_row[i];
+            if (pidx != no_component_row) {
                 row.threat = .{
                     .target_visible = perception.target_visible[pidx],
                     .nearest_threat = perception.nearest_threat[pidx],
@@ -673,7 +676,8 @@ const AiGatherInputs = struct {
         }
 
         if (self.memory_slice) |memory| {
-            if (self.data.aiMemoryDenseIndex(ent)) |midx| {
+            const midx = self.ai_slice.memory_row[i];
+            if (midx != no_component_row) {
                 row.memory = .{
                     .last_known_target = memory.last_known_target[midx],
                     .last_known_x = memory.last_known_x[midx],
@@ -697,7 +701,8 @@ const AiGatherInputs = struct {
         }
 
         if (self.affect_slice) |affect| {
-            if (self.data.aiAffectDenseIndex(ent)) |aidx| {
+            const aidx = self.ai_slice.affect_row[i];
+            if (aidx != no_component_row) {
                 row.drives = .{
                     .fear = affect.fear[aidx],
                     .curiosity = affect.curiosity[aidx],
@@ -707,7 +712,7 @@ const AiGatherInputs = struct {
             }
         }
 
-        row.interest = .{ .has_faction = maybe_faction != null };
+        row.interest = .{ .has_faction = self.ai_slice.has_faction[i] };
         return row;
     }
 };
@@ -1288,6 +1293,40 @@ fn gatherInline(system: *AiSystem, inputs: AiGatherInputs) !void {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     _ = try system.gatherAiData(inputs, &threads, .{});
+}
+
+test "ai gather reads faction and level from the think row" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 12, .y = 34 }, .previous_position = .{ .x = 12, .y = 34 }, .velocity = .{ .x = 1, .y = 2 } });
+    try data.setAiAgent(entity, .{});
+    try data.setFaction(entity, .hostile);
+    try data.setWorldLevel(entity, 3);
+    const movement_index = data.movementBodyDenseIndex(entity).?;
+    var movement = data.movementBodySlice();
+    movement.previous_x[movement_index] = 90;
+    movement.previous_y[movement_index] = 80;
+    data.factions.setFaction(0, .player);
+    data.world_levels.set(0, 9);
+    const agents = data.aiAgentSliceConst();
+    try std.testing.expectEqual(@as(f32, 12), agents.previous_x[0]);
+    try std.testing.expectEqual(@as(f32, 34), agents.previous_y[0]);
+    try std.testing.expectEqual(Faction.hostile, agents.faction[0]);
+    try std.testing.expectEqual(@as(u16, 3), agents.level[0]);
+    try std.testing.expect(data.movementBodySliceConst().previous_x[movement_index] != 12);
+    try std.testing.expect(data.movementBodySliceConst().previous_y[movement_index] != 34);
+    try std.testing.expect(data.factionConst(entity).? != .hostile);
+    try std.testing.expect(data.worldLevelConst(entity).? != 3);
+    var system = AiSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try gatherInline(&system, .{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
+    const gathered = system.rows.slice();
+    try std.testing.expectEqual(@as(usize, 1), system.rows.len);
+    try std.testing.expectEqual(@as(f32, 12), gathered.items(.pos_x)[0]);
+    try std.testing.expectEqual(@as(f32, 34), gathered.items(.pos_y)[0]);
+    try std.testing.expectEqual(Faction.hostile, gathered.items(.faction)[0]);
+    try std.testing.expectEqual(@as(u16, 3), gathered.items(.level)[0]);
 }
 
 // The unstaggered think set over `view`, compacted inline.

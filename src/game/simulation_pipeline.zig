@@ -91,6 +91,8 @@ const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chunks;
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
 const IndexGeometry = @import("systems/spatial_index.zig").IndexGeometry;
+const SpatialIndexConfig = @import("systems/spatial_index.zig").SpatialIndexConfig;
+const cellGrid = @import("systems/spatial_index.zig").cellGrid;
 const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats;
 const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
 const CellCoord = @import("world/system.zig").CellCoord;
@@ -1655,6 +1657,15 @@ pub const SimulationPipeline = struct {
         self.scope.advanceStep();
         step.cognition_region = context.world.cognitionRegionForWorldRect(context.sim_view, sim_view_overscan_chunks, cognition_halo_chunks);
         step.stagger_step = self.scope.staggerStep();
+        const geometry = IndexGeometry.ofWorld(context.world);
+        const grid = cellGrid(geometry, (SpatialIndexConfig{}).cell_size);
+        const per_chunk: u32 = if (geometry.chunks_x == 0) 1 else @max(grid.cells_x / geometry.chunks_x, 1);
+        try self.scope.orderThinkPhases(context.data, step.cognition_region, .{
+            .cell_size = grid.cell_size,
+            .cells_x = grid.cells_x,
+            .cells_y = grid.cells_y,
+            .cells_per_chunk = per_chunk,
+        }, context.thread_system, .{});
         const gathered = try self.scope.gatherAiPopulations(context.data, step.cognition_region, context.thread_system, .{});
         step.ai_halo_indices = gathered.halo;
         if (comptime runtime_perf_log.enabled) step.perf.scope_ai_gather = gathered.perf.batch;
@@ -1684,6 +1695,7 @@ pub const SimulationPipeline = struct {
         const cognition_order_timer = BenchStageTimer.start(context.perf);
         const index = self.spatial_index.view();
         const result = try self.scope.compactCognition(&index, step.stagger_step, step.cognition_region != null, context.thread_system, .{});
+        try self.scope.packThinkSpan(context.data, context.thread_system, .{});
         step.ai_cognition_indices = result.cognition;
         if (comptime runtime_perf_log.enabled) step.perf.scope_cognition = result.perf.batch;
         cognition_order_timer.stop(context.perf, .pipeline_cognition_order);
@@ -8135,7 +8147,10 @@ test "the think set reaches AI in the index's cell-major order, not AI index ord
         .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 3), pipeline.ai.rows.len);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 0 }, pipeline.scope.ai_cognition_indices.items);
+    const span = pipeline.scope.ai_cognition_indices.items;
+    const rows = data.aiAgentSliceConst().entities;
+    try std.testing.expectEqual(@as(usize, 3), span.len);
+    for (span, [_]usize{ 1, 2, 0 }) |ai_row, agent| try std.testing.expect(rows[ai_row].eql(agents[agent]));
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 3), intents.len);
     for (intents, [_]usize{ 1, 2, 0 }) |intent, agent| try std.testing.expect(intent.entity.eql(agents[agent]));

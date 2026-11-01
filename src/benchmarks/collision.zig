@@ -2086,10 +2086,11 @@ fn dynamicStageBatches(perf: CollisionStats.Perf) [dynamic_stage_names.len]Batch
 }
 
 // A collision step's stage tuners, in `step_tuner_names` order.
-const step_tuner_names = [_][]const u8{ "fill", "sort", "broad", "narrow", "static_pairs", "static_rect", "static_place", "static_sort", "refresh_place", "refresh_sort", "refresh", "emit" };
+const step_tuner_names = [_][]const u8{ "fill_gather", "fill", "sort", "broad", "narrow", "static_pairs", "static_rect", "static_place", "static_sort", "refresh_place", "refresh_sort", "refresh", "emit" };
 
 fn stepTuners(system: *const CollisionSystem) [step_tuner_names.len]*const AdaptiveWorkTuner {
     return .{
+        &system.fill_gather_tuner,
         &system.fill_tuner,
         &system.sort_tuner,
         &system.broadphase_tuner,

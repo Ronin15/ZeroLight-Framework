@@ -55,6 +55,8 @@ const PerceptionRow = struct {
 
 pub const PerceptionStore = struct {
     rows: std.MultiArrayList(PerceptionRow) = .{},
+    // Scratch image for packing the think span's rows. Same allocator as `rows`.
+    pack_image: std.MultiArrayList(PerceptionRow) = .{},
 
     pub fn len(self: *const PerceptionStore) usize {
         return self.rows.len;
@@ -177,8 +179,32 @@ pub const PerceptionStore = struct {
     }
 
     pub fn deinit(self: *PerceptionStore, allocator: std.mem.Allocator) void {
+        self.pack_image.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = .{};
+    }
+
+    pub fn ensurePackImage(self: *PerceptionStore, allocator: std.mem.Allocator, count: usize) !bool {
+        return types.ensureGeometricImage(PerceptionRow, &self.pack_image, allocator, count);
+    }
+
+    /// `[start, end)` of `pack_image` from `rows[perm[i]]`, one pass per column.
+    pub fn copyToPack(self: *PerceptionStore, start: usize, end: usize, perm: []const u32) void {
+        types.copyPermutedColumns(PerceptionRow, &self.pack_image, &self.rows, start, end, perm, types.u32Index);
+    }
+
+    /// `[start, end)` of `rows` from the same indices of `pack_image`.
+    pub fn copyPackToRows(self: *PerceptionStore, start: usize, end: usize) void {
+        types.copyColumnRange(PerceptionRow, &self.rows, &self.pack_image, start, end);
+    }
+
+    /// `rows[dest[j]] = rows[src[j]]` for pair index `j` in `[start, end)`.
+    pub fn scatterRows(self: *PerceptionStore, start: usize, end: usize, dest: anytype, src: anytype, comptime destAt: fn (@TypeOf(dest), usize) usize, comptime srcAt: fn (@TypeOf(src), usize) usize) void {
+        types.scatterColumns(PerceptionRow, &self.rows, start, end, dest, src, destAt, srcAt);
+    }
+
+    pub fn entityAt(self: *const PerceptionStore, index: usize) EntityId {
+        return self.rows.slice().items(.entity)[index];
     }
 
     fn ensureCapacityForOne(self: *PerceptionStore, allocator: std.mem.Allocator) !void {

@@ -29,6 +29,108 @@ pub fn hotStoreCapacity(min_len: usize) usize {
     return std.mem.alignForwardAnyAlign(usize, min_len, movement_range_alignment_items);
 }
 
+/// No linked component row. A live dense index is below this.
+pub const no_component_row: u32 = std.math.maxInt(u32);
+
+/// Grows `image` geometrically to at least `count` and sets its length. Returns whether
+/// the capacity grew. A failed ensure leaves the image as it was.
+pub fn ensureGeometricImage(comptime Row: type, image: *std.MultiArrayList(Row), allocator: std.mem.Allocator, count: usize) !bool {
+    if (image.capacity >= count) {
+        image.len = count;
+        return false;
+    }
+    var cap: usize = if (image.capacity == 0) count else image.capacity;
+    while (cap < count) {
+        const doubled = std.math.mul(usize, cap, 2) catch count;
+        cap = if (doubled < count) count else doubled;
+    }
+    const before = image.capacity;
+    try image.ensureTotalCapacity(allocator, hotStoreCapacity(cap));
+    image.len = count;
+    return image.capacity > before;
+}
+
+/// `u32` row index widened to a slice index. The store's growth seam rejects a longer list.
+pub fn u32Index(items: []const u32, index: usize) usize {
+    return @intCast(items[index]);
+}
+
+/// One pass per column over `[start, end)`: `dest[i] = src[sourceAt(sources, i)]`.
+/// Each column is sliced once.
+pub fn copyPermutedColumns(
+    comptime Row: type,
+    dest_list: *std.MultiArrayList(Row),
+    src_list: *const std.MultiArrayList(Row),
+    start: usize,
+    end: usize,
+    sources: anytype,
+    comptime sourceAt: fn (@TypeOf(sources), usize) usize,
+) void {
+    const dest = dest_list.slice();
+    const src = src_list.slice();
+    inline for (@typeInfo(Row).@"struct".field_names) |name| {
+        const d = dest.items(@field(std.MultiArrayList(Row).Field, name));
+        const s = src.items(@field(std.MultiArrayList(Row).Field, name));
+        for (start..end) |i| d[i] = s[sourceAt(sources, i)];
+    }
+}
+
+/// One pass per column over each `[span[0], span[1])`, columns sliced once for every span.
+pub fn copyPermutedSpans(
+    comptime Row: type,
+    dest_list: *std.MultiArrayList(Row),
+    src_list: *const std.MultiArrayList(Row),
+    spans: []const [2]usize,
+    sources: anytype,
+    comptime sourceAt: fn (@TypeOf(sources), usize) usize,
+) void {
+    const dest = dest_list.slice();
+    const src = src_list.slice();
+    inline for (@typeInfo(Row).@"struct".field_names) |name| {
+        const d = dest.items(@field(std.MultiArrayList(Row).Field, name));
+        const s = src.items(@field(std.MultiArrayList(Row).Field, name));
+        for (spans) |span| {
+            for (span[0]..span[1]) |i| d[i] = s[sourceAt(sources, i)];
+        }
+    }
+}
+
+/// One pass per column over `[start, end)`: `dest[i] = src[i]`.
+pub fn copyColumnRange(
+    comptime Row: type,
+    dest_list: *std.MultiArrayList(Row),
+    src_list: *const std.MultiArrayList(Row),
+    start: usize,
+    end: usize,
+) void {
+    const dest = dest_list.slice();
+    const src = src_list.slice();
+    inline for (@typeInfo(Row).@"struct".field_names) |name| {
+        const d = dest.items(@field(std.MultiArrayList(Row).Field, name));
+        const s = src.items(@field(std.MultiArrayList(Row).Field, name));
+        for (start..end) |i| d[i] = s[i];
+    }
+}
+
+/// One pass per column over pair range `[start, end)`: `column[destAt(j)] = column[srcAt(j)]`.
+/// Dest and source indices are disjoint, so the read stays ahead of the write.
+pub fn scatterColumns(
+    comptime Row: type,
+    rows: *std.MultiArrayList(Row),
+    start: usize,
+    end: usize,
+    dest: anytype,
+    src: anytype,
+    comptime destAt: fn (@TypeOf(dest), usize) usize,
+    comptime srcAt: fn (@TypeOf(src), usize) usize,
+) void {
+    const cols = rows.slice();
+    inline for (@typeInfo(Row).@"struct".field_names) |name| {
+        const column = cols.items(@field(std.MultiArrayList(Row).Field, name));
+        for (start..end) |j| column[destAt(dest, j)] = column[srcAt(src, j)];
+    }
+}
+
 /// Committed row counts of the component stores whose pipeline scratch, event
 /// shares, and pathfinding pools are population-sized. Read by the pipeline's
 /// population growth seam (`SimulationPipeline.syncPopulationCapacity`).
@@ -317,6 +419,8 @@ pub const ConstCollisionBoundsSlice = struct {
     offset_y: ConstHotF32Slice,
     size_x: ConstHotF32Slice,
     size_y: ConstHotF32Slice,
+    movement_row: []const u32,
+    tier: []const SimulationTier,
 };
 
 pub const CollisionResponseMode = enum {
@@ -397,6 +501,22 @@ pub const ConstAiAgentSlice = struct {
     sticky_bonus: ConstHotF32Slice,
     commitment_remaining: []const u16,
     last_score: ConstHotF32Slice,
+    movement_row: []const u32,
+    perception_row: []const u32,
+    memory_row: []const u32,
+    affect_row: []const u32,
+    faction: []const Faction,
+    has_faction: []const bool,
+    level: []const u16,
+    chunk_x: []const i32,
+    chunk_y: []const i32,
+    tier: []const SimulationTier,
+    stagger_phase: []const u8,
+    always_active: []const bool,
+    previous_x: ConstHotF32Slice,
+    previous_y: ConstHotF32Slice,
+    velocity_x: ConstHotF32Slice,
+    velocity_y: ConstHotF32Slice,
 };
 
 /// Mutable hot-column view for arbitration's per-step sticky-selection

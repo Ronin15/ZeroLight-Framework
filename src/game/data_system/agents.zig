@@ -11,6 +11,9 @@ const types = @import("types.zig");
 const EntityId = types.EntityId;
 const AiBehavior = types.AiBehavior;
 const AiAgent = types.AiAgent;
+const Faction = types.Faction;
+const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
+const no_component_row = types.no_component_row;
 const max_ai_wander_amplitude = types.max_ai_wander_amplitude;
 const max_ai_gain = types.max_ai_gain;
 const ConstAiAgentSlice = types.ConstAiAgentSlice;
@@ -63,7 +66,7 @@ pub fn validateSteeringAgent(agent: SteeringAgent) !void {
     }
 }
 
-const AiAgentRow = struct {
+pub const AiAgentRow = struct {
     entity: EntityId,
     // Cold
     gain_wander: f32,
@@ -78,6 +81,23 @@ const AiAgentRow = struct {
     active_behavior: AiBehavior,
     commitment_remaining: u16,
     last_score: f32,
+    // Think-set columns. Index sentinels are `no_component_row` until attach.
+    movement_row: u32 = no_component_row,
+    perception_row: u32 = no_component_row,
+    memory_row: u32 = no_component_row,
+    affect_row: u32 = no_component_row,
+    faction: Faction = .neutral,
+    has_faction: bool = false,
+    level: u16 = 0,
+    chunk_x: i32 = 0,
+    chunk_y: i32 = 0,
+    tier: SimulationTier = .cognition,
+    stagger_phase: u8 = 0,
+    always_active: bool = false,
+    previous_x: f32 = 0,
+    previous_y: f32 = 0,
+    velocity_x: f32 = 0,
+    velocity_y: f32 = 0,
 };
 
 const SteeringAgentRow = struct {
@@ -94,6 +114,8 @@ const SteeringAgentRow = struct {
 
 pub const AiAgentStore = struct {
     rows: std.MultiArrayList(AiAgentRow) = .{},
+    // Sorted image for the think-set order pass. Swapped with `rows` after the workers fill it.
+    order_image: std.MultiArrayList(AiAgentRow) = .{},
 
     pub fn len(self: *const AiAgentStore) usize {
         return self.rows.len;
@@ -177,6 +199,22 @@ pub const AiAgentStore = struct {
             .sticky_bonus = s.items(.sticky_bonus),
             .commitment_remaining = s.items(.commitment_remaining),
             .last_score = s.items(.last_score),
+            .movement_row = s.items(.movement_row),
+            .perception_row = s.items(.perception_row),
+            .memory_row = s.items(.memory_row),
+            .affect_row = s.items(.affect_row),
+            .faction = s.items(.faction),
+            .has_faction = s.items(.has_faction),
+            .level = s.items(.level),
+            .chunk_x = s.items(.chunk_x),
+            .chunk_y = s.items(.chunk_y),
+            .tier = s.items(.tier),
+            .stagger_phase = s.items(.stagger_phase),
+            .always_active = s.items(.always_active),
+            .previous_x = s.items(.previous_x),
+            .previous_y = s.items(.previous_y),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
         };
     }
 
@@ -198,8 +236,115 @@ pub const AiAgentStore = struct {
     }
 
     pub fn deinit(self: *AiAgentStore, allocator: std.mem.Allocator) void {
+        self.order_image.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = .{};
+    }
+
+    pub fn movementRowAt(self: *const AiAgentStore, index: usize) u32 {
+        return self.rows.slice().items(.movement_row)[index];
+    }
+
+    pub fn setMovementRow(self: *AiAgentStore, index: usize, movement_row: u32) void {
+        self.rows.slice().items(.movement_row)[index] = movement_row;
+    }
+
+    pub fn setPerceptionRow(self: *AiAgentStore, index: usize, perception_row: u32) void {
+        self.rows.slice().items(.perception_row)[index] = perception_row;
+    }
+
+    pub fn setMemoryRow(self: *AiAgentStore, index: usize, memory_row: u32) void {
+        self.rows.slice().items(.memory_row)[index] = memory_row;
+    }
+
+    pub fn setAffectRow(self: *AiAgentStore, index: usize, affect_row: u32) void {
+        self.rows.slice().items(.affect_row)[index] = affect_row;
+    }
+
+    pub fn setFactionColumn(self: *AiAgentStore, index: usize, faction: Faction) void {
+        const s = self.rows.slice();
+        s.items(.faction)[index] = faction;
+        s.items(.has_faction)[index] = true;
+    }
+
+    /// Copies the movement row's scope and motion onto the AI row. Cold personality stays.
+    pub fn writeMirroredScope(
+        self: *AiAgentStore,
+        index: usize,
+        level: u16,
+        chunk_x: i32,
+        chunk_y: i32,
+        tier: SimulationTier,
+        stagger_phase: u8,
+        always_active: bool,
+        previous_x: f32,
+        previous_y: f32,
+        velocity_x: f32,
+        velocity_y: f32,
+    ) void {
+        const s = self.rows.slice();
+        s.items(.level)[index] = level;
+        s.items(.chunk_x)[index] = chunk_x;
+        s.items(.chunk_y)[index] = chunk_y;
+        s.items(.tier)[index] = tier;
+        s.items(.stagger_phase)[index] = stagger_phase;
+        s.items(.always_active)[index] = always_active;
+        s.items(.previous_x)[index] = previous_x;
+        s.items(.previous_y)[index] = previous_y;
+        s.items(.velocity_x)[index] = velocity_x;
+        s.items(.velocity_y)[index] = velocity_y;
+    }
+
+    /// Grows `order_image` to at least `count` rows. Returns whether the capacity grew.
+    /// A failed ensure leaves the image as it was.
+    pub fn ensureOrderImage(self: *AiAgentStore, allocator: std.mem.Allocator, count: usize) !bool {
+        return types.ensureGeometricImage(AiAgentRow, &self.order_image, allocator, count);
+    }
+
+    /// Sizes the image for `live` sorted rows, at least the live store's capacity, so a swap
+    /// does not shrink the store. Returns whether the image capacity grew.
+    pub fn prepareOrderImage(self: *AiAgentStore, allocator: std.mem.Allocator, live: usize) !bool {
+        // Exact capacity on both lists, so publishing by swap does not shrink either and
+        // the next step does not allocate.
+        const target = hotStoreCapacity(@max(live, @max(self.rows.capacity, self.order_image.capacity)));
+        if (self.order_image.len > target) self.order_image.len = target;
+        var grew = false;
+        if (self.order_image.capacity < target) {
+            try self.order_image.setCapacity(allocator, target);
+            grew = true;
+        }
+        if (self.rows.capacity < target) {
+            try self.rows.setCapacity(allocator, target);
+            grew = true;
+        }
+        self.order_image.len = live;
+        return grew;
+    }
+
+    /// `[start, end)` of `order_image` from `rows[perm[i]]`, one pass per column.
+    pub fn writeOrderImage(self: *AiAgentStore, start: usize, end: usize, perm: []const u32) void {
+        types.copyPermutedColumns(AiAgentRow, &self.order_image, &self.rows, start, end, perm, types.u32Index);
+    }
+
+    /// Each span is a dest range into `order_image`. Columns are sliced once for all of them.
+    pub fn writeOrderSpans(self: *AiAgentStore, spans: []const [2]usize, sources: anytype, comptime sourceAt: fn (@TypeOf(sources), usize) usize) void {
+        types.copyPermutedSpans(AiAgentRow, &self.order_image, &self.rows, spans, sources, sourceAt);
+    }
+
+    /// `[start, end)` of `rows` from the same indices of `order_image`.
+    pub fn copyOrderToRows(self: *AiAgentStore, start: usize, end: usize) void {
+        types.copyColumnRange(AiAgentRow, &self.rows, &self.order_image, start, end);
+    }
+
+    /// `rows[dest[j]] = rows[src[j]]` for pair index `j` in `[start, end)`.
+    pub fn scatterRows(self: *AiAgentStore, start: usize, end: usize, dest: anytype, src: anytype, comptime destAt: fn (@TypeOf(dest), usize) usize, comptime srcAt: fn (@TypeOf(src), usize) usize) void {
+        types.scatterColumns(AiAgentRow, &self.rows, start, end, dest, src, destAt, srcAt);
+    }
+
+    pub fn publishOrderImage(self: *AiAgentStore) void {
+        const sorted = self.order_image;
+        self.order_image = self.rows;
+        self.rows = sorted;
     }
 
     fn ensureCapacityForOne(self: *AiAgentStore, allocator: std.mem.Allocator) !void {

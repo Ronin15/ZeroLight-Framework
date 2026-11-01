@@ -36,6 +36,7 @@ const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const required_tile_size = @import("../../assets/world_tileset_meta.zig").required_tile_size;
 const ConstCollisionBoundsSlice = @import("../data_system.zig").ConstCollisionBoundsSlice;
+const no_component_row = @import("../data_system/types.zig").no_component_row;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -866,6 +867,7 @@ pub const CollisionSystem = struct {
     // merges static pairs; a dynamic-only step leaves it unused.
     narrowphase_keys: NarrowphaseKeyList = .empty,
     narrowphase_tallies: SlotList(NarrowphaseTally) = .empty,
+    fill_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     fill_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -1214,16 +1216,8 @@ pub const CollisionSystem = struct {
         self.warm_count = 0;
     }
 
-    fn fillContext(self: *CollisionSystem, data: *const DataSystem, scope_dense_indices: ?[]const u32, strips: CollisionStrips, input_count: usize) FillContext {
+    fn fillContext(self: *CollisionSystem, strips: CollisionStrips) FillContext {
         return .{
-            .data = data,
-            .bounds = data.collisionBoundsSliceConst(),
-            .movement = data.movementBodySliceConst(),
-            .tier = data.scopeColumnsSliceConst().tier,
-            .levels = data.worldLevelSliceConst().levels,
-            .scope = scope_dense_indices,
-            .dynamic_ids = data.collision_bounds.dynamic_ids.items,
-            .warm_sources = if (self.warm_count == input_count) self.warm_sources.items[0..input_count] else null,
             .strips = strips,
             .proxies = ProxyColumns.of(self.proxies.slice()),
             .inputs = FillColumns.of(self.fill_inputs.slice()),
@@ -1241,11 +1235,12 @@ pub const CollisionSystem = struct {
             return false;
         }
         try self.beginStep(input_count);
+        try gatherFillMotion(self, data, scope_dense_indices, threads);
         try self.staging.ensureTotalCapacity(self.allocator, input_count);
         self.staging.items.len = input_count;
         try self.second_staging.ensureTotalCapacity(self.allocator, input_count);
         self.second_staging.items.len = input_count;
-        const fill = self.fillContext(data, scope_dense_indices, strips, input_count);
+        const fill = self.fillContext(strips);
 
         const fill_stage = threads.stage(&self.fill_tuner);
         const fill_shape = StageShape.select(fill_stage, input_count, collision_range_alignment_items);
@@ -1258,7 +1253,7 @@ pub const CollisionSystem = struct {
         const spill_slots = self.spill_slots.slots();
         var fill_job = FillJob{
             .fill = fill,
-            .splitters = chooseSplitters(&fill, input_count),
+            .splitters = chooseSplitters(strips, fill.inputs, input_count),
             .scratch = self.keys.items[0..input_count],
             .staging = self.staging.items[0..input_count],
             .second_scratch = self.second_scratch.items[0..input_count],
@@ -2641,26 +2636,91 @@ fn contactKeyFromProxies(strips: CollisionStrips, proxies: ConstProxyColumns, a:
 
 // ---- Fill ---------------------------------------------------------------------------
 
+// One movement-row load per fill input into `FillInput` and the proxy identity columns.
+// The fill's lane kernel then reads only those columns.
+fn gatherFillMotion(self: *CollisionSystem, data: *const DataSystem, scope_dense_indices: ?[]const u32, threads: Threads) !void {
+    const input_count = fillInputCount(data, scope_dense_indices);
+    if (input_count == 0) return;
+    const stage = threads.stage(&self.fill_gather_tuner);
+    const selection = stage.select(input_count, collision_range_alignment_items);
+    var job = FillGatherJob{
+        .bounds = data.collisionBoundsSliceConst(),
+        .movement = data.movementBodySliceConst(),
+        .level = data.scopeColumnsSliceConst().level,
+        .scope_ids = scope_dense_indices,
+        .dynamic_ids = data.collision_bounds.dynamic_ids.items,
+        .warm_sources = if (self.warm_count == input_count) self.warm_sources.items[0..input_count] else null,
+        .proxies = ProxyColumns.of(self.proxies.slice()),
+        .inputs = FillColumns.of(self.fill_inputs.slice()),
+        .items_per_range = selection.items_per_range,
+    };
+    _ = stage.run(selection, input_count, collision_range_alignment_items, &job, fillGatherJob);
+}
+
+const FillGatherJob = struct {
+    bounds: ConstCollisionBoundsSlice,
+    movement: ConstMovementBodySlice,
+    level: []const u16,
+    scope_ids: ?[]const u32,
+    dynamic_ids: []const u32,
+    warm_sources: ?[]const u32,
+    proxies: ProxyColumns,
+    inputs: FillColumns,
+    items_per_range: usize,
+};
+
+fn fillGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *FillGatherJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.inputs.x.len and range.end <= job.proxies.entity.len);
+    const proxies = job.proxies;
+    const inputs = job.inputs;
+    for (range.start..range.end) |slot| {
+        const input: u32 = if (job.warm_sources) |order| order[slot] else @intCast(slot);
+        proxies.source[slot] = input;
+        const bounds_index: usize = if (job.scope_ids) |ids| ids[input] else job.dynamic_ids[input];
+        const movement_row = job.bounds.movement_row[bounds_index];
+        if (movement_row == no_component_row) {
+            inputs.x[slot] = 0;
+            inputs.y[slot] = 0;
+            inputs.offset_x[slot] = 0;
+            inputs.offset_y[slot] = 0;
+            inputs.size_x[slot] = 0;
+            inputs.size_y[slot] = 0;
+            inputs.level[slot] = 0;
+            inputs.entity_index[slot] = 0;
+            inputs.filled[slot] = 0;
+            proxies.entity[slot] = EntityId.invalid;
+            proxies.movement_index[slot] = 0;
+            proxies.level[slot] = 0;
+            proxies.velocity_x[slot] = 0;
+            proxies.velocity_y[slot] = 0;
+            proxies.allow[slot] = 0;
+        } else {
+            const body: usize = movement_row;
+            inputs.x[slot] = job.movement.position_x[body];
+            inputs.y[slot] = job.movement.position_y[body];
+            inputs.offset_x[slot] = job.bounds.offset_x[bounds_index];
+            inputs.offset_y[slot] = job.bounds.offset_y[bounds_index];
+            inputs.size_x[slot] = job.bounds.size_x[bounds_index];
+            inputs.size_y[slot] = job.bounds.size_y[bounds_index];
+            inputs.level[slot] = job.level[body];
+            inputs.entity_index[slot] = job.bounds.entities[bounds_index].index;
+            inputs.filled[slot] = 1;
+            proxies.entity[slot] = job.bounds.entities[bounds_index];
+            proxies.movement_index[slot] = movement_row;
+            proxies.level[slot] = job.level[body];
+            proxies.velocity_x[slot] = job.movement.velocity_x[body];
+            proxies.velocity_y[slot] = job.movement.velocity_y[body];
+            proxies.allow[slot] = @intFromBool(job.bounds.tier[bounds_index].allowsCollision());
+        }
+    }
+}
+
 // The fill's input count: the scoped bounds rows, or the dynamic bounds index.
 fn fillInputCount(data: *const DataSystem, scope_dense_indices: ?[]const u32) usize {
     return if (scope_dense_indices) |indices| indices.len else data.collision_bounds.dynamic_ids.items.len;
 }
-
-// One fill input as resolved this step.
-const ResolvedSlot = struct {
-    entity: EntityId,
-    movement_index: u32,
-    level: u16,
-    x: f32,
-    y: f32,
-    offset_x: f32,
-    offset_y: f32,
-    size_x: f32,
-    size_y: f32,
-    velocity_x: f32,
-    velocity_y: f32,
-    allow: u8,
-};
 
 // One slot's packed fill inputs. The fill job writes its range; `fillSlots` only loads
 // these columns. `filled` is 0 or 1, and u32 so one fill range of the column is a cache line.
@@ -2708,59 +2768,21 @@ const FillColumns = struct {
 };
 
 const FillContext = struct {
-    data: *const DataSystem,
-    bounds: ConstCollisionBoundsSlice,
-    movement: ConstMovementBodySlice,
-    // The movement store's tier column, row for row with `movement`.
-    tier: @FieldType(ConstScopeColumnsSlice, "tier"),
-    // The world-level store's level column.
-    levels: []const u16,
-    scope: ?[]const u32,
-    // Bounds indexes of the dynamic rows, used when `scope` is null.
-    dynamic_ids: []const u32,
-    // Slot p reads input `warm_sources[p]` when set, else input p.
-    warm_sources: ?[]const u32,
     strips: CollisionStrips,
     // Identity columns for every slot in the range; min and max from the lane kernel.
     proxies: ProxyColumns,
-    // Lane inputs for every slot in the range, packed before `fillSlots`.
+    // Lane inputs for every slot in the range, packed by `gatherFillMotion`.
     inputs: FillColumns,
-
-    fn source(self: *const FillContext, slot: usize) u32 {
-        // A slot is below the input count <= maxInt(u32).
-        return if (self.warm_sources) |order| order[slot] else @intCast(slot);
-    }
-
-    // Scalar: one dense-index point lookup per input, with a skip. A missing world level is
-    // the surface (0).
-    fn resolve(self: *const FillContext, input: u32) ?ResolvedSlot {
-        const row: usize = if (self.scope) |indices| indices[input] else self.dynamic_ids[input];
-        const entity = self.bounds.entities[row];
-        const found = self.data.collisionBodyRefs(entity, self.levels) orelse return null;
-        const body = found.movement_body;
-        return .{
-            .entity = entity,
-            .movement_index = body,
-            .level = found.level orelse 0,
-            .x = self.movement.position_x[body],
-            .y = self.movement.position_y[body],
-            .offset_x = self.bounds.offset_x[row],
-            .offset_y = self.bounds.offset_y[row],
-            .size_x = self.bounds.size_x[row],
-            .size_y = self.bounds.size_y[row],
-            .velocity_x = self.movement.velocity_x[body],
-            .velocity_y = self.movement.velocity_y[body],
-            .allow = @intFromBool(self.tier[body].allowsCollision()),
-        };
-    }
 };
 
-// A resolved input's first-copy key, bit for bit the fill lanes'.
-fn firstKey(strips: CollisionStrips, row: ResolvedSlot) u128 {
-    const min_x = row.x + row.offset_x;
-    const min_y = row.y + row.offset_y;
+// A packed input's first-copy key, bit for bit the fill lanes'.
+fn firstKeyFromInput(strips: CollisionStrips, inputs: FillColumns, slot: usize) u128 {
+    const min_x = inputs.x[slot] + inputs.offset_x[slot];
+    const min_y = inputs.y[slot] + inputs.offset_y[slot];
     const strip = math.worldPosToCell(min_y, strips.height, strip_count);
-    return packKey(runOf(row.level, strip), math.orderedBits(min_x), math.orderedBits(min_y), row.entity.index);
+    // `level` is the scope level, which fits in u16.
+    const level: u16 = @intCast(inputs.level[slot]);
+    return packKey(runOf(level, strip), math.orderedBits(min_x), math.orderedBits(min_y), inputs.entity_index[slot]);
 }
 
 // The copies a fill range wrote to its slot windows.
@@ -2768,53 +2790,6 @@ const FillCounts = struct {
     firsts: usize = 0,
     seconds: usize = 0,
 };
-
-// One scalar pass over `[start, end)`: the warm-order input, then that input's bounds and
-// movement row. Writes the proxy identity columns and the packed lane inputs. An unresolved
-// slot stores an invalid entity and zeros, so the lane kernel's min and max stay zero.
-fn packFillRange(fill: *const FillContext, start: usize, end: usize) void {
-    const proxies = fill.proxies;
-    const inputs = fill.inputs;
-    std.debug.assert(start <= end and end <= proxies.entity.len and end <= inputs.x.len);
-    var slot = start;
-    while (slot < end) : (slot += 1) {
-        const input = fill.source(slot);
-        proxies.source[slot] = input;
-        if (fill.resolve(input)) |row| {
-            inputs.x[slot] = row.x;
-            inputs.y[slot] = row.y;
-            inputs.offset_x[slot] = row.offset_x;
-            inputs.offset_y[slot] = row.offset_y;
-            inputs.size_x[slot] = row.size_x;
-            inputs.size_y[slot] = row.size_y;
-            inputs.level[slot] = row.level;
-            inputs.entity_index[slot] = row.entity.index;
-            inputs.filled[slot] = 1;
-            proxies.entity[slot] = row.entity;
-            proxies.movement_index[slot] = row.movement_index;
-            proxies.level[slot] = row.level;
-            proxies.velocity_x[slot] = row.velocity_x;
-            proxies.velocity_y[slot] = row.velocity_y;
-            proxies.allow[slot] = row.allow;
-        } else {
-            inputs.x[slot] = 0;
-            inputs.y[slot] = 0;
-            inputs.offset_x[slot] = 0;
-            inputs.offset_y[slot] = 0;
-            inputs.size_x[slot] = 0;
-            inputs.size_y[slot] = 0;
-            inputs.level[slot] = 0;
-            inputs.entity_index[slot] = 0;
-            inputs.filled[slot] = 0;
-            proxies.entity[slot] = EntityId.invalid;
-            proxies.movement_index[slot] = 0;
-            proxies.level[slot] = 0;
-            proxies.velocity_x[slot] = 0;
-            proxies.velocity_y[slot] = 0;
-            proxies.allow[slot] = 0;
-        }
-    }
-}
 
 // Writes each filled slot's first copy to `firsts` and its second-strip copy to `seconds`,
 // both in slot order, and spills its copies in later strips to `spill`. Bounds, strips,
@@ -2881,12 +2856,13 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, firsts: []SortE
 // The band splitters: the band quantiles of the sampled slots' first-copy keys (slots
 // without a body skipped). Fixed work on the main thread; with no sampled body every
 // splitter is `max_key`.
-fn chooseSplitters(fill: *const FillContext, input_count: usize) EntrySort.Splitters {
+fn chooseSplitters(strips: CollisionStrips, inputs: FillColumns, input_count: usize) EntrySort.Splitters {
     var samples: [banded_sort.splitter_sample_count]u128 = undefined;
     var valid: usize = 0;
     for (0..banded_sort.sampleCount(input_count)) |sample| {
-        const row = fill.resolve(fill.source(banded_sort.sampleSlot(sample, input_count))) orelse continue;
-        samples[valid] = firstKey(fill.strips, row);
+        const slot = banded_sort.sampleSlot(sample, input_count);
+        if (inputs.filled[slot] == 0) continue;
+        samples[valid] = firstKeyFromInput(strips, inputs, slot);
         valid += 1;
     }
     return EntrySort.splittersFromSamples(samples[0..valid]);
@@ -2920,7 +2896,6 @@ fn fillJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const spill = &job.spill_slots[range.index].value;
     const firsts = job.scratch[range.start..range.end];
     const seconds = job.second_scratch[range.start..range.end];
-    packFillRange(&job.fill, range.start, range.end);
     const counts = fillSlots(&job.fill, range.start, range.end, firsts, seconds, spill);
     job.first_offsets[range.index].value = EntrySort.placeByBand(&job.splitters, firsts[0..counts.firsts], job.staging[range.start..range.end]);
     job.second_offsets[range.index].value = EntrySort.placeByBand(&job.splitters, seconds[0..counts.seconds], job.second_staging[range.start..range.end]);
@@ -3678,17 +3653,16 @@ test "fill lanes write the scalar key for every copy of every body" {
     const stats = try buildBandedInline(&system, &data);
     try std.testing.expectEqual(@as(usize, 6), stats.body_count);
 
-    const fill = system.fillContext(&data, null, .default, system.proxies.len);
-    const proxies = ConstProxyColumns.of(system.proxies.slice());
+    const inputs = FillColumns.of(system.fill_inputs.slice());
     var copies: usize = 0;
     for (system.keys.items[0..stats.entry_count]) |entry| {
-        const row = fill.resolve(proxies.source[entry.slot]).?;
-        const first_key = firstKey(.default, row);
-        const min_y = row.y + row.offset_y;
+        const slot = entry.slot;
+        const first_key = firstKeyFromInput(.default, inputs, slot);
+        const min_y = inputs.y[slot] + inputs.offset_y[slot];
         const first_strip = math.worldPosToCell(min_y, CollisionStrips.default.height, strip_count);
-        const last_strip = math.lastCellOfSpan(min_y, min_y + row.size_y, CollisionStrips.default.height, strip_count);
+        const last_strip = math.lastCellOfSpan(min_y, min_y + inputs.size_y[slot], CollisionStrips.default.height, strip_count);
         const strip = keyRun(entry.key) & 0xFFFF;
-        try std.testing.expectEqual(@as(u32, row.level), keyRun(entry.key) >> 16);
+        try std.testing.expectEqual(inputs.level[slot], keyRun(entry.key) >> 16);
         try std.testing.expect(strip >= first_strip and strip <= last_strip);
         try std.testing.expectEqual(strip == first_strip, entry.first);
         // Every copy shares the first copy's words below the run.
@@ -3698,7 +3672,7 @@ test "fill lanes write the scalar key for every copy of every body" {
     }
     // 1 + 2 + 3 + 1 + 5 + 1 copies, the signed zero's key the positive zero's.
     try std.testing.expectEqual(@as(usize, 13), copies);
-    try std.testing.expectEqual(math.orderedBits(0), @as(u32, @truncate(firstKey(.default, fill.resolve(0).?) >> 64)));
+    try std.testing.expectEqual(math.orderedBits(0), @as(u32, @truncate(firstKeyFromInput(.default, inputs, 0) >> 64)));
 }
 
 fn expectSamePackedFill(serial: *const CollisionSystem, threaded: *const CollisionSystem) !void {
@@ -3819,7 +3793,7 @@ test "collision warm fill reads packed columns not the stores" {
     var seconds: [xs.len]SortEntry = undefined;
     var spill = SpillCopies{};
     defer spill.deinit(std.testing.allocator);
-    const fill = system.fillContext(&data, null, .default, xs.len);
+    const fill = system.fillContext(.default);
     const counts = fillSlots(&fill, 0, xs.len, &firsts, &seconds, &spill);
     try std.testing.expectEqual(xs.len, counts.firsts);
     try std.testing.expectEqual(@as(usize, 0), counts.seconds);
@@ -3982,6 +3956,46 @@ test "a fill range past its spill slot replays to the reference contacts" {
     try std.testing.expectEqual(@as(usize, 96), stats.entry_count);
     try std.testing.expect(stats.entry_count <= system.reserved_entry_bound);
     try expectSameContacts(expected, contacts.mergedItems());
+}
+
+test "collision warm fill gathers motion once into packed columns" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try addBox(&data, .{ .x = 11, .y = 22, .w = 5, .h = 7, .offset_x = 1, .offset_y = 2, .velocity_x = 3, .velocity_y = 4, .level = 6 });
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    _ = try buildBandedInline(&system, &data);
+    const inputs = FillColumns.of(system.fill_inputs.slice());
+    const movement = data.movementBodyDenseIndex(entity).?;
+    const body = data.movementBodySliceConst();
+    const bounds_index = data.resolveSlotConst(entity).?.collision_bounds_index.?;
+    const bounds = data.collisionBoundsSliceConst();
+    try std.testing.expectEqual(body.position_x[movement], inputs.x[0]);
+    try std.testing.expectEqual(body.position_y[movement], inputs.y[0]);
+    try std.testing.expectEqual(body.velocity_x[movement], ConstProxyColumns.of(system.proxies.slice()).velocity_x[0]);
+    try std.testing.expectEqual(body.velocity_y[movement], ConstProxyColumns.of(system.proxies.slice()).velocity_y[0]);
+    try std.testing.expectEqual(@as(u32, data.scopeColumnsSliceConst().level[movement]), inputs.level[0]);
+    try std.testing.expectEqual(bounds.offset_x[bounds_index], inputs.offset_x[0]);
+    try std.testing.expectEqual(bounds.offset_y[bounds_index], inputs.offset_y[0]);
+    try std.testing.expectEqual(bounds.size_x[bounds_index], inputs.size_x[0]);
+    try std.testing.expectEqual(bounds.size_y[bounds_index], inputs.size_y[0]);
+}
+
+test "threaded collision fill gather matches serial" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const xs = [_]f32{ 40, 0, 30, 10, 20 };
+    for (xs) |x| _ = try addBox(&data, .{ .x = x, .y = 4, .w = 6, .h = 6, .offset_x = 1, .offset_y = 2, .velocity_x = x });
+    var serial = CollisionSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    _ = try buildBandedInline(&serial, &data);
+    var threaded = CollisionSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var stats = CollisionStats{};
+    _ = try threaded.buildBanded(&data, null, .default, .{ .thread_system = &threads, .config = .{ .items_per_range = 2, .max_worker_threads = 2, .adaptive = false } }, &stats);
+    try expectSamePackedFill(&serial, &threaded);
 }
 
 test "a serial fill past its spill slot replays to the reference contacts" {

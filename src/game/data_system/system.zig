@@ -49,6 +49,7 @@ const StructuralCommand = types.StructuralCommand;
 const movement_range_alignment_items = types.movement_range_alignment_items;
 const hot_soa_column_alignment = types.hot_soa_column_alignment;
 const hotStoreCapacity = types.hotStoreCapacity;
+const no_component_row = types.no_component_row;
 const MovementBodyStore = @import("movement.zig").MovementBodyStore;
 const validateMovementBody = @import("movement.zig").validateMovementBody;
 const FacingStore = @import("visual.zig").FacingStore;
@@ -103,12 +104,6 @@ const keep_stagger_phase = @import("../simulation_scope.zig").keep_stagger_phase
 const SimulationScopeStats = @import("../simulation_scope.zig").SimulationScopeStats;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const simd = @import("../../core/simd.zig");
-
-// `collisionBodyRefs`' result: a collider's movement row and world level.
-const CollisionBodyRefs = struct {
-    movement_body: u32,
-    level: ?u16,
-};
 
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
@@ -314,6 +309,7 @@ pub const DataSystem = struct {
         if (names_phase) self.movement_bodies.markStaggerSettled(di);
         try self.movement_bodies.reserveDrawableNeighborLevels(self.allocator, di);
         self.snapInterpolationIfStill(di, metadata.tier);
+        self.mirrorLinkedScope(di);
     }
 
     /// Installs the spatial index's cell grid. The same scalars are a no-op.
@@ -378,6 +374,7 @@ pub const DataSystem = struct {
         const index: usize = slot.movement_body_index orelse return;
         const level = self.worldLevelConst(id) orelse 0;
         try self.movement_bodies.commitStagger(self.allocator, world_id, index, level, slot.ai_agent_index != null, false);
+        self.mirrorLinkedScope(index);
     }
 
     fn commitStaggerPhaseMode(self: *DataSystem, id: EntityId, assume_capacity: bool) !void {
@@ -386,6 +383,7 @@ pub const DataSystem = struct {
         if (!self.movement_bodies.staggerCommitOpen(index)) return;
         const level = self.worldLevelConst(id) orelse 0;
         try self.movement_bodies.commitStagger(self.allocator, 0, index, level, slot.ai_agent_index != null, assume_capacity);
+        self.mirrorLinkedScope(index);
     }
 
     /// Changes an entity's simulation tier while preserving chunk, stagger_phase,
@@ -402,6 +400,7 @@ pub const DataSystem = struct {
         self.movement_bodies.setTier(di, tier);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
+        self.mirrorLinkedScope(di);
     }
 
     // Dormant and kinematic are the tiers that do not allow collision. Locomotion
@@ -599,7 +598,17 @@ pub const DataSystem = struct {
         if (slot.collision_bounds_index) |bounds_index| {
             self.movement_bodies.setCollisionBounds(dense_index, self.collision_bounds.get(@intCast(bounds_index)));
         }
-        if (slot.ai_agent_index != null) self.movement_bodies.setHasAiAgent(dense_index, true);
+        if (slot.ai_agent_index) |ai_index| {
+            self.movement_bodies.setHasAiAgent(dense_index, true);
+            self.movement_bodies.setAiRow(dense_index, ai_index);
+            self.ai_agents.setMovementRow(ai_index, dense_index);
+            self.mirrorLinkedScope(dense_index);
+        }
+        if (slot.collision_bounds_index) |bounds_index| {
+            self.movement_bodies.setBoundsRow(dense_index, bounds_index);
+            self.collision_bounds.setMovementRow(bounds_index, dense_index);
+            self.collision_bounds.setTier(bounds_index, self.movement_bodies.tierAt(dense_index));
+        }
         // A world-level row may already exist (setWorldLevel called first) —
         // sync it onto the new scope row.
         if (slot.world_level_index) |world_level_index| {
@@ -643,18 +652,6 @@ pub const DataSystem = struct {
             .movement_body = @intCast(movement_body),
             .level = if (slot.world_level_index) |index| self.world_levels.get(@intCast(index)) else null,
             .faction = if (slot.faction_index) |index| self.factions.factionAt(@intCast(index)) else null,
-        };
-    }
-
-    /// A collider's movement row and world level (null without the component), read
-    /// through the caller's `worldLevelSliceConst().levels`: one slot resolve per call and no
-    /// store slice.
-    pub fn collisionBodyRefs(self: *const DataSystem, id: EntityId, levels: []const u16) ?CollisionBodyRefs {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const movement_body = slot.movement_body_index orelse return null;
-        return .{
-            .movement_body = movement_body,
-            .level = if (slot.world_level_index) |index| levels[index] else null,
         };
     }
 
@@ -800,7 +797,12 @@ pub const DataSystem = struct {
         const dense_index = try self.collision_bounds.append(self.allocator, id, bounds);
         slot.collision_bounds_index = dense_index;
         slot.addComponent(.collision_bounds);
-        if (slot.movement_body_index) |movement_index| self.movement_bodies.setCollisionBounds(movement_index, bounds);
+        if (slot.movement_body_index) |movement_index| {
+            self.movement_bodies.setCollisionBounds(movement_index, bounds);
+            self.movement_bodies.setBoundsRow(movement_index, dense_index);
+            self.collision_bounds.setMovementRow(dense_index, movement_index);
+            self.collision_bounds.setTier(dense_index, self.movement_bodies.tierAt(movement_index));
+        }
         // In-place size writes do not change membership. Append can complete a static obstacle.
         self.syncDynamicBounds(id);
     }
@@ -851,7 +853,18 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_agents.append(self.allocator, id, agent);
         slot.ai_agent_index = dense_index;
         slot.addComponent(.ai_agent);
-        if (slot.movement_body_index) |movement_index| self.movement_bodies.setHasAiAgent(movement_index, true);
+        if (slot.movement_body_index) |movement_index| {
+            self.movement_bodies.setHasAiAgent(movement_index, true);
+            self.movement_bodies.setAiRow(movement_index, dense_index);
+            self.ai_agents.setMovementRow(dense_index, movement_index);
+            self.mirrorLinkedScope(movement_index);
+        }
+        if (slot.faction_index) |faction_index| {
+            self.ai_agents.setFactionColumn(dense_index, self.factions.factionAt(faction_index));
+        }
+        if (slot.ai_perception_index) |perception_index| self.ai_agents.setPerceptionRow(dense_index, perception_index);
+        if (slot.ai_memory_index) |memory_index| self.ai_agents.setMemoryRow(dense_index, memory_index);
+        if (slot.ai_affect_index) |affect_index| self.ai_agents.setAffectRow(dense_index, affect_index);
     }
 
     pub fn aiAgentSliceConst(self: *const DataSystem) ConstAiAgentSlice {
@@ -913,12 +926,12 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.faction_index) |index| {
             self.factions.setFaction(@intCast(index), entity_faction);
-            return;
+        } else {
+            const dense_index = try self.factions.append(self.allocator, id, entity_faction);
+            slot.faction_index = dense_index;
+            slot.addComponent(.faction);
         }
-
-        const dense_index = try self.factions.append(self.allocator, id, entity_faction);
-        slot.faction_index = dense_index;
-        slot.addComponent(.faction);
+        if (slot.ai_agent_index) |ai_index| self.ai_agents.setFactionColumn(ai_index, entity_faction);
     }
 
     pub fn factionConst(self: *const DataSystem, id: EntityId) ?Faction {
@@ -940,6 +953,7 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_perceptions.append(self.allocator, id, perception_value);
         slot.ai_perception_index = dense_index;
         slot.addComponent(.ai_perception);
+        self.attachOptionalAiRow(slot, .perception, dense_index);
     }
 
     pub fn aiPerceptionSliceConst(self: *const DataSystem) ConstPerceptionSlice {
@@ -972,6 +986,7 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_memories.append(self.allocator, id, memory_value);
         slot.ai_memory_index = dense_index;
         slot.addComponent(.ai_memory);
+        self.attachOptionalAiRow(slot, .memory, dense_index);
     }
 
     pub fn aiMemorySliceConst(self: *const DataSystem) ConstAiMemorySlice {
@@ -1004,6 +1019,7 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_affects.append(self.allocator, id, affect_value);
         slot.ai_affect_index = dense_index;
         slot.addComponent(.ai_affect);
+        self.attachOptionalAiRow(slot, .affect, dense_index);
     }
 
     pub fn aiAffectSliceConst(self: *const DataSystem) ConstAiAffectSlice {
@@ -1056,6 +1072,7 @@ pub const DataSystem = struct {
         metadata.level = level;
         self.movement_bodies.setScopeMetadata(di, metadata);
         self.snapInterpolationIfStill(di, metadata.tier);
+        self.mirrorLinkedScope(di);
     }
 
     pub const applyStructuralCommands = structural.applyStructuralCommands;
@@ -1111,10 +1128,18 @@ pub const DataSystem = struct {
         self.movement_bodies.unlinkDrawable(index);
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
+        const removed_ai = self.movement_bodies.aiRowAt(index);
+        const removed_bounds = self.movement_bodies.boundsRowAt(index);
         const moved = self.movement_bodies.removeAt(index);
+        if (removed_ai != no_component_row) self.ai_agents.setMovementRow(removed_ai, no_component_row);
+        if (removed_bounds != no_component_row) self.collision_bounds.setMovementRow(removed_bounds, no_component_row);
         if (moved) |entity| {
             self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
             self.movement_bodies.retieDrawableMovementIndex(index);
+            const tail_ai = self.movement_bodies.aiRowAt(index);
+            if (tail_ai != no_component_row) self.ai_agents.setMovementRow(tail_ai, @intCast(index));
+            const tail_bounds = self.movement_bodies.boundsRowAt(index);
+            if (tail_bounds != no_component_row) self.collision_bounds.setMovementRow(tail_bounds, @intCast(index));
         }
         // Losing the movement body ends a static obstacle. The bounds row stays.
         if (bounds_index) |dense| self.collision_bounds.addDynamic(dense);
@@ -1136,8 +1161,14 @@ pub const DataSystem = struct {
     }
 
     fn removeCollisionBoundsAt(self: *DataSystem, index: usize) void {
+        const removed_movement = self.collision_bounds.movementRowAt(index);
+        if (removed_movement != no_component_row) self.movement_bodies.setBoundsRow(removed_movement, no_component_row);
         const moved = self.collision_bounds.removeAt(index);
-        if (moved) |entity| self.slots.items[@intCast(entity.index)].collision_bounds_index = @intCast(index);
+        if (moved) |entity| {
+            self.slots.items[@intCast(entity.index)].collision_bounds_index = @intCast(index);
+            const tail_movement = self.collision_bounds.movementRowAt(index);
+            if (tail_movement != no_component_row) self.movement_bodies.setBoundsRow(tail_movement, @intCast(index));
+        }
     }
 
     fn removeCollisionResponseAt(self: *DataSystem, index: usize) void {
@@ -1165,8 +1196,14 @@ pub const DataSystem = struct {
     }
 
     fn removeAiAgentAt(self: *DataSystem, index: usize) void {
+        const removed_movement = self.ai_agents.movementRowAt(index);
+        if (removed_movement != no_component_row) self.movement_bodies.setAiRow(removed_movement, no_component_row);
         const moved = self.ai_agents.removeAt(index);
-        if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_agent_index = @intCast(index);
+        if (moved) |entity| {
+            self.slots.items[@intCast(entity.index)].ai_agent_index = @intCast(index);
+            const tail_movement = self.ai_agents.movementRowAt(index);
+            if (tail_movement != no_component_row) self.movement_bodies.setAiRow(tail_movement, @intCast(index));
+        }
     }
 
     fn removeSteeringAgentAt(self: *DataSystem, index: usize) void {
@@ -1185,18 +1222,127 @@ pub const DataSystem = struct {
     }
 
     fn removeAiPerceptionAt(self: *DataSystem, index: usize) void {
+        self.detachOptionalAiRow(self.ai_perceptions.entityAt(index), .perception);
         const moved = self.ai_perceptions.removeAt(index);
-        if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_perception_index = @intCast(index);
+        if (moved) |entity| {
+            self.slots.items[@intCast(entity.index)].ai_perception_index = @intCast(index);
+            self.retieOptionalAiRow(entity, .perception, @intCast(index));
+        }
     }
 
     fn removeAiMemoryAt(self: *DataSystem, index: usize) void {
+        self.detachOptionalAiRow(self.ai_memories.entityAt(index), .memory);
         const moved = self.ai_memories.removeAt(index);
-        if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_memory_index = @intCast(index);
+        if (moved) |entity| {
+            self.slots.items[@intCast(entity.index)].ai_memory_index = @intCast(index);
+            self.retieOptionalAiRow(entity, .memory, @intCast(index));
+        }
     }
 
     fn removeAiAffectAt(self: *DataSystem, index: usize) void {
+        self.detachOptionalAiRow(self.ai_affects.entityAt(index), .affect);
         const moved = self.ai_affects.removeAt(index);
-        if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_affect_index = @intCast(index);
+        if (moved) |entity| {
+            self.slots.items[@intCast(entity.index)].ai_affect_index = @intCast(index);
+            self.retieOptionalAiRow(entity, .affect, @intCast(index));
+        }
+    }
+
+    const OptionalAiColumn = enum { perception, memory, affect };
+
+    fn attachOptionalAiRow(self: *DataSystem, slot: *EntitySlot, column: OptionalAiColumn, dense_index: u32) void {
+        if (slot.ai_agent_index) |ai_index| {
+            switch (column) {
+                .perception => self.ai_agents.setPerceptionRow(ai_index, dense_index),
+                .memory => self.ai_agents.setMemoryRow(ai_index, dense_index),
+                .affect => self.ai_agents.setAffectRow(ai_index, dense_index),
+            }
+            if (slot.movement_body_index) |movement_index| self.mirrorLinkedScope(movement_index);
+        }
+    }
+
+    fn detachOptionalAiRow(self: *DataSystem, entity: EntityId, column: OptionalAiColumn) void {
+        const slot = &self.slots.items[@intCast(entity.index)];
+        const ai_index = slot.ai_agent_index orelse return;
+        // Destroy drops the AI row first. The slot still names that index, which now holds
+        // the swapped tail or is past the store.
+        if (ai_index >= self.ai_agents.len()) return;
+        if (!self.ai_agents.sliceConst().entities[ai_index].eql(entity)) return;
+        switch (column) {
+            .perception => self.ai_agents.setPerceptionRow(ai_index, no_component_row),
+            .memory => self.ai_agents.setMemoryRow(ai_index, no_component_row),
+            .affect => self.ai_agents.setAffectRow(ai_index, no_component_row),
+        }
+    }
+
+    fn retieOptionalAiRow(self: *DataSystem, entity: EntityId, column: OptionalAiColumn, dense_index: u32) void {
+        const slot = &self.slots.items[@intCast(entity.index)];
+        const ai_index = slot.ai_agent_index orelse return;
+        switch (column) {
+            .perception => self.ai_agents.setPerceptionRow(ai_index, dense_index),
+            .memory => self.ai_agents.setMemoryRow(ai_index, dense_index),
+            .affect => self.ai_agents.setAffectRow(ai_index, dense_index),
+        }
+    }
+
+    /// Copies the movement row's scope and motion onto its AI row, and its tier onto its bounds row.
+    fn mirrorLinkedScope(self: *DataSystem, movement_index: usize) void {
+        const metadata = self.movement_bodies.scopeMetadataAt(movement_index);
+        const body = self.movement_bodies.get(movement_index);
+        const ai_row = self.movement_bodies.aiRowAt(movement_index);
+        if (ai_row != no_component_row) {
+            self.ai_agents.writeMirroredScope(
+                ai_row,
+                metadata.level orelse 0,
+                metadata.chunk.x,
+                metadata.chunk.y,
+                metadata.tier,
+                metadata.stagger_phase,
+                metadata.always_active,
+                body.previous_position.x,
+                body.previous_position.y,
+                body.velocity.x,
+                body.velocity.y,
+            );
+        }
+        const bounds_row = self.movement_bodies.boundsRowAt(movement_index);
+        if (bounds_row != no_component_row) self.collision_bounds.setTier(bounds_row, metadata.tier);
+    }
+
+    pub const PackedColumn = enum { perception, memory, affect };
+
+    /// Points `index`'s entity slot and AI row at the packed optional-component row.
+    pub fn retiePackedRow(self: *DataSystem, column: PackedColumn, index: u32) void {
+        const entity = switch (column) {
+            .perception => self.ai_perceptions.entityAt(index),
+            .memory => self.ai_memories.entityAt(index),
+            .affect => self.ai_affects.entityAt(index),
+        };
+        const slot = &self.slots.items[@intCast(entity.index)];
+        switch (column) {
+            .perception => {
+                slot.ai_perception_index = index;
+                if (slot.ai_agent_index) |ai| self.ai_agents.setPerceptionRow(ai, index);
+            },
+            .memory => {
+                slot.ai_memory_index = index;
+                if (slot.ai_agent_index) |ai| self.ai_agents.setMemoryRow(ai, index);
+            },
+            .affect => {
+                slot.ai_affect_index = index;
+                if (slot.ai_agent_index) |ai| self.ai_agents.setAffectRow(ai, index);
+            },
+        }
+    }
+
+    /// Rewrites every AI row's slot index and its movement row's `ai_row` after a full reorder.
+    pub fn retieAiRows(self: *DataSystem) void {
+        const rows = self.ai_agents.sliceConst();
+        const movement_ai = self.movement_bodies.aiRowColumn();
+        for (rows.entities, rows.movement_row, 0..) |entity, movement, i| {
+            self.slots.items[@intCast(entity.index)].ai_agent_index = @intCast(i);
+            if (movement != no_component_row) movement_ai[movement] = @intCast(i);
+        }
     }
 
     fn removeDestructibleAt(self: *DataSystem, index: usize) void {
@@ -3590,6 +3736,31 @@ test "ai affect survives entity destruction and reuse with generational correctn
     try data.setAiAffect(reused, .{ .baseline_fear = 0.6 });
     try std.testing.expectEqual(@as(f32, 0.6), data_test_support.aiAffect(&data, reused).?.baseline_fear);
     try std.testing.expectEqual(@as(?AiAffect, null), data_test_support.aiAffect(&data, original));
+}
+
+test "swap-remove of the first of two movement-plus-ai rows leaves the survivor ai_row at 0" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try data.createEntity();
+    const survivor = try data.createEntity();
+    try data.setMovementBody(first, .{ .position = .{ .x = 1, .y = 1 } });
+    try data.setAiAgent(first, .{});
+    try data.setMovementBody(survivor, .{ .position = .{ .x = 2, .y = 2 } });
+    try data.setAiAgent(survivor, .{});
+    const survivor_movement = data.movementBodyDenseIndex(survivor).?;
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.aiRowAt(survivor_movement));
+    try std.testing.expect(try data.destroyEntity(first));
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.aiRowAt(data.movementBodyDenseIndex(survivor).?));
+}
+
+test "setMovementBody then setCollisionBounds then setSimulationTier dormant leaves the bounds tier dormant" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 1, .y = 1 } });
+    try data.setCollisionBounds(entity, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setSimulationTier(entity, .dormant);
+    try std.testing.expectEqual(SimulationTier.dormant, data.collisionBoundsSliceConst().tier[0]);
 }
 
 fn testBody(base: f32) MovementBody {

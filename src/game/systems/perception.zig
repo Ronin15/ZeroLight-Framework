@@ -45,6 +45,7 @@ const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
+const no_component_row = @import("../data_system/types.zig").no_component_row;
 const Faction = @import("../data_system.zig").Faction;
 const PerceptionSlice = @import("../data_system.zig").PerceptionSlice;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -497,28 +498,29 @@ const PerceptionGatherInputs = struct {
         return if (self.scope_dense_indices) |indices| indices.len else self.ai_agents.entities.len;
     }
 
-    // Think row `k`'s observer row, or null without a movement body or `AiPerception`.
-    // Scalar per row: dense-index lookups into the movement, perception, faction, and level
-    // stores, with skips; threaded in windows.
+    // Think row `k`'s observer row, or null without a movement body or perception.
+    // Reads that row's position, faction, and level columns and its perception row.
+    // Scalar per row; threaded in windows.
     fn gatherRow(self: *const PerceptionGatherInputs, k: usize) ?PerceptionGatherRow {
         const i: usize = if (self.scope_dense_indices) |indices| indices[k] else k;
         const ent = self.ai_agents.entities[i];
-        const mi = self.data.movementBodyDenseIndex(ent) orelse return null;
-        const perception_index = self.data.aiPerceptionDenseIndex(ent) orelse return null;
+        if (self.ai_agents.movement_row[i] == no_component_row) return null;
+        const perception_index = self.ai_agents.perception_row[i];
+        if (perception_index == no_component_row) return null;
         const perception = self.perception_slice;
         const prev_nearest = perception.nearest_threat[perception_index];
         const vision_range = perception.vision_range[perception_index];
         return .{
             .entity = ent,
-            .pos_x = self.movement.previous_x[mi],
-            .pos_y = self.movement.previous_y[mi],
-            .velocity_x = self.movement.velocity_x[mi],
-            .velocity_y = self.movement.velocity_y[mi],
+            .pos_x = self.ai_agents.previous_x[i],
+            .pos_y = self.ai_agents.previous_y[i],
+            .velocity_x = self.ai_agents.velocity_x[i],
+            .velocity_y = self.ai_agents.velocity_y[i],
             .vision_range = vision_range,
             .cos_half_fov = perception.cos_half_fov[perception_index],
             .hearing_range = perception.hearing_range[perception_index],
-            .faction = self.data.factionConst(ent) orelse .neutral,
-            .level = self.data.worldLevelConst(ent) orelse 0,
+            .faction = self.ai_agents.faction[i],
+            .level = self.ai_agents.level[i],
             // Non-negative: the vision range is at least 0.
             .scan_box = @intCast(cellScanRadius(vision_range, self.cell_size)),
             .perception_dense_index = perception_index,

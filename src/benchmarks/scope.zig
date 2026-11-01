@@ -168,6 +168,15 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     defer setup_threads.deinit();
     var spatial_index = SpatialIndexSystem.init(allocator);
     defer spatial_index.deinit();
+    const geometry = index_geometry;
+    const grid = @import("../game/systems/spatial_index.zig").cellGrid(geometry, 32);
+    const per_chunk: u32 = if (geometry.chunks_x == 0) 1 else @max(grid.cells_x / geometry.chunks_x, 1);
+    try scope.orderThinkPhases(&data, cognitionHaloRegion(), .{
+        .cell_size = grid.cell_size,
+        .cells_x = grid.cells_x,
+        .cells_y = grid.cells_y,
+        .cells_per_chunk = per_chunk,
+    }, &setup_threads, .{});
     const halo = (try scope.gatherAiPopulations(&data, cognitionHaloRegion(), &setup_threads, .{})).halo;
     _ = try spatial_index.build(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, &setup_threads, .{});
     const view = spatial_index.view();

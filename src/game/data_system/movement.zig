@@ -20,6 +20,7 @@ const ConstMovementBodySlice = types.ConstMovementBodySlice;
 const ScopeColumnsSlice = types.ScopeColumnsSlice;
 const ConstScopeColumnsSlice = types.ConstScopeColumnsSlice;
 const hotStoreCapacity = types.hotStoreCapacity;
+const no_component_row = types.no_component_row;
 const EntitySimulationMetadata = @import("../simulation_scope.zig").EntitySimulationMetadata;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
@@ -80,6 +81,9 @@ const MovementBodyRow = struct {
     // append placeholder `dense_index % cognition_stagger_n`.
     stagger_settled: bool = false,
     always_active: bool,
+    // Linked component rows. `no_component_row` when that component is absent.
+    ai_row: u32 = no_component_row,
+    bounds_row: u32 = no_component_row,
     // Index of this row's drawable run, and its slot in that run. `no_drawable` is none.
     drawable_run: u32 = no_drawable,
     drawable_slot: u32 = no_drawable,
@@ -235,6 +239,8 @@ pub const MovementBodyStore = struct {
             .stagger_phase = @intCast(index % cognition_stagger_n),
             .stagger_settled = false,
             .always_active = false,
+            .ai_row = no_component_row,
+            .bounds_row = no_component_row,
         });
         self.arrival_holds.appendAssumeCapacity(.{});
         std.debug.assert(self.arrival_holds.items.len == self.rows.len);
@@ -308,6 +314,26 @@ pub const MovementBodyStore = struct {
 
     pub fn setHasAiAgent(self: *MovementBodyStore, index: usize, has_agent: bool) void {
         self.rows.slice().items(.has_ai_agent)[index] = has_agent;
+    }
+
+    pub fn aiRowAt(self: *const MovementBodyStore, index: usize) u32 {
+        return self.rows.slice().items(.ai_row)[index];
+    }
+
+    pub fn setAiRow(self: *MovementBodyStore, index: usize, ai_row: u32) void {
+        self.rows.slice().items(.ai_row)[index] = ai_row;
+    }
+
+    pub fn aiRowColumn(self: *MovementBodyStore) []u32 {
+        return self.rows.slice().items(.ai_row);
+    }
+
+    pub fn boundsRowAt(self: *const MovementBodyStore, index: usize) u32 {
+        return self.rows.slice().items(.bounds_row)[index];
+    }
+
+    pub fn setBoundsRow(self: *MovementBodyStore, index: usize, bounds_row: u32) void {
+        self.rows.slice().items(.bounds_row)[index] = bounds_row;
     }
 
     pub fn scopeMetadataAt(self: *const MovementBodyStore, index: usize) EntitySimulationMetadata {
