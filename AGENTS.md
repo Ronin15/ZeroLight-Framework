@@ -42,7 +42,12 @@ no design question) may be done inline. The main session coordinates.
 Specialists own the design and the code. It keeps each unit on the agreed
 goal and order. Its check is the slice pass, the named plan, and the
 landing's cited lines. It does not design the change or walk the
-module. It calls out a needed direction change to the owner and reports.
+module. The spawn prompt is the handoff, the slice item, and the finding.
+`src/` stays unread while writing it. A check reads only the
+plan or the landing at the path the handoff names, and the slice item
+those cite. A specialist that is on the item runs until it finishes. Stop
+one only when its diff leaves that item. It calls out a needed direction
+change to the owner and reports.
 Before it starts or continues a unit, it reads `.grok/reports/handoffs.md`.
 That file names the next unit, the specialist, and the sources. When a unit
 finishes, or a review routes the next one, the main session rewrites the file.
@@ -55,13 +60,18 @@ finishes, or a review routes the next one, the main session rewrites the file.
 - **Implement** prompt: the design plan's path and its overrides. The plan
   lists the exact test and bench commands, and the values the new test
   asserts. The implementer runs those commands. That result is the proof.
-  A stated fix with no plan is the prompt, and that prompt carries the same
+  A slice item arrives as a plan. A review finding on the current landing,
+  with no new plan, is the prompt, and that prompt carries the same
   commands and values. Every command it names exercises the changed code.
 - **Review** prompt: the files and the report path.
 - A repeated constraint belongs in `.grok/rules/`.
-- **Design** (`zig-design-specialist`) only when a design is open or the
-  structure fails the cost model, right before implementation. A known fix or
-  a call already made goes straight to `zig-specialist`.
+- **Design** (`zig-design-specialist`) for every slice item, right before
+  its implementation. An audit finding is a slice item. The short path
+  when the owner exists. The long path when it does not, and for a big
+  feature. Then `zig-specialist`. A finding's fix sentence does not skip
+  design. The route is named once, before spawn. Finishing an agent
+  already on an item does not change the route of an item that has not
+  started.
 - **Review** (`zig-review-specialist`) once per landing, before commit,
   spawned the same turn the code is ready. A large diff is two review
   agents, spawned together. Each prompt names its own files. The split is

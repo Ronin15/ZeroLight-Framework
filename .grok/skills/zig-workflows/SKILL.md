@@ -28,15 +28,15 @@ test fix stays inline.
 
 | Signal | Route |
 |--------|--------|
-| The how is open, or the structure fails the cost model | Design, then implement |
-| The change is already decided | Implement |
-| A decision inside an existing owner, how still open | Design on the short path, then implement |
+| A slice item, including an audit finding | Design, then implement. The short path when the owner exists. The long path when it does not, and for a big feature. A finding's fix sentence does not skip design. |
+| A review finding with a stated local fix on the current landing | Implement |
+| An open choice in a review | Design, then implement |
 | A command failed | Debug |
 | The landing's code is ready | Review, the same turn |
 | The slice's programming is done | Docs |
 | Pathfinder / best-practices / deep-correctness / architecture | That skill |
 
-When unsure, implement. Review a substantive diff. Debug a failing command.
+When unsure whether the owner exists, design on the long path. Review a substantive diff. Debug a failing command.
 
 Spawn, review split, and the parent's check are `AGENTS.md` § Agent
 Pipeline. The spawn prompt does not restate this skill or the agent's job.
