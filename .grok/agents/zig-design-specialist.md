@@ -1,8 +1,8 @@
 ---
 name: zig-design-specialist
 description: >-
-  Writes a decision-complete plan when the how is open or the structure
-  fails the cost model.
+  Writes a decision-complete plan for a new slice item, and when the how
+  is open or the structure fails the cost model.
 tools:
   - read_file
   - grep

@@ -64,17 +64,19 @@ finishes, or a review routes the next one, the main session rewrites the file.
   commands and values. Every command it names exercises the changed code.
 - **Review** prompt: the files and the report path.
 - A repeated constraint belongs in `.grok/rules/`.
-- **Design** (`zig-design-specialist`) only when a design is open or the
-  structure fails the cost model, right before implementation. A known fix or
-  a call already made goes straight to `zig-specialist`.
+- **Design** (`zig-design-specialist`) for every new slice item, and when
+  a design is open or the structure fails the cost model, right before
+  implementation. A stated local fix on the landing under review goes
+  straight to `zig-specialist`.
 - **Review** (`zig-review-specialist`) once per landing, before commit,
   spawned the same turn the code is ready. A large diff is two review
   agents, spawned together. Each prompt names its own files. The split is
   files that do not share a write. The main session merges the two reports
   into one finding list. That is one review, not a second round. Fixes fold
   into that commit. A
-  finding with a stated local fix goes to `zig-specialist`, an open choice to
-  design. A High structural data-layout finding in new code is fixed in its
+  stated local fix on the landing under review goes to `zig-specialist`. A
+  finding filed as a new slice item goes to design, then `zig-specialist`.
+  An open choice goes to design. A High structural data-layout finding in new code is fixed in its
   landing. Any finding not fixed becomes a checklist item in its owning slice
   (`file:line`, failure scenario, pass condition). Each High carries the
   source tag from `zig-review-specialist`. A `rule-gap` is shown to the
@@ -118,7 +120,10 @@ The owner pushes.
 
 ## Commands
 
-Zig 0.17.0 minimum. `zig` on `PATH` is the current binary. `zig build test`
+Zig 0.17.0 minimum. `zig` on `PATH` is the current binary. The standard
+library is the mise install on Linux,
+`/home/roninxv/.local/share/mise/installs/zig/0.17.0/lib/std`, and the
+Homebrew install on the Mac, `/opt/homebrew/opt/zig/lib/zig/std`. `zig build test`
 with its `-Dtest-filter`, and `zig build bench` or `tools/bench_ab.py` with
 its group, run that binary. Do not search `.zig-cache` or `zig-out` for a
 test or bench executable. `zig build -h` lists the steps and the `-D` options; stop
