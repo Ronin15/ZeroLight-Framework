@@ -3353,7 +3353,7 @@ const TestAllocatorCounters = struct {
                 break :blk false;
             };
             if (!is_allowed and self.countAt(index) != 0) {
-                std.debug.print("unexpected allocations on owner '{s}': {d}\n", .{ name, self.countAt(index) });
+                if (comptime logging.enabled(.err)) logging.game.err("unexpected allocations on owner '{s}': {d}", .{ name, self.countAt(index) });
                 return error.TestUnexpectedResult;
             }
         }

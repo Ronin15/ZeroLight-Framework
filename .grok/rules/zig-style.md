@@ -102,7 +102,7 @@
 - Route runtime diagnostics through the owning module's scoped logger in
   `src/core/logging.zig` (`const log = @import("../core/logging.zig").render;`).
   Never call `std.log`/`std.log.scoped(...)` directly; `std.debug.print` is
-  for `src/benchmarks/` CLI stdout only.
+  for `src/benchmarks/` CLI stdout only. `idiom-lint` rejects both.
 - `info`/`debug` for lifecycle, config, and fallback; `warn` for recovered
   degradation; `err` for real failures. Pure helpers and validation stay
   log-free.

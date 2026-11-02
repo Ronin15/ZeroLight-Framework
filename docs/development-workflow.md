@@ -25,8 +25,10 @@ zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreac
 
 `zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) checks
 the mechanical subset of `.grok/rules/zig-style.md` and
-`.grok/rules/memory-performance.md` as 13 rules; the script's docstring lists
-exactly what it enforces. Rule 13 gates `ThreadSystem`'s fixed-shape dispatch
+`.grok/rules/memory-performance.md` as 14 rules; the script's docstring lists
+exactly what it enforces. Rule 14 rejects a direct `std.log` call and a
+`std.debug.print` outside `src/benchmarks/` (`.grok/rules/zig-style.md`
+§ Logging). Rule 13 gates `ThreadSystem`'s fixed-shape dispatch
 options (`.grok/rules/tests-benchmarks.md`): production code outside
 `thread_system.zig`, tests, test-only helpers, and benches may only forward a
 stage config's own controls (`docs/architecture.md` § Thread System). It runs a

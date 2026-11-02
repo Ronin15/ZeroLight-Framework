@@ -91,6 +91,11 @@ reviewer diligence:
     declarations), their `test` blocks, and helpers only tests reach. A
     self-check runs the removed hit lines, one hit per context, and forwards
     first.
+14. Runtime diagnostics use `src/core/logging.zig`. A `std.log.scoped` or
+    `std.log.err` / `warn` / `info` / `debug` / `log` call outside that file
+    is a hit. `std.log.Level` is a type and is not a hit. `std.debug.print`
+    outside `src/benchmarks/` is a hit. A self-check runs must-hit and
+    must-pass lines.
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
 blanked and `//` comments removed, so text inside literals never trips a rule.
@@ -425,12 +430,23 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                     )
                 )
 
-        if path.is_relative_to(SRC_DIR) and "error.SkipZigTest" in code:
+        if path.is_relative_to(SRC_DIR) and "error.Skip ZigTest" in code:
             issues.append(
                 (
                     rel,
                     lineno,
                     "`error.SkipZigTest` is banned under src/ (tests, benches, and smoke included)",
+                    raw.strip(),
+                )
+            )
+
+        if path.is_relative_to(SRC_DIR) and direct_log_hit(rel, code):
+            issues.append(
+                (
+                    rel,
+                    lineno,
+                    "direct log call; use the scoped logger in src/core/logging.zig "
+                    "(`std.debug.print` is src/benchmarks/ stdout only)",
                     raw.strip(),
                 )
             )
@@ -693,6 +709,43 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
                 (rel, index + 1, f"method `{name}` has no production use in its file (only tests reach it); remove it from production", raw_lines[index].strip())
             )
     return issues
+
+
+# Rule 14. Direct std.log calls and std.debug.print outside bench stdout.
+# `std.log.Level` is a type. The scoped loggers live in logging.zig.
+DIRECT_LOG_CALL = re.compile(r"\bstd\.log\.(?:scoped|err|warn|info|debug|log)\b")
+DEBUG_PRINT_CALL = re.compile(r"\bstd\.debug\.print\b")
+LOGGER_FILE = "src/core/logging.zig"
+# (code, rel path, hit). The self-check fails the lint when a case flips.
+LOG_CALL_CASES = (
+    ("pub const game = std.log.scoped(.game);", "src/core/logging.zig", False),
+    ("std.log.scoped(.app);", "src/game/foo.zig", True),
+    ("std.log.err(\"failed\", .{});", "src/game/foo.zig", True),
+    ("const level: std.log.Level = .warn;", "src/game/foo.zig", False),
+    ("std.debug.print(\"row\\n\", .{});", "src/benchmarks/suite.zig", False),
+    ("std.debug.print(\"row\\n\", .{});", "src/game/foo.zig", True),
+    ("logging.game.warn(\"grew\", .{});", "src/game/foo.zig", False),
+)
+
+
+def direct_log_hit(rel: str, code: str) -> bool:
+    """True when `code` in `rel` bypasses the scoped logger."""
+    if rel != LOGGER_FILE and DIRECT_LOG_CALL.search(code):
+        return True
+    if DEBUG_PRINT_CALL.search(code) and not rel.startswith("src/benchmarks/"):
+        return True
+    return False
+
+
+def check_direct_log() -> None:
+    """Fails the lint when rule 14's pattern misreads one of its self-check cases."""
+    for code, rel, hit in LOG_CALL_CASES:
+        if direct_log_hit(rel, code) != hit:
+            print(
+                f"idiom-lint: rule 14 self-check failed on `{code}` in {rel} (expected {'a hit' if hit else 'no hit'})",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
 
 # Rule 11. `.perf` is any member access (`stats.perf.x`, `.perf.x`), never the `perf_counters`
@@ -1484,6 +1537,7 @@ def main() -> None:
         raise SystemExit(1)
 
     check_perf_ref()
+    check_direct_log()
     check_dispatch_controls()
     files = sorted(SRC_DIR.rglob("*.zig")) + [BUILD_FILE]
     issues: list[tuple[str, int, str, str]] = []
