@@ -76,8 +76,9 @@ finishes, or a review routes the next one, the main session rewrites the file.
   into that commit. A
   stated local fix on the landing under review goes to `zig-specialist`. A
   finding filed as a new slice item goes to design, then `zig-specialist`.
-  An open choice goes to design. A High structural data-layout finding in new code is fixed in its
-  landing. Any finding not fixed becomes a checklist item in its owning slice
+  An open choice goes to design. A High structural data-layout finding
+  in new code is fixed in its landing. Any finding not fixed becomes a
+  checklist item in its owning slice
   (`file:line`, failure scenario, pass condition). Each High carries the
   source tag from `zig-review-specialist`. A `rule-gap` is shown to the
   owner as that one sentence; on approval it lands in the named rule, with

@@ -83,9 +83,8 @@ files it links. Do not load the whole roadmap.
    other slice files unless linked.
 3. **Design plan right before implementation.** `zig-design-specialist`
    writes the plan for each new slice item, and for a landing whose design
-   is open, against
-   the live code (`AGENTS.md` § Agent Pipeline). The plan goes to the
-   implementer, not into the slice.
+   is open, against the live code (`AGENTS.md` § Agent Pipeline). The plan
+   goes to the implementer, not into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
 5. **Review before commit** (`AGENTS.md` § Agent Pipeline); fixes fold into
    the commit.
