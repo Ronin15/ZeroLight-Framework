@@ -82,11 +82,9 @@ files it links. Do not load the whole roadmap.
    architecture.md, the header's track file, and any doc the slice links; no
    other slice files unless linked.
 3. **Design plan right before implementation.** `zig-design-specialist`
-   writes the plan for every slice item, against the live code
-   (`AGENTS.md` § Agent Pipeline). An audit finding is a slice item. The
-   short path when the owner exists. The long path when it does not, and
-   for a big feature. Then implementation. A finding's fix sentence does
-   not skip the plan. The plan goes to the implementer, not into the slice.
+   writes the plan for each slice or landing whose design is open, against
+   the live code (`AGENTS.md` § Agent Pipeline). The plan goes to the
+   implementer, not into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
 5. **Review before commit** (`AGENTS.md` § Agent Pipeline); fixes fold into
    the commit.

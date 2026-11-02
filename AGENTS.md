@@ -60,18 +60,13 @@ finishes, or a review routes the next one, the main session rewrites the file.
 - **Implement** prompt: the design plan's path and its overrides. The plan
   lists the exact test and bench commands, and the values the new test
   asserts. The implementer runs those commands. That result is the proof.
-  A slice item arrives as a plan. A review finding on the current landing,
-  with no new plan, is the prompt, and that prompt carries the same
+  A stated fix with no plan is the prompt, and that prompt carries the same
   commands and values. Every command it names exercises the changed code.
 - **Review** prompt: the files and the report path.
 - A repeated constraint belongs in `.grok/rules/`.
-- **Design** (`zig-design-specialist`) for every slice item, right before
-  its implementation. An audit finding is a slice item. The short path
-  when the owner exists. The long path when it does not, and for a big
-  feature. Then `zig-specialist`. A finding's fix sentence does not skip
-  design. The route is named once, before spawn. Finishing an agent
-  already on an item does not change the route of an item that has not
-  started.
+- **Design** (`zig-design-specialist`) only when a design is open or the
+  structure fails the cost model, right before implementation. A known fix or
+  a call already made goes straight to `zig-specialist`.
 - **Review** (`zig-review-specialist`) once per landing, before commit,
   spawned the same turn the code is ready. A large diff is two review
   agents, spawned together. Each prompt names its own files. The split is

@@ -45,9 +45,10 @@ Report every real finding, ranked:
 - **Low**: maintainability, naming, duplication, doc drift.
 
 Tag each finding **structural** (a symptom of a design that fails the cost
-model) or **local**, with its fix direction. A structural finding whose fix is
-one local change routes to zig-specialist; only an open choice routes to
-design.
+model) or **local**, with its fix direction. A stated local fix on the
+landing under review routes to zig-specialist. A finding filed as a new
+slice item routes to zig-design-specialist, then zig-specialist. An open
+choice routes to design.
 
 Each High also carries one source tag:
 
