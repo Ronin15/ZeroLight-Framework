@@ -48,12 +48,16 @@ group, case, and `--items`. "No bench" when none runs. Omit an empty
 section. A hot loop whose cost, placement, or access order changes is
 named in the condition: what it reads, its read order, its filter keys,
 and `memory-performance.md` § Data-oriented design. A layout that fails
-that section is the decision. A cost order is the work the next call
-still does. Retained capacity a later smaller change still walks is not
-the order of what that change touched (`engine-design.md` § Cost model).
-The plan does not close that order on a reopen condition that excludes
-the later change. A proof that requires the retained capacity to remain
-does not prove the next change.
+that section is the decision. The condition states every order
+`engine-design.md` § Cost model requires for this change, each marked
+measured or derived. That includes the next call that still touches what
+this change retains. Retained capacity a later smaller change still walks
+is not the order of what that change touched. The plan does not close an
+order on a reopen condition that leaves one of those orders out. The
+proof fails when an order is violated. A proof of only the call that
+grew the storage does not prove the next call. Check the finished plan
+against the loaded rules for the steps it cites, the same check as the
+long path.
 
 A settle, merge, or remove the slice names is the plan. A new tuner
 architecture, a new stage pattern, or a rule edit is reported. An
