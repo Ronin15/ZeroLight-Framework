@@ -80,11 +80,13 @@ const affect_events_per_row_max = @import("simulation.zig").affect_events_per_ro
 const ActionIntent = @import("simulation.zig").ActionIntent;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const pipeline_structural_event_share = @import("simulation.zig").pipeline_structural_event_share;
+const max_structural_events_per_create = @import("data_system.zig").max_structural_events_per_create;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const stimulus_max_impacts_per_step = @import("simulation.zig").stimulus_max_impacts_per_step;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
+const StructuralPrefix = @import("data_system.zig").StructuralPrefix;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -1308,12 +1310,11 @@ pub const SimulationPipeline = struct {
     }
 
     /// The commit seam's collider reserve, before the structural commit: sizes the static
-    /// colliders' dirty list to every entity index this step's commands can produce, so the
+    /// colliders' dirty list to every entity index the applied commands can produce, so the
     /// capture after the commit allocates nothing, and nav's static marks to every change
-    /// the next collider sync can record (the pending changes plus one per command). An
-    /// error commits nothing.
-    fn reserveStaticColliders(self: *SimulationPipeline, frame: *const SimulationFrame, data: *const DataSystem) !void {
-        const command_count = frame.structural_commands.mergedItems().len;
+    /// the next collider sync can record (the pending changes plus one per applied command).
+    /// The deferred tail is not this step's collider or nav-mark bound. An error commits nothing.
+    fn reserveStaticColliders(self: *SimulationPipeline, data: *const DataSystem, command_count: usize) !void {
         try self.static_colliders.reserveForCommit(data, command_count);
         try self.pathfinding.reserveStaticColliderMarks(self.static_colliders.pendingChangeCount() + command_count);
     }
@@ -1349,8 +1350,9 @@ pub const SimulationPipeline = struct {
         try self.topUpTriggerContactBound(frame);
     }
 
-    /// The structural-commit seam, in order: the static-collider and static nav-mark
-    /// reserve, the budgeted commit, the collider capture of the step's static changes, the
+    /// The structural-commit seam, in order: the share's prefix, the static-collider and
+    /// static nav-mark reserve for that prefix, the commit (the fresh suffix stays for
+    /// the next step), the collider capture of the step's static changes, the
     /// population growth seam, the collider sync with its nav record and the stored-trigger
     /// contact bound growth (run even when the growth seam failed, so the step's static
     /// changes land and reach nav), then the post-commit nav reaction. The nav apply runs only
@@ -1369,14 +1371,17 @@ pub const SimulationPipeline = struct {
         thread_system: *ThreadSystem,
     ) !CommitSeamResult {
         if (comptime runtime_perf_log.enabled) self.perf = .{};
-        // The post-commit nav reaction appends at most one nav_region_invalidated event,
-        // driven by structural commands applied this frame, marks a terrain writer recorded
-        // (a dig's world_tile_changed), or nav work the world left pending (a level, link, or
-        // content revision). Reserve the slot for every source so the append never trips a
-        // tight capacity_limit.
-        const extra_event_count: usize = if (self.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
-        try self.reserveStaticColliders(frame, data);
-        const structural = try frame.applyStructuralCommandsBudgeted(data, self.structuralCommitBudget(extra_event_count));
+        // The post-commit nav reaction appends at most one nav_region_invalidated event.
+        // The slot covers the applied prefix, marks a terrain writer recorded, or nav work
+        // the world left pending. A command that did not commit does not invalidate this step.
+        const share = maxEventsPerStep(.structural_commit, self.eventBudgets());
+        const prefix = try frame.beginStructuralCommit(data, share);
+        const structural = structural: {
+            errdefer frame.structural_plan_scratch.clearRetainingCapacity();
+            const extra_event_count: usize = if (self.appliedPrefixMayEmitNav(data, frame, world, prefix)) maxEventsPerStep(.nav_reaction, .{}) else 0;
+            try self.reserveStaticColliders(data, prefix.plan.command_count);
+            break :structural try frame.completeStructuralCommit(data, prefix, self.structuralCommitBudget(extra_event_count));
+        };
         self.captureStaticColliderChanges(frame);
         // Population growth seam: the nav reaction and the next step see grown capacities.
         // O(1) when the committed rows fit the tracked capacities.
@@ -1432,9 +1437,19 @@ pub const SimulationPipeline = struct {
     /// Whether the post-commit nav reaction may emit its event this step: a pending
     /// structural command may change nav, a failed collider sync left static changes for
     /// this step's sync, or nav has recorded marks, levels, links, or a content revision
-    /// still to apply. Used for the pre-commit event capacity preflight.
+    /// still to apply. Scans the fresh command stream. The commit seam uses
+    /// `appliedPrefixMayEmitNav` so a command that did not commit is not included.
     fn navReactionMayEmit(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
         return self.static_colliders.hasPendingChanges() or self.pathfinding.navReactionMayEmit(data, frame, world);
+    }
+
+    fn appliedPrefixMayEmitNav(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem, prefix: StructuralPrefix) bool {
+        if (self.static_colliders.hasPendingChanges()) return true;
+        if (self.pathfinding.hasPendingNavUpdates(world)) return true;
+        const deferred = frame.deferredStructuralItems();
+        if (PathfindingSystem.commandsMayInvalidateNavigation(data, deferred[0..prefix.deferred_applied])) return true;
+        const fresh = frame.structural_commands.mergedItems();
+        return PathfindingSystem.commandsMayInvalidateNavigation(data, fresh[0..prefix.fresh_applied]);
     }
 
     /// Queues ambient audio (music + movement-gated jet loop) through the owned
@@ -4106,18 +4121,31 @@ const NavSeamFixture = struct {
 };
 
 const StructuralBurstOutcome = struct {
-    failed: bool,
     bodies: usize,
+    structural_events: usize,
+    deferred: usize,
+    deferred_x: f32,
+    resumed_bodies: usize = 0,
+    resumed_events: usize = 0,
+    resumed_deferred: usize = 0,
 };
 
 const structural_burst_max_creates: usize = 20;
+
+fn deferredCreateX(frame: *const SimulationFrame) f32 {
+    const live = frame.deferredStructuralItems();
+    if (live.len == 0) return 0;
+    const body = live[0].create_entity.movement_body orelse return 0;
+    return body.position.x;
+}
 
 /// Commits `create_count` 4-event creates against the structural share of a
 /// `structuralEventHeadroom(1, 0)` caller headroom (15) plus the pipeline's own
 /// `pipeline_structural_event_share` (64) = 79 events, on a minimal pipeline with 2
 /// perception/affect observers. With `saturate_other_producers`, every other producer's share is filled
-/// first, so only the structural share is left in the shared bound.
-fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !StructuralBurstOutcome {
+/// first, so only the structural share is left in the shared bound. `worker_threads` is the
+/// seam's pool. A retained create is committed on the next `beginStep`.
+fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool, worker_threads: usize) !StructuralBurstOutcome {
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -4157,17 +4185,145 @@ fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !S
     std.debug.assert(create_count <= commands.len);
     for (commands[0..create_count], 0..) |*command, index| command.* = responderTemplate(index, .dynamic);
     try writeStructuralCommands(&frame, commands[0..create_count]);
-    const events_before = frame.events.mergedItems().len;
-    const bodies_before = data.movementBodySliceConst().entities.len;
 
-    _ = commitSeamInline(&pipeline, &frame, &data, &world) catch |err| {
-        try std.testing.expectEqual(error.EventCapacityExceeded, err);
-        // Rejected before mutation: no rows, no events.
-        try std.testing.expectEqual(bodies_before, data.movementBodySliceConst().entities.len);
-        try std.testing.expectEqual(events_before, frame.events.mergedItems().len);
-        return .{ .failed = true, .bodies = data.movementBodySliceConst().entities.len };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_threads });
+    defer threads.deinit();
+    _ = try pipeline.commitStructuralAndReact(&frame, &data, &world, &threads);
+    var outcome = StructuralBurstOutcome{
+        .bodies = data.movementBodySliceConst().entities.len,
+        .structural_events = frame.events.stats.structural_commit_stage,
+        .deferred = frame.deferredStructuralItems().len,
+        .deferred_x = deferredCreateX(&frame),
     };
-    return .{ .failed = false, .bodies = data.movementBodySliceConst().entities.len };
+    if (outcome.deferred != 0) {
+        frame.beginStep();
+        try std.testing.expectEqual(outcome.deferred, frame.deferredStructuralItems().len);
+        _ = try pipeline.commitStructuralAndReact(&frame, &data, &world, &threads);
+        outcome.resumed_bodies = data.movementBodySliceConst().entities.len;
+        outcome.resumed_events = frame.events.stats.structural_commit_stage;
+        outcome.resumed_deferred = frame.deferredStructuralItems().len;
+    }
+    return outcome;
+}
+
+const OverShareStaticOutcome = struct {
+    bodies: usize,
+    nav_region_invalidated: usize,
+    applied_blocked: bool,
+    tail_absent: bool,
+    deferred_x: f32,
+};
+
+// Share `pipeline_structural_event_share` (64) admits 16 creates of 4 events. Fifteen
+// dynamic creates and one static at cell (0, 0) commit; the next static stays deferred.
+// Fresh commands sit past that cut. Collider indices and nav marks are reserved to the
+// applied prefix. `mergedItems().len` and the deferred backlog are past that capacity.
+fn commitOverShareStatic(worker_threads: usize) !OverShareStaticOutcome {
+    const create_events: usize = 4;
+    const applied = pipeline_structural_event_share / create_events;
+    const tail_x: f32 = 64;
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = applied,
+        .structural_headroom = 0,
+        .pathfinding = sync_test_pathfinding,
+        .navigation_world = &world,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + pipeline.structuralCommandHeadroom());
+    try pipeline.reserve(&frame, applied);
+    const share = maxEventsPerStep(.structural_commit, pipeline.eventBudgets());
+    try std.testing.expectEqual(pipeline_structural_event_share, share);
+    try std.testing.expectEqual(@as(usize, 0), share % create_events);
+    try std.testing.expectEqual(applied * create_events, share);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_threads });
+    defer threads.deinit();
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{responderTemplate(0, .static)});
+    _ = try pipeline.commitStructuralAndReact(&frame, &data, &world, &threads);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{.{ .destroy_entity = data.movementBodySliceConst().entities[0] }});
+    _ = try pipeline.commitStructuralAndReact(&frame, &data, &world, &threads);
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    try std.testing.expect(!pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
+    try std.testing.expect(!pipeline.pathfinding.hasPendingNavUpdates(&world));
+    try std.testing.expect(!pipeline.static_colliders.hasPendingChanges());
+    try std.testing.expectEqual(@as(usize, 0), pipeline.pathfinding.nav_marks.items.len);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    const collider_allocator = pipeline.static_colliders.allocator;
+    const path_allocator = pipeline.pathfinding.allocator;
+    defer pipeline.static_colliders.allocator = collider_allocator;
+    defer pipeline.pathfinding.allocator = path_allocator;
+    pipeline.static_colliders.allocator = failing.allocator();
+    pipeline.pathfinding.allocator = failing.allocator();
+    try pipeline.reserveStaticColliders(&data, applied);
+
+    const slots = data.slots.items.len;
+    const index_capacity = pipeline.static_colliders.row_of_index.capacity;
+    const mark_capacity = pipeline.pathfinding.nav_marks.capacity;
+    const index_need: usize = if (index_capacity >= slots) index_capacity - slots + 1 else 1;
+    const mark_need = mark_capacity / 2 + 1;
+    const backlog = @max(applied + 1, @max(index_need, mark_need));
+    const deferred_commands = try std.testing.allocator.alloc(StructuralCommand, backlog);
+    defer std.testing.allocator.free(deferred_commands);
+    const fresh_commands = try std.testing.allocator.alloc(StructuralCommand, backlog);
+    defer std.testing.allocator.free(fresh_commands);
+    for (deferred_commands, 0..) |*command, index| {
+        if (index == applied - 1) {
+            command.* = responderTemplate(0, .static);
+        } else if (index == applied) {
+            command.* = responderTemplate(1, .static);
+        } else {
+            command.* = responderTemplate(index + 2, .dynamic);
+        }
+    }
+    for (fresh_commands, 0..) |*command, index| command.* = responderTemplate(index + 2, .dynamic);
+
+    frame.beginStep();
+    try writeStructuralCommands(&frame, deferred_commands);
+    _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = 0 });
+    try std.testing.expectEqual(backlog, frame.deferredStructuralItems().len);
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, fresh_commands);
+    const fresh_len = frame.structural_commands.mergedItems().len;
+    const deferred_len = frame.deferredStructuralItems().len;
+    try std.testing.expectEqual(backlog, fresh_len);
+    try std.testing.expectEqual(backlog, deferred_len);
+    try std.testing.expect(fresh_len > applied and deferred_len > applied);
+    try std.testing.expectEqual(index_capacity, pipeline.static_colliders.row_of_index.capacity);
+    try std.testing.expectEqual(mark_capacity, pipeline.pathfinding.nav_marks.capacity);
+
+    const allocations_before = failing.allocations;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    _ = try pipeline.commitStructuralAndReact(&frame, &data, &world, &threads);
+    try std.testing.expectEqual(allocations_before, failing.allocations);
+
+    var tail_absent = true;
+    for (data.movementBodySliceConst().entities) |entity| {
+        if (data.movementBodyConst(entity).?.position.x == tail_x) tail_absent = false;
+    }
+    const outcome = OverShareStaticOutcome{
+        .bodies = data.movementBodySliceConst().entities.len,
+        .nav_region_invalidated = frame.events.stats.nav_region_invalidated,
+        .applied_blocked = pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }),
+        .tail_absent = tail_absent,
+        .deferred_x = deferredCreateX(&frame),
+    };
+    try std.testing.expectError(error.OutOfMemory, pipeline.reserveStaticColliders(&data, fresh_len));
+    try std.testing.expectError(error.OutOfMemory, pipeline.reserveStaticColliders(&data, deferred_len));
+    return outcome;
 }
 
 /// A static solid box of `size` from its min corner `position`.
@@ -7138,7 +7294,7 @@ test "a collider sync that runs out of memory keeps its change and the next step
     // A static created over the one cell; its collider sync runs out of memory.
     frame.beginStep();
     try writeStructuralCommands(&frame, &.{responderTemplate(0, .static)});
-    try pipeline.reserveStaticColliders(&frame, &data);
+    try pipeline.reserveStaticColliders(&data, frame.structural_commands.mergedItems().len);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     pipeline.static_colliders.allocator = failing.allocator();
     const failed = commitSeamInline(&pipeline, &frame, &data, &world);
@@ -7528,7 +7684,7 @@ test "a collider-sync OOM in a dig step still applies the dig the next step" {
     try fixture.update(.hole);
     try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
     // The seam's collider reserve holds; the sync after the commit runs out of memory.
-    try fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
+    try fixture.pipeline.reserveStaticColliders(&fixture.data, fixture.frame.structural_commands.mergedItems().len);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     fixture.pipeline.static_colliders.allocator = failing.allocator();
     const failed = fixture.seam();
@@ -7556,7 +7712,7 @@ test "a static nav-mark reserve OOM commits nothing and the retried commit reach
     const nav_allocator = fixture.pipeline.pathfinding.allocator;
     var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     fixture.pipeline.pathfinding.allocator = failing.allocator();
-    const failed = fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
+    const failed = fixture.pipeline.reserveStaticColliders(&fixture.data, fixture.frame.structural_commands.mergedItems().len);
     fixture.pipeline.pathfinding.allocator = nav_allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     // Nothing committed: no entity, no row, and nav unchanged.
@@ -7735,7 +7891,7 @@ test "a static committed at the seam pushes steering agents on the next step" {
     frame.beginStep();
     const beside = math.Vec2{ .x = agent_position.x + 8, .y = agent_position.y - 32 };
     try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = beside, .previous_position = beside, .velocity = .{}, .speed = 0 } } }});
-    try pipeline.reserveStaticColliders(&frame, &data);
+    try pipeline.reserveStaticColliders(&data, frame.structural_commands.mergedItems().len);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try std.testing.expectApproxEqAbs(@as(f32, 0), try steeringStageLateralForTest(&pipeline, context, agent), 0.001);
@@ -7772,7 +7928,7 @@ test "a static move installs its collider's moved row at a new revision, and a s
     frame.beginStep();
     const moved = math.Vec2{ .x = 500, .y = 500 };
     try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = moved, .previous_position = moved, .velocity = .{}, .speed = 0 } } }});
-    try pipeline.reserveStaticColliders(&frame, &data);
+    try pipeline.reserveStaticColliders(&data, frame.structural_commands.mergedItems().len);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
@@ -7793,7 +7949,7 @@ test "a static move installs its collider's moved row at a new revision, and a s
 
     // A seam with no static change installs nothing.
     frame.beginStep();
-    try pipeline.reserveStaticColliders(&frame, &data);
+    try pipeline.reserveStaticColliders(&data, frame.structural_commands.mergedItems().len);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
@@ -8034,20 +8190,42 @@ fn storedTriggerStepContext(data: *DataSystem, frame: *SimulationFrame, world: *
     };
 }
 
-test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {
-    // 20 creates x 4 events = 80 > 79: rejected at the structural boundary in both cases,
-    // never admitted by borrowing idle perception/affect/action shares.
-    const over_idle = try commitStructuralBurst(20, false);
-    const over_saturated = try commitStructuralBurst(20, true);
-    try std.testing.expect(over_idle.failed);
-    try std.testing.expectEqual(over_idle, over_saturated);
-
+test "a structural burst over its own event share defers the tail the same for idle and saturated producers" {
     // 19 creates x 4 events = 76 <= 79 commits in both cases.
-    const within_idle = try commitStructuralBurst(19, false);
-    const within_saturated = try commitStructuralBurst(19, true);
-    try std.testing.expect(!within_idle.failed);
-    try std.testing.expectEqual(@as(usize, 21), within_idle.bodies);
+    const within_idle = try commitStructuralBurst(19, false, 0);
+    const within_saturated = try commitStructuralBurst(19, true, 0);
     try std.testing.expectEqual(within_idle, within_saturated);
+    try std.testing.expectEqual(@as(usize, 21), within_idle.bodies);
+    try std.testing.expectEqual(@as(usize, 76), within_idle.structural_events);
+    try std.testing.expectEqual(@as(usize, 0), within_idle.deferred);
+
+    // 20 creates x 4 events = 80 > 79: 19 commit, the 20th stays for the next step.
+    // Idle and saturated match, and so do 0 and 2 workers.
+    const over_idle = try commitStructuralBurst(20, false, 0);
+    const over_saturated = try commitStructuralBurst(20, true, 0);
+    const over_idle_workers = try commitStructuralBurst(20, false, 2);
+    const over_saturated_workers = try commitStructuralBurst(20, true, 2);
+    try std.testing.expectEqual(over_idle, over_saturated);
+    try std.testing.expectEqual(over_idle, over_idle_workers);
+    try std.testing.expectEqual(over_idle, over_saturated_workers);
+    try std.testing.expectEqual(@as(usize, 21), over_idle.bodies);
+    try std.testing.expectEqual(@as(usize, 76), over_idle.structural_events);
+    try std.testing.expectEqual(@as(usize, 1), over_idle.deferred);
+    try std.testing.expectEqual(@as(f32, 1216), over_idle.deferred_x);
+    try std.testing.expectEqual(@as(usize, 22), over_idle.resumed_bodies);
+    try std.testing.expectEqual(@as(usize, 4), over_idle.resumed_events);
+    try std.testing.expectEqual(@as(usize, 0), over_idle.resumed_deferred);
+}
+
+test "an over-share static create reserves the applied prefix and defers the tail" {
+    const idle = try commitOverShareStatic(0);
+    const workers = try commitOverShareStatic(2);
+    try std.testing.expectEqual(idle, workers);
+    try std.testing.expectEqual(@as(usize, pipeline_structural_event_share / 4), idle.bodies);
+    try std.testing.expectEqual(@as(usize, 1), idle.nav_region_invalidated);
+    try std.testing.expect(idle.applied_blocked);
+    try std.testing.expect(idle.tail_absent);
+    try std.testing.expectEqual(@as(f32, 64), idle.deferred_x);
 }
 
 test "a destructible destroy commits through structuralCommitBudget with zero caller structural headroom" {
@@ -8105,11 +8283,16 @@ test "a full-template create costs max_structural_events_per_create events" {
         .ai_affect = .{},
         .destructible = .{},
     } }});
-    // Exactly the per-create share: one more event would not fit.
+    // One event under the per-create share defers the create. The next commit takes it.
     const share = structuralEventHeadroom(1, 0);
-    try std.testing.expectError(error.EventCapacityExceeded, frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share - 1 }));
+    try std.testing.expectEqual(max_structural_events_per_create, share);
+    _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share - 1 });
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 1), frame.deferredStructuralItems().len);
     _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share });
     try std.testing.expectEqual(share, frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.deferredStructuralItems().len);
 }
 
 test "the think-set stage reads the built index and writes the think set every cognition stage reads" {

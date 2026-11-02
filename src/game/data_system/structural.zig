@@ -40,7 +40,7 @@ pub const NullStructuralCommitPreparer = struct {
     fn prepare(_: *NullStructuralCommitPreparer, _: usize) !void {}
 };
 
-const StructuralCapacityNeeds = struct {
+pub const StructuralCapacityNeeds = struct {
     // Preflight reserves every storage target before the commit loop. That
     // keeps structural commits all-or-fail before DataSystem mutates.
     slots: usize,
@@ -190,12 +190,22 @@ fn addCapacity(value: usize, amount: usize) !usize {
     return std.math.add(usize, value, amount);
 }
 
-const StructuralCommitPlan = struct {
+pub const StructuralCommitPlan = struct {
     // `structural_event_count` lets callers reserve their change sink before
     // mutation so event publishing cannot fail halfway through commit.
     command_count: usize,
     capacity_needs: StructuralCapacityNeeds,
     structural_event_count: usize,
+};
+
+/// One budgeted commit's applied prefix. `deferred_applied` is the head of the
+/// deferred slice; `fresh_applied` is the head of the fresh slice. The tail of
+/// either slice is not part of this commit.
+pub const StructuralPrefix = struct {
+    plan: StructuralCommitPlan,
+    deferred_applied: usize = 0,
+    fresh_applied: usize = 0,
+    stagger_arrivals: usize = 0,
 };
 
 const ProjectedEntityState = struct {
@@ -396,23 +406,41 @@ pub fn applyStructuralCommandsPrepared(
     preparer: anytype,
     change_sink: anytype,
 ) !StructuralCommitStats {
-    // Prepared commits split allocation/preparation from mutation so callers
-    // can reuse scratch and reserve their own event buffers ahead of time.
-    const plan = try preflightStructuralCommands(self, commands, scratch);
-    preparer.prepare(plan.structural_event_count) catch |err| {
+    // One slice, no share cut, no deferred deque.
+    const prefix = try projectStructuralPrefix(self, &.{}, commands, scratch, null);
+    return commitStructuralPrefix(self, &.{}, commands[0..prefix.fresh_applied], prefix, scratch, preparer, change_sink);
+}
+
+pub fn commitStructuralPrefix(
+    self: *DataSystem,
+    deferred_applied: []const StructuralCommand,
+    fresh_applied: []const StructuralCommand,
+    prefix: StructuralPrefix,
+    scratch: *StructuralPlanScratch,
+    preparer: anytype,
+    change_sink: anytype,
+) !StructuralCommitStats {
+    var open = true;
+    errdefer if (open) {
         abortAppliedDrawablePlan(self, scratch);
         scratch.clearRetainingCapacity();
-        return err;
     };
+    try finishStructuralPrefix(self, scratch, prefix);
+    try preparer.prepare(prefix.plan.structural_event_count);
+    open = false;
     // No allocations or event-capacity failures should occur after this
     // point; the commit loop can mutate DataSystem in command order.
     scratch.clearRetainingCapacity();
-    return try commitStructuralCommands(self, commands, change_sink);
+    var stats = try commitStructuralCommands(self, deferred_applied, change_sink);
+    const fresh_stats = try commitStructuralCommands(self, fresh_applied, change_sink);
+    stats.created += fresh_stats.created;
+    stats.destroyed += fresh_stats.destroyed;
+    stats.components_set += fresh_stats.components_set;
+    stats.stale_skipped += fresh_stats.stale_skipped;
+    return stats;
 }
 
-/// File-private: only `applyStructuralCommandsPrepared` (and its unprepared
-/// wrappers) may commit. Callers must go through preflight/prepared entry points
-/// so capacity is reserved before mutation.
+/// File-private: commits one applied slice. Capacity is reserved before this runs.
 fn commitStructuralCommands(
     self: *DataSystem,
     commands: []const StructuralCommand,
@@ -630,117 +658,196 @@ fn consumeFreeGeneration(
     cursor.* = next;
 }
 
+fn projectedAlive(scratch: *const StructuralPlanScratch, data: *const DataSystem, entity: EntityId) bool {
+    if (scratch.projected_entities.get(structuralEntityKey(entity))) |state| return state.alive;
+    return data.isAlive(entity);
+}
+
+fn structuralEventDelta(scratch: *const StructuralPlanScratch, data: *const DataSystem, command: StructuralCommand) usize {
+    return switch (command) {
+        .create_entity => |template| 1 + templateComponentCount(template),
+        .set_simulation_tier => 0,
+        .destroy_entity => |entity| if (projectedAlive(scratch, data, entity)) 1 else 0,
+        .set_movement_body => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_facing => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_primitive_visual => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_asset_reference => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_collision_bounds => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_collision_response => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_ai_agent => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_steering_agent => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_world_level => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_faction => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_ai_perception => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_ai_memory => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_ai_affect => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+        .set_destructible => |set| if (projectedAlive(scratch, data, set.entity)) 1 else 0,
+    };
+}
+
+/// Walks `deferred` then `fresh`. `share` null takes both. A set share stops
+/// before the command whose event delta would exceed it; that command and the
+/// tail are not validated or projected. Does not reserve stores or apply the
+/// drawable plan.
+pub fn projectStructuralPrefix(
+    self: *DataSystem,
+    deferred: []const StructuralCommand,
+    fresh: []const StructuralCommand,
+    scratch: *StructuralPlanScratch,
+    share: ?usize,
+) !StructuralPrefix {
+    scratch.clearProjected();
+    scratch.clearDrawable();
+    defer scratch.clearProjected();
+    errdefer scratch.clearDrawable();
+    if (deferred.len == 0 and fresh.len == 0) {
+        return .{
+            .plan = .{
+                .command_count = 0,
+                .capacity_needs = StructuralCapacityNeeds.init(self),
+                .structural_event_count = 0,
+            },
+        };
+    }
+    scratch.clearRetainingCapacity();
+
+    var projection = StructuralCapacityProjection.init(self);
+    var structural_event_count: usize = 0;
+    var stagger_arrivals: usize = 0;
+    var deferred_applied: usize = 0;
+    var fresh_applied: usize = 0;
+    var free_cursor: ?u32 = self.first_free_slot;
+    var free_previous: ?u32 = null;
+
+    const slices = [2][]const StructuralCommand{ deferred, fresh };
+    commands: for (slices, 0..) |slice, slice_index| {
+        for (slice, 0..) |command, index| {
+            const summed = try addCapacity(structural_event_count, structuralEventDelta(scratch, self, command));
+            if (share) |limit| {
+                if (summed > limit) break :commands;
+            }
+            structural_event_count = summed;
+            _ = try validateStructuralCommands(&.{command});
+            try projectAcceptedCommand(self, scratch, &projection, &free_cursor, &free_previous, &stagger_arrivals, command);
+            if (slice_index == 0) {
+                deferred_applied = index + 1;
+            } else {
+                fresh_applied = index + 1;
+            }
+        }
+    }
+
+    return .{
+        .plan = .{
+            .command_count = deferred_applied + fresh_applied,
+            .capacity_needs = projection.required,
+            .structural_event_count = structural_event_count,
+        },
+        .deferred_applied = deferred_applied,
+        .fresh_applied = fresh_applied,
+        .stagger_arrivals = stagger_arrivals,
+    };
+}
+
+fn projectAcceptedCommand(
+    self: *DataSystem,
+    scratch: *StructuralPlanScratch,
+    projection: *StructuralCapacityProjection,
+    free_cursor: *?u32,
+    free_previous: *?u32,
+    stagger_arrivals: *usize,
+    command: StructuralCommand,
+) !void {
+    switch (command) {
+        .create_entity => |template| {
+            try consumeFreeGeneration(self, scratch, free_cursor, free_previous);
+            try projection.createSlot();
+            try projection.addTemplate(template);
+            if (template.movement_body != null and template.ai_agent != null) stagger_arrivals.* += 1;
+            try planTemplateDrawable(self, scratch, template);
+        },
+        .destroy_entity => |entity| {
+            const state = try scratch.projectedState(self, entity);
+            if (state.alive) {
+                if (scratch.reuse_generations.items.len == scratch.reuse_generations.capacity) {
+                    try scratch.reuse_generations.ensureTotalCapacity(scratch.allocator, scratch.reuse_generations.items.len + 1);
+                }
+                scratch.reuse_generations.appendAssumeCapacity(retiredSlotGeneration(self.slots.items[@intCast(entity.index)].generation));
+                try projection.destroySlot();
+                removeProjectedComponents(state.component_mask, projection);
+                state.destroy();
+            }
+        },
+        .set_movement_body => |set| {
+            const state = try scratch.projectedState(self, set.entity);
+            const inserting = state.alive and !state.hasComponent(.movement_body);
+            const inserts_ai_arrival = inserting and state.hasComponent(.ai_agent);
+            try preflightSetComponent(self, set.entity, .movement_body, scratch, projection);
+            if (inserts_ai_arrival) stagger_arrivals.* += 1;
+            try planMovementDrawable(self, scratch, set.entity, inserting);
+        },
+        .set_facing => |set| try preflightSetComponent(self, set.entity, .facing, scratch, projection),
+        .set_primitive_visual => |set| {
+            try preflightSetComponent(self, set.entity, .primitive_visual, scratch, projection);
+            const state = try scratch.projectedState(self, set.entity);
+            if (state.alive and state.hasComponent(.movement_body) and !state.linked) try cursorPlace(self, scratch, state);
+        },
+        .set_asset_reference => |set| try preflightSetComponent(self, set.entity, .asset_reference, scratch, projection),
+        .set_collision_bounds => |set| try preflightSetComponent(self, set.entity, .collision_bounds, scratch, projection),
+        .set_collision_response => |set| try preflightSetComponent(self, set.entity, .collision_response, scratch, projection),
+        .set_ai_agent => |set| {
+            const state = try scratch.projectedState(self, set.entity);
+            const adds_ai_arrival = state.alive and state.hasComponent(.movement_body) and !state.hasComponent(.ai_agent);
+            try preflightSetComponent(self, set.entity, .ai_agent, scratch, projection);
+            if (adds_ai_arrival) stagger_arrivals.* += 1;
+        },
+        .set_steering_agent => |set| try preflightSetComponent(self, set.entity, .steering_agent, scratch, projection),
+        .set_world_level => |set| {
+            const state = try scratch.projectedState(self, set.entity);
+            if (state.alive) state.world_level = set.level;
+            try preflightSetComponent(self, set.entity, .world_level, scratch, projection);
+            const live = try scratch.projectedState(self, set.entity);
+            if (live.alive and live.hasComponent(.movement_body)) try cursorSync(self, scratch, live, set.level, set.entity);
+        },
+        .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, projection),
+        .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, projection),
+        .set_ai_memory => |set| try preflightSetComponent(self, set.entity, .ai_memory, scratch, projection),
+        .set_ai_affect => |set| try preflightSetComponent(self, set.entity, .ai_affect, scratch, projection),
+        .set_destructible => |set| try preflightSetComponent(self, set.entity, .destructible, scratch, projection),
+        .set_simulation_tier => {},
+    }
+}
+
 pub fn preflightStructuralCommands(
     self: *DataSystem,
     commands: []const StructuralCommand,
     scratch: *StructuralPlanScratch,
 ) !StructuralCommitPlan {
-    const projecting = try validateStructuralCommands(commands);
-    scratch.clearProjected();
-    scratch.clearDrawable();
-    defer scratch.clearProjected();
-    errdefer scratch.clearDrawable();
-    if (commands.len == 0) {
-        return .{
-            .command_count = 0,
-            .capacity_needs = StructuralCapacityNeeds.init(self),
-            .structural_event_count = 0,
-        };
-    }
-    scratch.clearRetainingCapacity();
-    if (projecting != 0) {
-        try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(projecting));
-    }
-
-    var projection = StructuralCapacityProjection.init(self);
-    var structural_event_count: usize = 0;
-    var stagger_arrivals: usize = 0;
-    var free_cursor: ?u32 = self.first_free_slot;
-    var free_previous: ?u32 = null;
-
-    // Preflight simulates the command stream against projected liveness and
-    // masks so capacity and event reservations match what commit will do.
-    for (commands) |command| {
-        switch (command) {
-            .create_entity => |template| {
-                try consumeFreeGeneration(self, scratch, &free_cursor, &free_previous);
-                try projection.createSlot();
-                try projection.addTemplate(template);
-                if (template.movement_body != null and template.ai_agent != null) stagger_arrivals += 1;
-                structural_event_count = try addCapacity(structural_event_count, 1 + templateComponentCount(template));
-                try planTemplateDrawable(self, scratch, template);
-            },
-            .destroy_entity => |entity| {
-                const state = try scratch.projectedState(self, entity);
-                if (state.alive) {
-                    if (scratch.reuse_generations.items.len == 0) {
-                        try scratch.reuse_generations.ensureTotalCapacity(scratch.allocator, commands.len);
-                    }
-                    scratch.reuse_generations.appendAssumeCapacity(retiredSlotGeneration(self.slots.items[@intCast(entity.index)].generation));
-                    structural_event_count = try addCapacity(structural_event_count, 1);
-                    try projection.destroySlot();
-                    removeProjectedComponents(state.component_mask, &projection);
-                    state.destroy();
-                }
-            },
-            .set_movement_body => |set| {
-                const state = try scratch.projectedState(self, set.entity);
-                const inserting = state.alive and !state.hasComponent(.movement_body);
-                const inserts_ai_arrival = inserting and state.hasComponent(.ai_agent);
-                try preflightSetComponent(self, set.entity, .movement_body, scratch, &projection, &structural_event_count);
-                if (inserts_ai_arrival) stagger_arrivals += 1;
-                try planMovementDrawable(self, scratch, set.entity, inserting);
-            },
-            .set_facing => |set| try preflightSetComponent(self, set.entity, .facing, scratch, &projection, &structural_event_count),
-            .set_primitive_visual => |set| {
-                try preflightSetComponent(self, set.entity, .primitive_visual, scratch, &projection, &structural_event_count);
-                const state = try scratch.projectedState(self, set.entity);
-                if (state.alive and state.hasComponent(.movement_body) and !state.linked) try cursorPlace(self, scratch, state);
-            },
-            .set_asset_reference => |set| try preflightSetComponent(self, set.entity, .asset_reference, scratch, &projection, &structural_event_count),
-            .set_collision_bounds => |set| try preflightSetComponent(self, set.entity, .collision_bounds, scratch, &projection, &structural_event_count),
-            .set_collision_response => |set| try preflightSetComponent(self, set.entity, .collision_response, scratch, &projection, &structural_event_count),
-            .set_ai_agent => |set| {
-                const state = try scratch.projectedState(self, set.entity);
-                const adds_ai_arrival = state.alive and state.hasComponent(.movement_body) and !state.hasComponent(.ai_agent);
-                try preflightSetComponent(self, set.entity, .ai_agent, scratch, &projection, &structural_event_count);
-                if (adds_ai_arrival) stagger_arrivals += 1;
-            },
-            .set_steering_agent => |set| try preflightSetComponent(self, set.entity, .steering_agent, scratch, &projection, &structural_event_count),
-            .set_world_level => |set| {
-                const state = try scratch.projectedState(self, set.entity);
-                if (state.alive) state.world_level = set.level;
-                try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count);
-                const live = try scratch.projectedState(self, set.entity);
-                if (live.alive and live.hasComponent(.movement_body)) try cursorSync(self, scratch, live, set.level, set.entity);
-            },
-            .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
-            .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, &projection, &structural_event_count),
-            .set_ai_memory => |set| try preflightSetComponent(self, set.entity, .ai_memory, scratch, &projection, &structural_event_count),
-            .set_ai_affect => |set| try preflightSetComponent(self, set.entity, .ai_affect, scratch, &projection, &structural_event_count),
-            .set_destructible => |set| try preflightSetComponent(self, set.entity, .destructible, scratch, &projection, &structural_event_count),
-            .set_simulation_tier => {},
-        }
-    }
-
-    try projection.required.validateLimits();
-    // Each command records at most two allow ids (a removal and its landed tail,
-    // or a create's errdefer removal). Tier changes record one. Commit then appends
-    // without allocating.
-    try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + commands.len * 2);
-    const plan = StructuralCommitPlan{
-        .command_count = commands.len,
-        .capacity_needs = projection.required,
-        .structural_event_count = structural_event_count,
+    const prefix = try projectStructuralPrefix(self, &.{}, commands, scratch, null);
+    if (prefix.plan.command_count == 0) return prefix.plan;
+    var open = true;
+    errdefer if (open) {
+        abortAppliedDrawablePlan(self, scratch);
+        scratch.clearRetainingCapacity();
     };
-    try reserveStructuralPlanCapacity(self, plan);
+    try finishStructuralPrefix(self, scratch, prefix);
+    open = false;
+    return prefix.plan;
+}
+
+fn finishStructuralPrefix(self: *DataSystem, scratch: *StructuralPlanScratch, prefix: StructuralPrefix) !void {
+    if (prefix.plan.command_count == 0) return;
+    try prefix.plan.capacity_needs.validateLimits();
+    // Each applied command records at most two allow ids (a removal and its landed
+    // tail, or a create's errdefer removal). Tier changes record one. The tail does not.
+    try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + prefix.plan.command_count * 2);
+    try reserveStructuralPlanCapacity(self, prefix.plan);
     // Upper bound: one new arrival key and one level origin per AI arrival this commit
     // settles. The commit puts into that capacity. Without a grid the commit does not insert.
-    if (stagger_arrivals != 0 and self.movement_bodies.cells_x != 0 and self.movement_bodies.cells_y != 0) {
-        try self.movement_bodies.ensureStaggerMapCapacity(self.allocator, stagger_arrivals);
+    if (prefix.stagger_arrivals != 0 and self.movement_bodies.cells_x != 0 and self.movement_bodies.cells_y != 0) {
+        try self.movement_bodies.ensureStaggerMapCapacity(self.allocator, prefix.stagger_arrivals);
     }
     try applyDrawablePlan(self, scratch);
-    return plan;
 }
 
 fn planTemplateDrawable(self: *DataSystem, scratch: *StructuralPlanScratch, template: EntityTemplate) !void {
@@ -942,11 +1049,9 @@ fn preflightSetComponent(
     component: Component,
     scratch: *StructuralPlanScratch,
     projection: *StructuralCapacityProjection,
-    structural_event_count: *usize,
 ) !void {
     const state = try scratch.projectedState(self, entity);
     if (!state.alive) return;
-    structural_event_count.* = try addCapacity(structural_event_count.*, 1);
     if (!state.hasComponent(component)) {
         try projection.addComponent(component);
         state.addComponent(component);

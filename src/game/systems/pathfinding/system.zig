@@ -785,6 +785,7 @@ pub const PathfindingSystem = struct {
     pub const applyBufferedNavUpdates = nav_reaction.applyBufferedNavUpdates;
     pub const reactToPostCommitNavEvents = nav_reaction.reactToPostCommitNavEvents;
     pub const navReactionMayEmit = nav_reaction.navReactionMayEmit;
+    pub const commandsMayInvalidateNavigation = nav_reaction.commandsMayInvalidateNavigation;
 
     // Empties every request, result, and group field: a rebuilt graph's version and cells
     // match none of them.

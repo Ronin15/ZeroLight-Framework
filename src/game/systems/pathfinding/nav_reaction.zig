@@ -400,11 +400,17 @@ fn appendEventMark(self: *PathfindingSystem, mark: NavMark) void {
     appendMergedMark(&self.nav_marks, mark, self.graph.geometry.chunk_tiles);
 }
 
-/// Whether the post-commit nav reaction may run and emit its event this step: a pending
-/// structural command may change nav, or nav has recorded marks, levels, links, or a
-/// content revision still to apply. Callers reserve its event slot first.
+/// Full fresh command stream for the existing nav tests, or recorded marks, levels,
+/// links, or a content revision still to apply. Not the seam preflight.
 pub fn navReactionMayEmit(self: *const PathfindingSystem, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
     return structuralCommandsMayInvalidateNavigation(data, frame) or hasPendingNavUpdates(self, world);
+}
+
+pub fn commandsMayInvalidateNavigation(data: *const DataSystem, commands: []const StructuralCommand) bool {
+    for (commands) |command| {
+        if (structuralCommandMayInvalidateNavigation(data, command)) return true;
+    }
+    return false;
 }
 
 // Whether a committed world event changes nav cells. Static colliders reach nav through
@@ -417,12 +423,9 @@ fn eventInvalidatesNavigation(event: SimulationEvent) bool {
     }
 }
 
-// Whether any pending structural command may invalidate navigation once applied.
+// Whether any fresh structural command may invalidate navigation once applied.
 fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
-    for (frame.structural_commands.mergedItems()) |command| {
-        if (structuralCommandMayInvalidateNavigation(data, command)) return true;
-    }
-    return false;
+    return commandsMayInvalidateNavigation(data, frame.structural_commands.mergedItems());
 }
 
 fn structuralCommandMayInvalidateNavigation(data: *const DataSystem, command: StructuralCommand) bool {

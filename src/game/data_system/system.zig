@@ -1122,6 +1122,10 @@ pub const DataSystem = struct {
 
     pub const applyStructuralCommandsPrepared = structural.applyStructuralCommandsPrepared;
 
+    pub const projectStructuralPrefix = structural.projectStructuralPrefix;
+
+    pub const commitStructuralPrefix = structural.commitStructuralPrefix;
+
     const preflightStructuralCommands = structural.preflightStructuralCommands;
 
     pub const validateStructuralCommands = structural.validateStructuralCommands;

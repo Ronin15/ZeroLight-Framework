@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), and `validateAiAgent` bounds (`961c9b7`). Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, step contracts, the commit-share deferral, the pipeline, the kernels, and acceptance. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), and `validateAiAgent` bounds (`961c9b7`). Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, step contracts, the pipeline, the kernels, and acceptance. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -241,18 +241,14 @@ in its owning slice.
 - [ ] Step contracts (`simulation.zig`): per-step stream capacity and reserve
       against population and per-world load, event caps that simulation reads,
       `finishWrite` cost. Each finding becomes an item here.
-- [ ] Commands past the `.structural_commit` share defer deterministically to
-      a later step at the commit seam, one deferral every producer uses (56,
-      57, 61, 62, 76, and 77 depend on it;
-      `.grok/rules/budgets-capacities.md`; docs audit M7). Failure: a commit
-      past the share fails before mutation (`simulation.zig:483-484`) and the
-      error fails the step (`SimulationPipeline.commitStructuralAndReact`,
-      called from `applyStructuralCommandsAndPostCommitEvents`,
-      `game_demo_state.zig:640`).
+- [x] Commands past the `.structural_commit` share defer to a later step
+      (`reserveDeferredStructural`, `simulation.zig:870`;
+      `commitStructuralAndReact`, `simulation_pipeline.zig:1366`; the nav
+      cut is `appliedPrefixMayEmitNav`, `simulation_pipeline.zig:1446`).
       Failure scenario (derived, no bench): a kill burst, collapse, or
-      explosion over the share stops the step. Pass: a contract test where an
-      over-share burst defers and the step succeeds, identical serial and
-      threaded.
+      explosion over the share stops the step. Pass: an over-share burst
+      defers and the step succeeds, identical serial and threaded
+      (`.grok/rules/budgets-capacities.md`).
 - [ ] Pipeline scheduler: per-step work in `update` and the growth seam
       outside the stages, and any per-item work on main between stages.
       Each finding becomes an item here.

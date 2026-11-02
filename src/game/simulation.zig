@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const math = @import("../core/math.zig");
+const logging = @import("../core/logging.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -20,6 +21,7 @@ const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
+const StructuralPrefix = @import("data_system.zig").StructuralPrefix;
 const AiAffectDrive = @import("data_system.zig").AiAffectDrive;
 const max_structural_events_per_create = @import("data_system.zig").max_structural_events_per_create;
 
@@ -98,9 +100,9 @@ pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) u
         .plane_traversal => budgets.movement_body_capacity + 1,
         .action_react => action_intent_live_capacity,
         // A fixed per-step share sized in events; tier changes emit no structural
-        // event, so the share never follows population. Enforced on its own by the
-        // budgeted commit (`StructuralCommitBudget`). The pipeline's own destructible
-        // share plus the caller's headroom.
+        // event, so the share never follows population. The project walk cuts the
+        // prefix to this count (`StructuralCommitBudget`). The pipeline's own
+        // destructible share plus the caller's headroom.
         .structural_commit => pipeline_structural_event_share + budgets.structural_headroom,
         // The single post-commit `nav_region_invalidated`.
         .nav_reaction => 1,
@@ -463,9 +465,9 @@ pub const StructuralCommitBudget = struct {
     /// reaction's slot), preflighted with the commit.
     extra_required_events: usize = 0,
     /// The commit's own `.structural_commit` share
-    /// (`maxEventsPerStep(.structural_commit, ...)`). A commit needing more fails
-    /// before mutation, whatever other producers appended this step. Null checks only
-    /// the shared `capacity_limit`.
+    /// (`maxEventsPerStep(.structural_commit, ...)`). The project walk cuts the
+    /// prefix to this many events. Null does not cut. A shared `capacity_limit`
+    /// miss still fails the commit before mutation.
     structural_event_share: ?usize = null,
 };
 
@@ -477,11 +479,9 @@ const StructuralCommitPreparer = struct {
 
     pub fn prepare(self: *StructuralCommitPreparer, structural_event_count: usize) !void {
         self.structural_event_count = structural_event_count;
-        // The structural share is enforced on its own first, so an overrun fails at
-        // this boundary deterministically instead of borrowing other producers' idle
-        // shares through the shared bound.
+        // The share cuts the prefix in the project walk. Prepare checks the shared bound.
         if (self.budget.structural_event_share) |share| {
-            if (structural_event_count > share) return error.EventCapacityExceeded;
+            std.debug.assert(structural_event_count <= share);
         }
         const required_event_count = try std.math.add(usize, structural_event_count, self.budget.extra_required_events);
         try self.frame.events.ensureCanAppend(required_event_count);
@@ -676,6 +676,10 @@ pub const SimulationFrame = struct {
     collision_triggers: RangeOutputStream(CollisionTriggerEvent),
     structural_commands: RangeOutputStream(StructuralCommand),
     stimuli: RangeOutputStream(WorldStimulus),
+    /// Commands retained for the next commit. `beginStep` does not drop them.
+    deferred_structural: std.ArrayList(StructuralCommand) = .empty,
+    deferred_structural_head: usize = 0,
+    deferred_structural_growth_logged: bool = false,
     structural_plan_scratch: StructuralPlanScratch,
     // Reused across commits so a structural-mutating frame stays allocation-free
     // after warmup; cleared (capacity retained) at the start of each commit.
@@ -698,6 +702,7 @@ pub const SimulationFrame = struct {
     }
 
     pub fn deinit(self: *SimulationFrame) void {
+        self.deferred_structural.deinit(self.allocator);
         self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
         self.stimuli.deinit();
@@ -855,30 +860,113 @@ pub const SimulationFrame = struct {
         return true;
     }
 
+    pub fn deferredStructuralItems(self: *const SimulationFrame) []const StructuralCommand {
+        return self.deferred_structural.items[self.deferred_structural_head..];
+    }
+
+    /// Slides live commands to index 0 only when `additional` does not fit at the
+    /// end, then reserves `live + additional`. A failed allocation leaves the live
+    /// commands in place.
+    fn reserveDeferredStructural(self: *SimulationFrame, additional: usize) error{OutOfMemory}!void {
+        const list = &self.deferred_structural;
+        const live = list.items.len - self.deferred_structural_head;
+        const needed = std.math.add(usize, live, additional) catch return error.OutOfMemory;
+        const end_len = std.math.add(usize, list.items.len, additional) catch null;
+        if (end_len) |end| {
+            if (end <= list.capacity) return;
+        }
+        if (self.deferred_structural_head > 0 and needed <= list.capacity) {
+            self.slideDeferredStructural();
+            return;
+        }
+        const before = list.capacity;
+        try list.ensureTotalCapacity(self.allocator, needed);
+        if (list.capacity > before and !self.deferred_structural_growth_logged) {
+            self.deferred_structural_growth_logged = true;
+            if (comptime logging.enabled(.info)) logging.game.info("deferred structural commands grew to {d}", .{list.capacity});
+        }
+        if (self.deferred_structural_head > 0) self.slideDeferredStructural();
+    }
+
+    fn slideDeferredStructural(self: *SimulationFrame) void {
+        const head = self.deferred_structural_head;
+        if (head == 0) return;
+        const live = self.deferred_structural.items[head..];
+        @memmove(self.deferred_structural.items[0..live.len], live);
+        self.deferred_structural.shrinkRetainingCapacity(live.len);
+        self.deferred_structural_head = 0;
+    }
+
+    fn retainDeferredStructuralAssumeCapacity(self: *SimulationFrame, suffix: []const StructuralCommand) void {
+        self.deferred_structural.appendSliceAssumeCapacity(suffix);
+    }
+
+    fn advanceDeferredHead(self: *SimulationFrame, applied: usize) void {
+        std.debug.assert(applied <= self.deferred_structural.items.len - self.deferred_structural_head);
+        self.deferred_structural_head += applied;
+        if (self.deferred_structural_head == self.deferred_structural.items.len) {
+            self.deferred_structural_head = 0;
+            self.deferred_structural.clearRetainingCapacity();
+        }
+    }
+
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
         return try self.applyStructuralCommandsBudgeted(data, .{});
     }
 
-    /// Commits the merged structural commands all-or-fail against `budget`: the
-    /// preflight rejects an over-share or over-limit commit before any mutation.
+    /// Commits the longest prefix of the deferred commands, then this step's
+    /// commands, whose structural events fit `budget.structural_event_share`.
+    /// A null share does not cut. The fresh suffix stays for the next commit.
+    /// A shared-bound miss or `OutOfMemory` commits nothing and retains nothing.
     pub fn applyStructuralCommandsBudgeted(
         self: *SimulationFrame,
         data: *DataSystem,
         budget: StructuralCommitBudget,
     ) !StructuralCommitStats {
+        const prefix = try self.beginStructuralCommit(data, budget.structural_event_share);
+        return self.completeStructuralCommit(data, prefix, budget);
+    }
+
+    pub fn beginStructuralCommit(self: *SimulationFrame, data: *DataSystem, share: ?usize) !StructuralPrefix {
         self.phase = .commit_structural;
-        const commands = self.structural_commands.mergedItems();
+        self.structural_changes_scratch.clearRetainingCapacity();
+        var open = true;
+        errdefer if (open) self.structural_plan_scratch.clearRetainingCapacity();
+        const prefix = try data.projectStructuralPrefix(self.deferredStructuralItems(), self.structural_commands.mergedItems(), &self.structural_plan_scratch, share);
+        const fresh_len = self.structural_commands.mergedItems().len;
+        try self.reserveDeferredStructural(fresh_len - prefix.fresh_applied);
+        open = false;
+        return prefix;
+    }
+
+    pub fn completeStructuralCommit(
+        self: *SimulationFrame,
+        data: *DataSystem,
+        prefix: StructuralPrefix,
+        budget: StructuralCommitBudget,
+    ) !StructuralCommitStats {
+        const deferred = self.deferredStructuralItems();
+        const fresh = self.structural_commands.mergedItems();
         const changes = &self.structural_changes_scratch;
-        changes.clearRetainingCapacity();
         var preparer = StructuralCommitPreparer{
             .frame = self,
             .changes = changes,
             .budget = budget,
         };
         var sink = StructuralChangeSink{ .changes = changes };
-        const stats = try data.applyStructuralCommandsPrepared(commands, &self.structural_plan_scratch, &preparer, &sink);
+        const stats = try data.commitStructuralPrefix(
+            deferred[0..prefix.deferred_applied],
+            fresh[0..prefix.fresh_applied],
+            prefix,
+            &self.structural_plan_scratch,
+            &preparer,
+            &sink,
+        );
         std.debug.assert(changes.items.len <= preparer.structural_event_count);
         try self.publishStructuralChanges(changes.items);
+        self.advanceDeferredHead(prefix.deferred_applied);
+        self.retainDeferredStructuralAssumeCapacity(fresh[prefix.fresh_applied..]);
+        self.structural_commands.clearRetainingCapacity();
         return stats;
     }
 
@@ -1351,6 +1439,86 @@ test "simulation frame applies deferred structural commands" {
     try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), frame.events.stats.entity_created);
     try std.testing.expectEqual(@as(usize, 1), frame.events.stats.component_changed);
+}
+
+test "deferred structural destroys commit in order and beginStep keeps the tail" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity_a = try data.createEntity();
+    const entity_b = try data.createEntity();
+    const entity_c = try data.createEntity();
+    const budget = StructuralCommitBudget{ .structural_event_share = 1 };
+
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{ .{ .destroy_entity = entity_a }, .{ .destroy_entity = entity_b } });
+    _ = try frame.applyStructuralCommandsBudgeted(&data, budget);
+    try std.testing.expect(!data.isAlive(entity_a));
+    try std.testing.expect(data.isAlive(entity_b));
+    try std.testing.expectEqual(@as(usize, 1), frame.deferredStructuralItems().len);
+    try std.testing.expect(frame.deferredStructuralItems()[0].destroy_entity.eql(entity_b));
+
+    frame.beginStep();
+    try std.testing.expect(data.isAlive(entity_b));
+    try std.testing.expect(frame.deferredStructuralItems()[0].destroy_entity.eql(entity_b));
+    try writeStructuralCommands(&frame, &.{.{ .destroy_entity = entity_c }});
+    _ = try frame.applyStructuralCommandsBudgeted(&data, budget);
+    try std.testing.expect(!data.isAlive(entity_b));
+    try std.testing.expect(data.isAlive(entity_c));
+    try std.testing.expectEqual(@as(usize, 1), frame.deferredStructuralItems().len);
+    try std.testing.expect(frame.deferredStructuralItems()[0].destroy_entity.eql(entity_c));
+
+    frame.beginStep();
+    try std.testing.expect(frame.deferredStructuralItems()[0].destroy_entity.eql(entity_c));
+    _ = try frame.applyStructuralCommandsBudgeted(&data, budget);
+    try std.testing.expect(!data.isAlive(entity_c));
+    try std.testing.expectEqual(@as(usize, 0), frame.deferredStructuralItems().len);
+}
+
+test "deferred structural retain appends into reserved capacity without allocating" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const command = StructuralCommand{ .destroy_entity = EntityId.invalid };
+    try frame.reserveDeferredStructural(1);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const kept = frame.allocator;
+    frame.allocator = failing.allocator();
+    defer frame.allocator = kept;
+    frame.retainDeferredStructuralAssumeCapacity(&.{command});
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), frame.deferredStructuralItems().len);
+    try std.testing.expect(frame.deferredStructuralItems()[0].destroy_entity.eql(EntityId.invalid));
+}
+
+test "deferred structural reserve runs out of memory before a create mutates" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{.{ .create_entity = .{} }});
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const frame_allocator = frame.allocator;
+    const scratch_allocator = frame.structural_plan_scratch.allocator;
+    const data_allocator = data.allocator;
+    const fail = failing.allocator();
+    frame.allocator = fail;
+    frame.structural_plan_scratch.allocator = fail;
+    data.allocator = fail;
+    defer {
+        frame.allocator = frame_allocator;
+        frame.structural_plan_scratch.allocator = scratch_allocator;
+        data.allocator = data_allocator;
+    }
+
+    try std.testing.expectError(error.OutOfMemory, frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), frame.deferredStructuralItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.structural_commands.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.deferred_structural.capacity);
 }
 
 test "simulation frame rejects structural commit before mutation when event capacity is too small" {

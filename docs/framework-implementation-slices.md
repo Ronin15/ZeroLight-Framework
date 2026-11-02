@@ -209,7 +209,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
 | [**87**](roadmap/slices/slice-87.md) | Programming landed | Render Collect By Visible Chunks — Vulkan `gpu-smoke` passed; other machines are not a gate |
-| [**88**](roadmap/slices/slice-88.md) | In progress | Storage items landed; commit-share deferral, step contracts, pipeline, and kernels still open |
+| [**88**](roadmap/slices/slice-88.md) | In progress | Storage items and the commit-share deferral landed; step contracts, pipeline, and kernels still open |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; four items recorded | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); four items stay recorded |
 
 **Recently settled (archive only):** 85, 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
