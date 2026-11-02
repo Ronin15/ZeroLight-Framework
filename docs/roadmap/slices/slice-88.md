@@ -205,12 +205,15 @@ in its owning slice.
       not walk a retained capacity; a step that projects K entities costs
       O(K), and the following empty step does not walk that capacity
       (`.grok/rules/engine-design.md` § Cost model).
-- [ ] `nextGeneration` wraps to 1 (`system.zig:1379`). Failure scenario
-      (derived): after `2^32 - 1` reuses of one slot, a stale id resolves
-      to the new occupant (`system.zig:221` stores the wrapped generation;
-      `system.zig:1090` accepts it). Pass: a slot whose generation would
-      wrap is not reused, the failure is `OutOfMemory`, and an id from the
-      previous cycle does not resolve
+- [x] A slot whose generation would wrap is not reused
+      (`retiredSlotGeneration`, `types.zig:182`; destroy stores it,
+      `system.zig:233`; `createEntity` unlinks a `maxInt(u32)` head,
+      `system.zig:178`; a later free node unlinks in preflight,
+      `structural.zig:626`). Failure scenario (derived): after
+      `2^32 - 1` reuses of one slot, a stale id resolves to the new
+      occupant (`resolveSlotConst`, `system.zig:1147`). Pass: a slot whose
+      generation would wrap is not reused, the failure is `OutOfMemory`,
+      and an id from the previous cycle does not resolve
       (`.grok/rules/budgets-capacities.md`).
 - [ ] Releasing one stagger world scans every movement row, and an
       out-of-memory error returns without releasing it (`system.zig:329`,

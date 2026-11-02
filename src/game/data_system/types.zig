@@ -178,6 +178,12 @@ pub const EntityId = struct {
     }
 };
 
+/// A retired slot stores this. `maxInt(u32)` means the next occupant would alias an earlier cycle.
+pub fn retiredSlotGeneration(generation: u32) u32 {
+    if (generation == std.math.maxInt(u32)) return generation;
+    return generation + 1;
+}
+
 pub const Component = enum(u5) {
     movement_body,
     facing,

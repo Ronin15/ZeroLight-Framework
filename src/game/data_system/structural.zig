@@ -2,17 +2,16 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Deferred structural-command pipeline: capacity preflight (projects the
-//! command stream against current liveness/masks without touching real slots
-//! or dense stores), then command-order commit through DataSystem's already-
-//! pub accessor methods. Mirrors pathfinding/solve.zig's relationship to
-//! system.zig: these are free functions that borrow *DataSystem explicitly
-//! rather than living as DataSystem methods, keeping the wiring flat.
+//! Deferred structural-command pipeline: capacity preflight, then command-order
+//! commit through DataSystem's accessor methods. Preflight reads the free-list
+//! prefix this batch pops; the only slot write is that unlink on the
+//! OutOfMemory return, before commit.
 
 const std = @import("std");
 const math = @import("../../core/math.zig");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
+const retiredSlotGeneration = types.retiredSlotGeneration;
 const Component = types.Component;
 const ComponentMask = types.ComponentMask;
 const componentMask = types.componentMask;
@@ -290,6 +289,7 @@ pub const StructuralPlanScratch = struct {
     allocator: std.mem.Allocator,
     projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
     drawable_plan: std.AutoHashMapUnmanaged(DrawablePlanKey, DrawablePlanEntry) = .{},
+    reuse_generations: std.ArrayList(u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) StructuralPlanScratch {
         return .{ .allocator = allocator };
@@ -298,14 +298,18 @@ pub const StructuralPlanScratch = struct {
     pub fn deinit(self: *StructuralPlanScratch) void {
         self.projected_entities.deinit(self.allocator);
         self.drawable_plan.deinit(self.allocator);
+        self.reuse_generations.deinit(self.allocator);
         self.projected_entities = .{};
         self.drawable_plan = .{};
+        self.reuse_generations = .empty;
     }
 
     /// A zero count does not walk retained slots. A non-zero count releases the map.
+    /// The generation stack drops its length and keeps its capacity.
     pub fn clearRetainingCapacity(self: *StructuralPlanScratch) void {
         self.clearProjected();
         self.clearDrawable();
+        self.reuse_generations.clearRetainingCapacity();
     }
 
     fn clearProjected(self: *StructuralPlanScratch) void {
@@ -604,13 +608,36 @@ fn commitStructuralCommands(
     return stats;
 }
 
+fn consumeFreeGeneration(
+    self: *DataSystem,
+    scratch: *StructuralPlanScratch,
+    cursor: *?u32,
+    cursor_previous: *?u32,
+) error{OutOfMemory}!void {
+    if (scratch.reuse_generations.pop()) |generation| {
+        if (generation == std.math.maxInt(u32)) return error.OutOfMemory;
+        return;
+    }
+    const index = cursor.* orelse return;
+    const slot = &self.slots.items[@intCast(index)];
+    const generation = slot.generation;
+    const next = slot.next_free;
+    if (generation == std.math.maxInt(u32)) {
+        self.unlinkFreeSlot(index, cursor_previous.*);
+        return error.OutOfMemory;
+    }
+    cursor_previous.* = index;
+    cursor.* = next;
+}
+
 pub fn preflightStructuralCommands(
     self: *DataSystem,
     commands: []const StructuralCommand,
     scratch: *StructuralPlanScratch,
 ) !StructuralCommitPlan {
     const projecting = try validateStructuralCommands(commands);
-    scratch.clearRetainingCapacity();
+    scratch.clearProjected();
+    scratch.clearDrawable();
     defer scratch.clearProjected();
     errdefer scratch.clearDrawable();
     if (commands.len == 0) {
@@ -620,6 +647,7 @@ pub fn preflightStructuralCommands(
             .structural_event_count = 0,
         };
     }
+    scratch.clearRetainingCapacity();
     if (projecting != 0) {
         try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(projecting));
     }
@@ -627,12 +655,15 @@ pub fn preflightStructuralCommands(
     var projection = StructuralCapacityProjection.init(self);
     var structural_event_count: usize = 0;
     var stagger_arrivals: usize = 0;
+    var free_cursor: ?u32 = self.first_free_slot;
+    var free_previous: ?u32 = null;
 
     // Preflight simulates the command stream against projected liveness and
     // masks so capacity and event reservations match what commit will do.
     for (commands) |command| {
         switch (command) {
             .create_entity => |template| {
+                try consumeFreeGeneration(self, scratch, &free_cursor, &free_previous);
                 try projection.createSlot();
                 try projection.addTemplate(template);
                 if (template.movement_body != null and template.ai_agent != null) stagger_arrivals += 1;
@@ -642,6 +673,10 @@ pub fn preflightStructuralCommands(
             .destroy_entity => |entity| {
                 const state = try scratch.projectedState(self, entity);
                 if (state.alive) {
+                    if (scratch.reuse_generations.items.len == 0) {
+                        try scratch.reuse_generations.ensureTotalCapacity(scratch.allocator, commands.len);
+                    }
+                    scratch.reuse_generations.appendAssumeCapacity(retiredSlotGeneration(self.slots.items[@intCast(entity.index)].generation));
                     structural_event_count = try addCapacity(structural_event_count, 1);
                     try projection.destroySlot();
                     removeProjectedComponents(state.component_mask, &projection);
@@ -1190,6 +1225,8 @@ test "structural command preflight projection does not walk retained capacity" {
     scratch.projected_entities.available = 0;
     const data_allocator = data.allocator;
     const scratch_allocator = scratch.allocator;
+    scratch.reuse_generations.deinit(std.testing.allocator);
+    scratch.reuse_generations = .empty;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 0,
         .resize_fail_index = 0,

@@ -12,6 +12,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
+const retiredSlotGeneration = types.retiredSlotGeneration;
 const Component = types.Component;
 const ComponentMask = types.ComponentMask;
 const component_masks = types.component_masks;
@@ -173,18 +174,16 @@ pub const DataSystem = struct {
 
     pub fn createEntity(self: *DataSystem) !EntityId {
         if (self.first_free_slot) |index| {
-            const slot = &self.slots.items[@intCast(index)];
-            self.first_free_slot = slot.next_free;
-            std.debug.assert(self.free_slot_count > 0);
-            self.free_slot_count -= 1;
-            slot.alive = true;
-            slot.next_free = null;
+            const generation = self.slots.items[@intCast(index)].generation;
+            self.unlinkFreeSlot(index, null);
+            if (generation == std.math.maxInt(u32)) return error.OutOfMemory;
+            self.slots.items[@intCast(index)].alive = true;
             // Scope metadata (tier/chunk/stagger) is born with the movement body
             // as a dense column row, not on the slot. tier_counts is maintained at
             // movement-body add/remove.
             // Reused slots keep their incremented generation so stale IDs cannot
             // address the new entity.
-            return EntityId.init(index, slot.generation) catch unreachable;
+            return EntityId.init(index, generation) catch unreachable;
         }
 
         // `u32` slot indices: exhausting them fails at this growth seam as `OutOfMemory`.
@@ -192,6 +191,19 @@ pub const DataSystem = struct {
         const index: u32 = @intCast(self.slots.items.len);
         try self.slots.append(self.allocator, .{ .generation = 1, .alive = true });
         return EntityId.init(index, 1) catch unreachable;
+    }
+
+    /// Unlinks one free-list node. `previous == null` means `index` is the head.
+    pub fn unlinkFreeSlot(self: *DataSystem, index: u32, previous: ?u32) void {
+        const next = self.slots.items[@intCast(index)].next_free;
+        if (previous) |previous_index| {
+            self.slots.items[@intCast(previous_index)].next_free = next;
+        } else {
+            self.first_free_slot = next;
+        }
+        self.slots.items[@intCast(index)].next_free = null;
+        std.debug.assert(self.free_slot_count > 0);
+        self.free_slot_count -= 1;
     }
 
     pub fn destroyEntity(self: *DataSystem, id: EntityId) error{OutOfMemory}!bool {
@@ -218,7 +230,7 @@ pub const DataSystem = struct {
         // tier_counts is decremented in removeMovementBodyAt (called above) since
         // the tier now lives on the dense movement-body scope row, not the slot.
         const retired_slot = &self.slots.items[@intCast(index)];
-        retired_slot.generation = nextGeneration(retired_slot.generation);
+        retired_slot.generation = retiredSlotGeneration(retired_slot.generation);
         retired_slot.alive = false;
         retired_slot.next_free = self.first_free_slot;
         retired_slot.component_mask = 0;
@@ -541,7 +553,7 @@ pub const DataSystem = struct {
         self.free_slot_count = self.slots.items.len;
         self.tier_counts = .{ 0, 0, 0, 0 };
         for (self.slots.items, 0..) |*slot, index| {
-            slot.generation = nextGeneration(slot.generation);
+            slot.generation = retiredSlotGeneration(slot.generation);
             slot.alive = false;
             slot.next_free = self.first_free_slot;
             slot.component_mask = 0;
@@ -1416,11 +1428,6 @@ const EntitySlot = struct {
     }
 };
 
-fn nextGeneration(generation: u32) u32 {
-    const next = generation +% 1;
-    return if (next == 0) 1 else next;
-}
-
 fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.position_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.position_y.len);
@@ -1670,6 +1677,181 @@ test "entity generations reject stale ids after removal and reuse" {
     try std.testing.expect(reused.generation != first.generation);
     try std.testing.expect(data.isAlive(reused));
     try std.testing.expect(!(try data.destroyEntity(first)));
+}
+
+test "createEntity fails as OutOfMemory when entity generations would wrap a free slot" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+
+    const index0 = try data.createEntity();
+    const index1 = try data.createEntity();
+    try std.testing.expectEqual(@as(u32, 0), index0.index);
+    try std.testing.expectEqual(@as(u32, 1), index1.index);
+    try std.testing.expectEqual(@as(u32, 1), index0.generation);
+    try std.testing.expectEqual(@as(u32, 1), index1.generation);
+
+    try std.testing.expect(try data.destroyEntity(index0));
+    try std.testing.expectEqual(@as(u32, 2), data.slots.items[0].generation);
+    try std.testing.expect(!data.slots.items[0].alive);
+
+    data.slots.items[1].generation = std.math.maxInt(u32);
+    const max_id = try EntityId.init(1, std.math.maxInt(u32));
+    const original = try EntityId.init(1, 1);
+    try std.testing.expect(data.isAlive(max_id));
+    try std.testing.expect(!data.isAlive(original));
+
+    try std.testing.expect(try data.destroyEntity(max_id));
+    try std.testing.expectEqual(std.math.maxInt(u32), data.slots.items[1].generation);
+    try std.testing.expectEqual(@as(?u32, 1), data.first_free_slot);
+    try std.testing.expectEqual(@as(?u32, 0), data.slots.items[1].next_free);
+    try std.testing.expectEqual(@as(?u32, null), data.slots.items[0].next_free);
+    try std.testing.expectEqual(@as(usize, 2), data.free_slot_count);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try std.testing.expectError(error.OutOfMemory, data.createEntity());
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 2), data.slots.items.len);
+    try std.testing.expect(!data.slots.items[1].alive);
+    try std.testing.expectEqual(std.math.maxInt(u32), data.slots.items[1].generation);
+    try std.testing.expectEqual(@as(?u32, null), data.slots.items[1].next_free);
+    try std.testing.expectEqual(@as(?u32, 0), data.first_free_slot);
+    try std.testing.expectEqual(@as(usize, 1), data.free_slot_count);
+    try std.testing.expect(!data.isAlive(original));
+    try std.testing.expect(!data.isAlive(max_id));
+
+    const next = try data.createEntity();
+    try std.testing.expectEqual(@as(u32, 0), next.index);
+    try std.testing.expectEqual(@as(u32, 2), next.generation);
+    try std.testing.expect(data.isAlive(next));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(!data.slots.items[1].alive);
+    try std.testing.expectEqual(std.math.maxInt(u32), data.slots.items[1].generation);
+    try std.testing.expect(!data.isAlive(original));
+}
+
+test "createEntity fails as OutOfMemory when entity generations would wrap inside a structural batch" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const birth = try data.createEntity();
+    data.slots.items[birth.index].generation = std.math.maxInt(u32);
+    const exhausted = try EntityId.init(birth.index, std.math.maxInt(u32));
+    try std.testing.expect(data.isAlive(exhausted));
+    try std.testing.expect(!data.isAlive(birth));
+
+    const free_before = data.free_slot_count;
+    const len_before = data.slots.items.len;
+    const destroy_and_create = [_]StructuralCommand{
+        .{ .destroy_entity = exhausted },
+        .{ .create_entity = .{} },
+    };
+    try std.testing.expectError(error.OutOfMemory, data.applyStructuralCommands(&destroy_and_create));
+    try std.testing.expect(data.isAlive(exhausted));
+    try std.testing.expectEqual(free_before, data.free_slot_count);
+    try std.testing.expectEqual(len_before, data.slots.items.len);
+
+    try std.testing.expect(try data.destroyEntity(exhausted));
+    const create_only = [_]StructuralCommand{
+        .{ .create_entity = .{} },
+    };
+    try std.testing.expectError(error.OutOfMemory, data.applyStructuralCommands(&create_only));
+    try std.testing.expectEqual(@as(usize, 0), data.free_slot_count);
+    try std.testing.expectEqual(len_before, data.slots.items.len);
+    try std.testing.expect(!data.isAlive(exhausted));
+
+    const created = try data.applyStructuralCommands(&create_only);
+    try std.testing.expectEqual(@as(usize, 1), created.created);
+    try std.testing.expectEqual(len_before + 1, data.slots.items.len);
+    try std.testing.expect(!data.slots.items[exhausted.index].alive);
+    try std.testing.expectEqual(std.math.maxInt(u32), data.slots.items[exhausted.index].generation);
+    try std.testing.expect(data.slots.items[1].alive);
+    try std.testing.expect(exhausted.index != 1);
+    try std.testing.expect(!data.isAlive(birth));
+    try std.testing.expect(!data.isAlive(exhausted));
+
+    var warm = DataSystem.init(std.testing.allocator);
+    defer warm.deinit();
+    const warm_entity = try warm.createEntity();
+    try std.testing.expect(warm_entity.generation < std.math.maxInt(u32));
+    const warm_len = warm.slots.items.len;
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    var preparer = NullStructuralCommitPreparer{};
+    var sink = NullStructuralChangeSink{};
+    const warm_commands = [_]StructuralCommand{
+        .{ .destroy_entity = warm_entity },
+        .{ .create_entity = .{} },
+    };
+    _ = try warm.applyStructuralCommandsPrepared(&warm_commands, &scratch, &preparer, &sink);
+    try std.testing.expectEqual(warm_len, warm.slots.items.len);
+    try std.testing.expect(scratch.reuse_generations.capacity >= warm_commands.len);
+    const stack_ptr = scratch.reuse_generations.items.ptr;
+    const stack_capacity = scratch.reuse_generations.capacity;
+
+    const reused = try EntityId.init(warm_entity.index, 2);
+    try std.testing.expect(warm.isAlive(reused));
+    try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, 1);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const scratch_allocator = scratch.allocator;
+    scratch.allocator = failing.allocator();
+    defer scratch.allocator = scratch_allocator;
+
+    const warm_again = [_]StructuralCommand{
+        .{ .destroy_entity = reused },
+        .{ .create_entity = .{} },
+    };
+    _ = try warm.applyStructuralCommandsPrepared(&warm_again, &scratch, &preparer, &sink);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(warm_len, warm.slots.items.len);
+    try std.testing.expectEqual(stack_ptr, scratch.reuse_generations.items.ptr);
+    try std.testing.expectEqual(stack_capacity, scratch.reuse_generations.capacity);
+
+    _ = try warm.preflightStructuralCommands(&create_only, &scratch);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(warm_len, warm.slots.items.len);
+    try std.testing.expectEqual(stack_ptr, scratch.reuse_generations.items.ptr);
+}
+
+test "createEntity fails as OutOfMemory when a wrapped free slot is not the free-list head" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const slot_a = try data.createEntity();
+    const slot_b = try data.createEntity();
+    data.slots.items[slot_b.index].generation = std.math.maxInt(u32);
+    const exhausted = try EntityId.init(slot_b.index, std.math.maxInt(u32));
+    try std.testing.expect(data.isAlive(exhausted));
+
+    try std.testing.expect(try data.destroyEntity(exhausted));
+    try std.testing.expect(try data.destroyEntity(slot_a));
+    try std.testing.expectEqual(@as(?u32, slot_a.index), data.first_free_slot);
+    try std.testing.expectEqual(@as(?u32, slot_b.index), data.slots.items[slot_a.index].next_free);
+    const len_before = data.slots.items.len;
+
+    const creates = [_]StructuralCommand{
+        .{ .create_entity = .{} },
+        .{ .create_entity = .{} },
+    };
+    try std.testing.expectError(error.OutOfMemory, data.applyStructuralCommands(&creates));
+    try std.testing.expectEqual(@as(?u32, slot_a.index), data.first_free_slot);
+    try std.testing.expect(!data.isAlive(slot_a));
+    try std.testing.expect(!data.isAlive(exhausted));
+    try std.testing.expectEqual(@as(usize, 1), data.free_slot_count);
+    try std.testing.expect(!data.slots.items[slot_a.index].alive);
+    try std.testing.expect(!data.slots.items[slot_b.index].alive);
+    try std.testing.expectEqual(std.math.maxInt(u32), data.slots.items[slot_b.index].generation);
+    try std.testing.expectEqual(@as(?u32, null), data.slots.items[slot_a.index].next_free);
+    try std.testing.expectEqual(@as(?u32, null), data.slots.items[slot_b.index].next_free);
+    try std.testing.expectEqual(len_before, data.slots.items.len);
 }
 
 test "entity simulation metadata defaults and rejects stale ids" {
