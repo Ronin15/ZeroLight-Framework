@@ -440,6 +440,7 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_levels_built, metric(self.levels_built));
         perf.recordMetric(.nav_records_patched, metric(self.records_patched));
         if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.nav_closure_land_deferrals, metric(self.perf.closure_land_deferrals));
             perf.recordBatch(.nav_remask, self.perf.remask_batch);
             perf.recordBatch(.nav_connect, self.perf.conn_flood_batch);
             perf.recordBatch(.nav_closure, self.perf.conn_closure_rows_batch);

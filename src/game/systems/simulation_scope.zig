@@ -168,11 +168,12 @@ pub const SimulationScopeSystem = struct {
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: the last think set's indexed halo entities
-    /// whose stagger_phase did not match its step, and the out-of-halo suffixes of the
-    /// think-set runs (`publishRunBounds`).
+    /// whose stagger_phase did not match its step, the out-of-halo suffixes of the
+    /// think-set runs (`publishRunBounds`), and every think-set scratch grow.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         stagger_skips: usize = 0,
         chunk_filtered_entities: usize = 0,
+        scratch_grows: u64 = 0,
     } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) SimulationScopeSystem {
@@ -519,6 +520,7 @@ pub const SimulationScopeSystem = struct {
     }
 
     fn noteThinkScratchGrow(self: *SimulationScopeSystem, count: usize) void {
+        if (comptime runtime_perf_log.enabled) self.perf.scratch_grows += 1;
         if (self.think_scratch_grow_logged) return;
         self.think_scratch_grow_logged = true;
         if (comptime logging.enabled(.warn)) logging.game.warn("think-set scratch grew to {d} rows", .{count});
@@ -2957,6 +2959,25 @@ test "think set phase runs are contiguous and cell-major" {
     }
     try std.testing.expectEqual(cursor, halo.len);
     for (halo) |index| try std.testing.expect(!agents.entities[index].eql(outside));
+}
+
+test "think scratch growth warns once" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setAiAgent(entity, .{});
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+
+    try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    try std.testing.expect(sys.think_scratch_grow_logged);
+
+    try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    try std.testing.expect(sys.think_scratch_grow_logged);
 }
 
 test "a packed think span keeps the think set's entity order" {

@@ -112,4 +112,5 @@
   `src/app/runtime_perf_log.zig`). Gate any non-trivially formatted diagnostic
   behind `logging.enabled(level)`.
 - A new growth or drop counter logs once through a scoped logger; its once-only
-  flag lives on the owning system, never global.
+  flag lives on the owning system, never global. Repeats of a `warn` are a
+  count on the runtime perf log.

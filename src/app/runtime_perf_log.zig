@@ -16,8 +16,8 @@ const log = logging.perf;
 // Debug (`dev` / `run`): fix cycles — iterate code and behavior. Perf lines may
 // appear but are not the soak authority (Debug is heavily pessimistic).
 // ReleaseSafe: intentional soaks for ranking and absolute scale numbers (slow
-// compile — not every edit). Emit uses `log.debug`; both modes' `auto` log
-// level includes debug.
+// compile — not every edit). The dump is an `info` line. Debug and ReleaseSafe
+// `auto` includes it, and `-Dlog-level=info` keeps the dump.
 pub const enabled = @import("build_options").perf_counters;
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
@@ -103,6 +103,10 @@ pub const Metric = enum {
     dig_plane_scratch_grown,
     plane_entry_windows_grown,
     collision_pair_bound_exceeded,
+    collision_entry_bound_exceeded,
+    nav_closure_land_deferrals,
+    ai_memory_scratch_grows,
+    think_scratch_grows,
     population_capacity_grows,
     movement_bodies,
     collision_bodies,
@@ -581,7 +585,7 @@ const EnabledRuntimePerfLog = struct {
         const rendered_frame_count = self.metricValue(.submitted_frames) +
             self.metricValue(.skipped_no_swapchain_frames);
 
-        log.debug(
+        log.info(
             "perf {d:.1}s frames={} submitted={} no_swapchain={} no_render={} updates={} cap_hits={} frame_interval_avg_ms={d:.3} frame_interval_max_ms={d:.3} events_avg_ms={d:.3} events_max_ms={d:.3} controls_avg_ms={d:.3} controls_max_ms={d:.3} app_tick_avg_ms={d:.3} app_tick_max_ms={d:.3} render_total_avg_ms={d:.3} render_total_max_ms={d:.3} event_count={} presentation_events={} resize={} fullscreen={} display={} focus={} visibility={} move={}",
             .{
                 elapsed_s,
@@ -611,7 +615,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.sdl_window_move_events),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s update state_avg_ms={d:.3} state_max_ms={d:.3} gameplay_avg_ms={d:.3} gameplay_max_ms={d:.3} transitions_avg_ms={d:.3} transitions_max_ms={d:.3} audio_drain_avg_ms={d:.3} audio_drain_max_ms={d:.3} loading_build_avg_ms={d:.3} loading_build_max_ms={d:.3}",
             .{
                 elapsed_s,
@@ -641,7 +645,7 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_collision_timing = self.timingValue(.pipeline_collision);
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
         const pipeline_chunk_derive_timing = self.timingValue(.pipeline_chunk_derive);
-        log.debug(
+        log.info(
             "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} path_goals_avg_ms={d:.3} path_goals_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3} chunk_derive_avg_ms={d:.3} chunk_derive_max_ms={d:.3}",
             .{
                 elapsed_s,
@@ -680,7 +684,7 @@ const EnabledRuntimePerfLog = struct {
         const gameplay_particles_timing = self.timingValue(.gameplay_particles);
         const gameplay_camera_timing = self.timingValue(.gameplay_camera);
         const gameplay_structural_timing = self.timingValue(.gameplay_structural);
-        log.debug(
+        log.info(
             "perf {d:.1}s gameplay_stage input_avg_ms={d:.3} input_max_ms={d:.3} audio_avg_ms={d:.3} audio_max_ms={d:.3} particles_avg_ms={d:.3} particles_max_ms={d:.3} camera_avg_ms={d:.3} camera_max_ms={d:.3} structural_avg_ms={d:.3} structural_max_ms={d:.3}",
             .{
                 elapsed_s,
@@ -701,7 +705,7 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
         const pathfinding_resize_timing = self.timingValue(.pathfinding_resize);
-        log.debug(
+        log.info(
             "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} resize_avg_ms={d:.3} resize_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={} group_evictions={}",
             .{
                 elapsed_s,
@@ -727,7 +731,7 @@ const EnabledRuntimePerfLog = struct {
         const steering_select_timing = self.timingValue(.steering_select);
         const steering_snapshot_timing = self.timingValue(.steering_snapshot);
         const steering_directions_timing = self.timingValue(.steering_directions);
-        log.debug(
+        log.info(
             "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3}",
             .{
                 elapsed_s,
@@ -739,7 +743,7 @@ const EnabledRuntimePerfLog = struct {
                 millis(steering_directions_timing.max_ns),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={} overflow_grows={}",
             .{
                 elapsed_s,
@@ -760,7 +764,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.sprite_command_overflow_grows),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s scope total={} dormant={} kinematic={} locomotion={} cognition={} stage movement={} collision={} response={} ai={} steering={} stagger_skips={} chunk_filtered={}",
             .{
                 elapsed_s,
@@ -778,7 +782,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.scope_chunk_filtered_entities),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} destructibles_destroyed={} destructibles_hit={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
             .{
                 elapsed_s,
@@ -812,7 +816,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.structural_stale_skipped),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s perception observers={} observers_avg={d:.1} sensed={} los_checks={} los_blocked={} nearest_found={} candidate_checks={}",
             .{
                 elapsed_s,
@@ -825,7 +829,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.perception_candidate_checks),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} entity_perceived={} entity_lost={} affect_crossed={} structural_stage={} domain_stage={}",
             .{
                 elapsed_s,
@@ -844,7 +848,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.simulation_events_domain_reaction_stage),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} solve_admissions={} available={} partial={} unavailable={} dropped={} admission_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
             .{
                 elapsed_s,
@@ -870,8 +874,8 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_group_field_samples),
             },
         );
-        log.debug(
-            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} chunks_patched={} levels_built={} records_patched={} region_invalidated={} dig_plane_scratch_grown={} plane_entry_windows_grown={} collision_pair_bound_exceeded={} population_capacity_grows={}",
+        log.info(
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} chunks_patched={} levels_built={} records_patched={} region_invalidated={} dig_plane_scratch_grown={} plane_entry_windows_grown={} collision_pair_bound_exceeded={} population_capacity_grows={} collision_entry_bound_exceeded={} nav_closure_land_deferrals={} ai_memory_scratch_grows={} think_scratch_grows={}",
             .{
                 elapsed_s,
                 self.metricValue(.nav_dirty_chunks),
@@ -884,9 +888,13 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.plane_entry_windows_grown),
                 self.metricValue(.collision_pair_bound_exceeded),
                 self.metricValue(.population_capacity_grows),
+                self.metricValue(.collision_entry_bound_exceeded),
+                self.metricValue(.nav_closure_land_deferrals),
+                self.metricValue(.ai_memory_scratch_grows),
+                self.metricValue(.think_scratch_grows),
             },
         );
-        log.debug(
+        log.info(
             "perf {d:.1}s steering path_requests={} available={} pending={} unavailable={} replans={} unavailable_backoff={} stuck={} agent_samples={} obstacle_samples={} agent_checks={} obstacle_checks={} ai_sep_checks={} ai_sep_samples={} collision_simd_groups={}",
             .{
                 elapsed_s,
@@ -910,7 +918,7 @@ const EnabledRuntimePerfLog = struct {
         inline for (comptime std.meta.tags(BatchStage)) |stage| {
             const batch_stats = self.batchValue(stage);
             if (batch_stats.calls != 0) {
-                log.debug(
+                log.info(
                     "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} wait_on_max_ms={d:.3} worker_util_avg={d:.1}%",
                     .{
                         elapsed_s,

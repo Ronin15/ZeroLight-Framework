@@ -404,9 +404,9 @@ pub const CollisionStats = struct {
     broadphase_simd_groups: usize = 0,
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`: whether the step outgrew its pair bound,
-    /// the entries the sweep tested against an earlier entry of its run inside that entry's
-    /// x span, and the batches of the stages the step ran. A stage that did not run leaves
+    /// Kept only with `runtime_perf_log.enabled`: whether the step outgrew its pair bound
+    /// or its entry bound, the entries the sweep tested against an earlier entry of its run
+    /// inside that entry's x span, and the batches of the stages the step ran. A stage that did not run leaves
     /// its batch zero: the Debug stored-rect compare in every other mode, the stored-trigger
     /// refresh on a step whose allow epoch did not move.
     pub const Perf = if (runtime_perf_log.enabled) struct {
@@ -417,6 +417,10 @@ pub const CollisionStats = struct {
         /// that grew inside those bounds counts only in its set. Set once per step, with one
         /// `CollisionSystem.perf.pair_bound_overflows` count.
         pair_bound_exceeded: bool = false,
+        /// This reserved step's sweep entries exceeded `CollisionSystem.reserved_entry_bound`
+        /// (the keys and entries grew). Set once per step, with one
+        /// `CollisionSystem.perf.entry_bound_overflows` count.
+        entry_bound_exceeded: bool = false,
         broadphase_visits: usize = 0,
         broadphase_batch: BatchStats = .{},
         narrowphase_batch: BatchStats = .{},
@@ -1317,7 +1321,7 @@ pub const CollisionSystem = struct {
         self.warm_count = if (first_count == input_count) input_count else 0;
         stats.body_count = first_count;
         stats.entry_count = entry_count;
-        self.countEntryBoundOverflow(entry_count);
+        self.countEntryBoundOverflow(stats, entry_count);
         return first_count > 1;
     }
 
@@ -1441,14 +1445,22 @@ pub const CollisionSystem = struct {
 
     /// Counts, once, a reserved step whose `entry_count` exceeds `reserved_entry_bound`.
     /// Main thread, after the fill.
-    fn countEntryBoundOverflow(self: *CollisionSystem, entry_count: usize) void {
+    fn countEntryBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, entry_count: usize) void {
         if (self.reserved_entry_bound == 0 or entry_count <= self.reserved_entry_bound) return;
-        self.noteEntryBoundOverflow(entry_count);
+        self.noteEntryBoundOverflow(stats, entry_count);
     }
 
-    fn noteEntryBoundOverflow(self: *CollisionSystem, entry_count: usize) void {
+    // Flags the step and counts it once, however many builds it took.
+    fn markEntryBoundExceeded(self: *CollisionSystem, stats: *CollisionStats) void {
+        if (comptime !runtime_perf_log.enabled) return;
+        if (stats.perf.entry_bound_exceeded) return;
+        stats.perf.entry_bound_exceeded = true;
+        self.perf.entry_bound_overflows += 1;
+    }
+
+    fn noteEntryBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, entry_count: usize) void {
         @branchHint(.cold);
-        if (comptime runtime_perf_log.enabled) self.perf.entry_bound_overflows += 1;
+        self.markEntryBoundExceeded(stats);
         if (self.entry_bound_warned) return;
         self.entry_bound_warned = true;
         if (comptime logging.enabled(.warn)) logging.game.warn(
@@ -3956,6 +3968,30 @@ test "a fill range past its spill slot replays to the reference contacts" {
     try std.testing.expectEqual(@as(usize, 96), stats.entry_count);
     try std.testing.expect(stats.entry_count <= system.reserved_entry_bound);
     try expectSameContacts(expected, contacts.mergedItems());
+}
+
+test "collision entry bound overflow warns once and a larger reserve holds" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..3) |index| _ = try addBox(&data, .{ .x = @as(f32, @floatFromInt(index)) * 40, .y = 2, .w = 8, .h = 8 });
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(1);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const first = try updateInline(&system, &data, &contacts);
+    try std.testing.expect(first.entry_count > system.reserved_entry_bound);
+    try std.testing.expect(system.entry_bound_warned);
+
+    const second = try updateInline(&system, &data, &contacts);
+    try std.testing.expect(second.entry_count > system.reserved_entry_bound);
+    try std.testing.expect(system.entry_bound_warned);
+
+    try system.reserve(3);
+    const settled = try updateInline(&system, &data, &contacts);
+    try std.testing.expect(settled.entry_count <= system.reserved_entry_bound);
+    try std.testing.expect(system.entry_bound_warned);
 }
 
 test "collision warm fill gathers motion once into packed columns" {

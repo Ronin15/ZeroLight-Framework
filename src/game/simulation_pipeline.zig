@@ -561,12 +561,14 @@ pub const SimulationPipelineStats = struct {
 
     /// Kept only with `runtime_perf_log.enabled`: this step's plane-traversal scratch and
     /// plane-entry window growths past their reservations (the reservation short of the
-    /// live population; zero in steady state), and the batches of the stages the pipeline
-    /// runs itself: the scope passes, the world gate, the plane-entry gather, and the chunk
-    /// derive.
+    /// live population; zero in steady state), the ai-memory and think-set scratch growths,
+    /// and the batches of the stages the pipeline runs itself: the scope passes, the world
+    /// gate, the plane-entry gather, and the chunk derive.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         dig_plane_scratch_grows: usize = 0,
         plane_entry_window_grows: usize = 0,
+        ai_memory_scratch_grows: usize = 0,
+        think_scratch_grows: usize = 0,
         scope_ai_gather: BatchStats = .{},
         scope_cognition: BatchStats = .{},
         scope_collision_gather: BatchStats = .{},
@@ -735,6 +737,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
         if (comptime runtime_perf_log.enabled) {
             if (collision_stats.perf.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
+            if (collision_stats.perf.entry_bound_exceeded) perf.recordMetric(.collision_entry_bound_exceeded, 1);
             const fill_batch = collision_stats.perf.fill_batch;
             // An untimed batch with no workers is not a sample. The inline banded fill is timed.
             if (fill_batch.available_worker_threads != 0 or fill_batch.batch_duration_ns != 0) {
@@ -780,6 +783,8 @@ pub const SimulationPipelineStats = struct {
         if (comptime runtime_perf_log.enabled) {
             perf.recordMetric(.dig_plane_scratch_grown, metric(self.perf.dig_plane_scratch_grows));
             perf.recordMetric(.plane_entry_windows_grown, metric(self.perf.plane_entry_window_grows));
+            perf.recordMetric(.ai_memory_scratch_grows, metric(self.perf.ai_memory_scratch_grows));
+            perf.recordMetric(.think_scratch_grows, metric(self.perf.think_scratch_grows));
         }
     }
 };
@@ -1581,8 +1586,10 @@ pub const SimulationPipeline = struct {
     /// columns are derived in their own late stage after positions settle.
     /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
+        const think_grows_before = if (comptime runtime_perf_log.enabled) self.scope.perf.scratch_grows else 0;
         var step = StepState.init(self, context);
         inline for (stage_order) |id| try self.runStage(id, &step);
+        if (comptime runtime_perf_log.enabled) step.perf.think_scratch_grows = @intCast(self.scope.perf.scratch_grows - think_grows_before);
         return step.finish(self);
     }
 
@@ -1746,9 +1753,11 @@ pub const SimulationPipeline = struct {
     fn stageAiMemoryUpdate(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var ai_memory_timer = StageTimer.start();
+        const scratch_grows_before = if (comptime runtime_perf_log.enabled) self.ai_memory.perf.scratch_grows else 0;
         step.ai_memory = try self.ai_memory.update(context.data.aiAgentSliceConst(), context.data, context.frame, context.thread_system, .{
             .scope_dense_indices = step.ai_cognition_indices,
         });
+        if (comptime runtime_perf_log.enabled) step.perf.ai_memory_scratch_grows = @intCast(self.ai_memory.perf.scratch_grows - scratch_grows_before);
         ai_memory_timer.stop(context.perf, .pipeline_ai_memory);
     }
 

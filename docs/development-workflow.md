@@ -190,8 +190,8 @@ zig build -Dgpu-debug=true
 
 Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
 
-- **Debug** and **ReleaseSafe** → `debug` (full diagnostics + 60s runtime perf
-  dumps from `runtime_perf_log`)
+- **Debug** and **ReleaseSafe** → `debug` (full diagnostics). The 60s runtime
+  perf dump is an `info` line, so `-Dlog-level=info` keeps it.
 - **ReleaseFast** / **ReleaseSmall** → `warn` (ship/package; runtime perf is
   fully compiled out)
 
