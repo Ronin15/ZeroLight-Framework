@@ -31,7 +31,7 @@ const validateAiPerception = @import("perception.zig").validateAiPerception;
 const validateAiMemory = @import("memory.zig").validateAiMemory;
 const validateAiAffect = @import("affect.zig").validateAiAffect;
 // Destructible payloads are scalar bools + u8 — no fallible validation beyond
-// StructuralCommand payload shape (see validateStructuralCommands else branch).
+// StructuralCommand payload shape.
 
 pub const NullStructuralChangeSink = struct {
     fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
@@ -284,8 +284,8 @@ const DrawablePlanEntry = struct {
     created: bool = false,
 };
 
-/// Reusable scratch for prepared structural commits. Simulation pipelines keep
-/// this around to avoid per-step hash-map allocation churn.
+/// Prepared-commit scratch. Pipelines keep the struct. A non-zero map is
+/// released so a later step does not walk retained slots.
 pub const StructuralPlanScratch = struct {
     allocator: std.mem.Allocator,
     projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
@@ -302,9 +302,22 @@ pub const StructuralPlanScratch = struct {
         self.drawable_plan = .{};
     }
 
+    /// A zero count does not walk retained slots. A non-zero count releases the map.
     pub fn clearRetainingCapacity(self: *StructuralPlanScratch) void {
-        self.projected_entities.clearRetainingCapacity();
-        self.drawable_plan.clearRetainingCapacity();
+        self.clearProjected();
+        self.clearDrawable();
+    }
+
+    fn clearProjected(self: *StructuralPlanScratch) void {
+        if (self.projected_entities.count() == 0) return;
+        self.projected_entities.deinit(self.allocator);
+        self.projected_entities = .{};
+    }
+
+    fn clearDrawable(self: *StructuralPlanScratch) void {
+        if (self.drawable_plan.count() == 0) return;
+        self.drawable_plan.deinit(self.allocator);
+        self.drawable_plan = .{};
     }
 
     fn drawableEntry(self: *StructuralPlanScratch, key: DrawablePlanKey) !*DrawablePlanEntry {
@@ -384,10 +397,12 @@ pub fn applyStructuralCommandsPrepared(
     const plan = try preflightStructuralCommands(self, commands, scratch);
     preparer.prepare(plan.structural_event_count) catch |err| {
         abortAppliedDrawablePlan(self, scratch);
+        scratch.clearRetainingCapacity();
         return err;
     };
     // No allocations or event-capacity failures should occur after this
     // point; the commit loop can mutate DataSystem in command order.
+    scratch.clearRetainingCapacity();
     return try commitStructuralCommands(self, commands, change_sink);
 }
 
@@ -594,8 +609,10 @@ pub fn preflightStructuralCommands(
     commands: []const StructuralCommand,
     scratch: *StructuralPlanScratch,
 ) !StructuralCommitPlan {
-    try validateStructuralCommands(commands);
+    const projecting = try validateStructuralCommands(commands);
     scratch.clearRetainingCapacity();
+    defer scratch.clearProjected();
+    errdefer scratch.clearDrawable();
     if (commands.len == 0) {
         return .{
             .command_count = 0,
@@ -603,7 +620,9 @@ pub fn preflightStructuralCommands(
             .structural_event_count = 0,
         };
     }
-    try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(commands.len));
+    if (projecting != 0) {
+        try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(projecting));
+    }
 
     var projection = StructuralCapacityProjection.init(self);
     var structural_event_count: usize = 0;
@@ -917,9 +936,11 @@ fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) 
     try self.destructibles.ensureCapacity(self.allocator, plan.capacity_needs.destructibles);
 }
 
-pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
+pub fn validateStructuralCommands(commands: []const StructuralCommand) !usize {
     // Validate fallible payloads up front so the later command-order commit
     // does not partially mutate before rejecting bad component data.
+    // The count is commands that call projectedState.
+    var projecting: usize = 0;
     for (commands) |command| {
         switch (command) {
             .create_entity => |template| {
@@ -951,18 +972,52 @@ pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
                     try validateAiAffect(ai_affect);
                 }
             },
-            .set_movement_body => |set| try validateMovementBody(set.body),
-            .set_primitive_visual => |set| try validatePrimitiveVisual(set.visual),
-            .set_collision_bounds => |set| try validateCollisionBounds(set.bounds),
-            .set_collision_response => |set| try validateCollisionResponse(set.response),
-            .set_ai_agent => |set| try validateAiAgent(set.agent),
-            .set_steering_agent => |set| try validateSteeringAgent(set.agent),
-            .set_ai_perception => |set| try validateAiPerception(set.perception),
-            .set_ai_memory => |set| try validateAiMemory(set.memory),
-            .set_ai_affect => |set| try validateAiAffect(set.affect),
-            else => {},
+            .destroy_entity => projecting += 1,
+            .set_movement_body => |set| {
+                try validateMovementBody(set.body);
+                projecting += 1;
+            },
+            .set_facing => projecting += 1,
+            .set_primitive_visual => |set| {
+                try validatePrimitiveVisual(set.visual);
+                projecting += 1;
+            },
+            .set_asset_reference => projecting += 1,
+            .set_collision_bounds => |set| {
+                try validateCollisionBounds(set.bounds);
+                projecting += 1;
+            },
+            .set_collision_response => |set| {
+                try validateCollisionResponse(set.response);
+                projecting += 1;
+            },
+            .set_ai_agent => |set| {
+                try validateAiAgent(set.agent);
+                projecting += 1;
+            },
+            .set_steering_agent => |set| {
+                try validateSteeringAgent(set.agent);
+                projecting += 1;
+            },
+            .set_world_level => projecting += 1,
+            .set_simulation_tier => {},
+            .set_faction => projecting += 1,
+            .set_ai_perception => |set| {
+                try validateAiPerception(set.perception);
+                projecting += 1;
+            },
+            .set_ai_memory => |set| {
+                try validateAiMemory(set.memory);
+                projecting += 1;
+            },
+            .set_ai_affect => |set| {
+                try validateAiAffect(set.affect);
+                projecting += 1;
+            },
+            .set_destructible => projecting += 1,
         }
     }
+    return projecting;
 }
 
 fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype, entity: EntityId, template: EntityTemplate) void {
@@ -1076,4 +1131,85 @@ test "StructuralCapacityNeeds.validateLimits fails every store's count beyond u3
         @field(over, name) = @as(usize, std.math.maxInt(u32)) + 1;
         try std.testing.expectError(error.OutOfMemory, over.validateLimits());
     }
+}
+
+test "structural command preflight projection does not walk retained capacity" {
+    const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+
+    // Slots a retained 2-entry map keeps. room + 1 does not fit in that map.
+    var retained = std.AutoHashMapUnmanaged(u64, u8){};
+    defer retained.deinit(std.testing.allocator);
+    try retained.ensureTotalCapacity(std.testing.allocator, 2);
+    const old_capacity = retained.capacity();
+    const room = retained.available;
+    try std.testing.expect(old_capacity > 0);
+    try std.testing.expect(room > 0);
+
+    const destroys = [_]StructuralCommand{
+        .{ .destroy_entity = first },
+        .{ .destroy_entity = second },
+    };
+    const projected = try preflightStructuralCommands(&data, &destroys, &scratch);
+    try std.testing.expectEqual(@as(usize, 2), projected.command_count);
+    try std.testing.expectEqual(@as(usize, 2), projected.structural_event_count);
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.count());
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.capacity());
+
+    const later = [_]StructuralCommand{
+        .{ .destroy_entity = first },
+    };
+    const again = try preflightStructuralCommands(&data, &later, &scratch);
+    try std.testing.expectEqual(@as(usize, 1), again.command_count);
+    try std.testing.expectEqual(@as(usize, 1), again.structural_event_count);
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.count());
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.capacity());
+    try std.testing.expect(scratch.projected_entities.capacity() != old_capacity);
+
+    const tier_count: usize = @as(usize, room) + 1;
+    var tier_commands: std.ArrayList(StructuralCommand) = .empty;
+    defer tier_commands.deinit(std.testing.allocator);
+    try tier_commands.ensureTotalCapacity(std.testing.allocator, tier_count);
+    for (0..tier_count) |_| {
+        tier_commands.appendAssumeCapacity(.{
+            .set_simulation_tier = .{ .entity = first, .tier = SimulationTier.dormant },
+        });
+    }
+    try data.collision_allow_records.ensureTotalCapacity(
+        std.testing.allocator,
+        data.collision_allow_records.items.len + tier_commands.items.len * 2,
+    );
+
+    scratch.projected_entities.available = 0;
+    const data_allocator = data.allocator;
+    const scratch_allocator = scratch.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    data.allocator = failing.allocator();
+    scratch.allocator = failing.allocator();
+    defer data.allocator = data_allocator;
+    defer scratch.allocator = scratch_allocator;
+
+    const empty = try preflightStructuralCommands(&data, &.{}, &scratch);
+    try std.testing.expectEqual(@as(usize, 0), empty.command_count);
+    try std.testing.expectEqual(@as(usize, 0), empty.structural_event_count);
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.count());
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.capacity());
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.available);
+
+    const tier_only = try preflightStructuralCommands(&data, tier_commands.items, &scratch);
+    try std.testing.expectEqual(tier_count, tier_only.command_count);
+    try std.testing.expectEqual(@as(usize, 0), tier_only.structural_event_count);
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.count());
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.capacity());
+    try std.testing.expectEqual(@as(u32, 0), scratch.projected_entities.available);
 }

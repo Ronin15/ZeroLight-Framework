@@ -194,10 +194,10 @@ in its owning slice.
       was. Proof: `system.zig:2208`, `system.zig:2229`, `movement.zig:1412`
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/budgets-capacities.md`).
-- [ ] The structural projection map is sized to every command and cleared
-      to its retained capacity every step (preflight clear and ensure,
-      `structural.zig:531`, `structural.zig:539`; `set_simulation_tier`
-      inserts nothing, `structural.zig:588`; the step clears the same map,
+- [x] The structural projection map is sized to projecting commands, and a
+      zero count does not walk retained slots (preflight clear and ensure,
+      `structural.zig:613`, `structural.zig:623`; `set_simulation_tier`
+      inserts nothing, `structural.zig:687`; the step clears the same map,
       `simulation.zig:731`). Failure scenario (derived): one population-sized
       tier wave, which inserts nothing, leaves every later step, including
       a step with no commands, walking that capacity on the main thread.
