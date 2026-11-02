@@ -165,15 +165,17 @@ pub const SimulationScopeSystem = struct {
     phase_halo_end: [4]u32 = @splat(0),
     phase_end: [4]u32 = @splat(0),
     think_scratch_grow_logged: bool = false,
+    /// Think-set scratch grows. Not on `perf`: `advanceStep` and `gatherAiPopulations`
+    /// replace that value with `.{}` every step.
+    think_scratch_grows: u64 = 0,
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: the last think set's indexed halo entities
-    /// whose stagger_phase did not match its step, the out-of-halo suffixes of the
-    /// think-set runs (`publishRunBounds`), and every think-set scratch grow.
+    /// whose stagger_phase did not match its step, and the out-of-halo suffixes of the
+    /// think-set runs (`publishRunBounds`).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         stagger_skips: usize = 0,
         chunk_filtered_entities: usize = 0,
-        scratch_grows: u64 = 0,
     } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) SimulationScopeSystem {
@@ -520,7 +522,7 @@ pub const SimulationScopeSystem = struct {
     }
 
     fn noteThinkScratchGrow(self: *SimulationScopeSystem, count: usize) void {
-        if (comptime runtime_perf_log.enabled) self.perf.scratch_grows += 1;
+        self.think_scratch_grows += 1;
         if (self.think_scratch_grow_logged) return;
         self.think_scratch_grow_logged = true;
         if (comptime logging.enabled(.warn)) logging.game.warn("think-set scratch grew to {d} rows", .{count});
@@ -2974,9 +2976,15 @@ test "think scratch growth warns once" {
     defer threads.deinit();
 
     try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    const grows = sys.think_scratch_grows;
+    try std.testing.expect(grows >= 1);
     try std.testing.expect(sys.think_scratch_grow_logged);
+    sys.advanceStep();
+    _ = try sys.gatherAiPopulations(&data, null, &threads, .{});
+    try std.testing.expectEqual(grows, sys.think_scratch_grows);
 
     try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    try std.testing.expectEqual(grows, sys.think_scratch_grows);
     try std.testing.expect(sys.think_scratch_grow_logged);
 }
 

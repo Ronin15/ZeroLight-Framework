@@ -402,10 +402,12 @@ pub const CollisionStats = struct {
     candidate_pair_count: usize = 0,
     /// Sweep lane groups: counted and set only with `runtime_perf_log.enabled`, else 0.
     broadphase_simd_groups: usize = 0,
+    /// This step's sweep entries exceeded `reserved_entry_bound`. Set once per step.
+    entry_bound_exceeded: bool = false,
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`: whether the step outgrew its pair bound
-    /// or its entry bound, the entries the sweep tested against an earlier entry of its run
+    /// Kept only with `runtime_perf_log.enabled`: whether the step outgrew its pair bound,
+    /// the entries the sweep tested against an earlier entry of its run
     /// inside that entry's x span, and the batches of the stages the step ran. A stage that did not run leaves
     /// its batch zero: the Debug stored-rect compare in every other mode, the stored-trigger
     /// refresh on a step whose allow epoch did not move.
@@ -417,10 +419,6 @@ pub const CollisionStats = struct {
         /// that grew inside those bounds counts only in its set. Set once per step, with one
         /// `CollisionSystem.perf.pair_bound_overflows` count.
         pair_bound_exceeded: bool = false,
-        /// This reserved step's sweep entries exceeded `CollisionSystem.reserved_entry_bound`
-        /// (the keys and entries grew). Set once per step, with one
-        /// `CollisionSystem.perf.entry_bound_overflows` count.
-        entry_bound_exceeded: bool = false,
         broadphase_visits: usize = 0,
         broadphase_batch: BatchStats = .{},
         narrowphase_batch: BatchStats = .{},
@@ -933,6 +931,8 @@ pub const CollisionSystem = struct {
     reserved_trigger_bound: usize = 0,
     pair_bound_warned: bool = false,
     entry_bound_warned: bool = false,
+    /// Steps whose entries exceeded `reserved_entry_bound`, one per such step.
+    entry_bound_overflows: u64 = 0,
     contact_bound_warned: bool = false,
     // The range slot sets whose first growth has logged.
     slot_growth_logged: std.EnumSet(SlotSet) = .empty,
@@ -952,9 +952,6 @@ pub const CollisionSystem = struct {
         /// (`reserved_pair_bound +| reserved_trigger_bound`), so the contact stream's values and
         /// range counts grew.
         pair_bound_overflows: u64 = 0,
-        /// Reserved steps whose entries exceeded `reserved_entry_bound` (the keys and entries
-        /// grew the first time), counted once per step.
-        entry_bound_overflows: u64 = 0,
         /// The last patch query's batch shape; `resetSeamBatches` clears it at seam entry and
         /// every rebuild clears it, so after a seam that did nothing or any rebuild it holds
         /// none.
@@ -1452,10 +1449,9 @@ pub const CollisionSystem = struct {
 
     // Flags the step and counts it once, however many builds it took.
     fn markEntryBoundExceeded(self: *CollisionSystem, stats: *CollisionStats) void {
-        if (comptime !runtime_perf_log.enabled) return;
-        if (stats.perf.entry_bound_exceeded) return;
-        stats.perf.entry_bound_exceeded = true;
-        self.perf.entry_bound_overflows += 1;
+        if (stats.entry_bound_exceeded) return;
+        stats.entry_bound_exceeded = true;
+        self.entry_bound_overflows += 1;
     }
 
     fn noteEntryBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, entry_count: usize) void {
@@ -3982,15 +3978,27 @@ test "collision entry bound overflow warns once and a larger reserve holds" {
 
     const first = try updateInline(&system, &data, &contacts);
     try std.testing.expect(first.entry_count > system.reserved_entry_bound);
+    try std.testing.expect(first.entry_bound_exceeded);
+    try std.testing.expectEqual(@as(u64, 1), system.entry_bound_overflows);
     try std.testing.expect(system.entry_bound_warned);
 
     const second = try updateInline(&system, &data, &contacts);
     try std.testing.expect(second.entry_count > system.reserved_entry_bound);
+    try std.testing.expect(second.entry_bound_exceeded);
+    try std.testing.expectEqual(@as(u64, 2), system.entry_bound_overflows);
     try std.testing.expect(system.entry_bound_warned);
+
+    var one_step = CollisionStats{};
+    system.countEntryBoundOverflow(&one_step, system.reserved_entry_bound + 1);
+    system.countEntryBoundOverflow(&one_step, system.reserved_entry_bound + 1);
+    try std.testing.expect(one_step.entry_bound_exceeded);
+    try std.testing.expectEqual(@as(u64, 3), system.entry_bound_overflows);
 
     try system.reserve(3);
     const settled = try updateInline(&system, &data, &contacts);
     try std.testing.expect(settled.entry_count <= system.reserved_entry_bound);
+    try std.testing.expect(!settled.entry_bound_exceeded);
+    try std.testing.expectEqual(@as(u64, 3), system.entry_bound_overflows);
     try std.testing.expect(system.entry_bound_warned);
 }
 

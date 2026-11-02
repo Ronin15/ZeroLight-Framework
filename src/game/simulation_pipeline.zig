@@ -737,7 +737,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
         if (comptime runtime_perf_log.enabled) {
             if (collision_stats.perf.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
-            if (collision_stats.perf.entry_bound_exceeded) perf.recordMetric(.collision_entry_bound_exceeded, 1);
+            if (collision_stats.entry_bound_exceeded) perf.recordMetric(.collision_entry_bound_exceeded, 1);
             const fill_batch = collision_stats.perf.fill_batch;
             // An untimed batch with no workers is not a sample. The inline banded fill is timed.
             if (fill_batch.available_worker_threads != 0 or fill_batch.batch_duration_ns != 0) {
@@ -1586,10 +1586,10 @@ pub const SimulationPipeline = struct {
     /// columns are derived in their own late stage after positions settle.
     /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
-        const think_grows_before = if (comptime runtime_perf_log.enabled) self.scope.perf.scratch_grows else 0;
+        const think_grows_before = if (comptime runtime_perf_log.enabled) self.scope.think_scratch_grows else 0;
         var step = StepState.init(self, context);
         inline for (stage_order) |id| try self.runStage(id, &step);
-        if (comptime runtime_perf_log.enabled) step.perf.think_scratch_grows = @intCast(self.scope.perf.scratch_grows - think_grows_before);
+        if (comptime runtime_perf_log.enabled) step.perf.think_scratch_grows = @intCast(self.scope.think_scratch_grows - think_grows_before);
         return step.finish(self);
     }
 

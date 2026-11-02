@@ -2153,7 +2153,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_collision_stats = CollisionStats{};
     var main_total: u128 = 0;
     // A warm system grows no bound past its reserve again.
-    const warm_overflows = .{ system.perf.entry_bound_overflows, system.perf.pair_bound_overflows };
+    const warm_overflows = .{ system.entry_bound_overflows, system.perf.pair_bound_overflows };
     // A warm mover's sync rewrites its two chunks in place: no row or payload growth.
     const warm_collider_grows = if (inputs.mover) |static_mover| static_mover.grows() else .{ 0, 0 };
     // Static query, Debug rect compare, static place, static sort, and stored-trigger
@@ -2202,7 +2202,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         if (inputs.mover) |static_mover| seam_stages.add(fixtures.seamBatches(&static_mover.seam.seam.pipeline));
     }
 
-    if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
+    if (system.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
     if (inputs.mover) |static_mover| {
         const grows = static_mover.grows();
         if (grows[0] != warm_collider_grows[0] or grows[1] != warm_collider_grows[1]) return error.CollisionWarmSyncGrewColliders;
