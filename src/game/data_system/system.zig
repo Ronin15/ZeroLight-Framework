@@ -2205,6 +2205,99 @@ test "a level-1 place keeps the drawable spare" {
     }
 }
 
+test "neighbor drawable reserves leave when the rows leave the chunk and are destroyed" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const visual = testVisual();
+    var entities: [3]EntityId = undefined;
+    for (&entities) |*entity| {
+        entity.* = try data.createEntity();
+        try data.setMovementBody(entity.*, .{});
+        try data.setPrimitiveVisual(entity.*, visual);
+    }
+    // A new row is level 0, chunk (0, 0). Each visual holds the empty level-1 run.
+    try std.testing.expect(data.movement_bodies.drawableRunIndex(1, 0, 0) != null);
+
+    for (entities) |entity| {
+        try data.setSimulationMetadata(entity, .{ .chunk = .{ .x = 1, .y = 0 } });
+    }
+    try std.testing.expect(data.movement_bodies.drawableRunIndex(1, 0, 0) == null);
+    for (entities) |entity| try std.testing.expect(try data.destroyEntity(entity));
+    try std.testing.expect(data.movement_bodies.drawableRunIndex(1, 0, 0) == null);
+}
+
+test "a neighbor drawable retarget does not consume another row's slot" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const visual = testVisual();
+    const row_b = try data.createEntity();
+    try data.setMovementBody(row_b, .{});
+    try data.setPrimitiveVisual(row_b, visual);
+    const row_a = try data.createEntity();
+    try data.setMovementBody(row_a, .{});
+    try data.setPrimitiveVisual(row_a, visual);
+    try data.setSimulationMetadata(row_a, .{ .chunk = .{ .x = 3, .y = 0 } });
+    try data.setWorldLevel(row_a, 0);
+
+    const held = data.movement_bodies.drawableReservedExtra(1, 0, 0);
+    const held_run = data.movement_bodies.drawableRunIndex(1, 0, 0).?;
+    try std.testing.expectEqual(@as(u32, 1), held);
+
+    // Level change in A's chunk spends A's own neighbor slot and does not allocate.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    const original = data.allocator;
+    data.allocator = failing.allocator();
+    try data.setWorldLevel(row_a, 1);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    data.allocator = original;
+    try std.testing.expectEqual(held, data.movement_bodies.drawableReservedExtra(1, 0, 0));
+    try std.testing.expectEqual(held_run, data.movement_bodies.drawableRunIndex(1, 0, 0).?);
+
+    // Retarget onto the key B holds. B's slot stays; A does not spend it.
+    try data.setSimulationMetadata(row_a, .{ .chunk = .{ .x = 0, .y = 0 } });
+    try std.testing.expectEqual(held, data.movement_bodies.drawableReservedExtra(1, 0, 0));
+    try std.testing.expectEqual(held_run, data.movement_bodies.drawableRunIndex(1, 0, 0).?);
+    const run = data.movement_bodies.drawableRunSlice(held_run);
+    const row_a_index = data.movementBodyDenseIndex(row_a).?;
+    var found = false;
+    for (run.movement_index) |movement_index| found = found or movement_index == row_a_index;
+    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(u16, 0), data.scopeColumnsSliceConst().level[data.movementBodyDenseIndex(row_b).?]);
+}
+
+test "a structural level change twice does not spend another row's neighbor hold" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const visual = testVisual();
+    const row_b = try data.createEntity();
+    try data.setMovementBody(row_b, .{});
+    try data.setPrimitiveVisual(row_b, visual);
+    const held = data.movement_bodies.drawableReservedExtra(1, 0, 0);
+    const held_run = data.movement_bodies.drawableRunIndex(1, 0, 0).?;
+    try std.testing.expectEqual(@as(u32, 1), held);
+
+    const row_a = try data.createEntity();
+    try data.setMovementBody(row_a, .{});
+    try data.setPrimitiveVisual(row_a, visual);
+    try std.testing.expectEqual(@as(u32, 2), data.movement_bodies.drawableReservedExtra(1, 0, 0));
+
+    const batch = [_]StructuralCommand{
+        .{ .set_world_level = .{ .entity = row_a, .level = 4 } },
+        .{ .set_world_level = .{ .entity = row_a, .level = 1 } },
+    };
+    _ = try data.applyStructuralCommands(&batch);
+
+    try std.testing.expectEqual(held, data.movement_bodies.drawableReservedExtra(1, 0, 0));
+    try std.testing.expectEqual(held_run, data.movement_bodies.drawableRunIndex(1, 0, 0).?);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.drawablePendingExtra(1, 0, 0));
+    try std.testing.expectEqual(@as(u16, 0), data.scopeColumnsSliceConst().level[data.movementBodyDenseIndex(row_b).?]);
+    try std.testing.expectEqual(@as(u16, 1), data.scopeColumnsSliceConst().level[data.movementBodyDenseIndex(row_a).?]);
+}
+
 test "a simulation metadata write takes the level from the entity's world level row" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

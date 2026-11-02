@@ -90,6 +90,9 @@ const MovementBodyRow = struct {
     // Index of this row's drawable run, and its slot in that run. `no_drawable` is none.
     drawable_run: u32 = no_drawable,
     drawable_slot: u32 = no_drawable,
+    // Neighbor runs this row reserved. At most one slot per key. `no_drawable` is none.
+    neighbor_below: u32 = no_drawable,
+    neighbor_above: u32 = no_drawable,
 };
 
 const no_drawable: u32 = std.math.maxInt(u32);
@@ -186,8 +189,10 @@ const DrawableRun = struct {
     refreshed_epoch: u32 = 0,
     key: u128 = 0,
     live: bool = false,
-    // Slots reserved past `rows.len` and not yet linked. Zero outside a reserve/link.
+    // Unlinked slots. `owned_extra` of them are neighbor reserves a row records;
+    // the rest are pending links. Both are zero outside a reserve.
     reserved_extra: u32 = 0,
+    owned_extra: u32 = 0,
 };
 
 fn drawableKey(level: u16, chunk_x: i32, chunk_y: i32) u128 {
@@ -585,6 +590,7 @@ pub const MovementBodyStore = struct {
             run.key = 0;
             run.refreshed_epoch = 0;
             run.reserved_extra = 0;
+            run.owned_extra = 0;
             self.free_runs.appendAssumeCapacity(@intCast(index));
         }
     }
@@ -639,6 +645,20 @@ pub const MovementBodyStore = struct {
     pub fn drawableReservedExtra(self: *const MovementBodyStore, level: u16, chunk_x: i32, chunk_y: i32) u32 {
         const index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)) orelse return 0;
         return self.runs.items[index].reserved_extra;
+    }
+
+    /// Unlinked slots on this key that no row holds. A link plan consumes these, not a row's reserve.
+    pub fn drawablePendingExtra(self: *const MovementBodyStore, level: u16, chunk_x: i32, chunk_y: i32) u32 {
+        const index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)) orelse return 0;
+        const run = &self.runs.items[index];
+        return run.reserved_extra - run.owned_extra;
+    }
+
+    /// True when row `index` holds the neighbor reserve for (`level`, `chunk_x`, `chunk_y`).
+    pub fn holdsNeighborReserve(self: *const MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) bool {
+        const run_index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)) orelse return false;
+        const movement = self.rows.slice();
+        return movement.items(.neighbor_below)[index] == run_index or movement.items(.neighbor_above)[index] == run_index;
     }
 
     pub fn drawableRunLength(self: *const MovementBodyStore, run_index: u32) usize {
@@ -720,41 +740,24 @@ pub const MovementBodyStore = struct {
     }
 
     pub fn unlinkDrawable(self: *MovementBodyStore, index: usize) void {
-        const movement = self.rows.slice();
-        const run_index = movement.items(.drawable_run)[index];
-        if (run_index == no_drawable) return;
-        const slot: usize = movement.items(.drawable_slot)[index];
-        const run = &self.runs.items[run_index];
-        const last = run.rows.len - 1;
-        if (slot != last) {
-            const moved_movement = run.rows.slice().items(.movement_index)[last];
-            run.rows.swapRemove(slot);
-            self.rows.slice().items(.drawable_slot)[moved_movement] = @intCast(slot);
-        } else {
-            run.rows.swapRemove(slot);
-        }
-        const row = self.rows.slice();
-        row.items(.drawable_run)[index] = no_drawable;
-        row.items(.drawable_slot)[index] = no_drawable;
-        // A reservation is a link that has not run yet. Releasing here drops that destination from `run_of`.
-        if (run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
+        self.releaseAllNeighborReserves(index);
+        self.unlinkDrawableRow(index);
     }
 
     pub fn placeDrawable(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
         const movement = self.rows.slice();
-        if (movement.items(.drawable_run)[index] != no_drawable) return;
-        const level = movement.items(.level)[index];
-        const chunk_x = movement.items(.chunk_x)[index];
-        const chunk_y = movement.items(.chunk_y)[index];
-        try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
-        self.commitDrawableLink(index, level, chunk_x, chunk_y);
-        // A level change moves the row into the neighbor level's run. That run is
-        // reserved with the visual, so the fall does not allocate.
-        if (level > 0) try self.reserveDrawableDestination(allocator, level - 1, chunk_x, chunk_y);
-        if (level != std.math.maxInt(u16)) try self.reserveDrawableDestination(allocator, level + 1, chunk_x, chunk_y);
+        if (movement.items(.drawable_run)[index] == no_drawable) {
+            const level = movement.items(.level)[index];
+            const chunk_x = movement.items(.chunk_x)[index];
+            const chunk_y = movement.items(.chunk_y)[index];
+            try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
+            self.commitDrawableLink(index, level, chunk_x, chunk_y);
+        }
+        // A level change moves the row into a neighbor run this row holds, so that fall allocates nothing.
+        try self.reserveOwnedNeighbors(allocator, index);
     }
 
-    // `placeDrawable` without the neighbor reserves. The slot is already reserved.
+    // `placeDrawable` without reserving. The link slot is already reserved; neighbor slots already counted are claimed.
     fn placeReservedDrawable(self: *MovementBodyStore, index: usize) void {
         const movement = self.rows.slice();
         if (movement.items(.drawable_run)[index] != no_drawable) return;
@@ -762,33 +765,47 @@ pub const MovementBodyStore = struct {
         const chunk_x = movement.items(.chunk_x)[index];
         const chunk_y = movement.items(.chunk_y)[index];
         self.commitDrawableLink(index, level, chunk_x, chunk_y);
+        self.claimPreparedNeighbors(index, level, chunk_x, chunk_y);
     }
 
-    /// Reserves the runs a level change from this row would move into, so that change allocates nothing.
+    /// Reserves the neighbor runs this row does not already hold, and drops holds that are no longer neighbors.
+    /// One row holds at most one slot per key. A later level change in this chunk spends the row's own slot.
     pub fn reserveDrawableNeighborLevels(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
         const movement = self.rows.slice();
         if (!movement.items(.has_primitive_visual)[index]) return;
         const level = movement.items(.level)[index];
         const chunk_x = movement.items(.chunk_x)[index];
         const chunk_y = movement.items(.chunk_y)[index];
-        if (level > 0) try self.reserveDrawableDestination(allocator, level - 1, chunk_x, chunk_y);
-        if (level != std.math.maxInt(u16)) try self.reserveDrawableDestination(allocator, level + 1, chunk_x, chunk_y);
+        self.releaseStaleNeighbors(index, level, chunk_x, chunk_y);
+        try self.reserveOwnedNeighbors(allocator, index);
     }
 
-    /// Reserves the run for (`level`, `chunk_x`, `chunk_y`) and one more row slot in it.
-    /// Does not link. On error, drops this pass's reservations and any run that is still empty.
+    /// Reserves one unlinked slot on (`level`, `chunk_x`, `chunk_y`). Does not link.
+    /// On error, rolls back the run this call created and leaves every other reserve as it was.
     pub fn reserveDrawableDestination(self: *MovementBodyStore, allocator: std.mem.Allocator, level: u16, chunk_x: i32, chunk_y: i32) !void {
-        const run_index = self.runForKey(allocator, drawableKey(level, chunk_x, chunk_y)) catch |err| {
-            self.abandonDrawableReservations();
-            return err;
-        };
+        const key = drawableKey(level, chunk_x, chunk_y);
+        const created = self.run_of.get(key) == null;
+        const run_index = try self.runForKey(allocator, key);
         const run = &self.runs.items[run_index];
-        const slots = run.reserved_extra + 1;
-        run.rows.ensureTotalCapacity(allocator, run.rows.len + slots) catch |err| {
-            self.abandonDrawableReservations();
+        if (run.reserved_extra == std.math.maxInt(u32)) {
+            if (created) self.releaseRun(run_index);
+            return error.OutOfMemory;
+        }
+        const slots = run.rows.len + @as(usize, run.reserved_extra) + 1;
+        run.rows.ensureTotalCapacity(allocator, slots) catch |err| {
+            if (created) self.releaseRun(run_index);
             return err;
         };
-        run.reserved_extra = slots;
+        run.reserved_extra += 1;
+    }
+
+    /// Returns one pending slot from `reserveDrawableDestination`. Releases the run when it is empty with none left.
+    pub fn unreserveDrawableDestination(self: *MovementBodyStore, level: u16, chunk_x: i32, chunk_y: i32) void {
+        const run_index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)).?;
+        const run = &self.runs.items[run_index];
+        std.debug.assert(run.reserved_extra > run.owned_extra);
+        run.reserved_extra -= 1;
+        if (run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
     }
 
     /// Reserves `count` unlinked slots. True when this call created the run.
@@ -823,50 +840,50 @@ pub const MovementBodyStore = struct {
         const run_index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)).?;
         const run = &self.runs.items[run_index];
         std.debug.assert(run.reserved_extra >= count);
+        std.debug.assert(run.reserved_extra - count >= run.owned_extra);
         run.reserved_extra -= count;
         if (created and run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
     }
 
-    /// Unlinks `index` and links it into a destination `reserveDrawableDestination` already reserved.
-    /// Allocates nothing. Appearance is copied onto the new slot; the same-run return does not.
+    /// Unlinks `index` and links it into a destination `reserveDrawableDestination` already reserved,
+    /// or into a neighbor slot this row holds. Allocates nothing. Appearance is copied onto the new
+    /// slot; the same-run return does not. A chunk or level change drops neighbor holds that are no longer adjacent.
     pub fn relinkReservedDrawable(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
         const key = drawableKey(level, chunk_x, chunk_y);
         const dest = self.run_of.get(key).?;
         const current = self.rows.slice().items(.drawable_run)[index];
         if (current == dest) {
-            std.debug.assert(self.runs.items[dest].reserved_extra > 0);
-            self.runs.items[dest].reserved_extra -= 1;
+            const run = &self.runs.items[dest];
+            std.debug.assert(run.reserved_extra > run.owned_extra);
+            run.reserved_extra -= 1;
             return;
         }
         if (current != no_drawable) {
             const appearance = self.appearanceAt(index);
-            self.unlinkDrawable(index);
+            self.unlinkDrawableRow(index);
             self.commitDrawableLink(index, level, chunk_x, chunk_y);
             self.writeDrawableAppearance(index, appearance);
         } else {
-            self.unlinkDrawable(index);
+            self.unlinkDrawableRow(index);
             self.commitDrawableLink(index, level, chunk_x, chunk_y);
         }
+        self.releaseStaleNeighbors(index, level, chunk_x, chunk_y);
     }
 
-    /// Links `index` at (`level`, `chunk_x`, `chunk_y`). The destination run and its row slot are
-    /// reserved before the unlink, so a failure leaves membership unchanged.
+    /// Links `index` at (`level`, `chunk_x`, `chunk_y`). Spends a neighbor slot this row holds when
+    /// it has one; otherwise reserves a slot. Does not spend another row's reserve. A failure leaves membership unchanged.
     pub fn retargetDrawable(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize, level: u16, chunk_x: i32, chunk_y: i32) !void {
         if (!self.rows.slice().items(.has_primitive_visual)[index]) return;
-        const key = drawableKey(level, chunk_x, chunk_y);
-        if (self.run_of.get(key)) |dest| {
-            if (self.runs.items[dest].reserved_extra > 0) {
-                self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
-                return;
-            }
+        if (!self.takeOwnedNeighbor(index, level, chunk_x, chunk_y)) {
+            try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
         }
-        try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
         self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
     }
 
-    /// Moves a visual whose slot was reserved ahead of the commit. Allocates nothing.
+    /// Moves a visual whose slot was reserved ahead of the commit, spending this row's neighbor hold when the destination is one. Allocates nothing.
     pub fn retargetReservedDrawable(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
         if (!self.rows.slice().items(.has_primitive_visual)[index]) return;
+        _ = self.takeOwnedNeighbor(index, level, chunk_x, chunk_y);
         self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
     }
 
@@ -961,6 +978,7 @@ pub const MovementBodyStore = struct {
         run.live = true;
         run.refreshed_epoch = self.pose_epoch;
         run.reserved_extra = 0;
+        run.owned_extra = 0;
         return index;
     }
 
@@ -971,6 +989,7 @@ pub const MovementBodyStore = struct {
         run.live = false;
         run.key = 0;
         run.reserved_extra = 0;
+        run.owned_extra = 0;
         self.free_runs.appendAssumeCapacity(run_index);
     }
 
@@ -978,7 +997,7 @@ pub const MovementBodyStore = struct {
         const key = drawableKey(level, chunk_x, chunk_y);
         const run_index = self.run_of.get(key).?;
         const run = &self.runs.items[run_index];
-        std.debug.assert(run.reserved_extra > 0);
+        std.debug.assert(run.reserved_extra > run.owned_extra);
         std.debug.assert(run.rows.capacity >= run.rows.len + 1);
         run.reserved_extra -= 1;
         const movement = self.rows.slice();
@@ -997,12 +1016,152 @@ pub const MovementBodyStore = struct {
         row.items(.drawable_slot)[index] = slot;
     }
 
-    fn abandonDrawableReservations(self: *MovementBodyStore) void {
-        for (self.runs.items, 0..) |*run, index| {
-            const empty = run.live and run.rows.len == 0;
-            run.reserved_extra = 0;
-            if (empty) self.releaseRun(@intCast(index));
+    fn unlinkDrawableRow(self: *MovementBodyStore, index: usize) void {
+        const movement = self.rows.slice();
+        const run_index = movement.items(.drawable_run)[index];
+        if (run_index == no_drawable) return;
+        const slot: usize = movement.items(.drawable_slot)[index];
+        const run = &self.runs.items[run_index];
+        const last = run.rows.len - 1;
+        if (slot != last) {
+            const moved_movement = run.rows.slice().items(.movement_index)[last];
+            run.rows.swapRemove(slot);
+            self.rows.slice().items(.drawable_slot)[moved_movement] = @intCast(slot);
+        } else {
+            run.rows.swapRemove(slot);
         }
+        const row = self.rows.slice();
+        row.items(.drawable_run)[index] = no_drawable;
+        row.items(.drawable_slot)[index] = no_drawable;
+        // A pending link keeps an otherwise empty run in `run_of` until it is spent or rolled back.
+        if (run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
+    }
+
+    fn reserveOwnedNeighbors(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
+        const movement = self.rows.slice();
+        const level = movement.items(.level)[index];
+        const chunk_x = movement.items(.chunk_x)[index];
+        const chunk_y = movement.items(.chunk_y)[index];
+        if (level > 0) try self.reserveOwnedNeighbor(allocator, index, level - 1, chunk_x, chunk_y);
+        if (level != std.math.maxInt(u16)) try self.reserveOwnedNeighbor(allocator, index, level + 1, chunk_x, chunk_y);
+    }
+
+    fn reserveOwnedNeighbor(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize, neighbor_level: u16, chunk_x: i32, chunk_y: i32) !void {
+        if (self.holdsNeighborReserve(index, neighbor_level, chunk_x, chunk_y)) return;
+        try self.reserveDrawableDestination(allocator, neighbor_level, chunk_x, chunk_y);
+        const run_index = self.run_of.get(drawableKey(neighbor_level, chunk_x, chunk_y)).?;
+        self.claimOwnedSlot(index, run_index, neighbor_level);
+    }
+
+    fn claimPreparedNeighbors(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
+        if (level > 0) self.claimPreparedNeighbor(index, level - 1, chunk_x, chunk_y);
+        if (level != std.math.maxInt(u16)) self.claimPreparedNeighbor(index, level + 1, chunk_x, chunk_y);
+    }
+
+    fn claimPreparedNeighbor(self: *MovementBodyStore, index: usize, neighbor_level: u16, chunk_x: i32, chunk_y: i32) void {
+        if (self.holdsNeighborReserve(index, neighbor_level, chunk_x, chunk_y)) return;
+        const run_index = self.run_of.get(drawableKey(neighbor_level, chunk_x, chunk_y)) orelse return;
+        if (self.runs.items[run_index].reserved_extra <= self.runs.items[run_index].owned_extra) return;
+        self.claimOwnedSlot(index, run_index, neighbor_level);
+    }
+
+    fn claimOwnedSlot(self: *MovementBodyStore, index: usize, run_index: u32, neighbor_level: u16) void {
+        const movement = self.rows.slice();
+        const below = neighbor_level < movement.items(.level)[index];
+        if (below) {
+            std.debug.assert(movement.items(.neighbor_below)[index] == no_drawable);
+            movement.items(.neighbor_below)[index] = run_index;
+        } else {
+            std.debug.assert(movement.items(.neighbor_above)[index] == no_drawable);
+            movement.items(.neighbor_above)[index] = run_index;
+        }
+        const run = &self.runs.items[run_index];
+        std.debug.assert(run.reserved_extra > run.owned_extra);
+        run.owned_extra += 1;
+    }
+
+    /// Spends this row's hold on the destination without freeing the slot, so the following link can take it.
+    fn takeOwnedNeighbor(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) bool {
+        const run_index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)) orelse return false;
+        if (!self.clearNeighborField(index, run_index)) return false;
+        const run = &self.runs.items[run_index];
+        std.debug.assert(run.owned_extra > 0);
+        run.owned_extra -= 1;
+        return true;
+    }
+
+    fn releaseAllNeighborReserves(self: *MovementBodyStore, index: usize) void {
+        self.releaseNeighborField(index, true);
+        self.releaseNeighborField(index, false);
+    }
+
+    fn releaseStaleNeighbors(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
+        const keep_below = if (level > 0) self.run_of.get(drawableKey(level - 1, chunk_x, chunk_y)) else null;
+        const keep_above = if (level != std.math.maxInt(u16)) self.run_of.get(drawableKey(level + 1, chunk_x, chunk_y)) else null;
+        self.releaseNeighborFieldUnless(index, true, keep_below, keep_above);
+        self.releaseNeighborFieldUnless(index, false, keep_below, keep_above);
+        // Park a kept run on the destination's side. Do not cover a field that still holds another run.
+        self.parkNeighborKeep(index, true, keep_below);
+        self.parkNeighborKeep(index, false, keep_above);
+    }
+
+    fn releaseNeighborField(self: *MovementBodyStore, index: usize, below: bool) void {
+        const run_index = self.neighborField(index, below);
+        if (run_index == no_drawable) return;
+        self.storeNeighborField(index, below, no_drawable);
+        self.dropOwnedCount(run_index);
+    }
+
+    fn releaseNeighborFieldUnless(self: *MovementBodyStore, index: usize, below: bool, keep_a: ?u32, keep_b: ?u32) void {
+        const run_index = self.neighborField(index, below);
+        if (run_index == no_drawable) return;
+        if (keep_a == @as(?u32, run_index) or keep_b == @as(?u32, run_index)) return;
+        self.storeNeighborField(index, below, no_drawable);
+        self.dropOwnedCount(run_index);
+    }
+
+    fn parkNeighborKeep(self: *MovementBodyStore, index: usize, below: bool, keep: ?u32) void {
+        const run_index = keep orelse return;
+        if (self.neighborField(index, below) == run_index) return;
+        const other = !below;
+        if (self.neighborField(index, other) != run_index) return;
+        if (self.neighborField(index, below) != no_drawable) return;
+        self.storeNeighborField(index, other, no_drawable);
+        self.storeNeighborField(index, below, run_index);
+    }
+
+    fn clearNeighborField(self: *MovementBodyStore, index: usize, run_index: u32) bool {
+        if (self.neighborField(index, true) == run_index) {
+            self.storeNeighborField(index, true, no_drawable);
+            return true;
+        }
+        if (self.neighborField(index, false) == run_index) {
+            self.storeNeighborField(index, false, no_drawable);
+            return true;
+        }
+        return false;
+    }
+
+    fn neighborField(self: *const MovementBodyStore, index: usize, below: bool) u32 {
+        const movement = self.rows.slice();
+        return if (below) movement.items(.neighbor_below)[index] else movement.items(.neighbor_above)[index];
+    }
+
+    fn storeNeighborField(self: *MovementBodyStore, index: usize, below: bool, run_index: u32) void {
+        const movement = self.rows.slice();
+        if (below) {
+            movement.items(.neighbor_below)[index] = run_index;
+        } else {
+            movement.items(.neighbor_above)[index] = run_index;
+        }
+    }
+
+    fn dropOwnedCount(self: *MovementBodyStore, run_index: u32) void {
+        const run = &self.runs.items[run_index];
+        std.debug.assert(run.owned_extra > 0 and run.reserved_extra > 0);
+        run.owned_extra -= 1;
+        run.reserved_extra -= 1;
+        if (run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
     }
 
     fn ensureCapacityForOne(self: *MovementBodyStore, allocator: std.mem.Allocator) !void {
@@ -1261,4 +1420,56 @@ test "a failed drawable slot reserve leaves the standing run" {
     try std.testing.expectEqual(length, store.drawableRunLength(standing));
     try std.testing.expect(store.drawableRunSlice(standing).entity[0].eql(occupant));
     try std.testing.expectEqual(extra, store.drawableReservedExtra(0, 0, 0));
+}
+
+test "a failed neighbor drawable reserve leaves the other row's slot for a retry" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const occupant = try EntityId.init(0, 1);
+    const index: usize = try store.append(std.testing.allocator, occupant, .{});
+    try store.setHasPrimitiveVisual(std.testing.allocator, index, true);
+    const held = store.drawableReservedExtra(1, 0, 0);
+    const held_run = store.drawableRunIndex(1, 0, 0).?;
+    try std.testing.expect(held != 0);
+
+    // The new key's run list and map fit, so the induced failure is its row grow after the run exists.
+    try store.runs.ensureTotalCapacity(std.testing.allocator, store.runs.items.len + 1);
+    try store.free_runs.ensureTotalCapacity(std.testing.allocator, store.runs.items.len + 2);
+    try store.run_of.ensureUnusedCapacity(std.testing.allocator, 1);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    try std.testing.expectError(error.OutOfMemory, store.reserveDrawableDestination(failing.allocator(), 4, 1, 2));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(store.drawableRunIndex(4, 1, 2) == null);
+    try std.testing.expectEqual(held, store.drawableReservedExtra(1, 0, 0));
+    try std.testing.expectEqual(held_run, store.drawableRunIndex(1, 0, 0).?);
+
+    try store.reserveDrawableDestination(std.testing.allocator, 4, 1, 2);
+    try std.testing.expect(store.drawableRunIndex(4, 1, 2) != null);
+    try std.testing.expectEqual(held, store.drawableReservedExtra(1, 0, 0));
+    try std.testing.expectEqual(held_run, store.drawableRunIndex(1, 0, 0).?);
+}
+
+test "a level change of two parks the kept neighbor" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const entity = try EntityId.init(0, 1);
+    const index: usize = try store.append(std.testing.allocator, entity, .{});
+    try store.setHasPrimitiveVisual(std.testing.allocator, index, true);
+
+    const level1 = store.drawableRunIndex(1, 0, 0).?;
+    try std.testing.expectEqual(@as(u32, 1), store.runs.items[level1].owned_extra);
+
+    try store.retargetDrawable(std.testing.allocator, index, 2, 0, 0);
+    store.setScopeMetadata(index, .{ .chunk = .{ .x = 0, .y = 0 }, .level = 2 });
+    try store.reserveDrawableNeighborLevels(std.testing.allocator, index);
+
+    try std.testing.expectEqual(level1, store.drawableRunIndex(1, 0, 0).?);
+    try std.testing.expectEqual(@as(u32, 1), store.runs.items[level1].owned_extra);
+    const level3 = store.drawableRunIndex(3, 0, 0).?;
+    try std.testing.expectEqual(@as(u32, 1), store.runs.items[level3].owned_extra);
+    try std.testing.expectEqual(level1, store.rows.slice().items(.neighbor_below)[index]);
+    try std.testing.expectEqual(level3, store.rows.slice().items(.neighbor_above)[index]);
 }

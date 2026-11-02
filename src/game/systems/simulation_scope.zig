@@ -301,14 +301,16 @@ pub const SimulationScopeSystem = struct {
         const items_per_range = selection.items_per_range;
         const range_count = selection.range_count;
         const bodies = &data.movement_bodies;
-        // Every destination is reserved before any unlink. A failed reserve writes the old
-        // chunks back and leaves run membership as it was; the link pass then allocates nothing.
+        // Every destination is reserved before any unlink. A failed reserve rolls back the
+        // destinations this pass reserved and writes the old chunks back. Standing neighbor
+        // reserves stay. The link pass then allocates nothing.
         // Each change is a hash lookup and an append, not a dense float loop.
         for (tallies[0..range_count], 0..) |*slot, range_index| {
             const src = range_index * items_per_range;
-            for (changes[src..][0..slot.value.count]) |change| {
+            for (changes[src..][0..slot.value.count], 0..) |change, change_index| {
                 const row: usize = change.movement_index;
                 bodies.reserveDrawableDestination(data.allocator, scope.level[row], scope.chunk_x[row], scope.chunk_y[row]) catch |err| {
+                    rollbackDrawableDestinations(data, changes, tallies, items_per_range, range_index, change_index);
                     restoreChunkColumns(scope.chunk_x, scope.chunk_y, changes, tallies, items_per_range, range_count);
                     return err;
                 };
@@ -1018,6 +1020,30 @@ fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         const cx: i32 = @intCast(tx / @as(u32, @intCast(chunk_size)));
         const cy: i32 = @intCast(ty / @as(u32, @intCast(chunk_size)));
         recordChunkChange(job, range, i, cx, cy);
+    }
+}
+
+fn rollbackDrawableDestinations(
+    data: *DataSystem,
+    changes: []const ChunkChange,
+    tallies: []const GatherTallySlot,
+    items_per_range: usize,
+    failed_range: usize,
+    failed_change: usize,
+) void {
+    const scope = data.scopeColumnsSlice();
+    const bodies = &data.movement_bodies;
+    for (tallies[0..failed_range], 0..) |*slot, range_index| {
+        const src = range_index * items_per_range;
+        for (changes[src..][0..slot.value.count]) |change| {
+            const row: usize = change.movement_index;
+            bodies.unreserveDrawableDestination(scope.level[row], scope.chunk_x[row], scope.chunk_y[row]);
+        }
+    }
+    const src = failed_range * items_per_range;
+    for (changes[src..][0..failed_change]) |change| {
+        const row: usize = change.movement_index;
+        bodies.unreserveDrawableDestination(scope.level[row], scope.chunk_x[row], scope.chunk_y[row]);
     }
 }
 

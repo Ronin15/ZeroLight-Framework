@@ -207,6 +207,12 @@ const ProjectedEntityState = struct {
     chunk_x: i32,
     chunk_y: i32,
     linked: bool,
+    // Set when this cursor reserved neighbor slots. An adjacent level sync spends that slot.
+    neighbor_reserved: bool = false,
+    // Neighbor levels this cursor still holds, at its chunk. A planned sync clears a hold
+    // `releaseStaleNeighbors` would drop before a later sync reads it.
+    hold_below: ?u16 = null,
+    hold_above: ?u16 = null,
     world_level: u16,
 
     fn init(data: *const DataSystem, entity: EntityId) ProjectedEntityState {
@@ -233,13 +239,18 @@ const ProjectedEntityState = struct {
             .world_level = world_level,
         };
         const metadata = data.movement_bodies.scopeMetadataAt(movement);
+        const level = metadata.level orelse 0;
+        const linked = data.movementBodySliceConst().has_primitive_visual[movement];
+        const holds = if (linked) projectedNeighborHolds(data, movement, level, metadata.chunk.x, metadata.chunk.y) else ProjectedNeighborHolds{};
         return .{
             .alive = true,
             .component_mask = data.componentMaskFor(entity),
-            .scope_level = metadata.level orelse 0,
+            .scope_level = level,
             .chunk_x = metadata.chunk.x,
             .chunk_y = metadata.chunk.y,
-            .linked = data.movementBodySliceConst().has_primitive_visual[movement],
+            .linked = linked,
+            .hold_below = holds.below,
+            .hold_above = holds.above,
             .world_level = world_level,
         };
     }
@@ -266,6 +277,8 @@ const DrawablePlanKey = struct {
 
 const DrawablePlanEntry = struct {
     added: u32 = 0,
+    // Neighbor slots included in `added`. A link consume does not spend these.
+    spare: u32 = 0,
     consumed: u32 = 0,
     applied: bool = false,
     created: bool = false,
@@ -645,7 +658,7 @@ pub fn preflightStructuralCommands(
                 if (state.alive) state.world_level = set.level;
                 try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count);
                 const live = try scratch.projectedState(self, set.entity);
-                if (live.alive and live.hasComponent(.movement_body)) try cursorSync(self, scratch, live, set.level);
+                if (live.alive and live.hasComponent(.movement_body)) try cursorSync(self, scratch, live, set.level, set.entity);
             },
             .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
             .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, &projection, &structural_event_count),
@@ -697,7 +710,7 @@ fn planTemplateDrawable(self: *DataSystem, scratch: *StructuralPlanScratch, temp
     if (template.primitive_visual != null and cursor.hasComponent(.movement_body)) try cursorPlace(self, scratch, &cursor);
     if (template.world_level) |level| {
         cursor.world_level = level;
-        if (cursor.hasComponent(.movement_body)) try cursorSync(self, scratch, &cursor, level);
+        if (cursor.hasComponent(.movement_body)) try cursorSync(self, scratch, &cursor, level, null);
     }
 }
 
@@ -710,10 +723,10 @@ fn planMovementDrawable(self: *DataSystem, scratch: *StructuralPlanScratch, enti
         state.chunk_y = 0;
         state.linked = false;
         if (state.hasComponent(.primitive_visual)) try cursorPlace(self, scratch, state);
-        if (state.hasComponent(.world_level)) try cursorSync(self, scratch, state, state.world_level);
+        if (state.hasComponent(.world_level)) try cursorSync(self, scratch, state, state.world_level, entity);
         return;
     }
-    if (state.hasComponent(.world_level)) try cursorSync(self, scratch, state, state.world_level);
+    if (state.hasComponent(.world_level)) try cursorSync(self, scratch, state, state.world_level, entity);
 }
 
 fn cursorPlace(self: *DataSystem, scratch: *StructuralPlanScratch, cursor: *ProjectedEntityState) !void {
@@ -726,32 +739,78 @@ fn cursorPlace(self: *DataSystem, scratch: *StructuralPlanScratch, cursor: *Proj
     try planEnsure(self, scratch, key);
     try planConsume(self, scratch, key);
     if (cursor.scope_level > 0) {
-        try planEnsure(self, scratch, .{
+        try planEnsureNeighbor(self, scratch, .{
             .level = cursor.scope_level - 1,
             .chunk_x = cursor.chunk_x,
             .chunk_y = cursor.chunk_y,
         });
     }
     if (cursor.scope_level != std.math.maxInt(u16)) {
-        try planEnsure(self, scratch, .{
+        try planEnsureNeighbor(self, scratch, .{
             .level = cursor.scope_level + 1,
             .chunk_x = cursor.chunk_x,
             .chunk_y = cursor.chunk_y,
         });
     }
     cursor.linked = true;
+    cursor.neighbor_reserved = true;
 }
 
-fn cursorSync(self: *DataSystem, scratch: *StructuralPlanScratch, cursor: *ProjectedEntityState, level: u16) !void {
+fn cursorSync(self: *DataSystem, scratch: *StructuralPlanScratch, cursor: *ProjectedEntityState, level: u16, owner: ?EntityId) !void {
     if (!cursor.hasComponent(.movement_body) or cursor.scope_level == level) return;
     if (cursor.linked) {
-        try planConsume(self, scratch, .{
+        const key: DrawablePlanKey = .{
             .level = level,
             .chunk_x = cursor.chunk_x,
             .chunk_y = cursor.chunk_y,
-        });
+        };
+        // Owns only while this cursor still holds the destination. The drop clears holds
+        // `releaseStaleNeighbors` would drop. An adjacent place spends its own spare.
+        const owns = owner != null and projectedHold(cursor, level);
+        const spent_spare = !owns and cursor.neighbor_reserved and levelsAdjacent(cursor.scope_level, level) and takePlanSpare(scratch, key);
+        if (!owns and !spent_spare) try planConsume(self, scratch, key);
+        dropStaleProjectedHolds(cursor, level);
     }
+    cursor.neighbor_reserved = false;
     cursor.scope_level = level;
+}
+
+const ProjectedNeighborHolds = struct {
+    below: ?u16 = null,
+    above: ?u16 = null,
+};
+
+fn projectedNeighborHolds(data: *const DataSystem, row: usize, level: u16, chunk_x: i32, chunk_y: i32) ProjectedNeighborHolds {
+    return .{
+        .below = if (level > 0 and data.movement_bodies.holdsNeighborReserve(row, level - 1, chunk_x, chunk_y)) level - 1 else null,
+        .above = if (level != std.math.maxInt(u16) and data.movement_bodies.holdsNeighborReserve(row, level + 1, chunk_x, chunk_y)) level + 1 else null,
+    };
+}
+
+fn projectedHold(cursor: *const ProjectedEntityState, level: u16) bool {
+    return cursor.hold_below == level or cursor.hold_above == level;
+}
+
+fn dropStaleProjectedHolds(cursor: *ProjectedEntityState, level: u16) void {
+    if (cursor.hold_below) |held| {
+        if (!projectedNeighborKept(level, held)) cursor.hold_below = null;
+    }
+    if (cursor.hold_above) |held| {
+        if (!projectedNeighborKept(level, held)) cursor.hold_above = null;
+    }
+}
+
+fn projectedNeighborKept(level: u16, held: u16) bool {
+    if (level > 0 and held == level - 1) return true;
+    if (level != std.math.maxInt(u16) and held == level + 1) return true;
+    return false;
+}
+
+fn levelsAdjacent(from_level: u16, to_level: u16) bool {
+    const wide_from: u32 = from_level;
+    const wide_to: u32 = to_level;
+    const delta = if (wide_from > wide_to) wide_from - wide_to else wide_to - wide_from;
+    return delta == 1;
 }
 
 fn planEnsure(self: *DataSystem, scratch: *StructuralPlanScratch, key: DrawablePlanKey) !void {
@@ -762,11 +821,26 @@ fn planEnsure(self: *DataSystem, scratch: *StructuralPlanScratch, key: DrawableP
     entry.added += 1;
 }
 
+fn planEnsureNeighbor(self: *DataSystem, scratch: *StructuralPlanScratch, key: DrawablePlanKey) !void {
+    try planEnsure(self, scratch, key);
+    scratch.drawable_plan.getPtr(key).?.spare += 1;
+}
+
+fn takePlanSpare(scratch: *StructuralPlanScratch, key: DrawablePlanKey) bool {
+    const entry = scratch.drawable_plan.getPtr(key) orelse return false;
+    if (entry.spare == 0) return false;
+    entry.spare -= 1;
+    entry.consumed += 1;
+    return true;
+}
+
 fn planConsume(self: *DataSystem, scratch: *StructuralPlanScratch, key: DrawablePlanKey) !void {
     const pending_empty = blk: {
         const entry = try scratch.drawableEntry(key);
-        const base = self.movement_bodies.drawableReservedExtra(key.level, key.chunk_x, key.chunk_y);
-        const summed = std.math.add(u32, base, entry.added) catch return error.OutOfMemory;
+        // Owned neighbor slots are not link slots. Spares reserved in this plan are not either.
+        const pending = self.movement_bodies.drawablePendingExtra(key.level, key.chunk_x, key.chunk_y);
+        const link_added = entry.added - entry.spare;
+        const summed = std.math.add(u32, pending, link_added) catch return error.OutOfMemory;
         std.debug.assert(summed >= entry.consumed);
         break :blk summed == entry.consumed;
     };

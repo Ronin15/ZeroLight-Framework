@@ -173,21 +173,25 @@ in its owning slice.
       proof is two visual creates, and one `set_world_level` that changes
       level (`.grok/rules/budgets-capacities.md`,
       `.grok/rules/simulation.md` § Events and streams).
-- [ ] Neighbor drawable reservations are a shared count on the run
-      (`reserved_extra`, `movement.zig:190`; `placeDrawable`
-      `movement.zig:731`, `unlinkDrawable` `movement.zig:728`,
-      `retargetDrawable` `movement.zig:799`). Failure: attaching N visuals
-      at the default chunk (a new row is level 0, chunk (0, 0),
-      `movement.zig:239-241`) grows an empty neighbor run to a capacity of
-      at least N, and that capacity stays after they move or are destroyed
-      (unlink releases a run only when the count is also zero; destroy
-      unlinks only the live run, `system.zig:1122`); a later retarget can
-      consume another row's count (`movement.zig:800`); a failed reserve
-      clears every run's standing count (`movement.zig:936`). Pass: an
-      empty neighbor run's memory follows the rows that reserved it and is
-      gone after those rows are destroyed or leave that chunk; one row
-      cannot consume another's reservation; a failed reserve leaves every
-      other row's standing reservation as it was
+- [x] Neighbor drawable reservations are a shared count on the run.
+      Each row records the holds (`neighbor_below` / `neighbor_above`,
+      `movement.zig:94-95`; `owned_extra` of `reserved_extra`,
+      `movement.zig:194-195`). `placeDrawable` (`movement.zig:747`) holds
+      level±1; `unlinkDrawable` (`movement.zig:742`) releases them, and
+      destroy unlinks the row (`system.zig:1162`). A chunk or level change
+      drops holds that are no longer adjacent (`relinkReservedDrawable`,
+      `movement.zig:851`); `retargetDrawable` (`movement.zig:875`) spends
+      only a slot this row holds (`takeOwnedNeighbor`, `movement.zig:1084`).
+      A new row is level 0, chunk (0, 0) (`movement.zig:244-246`).
+      `reserveDrawableDestination` (`movement.zig:785`) rolls back only the
+      run that call created. Derive rolls back that pass's destinations
+      (`simulation_scope.zig:313`, `:1026`) and leaves standing holds. The
+      structural preflight rollback is unchanged (`unreserveDrawableSlots`,
+      `movement.zig:839`). Pass: an empty neighbor run's memory follows the
+      rows that reserved it and is gone after those rows are destroyed or
+      leave that chunk; one row cannot consume another's reservation; a
+      failed reserve leaves every other row's standing reservation as it
+      was. Proof: `system.zig:2208`, `system.zig:2229`, `movement.zig:1412`
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/budgets-capacities.md`).
 - [ ] The structural projection map is sized to every command and cleared
