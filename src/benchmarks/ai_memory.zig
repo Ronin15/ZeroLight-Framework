@@ -14,6 +14,9 @@
 //! - `ai-memory-shuffled`: the same step over a stride shuffle of every agent, as a
 //!   cell-major think set arrives. Pass shape: within spread of `ai-memory` at the same size,
 //!   and threaded like it.
+//! - `ai-memory-perception-shuffled`: perception rows are stride-shuffled, retied, then
+//!   restored by `packThinkSpan` once before warmup, so the timed step is the prefix stream.
+//!   Pass shape: within spread of `ai-memory` at the same size.
 //! - `ai-memory-sparse`: a fixed think set of 256 rows, 4 in each of 64 row words spread
 //!   evenly over a growing memory store, stride-shuffled, so every stage's items stay fixed.
 //!   Pass shape: per-step time flat in memory rows.
@@ -36,6 +39,7 @@ const AiMemorySystem = @import("../game/systems/ai_memory.zig").AiMemorySystem;
 const ai_memory_range_alignment_items = @import("../game/systems/ai_memory.zig").ai_memory_range_alignment_items;
 const word_bits = @import("../game/systems/ai_memory.zig").word_bits;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -63,6 +67,14 @@ pub const sparse_group = suite.BenchmarkGroup{
     .write_workload = writeMemoryWorkload,
 };
 
+pub const perception_shuffled_group = suite.BenchmarkGroup{
+    .name = "ai-memory-perception-shuffled",
+    .item_label = "AI agents",
+    .item_counts = &suite.event_scale_counts,
+    .runCase = runPerceptionShuffledCase,
+    .write_workload = writeMemoryWorkload,
+};
+
 // Every Nth event row gets a synthetic `entity_perceived` event each iteration -- a fixed
 // fraction rather than a single event, so refresh cost stays proportional across this
 // bench's item-count sweep.
@@ -81,8 +93,11 @@ const Fixture = struct {
     // Shared perceived-target id for every injected event; only its value
     // (not its own components) matters to `AiMemorySystem`'s refresh pass.
     target: EntityId,
+    // The perception-shuffled group's prefix restore. Null for the other groups.
+    scope: ?SimulationScopeSystem = null,
 
     fn deinit(self: *Fixture) void {
+        if (self.scope) |*scope| scope.deinit();
         self.frame.deinit();
         self.data.deinit();
         self.* = undefined;
@@ -127,6 +142,15 @@ pub fn runShuffledCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     return runCaseImpl(allocator, io, options, case, item_count, .{ .think_set = think_set, .event_rows = null, .touched_words = @divCeil(item_count, word_bits) });
 }
 
+fn runPerceptionShuffledCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCaseImpl(allocator, io, options, case, item_count, .{
+        .think_set = null,
+        .event_rows = null,
+        .touched_words = @divCeil(item_count, word_bits),
+        .restore_perception_prefix = true,
+    });
+}
+
 fn runSparseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const word_count = item_count / word_bits;
     if (word_count < sparse_touched_words) return error.SparseThinkSetExceedsMemoryRows;
@@ -154,6 +178,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var fixture = try createFixture(allocator, item_count);
     defer fixture.deinit();
+    if (run.restore_perception_prefix) try restorePerceptionPrefix(allocator, io, &fixture, item_count);
     var system = AiMemorySystem.init(allocator);
     defer system.deinit();
 
@@ -222,7 +247,36 @@ const Run = struct {
     event_rows: ?[]const u32,
     // The order stage's items: the think set's nonzero member words.
     touched_words: usize,
+    // Once, before warmup: stride-shuffle perception and restore the prefix.
+    // Not part of `prepareStep` or the timed `AiMemorySystem.update`.
+    restore_perception_prefix: bool = false,
 };
+
+// Stride-shuffles perception (`k * 37 % count`, coprime), reties each row, then
+// `packThinkSpan` with cognition `0 .. count - 1` puts the prefix back. The scope
+// stays on the fixture; the pack runs on an inline thread system.
+fn restorePerceptionPrefix(allocator: std.mem.Allocator, io: std.Io, fixture: *Fixture, count: usize) !void {
+    std.debug.assert(std.math.gcd(37, count) == 1);
+    const perm = try allocator.alloc(u32, count);
+    defer allocator.free(perm);
+    for (perm, 0..) |*row, k| row.* = @intCast(k * 37 % count);
+    _ = try fixture.data.ai_perceptions.ensurePackImage(allocator, count);
+    fixture.data.ai_perceptions.copyToPack(0, count, perm);
+    fixture.data.ai_perceptions.copyPackToRows(0, count);
+    for (0..count) |index| fixture.data.retiePackedRow(.perception, @intCast(index));
+
+    var scope = SimulationScopeSystem.init(allocator);
+    var owned = false;
+    errdefer if (!owned) scope.deinit();
+    try scope.ai_cognition_indices.ensureTotalCapacity(allocator, count);
+    scope.ai_cognition_indices.items.len = count;
+    for (scope.ai_cognition_indices.items, 0..) |*row, k| row.* = @intCast(k);
+    var inline_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    try scope.packThinkSpan(&fixture.data, &inline_threads, .{});
+    fixture.scope = scope;
+    owned = true;
+}
 
 // A new step with this iteration's synthetic perceived events, outside the timed window.
 fn prepareStep(fixture: *Fixture, run: Run) !void {

@@ -44,6 +44,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     ai_memory.group,
     ai_memory.shuffled_group,
     ai_memory.sparse_group,
+    ai_memory.perception_shuffled_group,
     affect.group,
     affect.shuffled_group,
     collision.group,

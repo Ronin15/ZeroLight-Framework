@@ -22,7 +22,8 @@
 //!    follows its loss and retargets `last_known_target`.
 //! 3. Visibility over the gathered set: while perception's visible `nearest_threat` is
 //!    `last_known_target`, `last_known_*` follows `last_seen_*`, staleness stays 0, and
-//!    familiarity rises by `ai_memory_familiarity_gain_rate` (clamped).
+//!    familiarity rises by `ai_memory_familiarity_gain_rate` (clamped). The prefix
+//!    streams both stores at `i`; a divergent perception row is packed to `k` first.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
@@ -68,9 +69,14 @@ pub const ai_memory_range_alignment_items: usize = movement_range_alignment_item
 /// cache lines of each window list.
 pub const ai_memory_order_range_alignment_items: usize = 1;
 
+/// Visibility range alignment. The prefix writes contiguous columns; the narrowest written
+/// column is `ring_next_slot` (`u8`), so 64 items is one cache line and at least one lane batch.
+pub const ai_memory_visible_range_alignment_items: usize = 64;
+
 comptime {
     std.debug.assert(ai_memory_range_alignment_items * @sizeOf(u32) % thread_shared_record_alignment == 0);
     std.debug.assert(ai_memory_order_range_alignment_items * word_bits * @sizeOf(u32) % thread_shared_record_alignment == 0);
+    std.debug.assert(ai_memory_visible_range_alignment_items * @sizeOf(u8) % thread_shared_record_alignment == 0);
 }
 
 const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
@@ -94,8 +100,21 @@ const summary_level_count: usize = blk: {
 const RowList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 const MemoryThreads = StageThreads(AiMemoryConfig);
 
-// One order range's member count, written once by its job.
-const OrderTally = struct { kept: usize = 0 };
+// One order range's member count and whether any filed perception row differs from its
+// memory row. The job writes both, every range.
+const OrderTally = struct {
+    kept: usize = 0,
+    diverged: bool = false,
+};
+
+// The four perception columns the visibility pass reads, packed to member order when a
+// perception row diverges from its memory row.
+const VisibleScratch = struct {
+    target_visible: bool,
+    nearest_threat: EntityId,
+    last_seen_x: f32,
+    last_seen_y: f32,
+};
 
 pub const AiMemoryConfig = struct {
     /// When non-null, only these dense ai-store indices participate this step
@@ -144,6 +163,9 @@ pub const AiMemorySystem = struct {
     memory_dense_indices: RowList = .empty,
     perception_dense_indices: RowList = .empty,
     order_tallies: SlotList(OrderTally) = .empty,
+    // Member-order perception columns when a perception row diverges from its memory
+    // row. The non-diverged prefix and the shared-index mode do not touch it.
+    visible_scratch: std.MultiArrayList(VisibleScratch) = .{},
     // Think rows and memory rows the scratch is reserved for; the grow gate compares
     // against them.
     reserved_think_rows: usize = 0,
@@ -174,6 +196,7 @@ pub const AiMemorySystem = struct {
     }
 
     pub fn deinit(self: *AiMemorySystem) void {
+        self.visible_scratch.deinit(self.allocator);
         self.order_tallies.deinit(self.allocator);
         self.perception_dense_indices.deinit(self.allocator);
         self.memory_dense_indices.deinit(self.allocator);
@@ -213,6 +236,8 @@ pub const AiMemorySystem = struct {
         const perception_slice = data.aiPerceptionSliceConst();
         const think_count = if (think) |rows| rows.len else ai_agents.entities.len;
         const row_count = memory_slice.entities.len;
+        // Set only when order ran. Empty members do not read stale tallies.
+        var perception_diverged = false;
 
         if (think_count != 0 and row_count != 0) {
             if (think_count > self.reserved_think_rows or row_count > self.reserved_memory_rows) try self.growPastReserve(think_count, row_count);
@@ -229,6 +254,9 @@ pub const AiMemorySystem = struct {
                 const order_batch = self.orderMembers(row_count, threads.stage(&self.order_tuner));
                 if (comptime runtime_perf_log.enabled) stats.perf.order_batch = order_batch;
                 std.debug.assert(self.memory_dense_indices.items.len == members and self.perception_dense_indices.items.len == members);
+                for (self.order_tallies.items) |slot| {
+                    if (slot.value.diverged) perception_diverged = true;
+                }
                 self.unmark();
             }
 
@@ -241,8 +269,37 @@ pub const AiMemorySystem = struct {
 
         refreshFromEvents(data, &memory_slice, perception_slice, frame);
 
-        var visible = VisibleJob{ .memory = memory_slice, .perception = perception_slice, .rows = self.memory_dense_indices.items, .perception_rows = self.perception_dense_indices.items };
-        const visible_batch = runStage(threads.stage(&self.visible_tuner), visible.rows.len, 1, &visible, &visible.range_count, visibleJob);
+        const visible_rows = self.memory_dense_indices.items;
+        // Ordered memory rows are strictly ascending, so `0 .. members - 1` is this test.
+        const prefix = visible_rows.len == 0 or (visible_rows[0] == 0 and visible_rows[visible_rows.len - 1] == @as(u32, @intCast(visible_rows.len - 1)));
+        // A prefix stays direct at `i` after the gather. `rows[k]` is only a non-prefix set.
+        const visible_mode: VisibleMode = if (prefix) .prefix else if (perception_diverged) .pack else .shared_index;
+        var scratch_visible: []bool = &.{};
+        var scratch_threat: []EntityId = &.{};
+        var scratch_x: []f32 = &.{};
+        var scratch_y: []f32 = &.{};
+        if (perception_diverged) {
+            std.debug.assert(self.visible_scratch.capacity >= visible_rows.len);
+            self.visible_scratch.len = visible_rows.len;
+            const scratch = self.visible_scratch.slice();
+            scratch_visible = scratch.items(.target_visible);
+            scratch_threat = scratch.items(.nearest_threat);
+            scratch_x = scratch.items(.last_seen_x);
+            scratch_y = scratch.items(.last_seen_y);
+        }
+        var visible = VisibleJob{
+            .memory = memory_slice,
+            .perception = perception_slice,
+            .rows = visible_rows,
+            .perception_rows = self.perception_dense_indices.items,
+            .mode = visible_mode,
+            .perception_diverged = perception_diverged,
+            .scratch_visible = scratch_visible,
+            .scratch_threat = scratch_threat,
+            .scratch_x = scratch_x,
+            .scratch_y = scratch_y,
+        };
+        const visible_batch = runStage(threads.stage(&self.visible_tuner), visible.rows.len, ai_memory_visible_range_alignment_items, &visible, &visible.range_count, visibleJob);
         if (comptime runtime_perf_log.enabled) stats.perf.visible_batch = visible_batch;
         return stats;
     }
@@ -380,6 +437,7 @@ pub const AiMemorySystem = struct {
         // Every row word's window, which also holds every row.
         try self.memory_dense_indices.ensureTotalCapacity(self.allocator, word_count * word_bits);
         try self.perception_dense_indices.ensureTotalCapacity(self.allocator, word_count * word_bits);
+        try self.visible_scratch.ensureTotalCapacity(self.allocator, row_limit);
         try self.touched_words.ensureTotalCapacity(self.allocator, word_count);
         // Touched words, the order stage's items, are at most the think rows and the row words.
         try self.order_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(@min(think_limit, word_count), ai_memory_order_range_alignment_items));
@@ -397,6 +455,7 @@ pub const AiMemorySystem = struct {
         std.debug.assert(self.perception_by_memory_row.capacity >= self.reserved_memory_rows);
         std.debug.assert(self.memory_dense_indices.capacity >= reserved_words * word_bits);
         std.debug.assert(self.perception_dense_indices.capacity >= reserved_words * word_bits);
+        std.debug.assert(self.visible_scratch.capacity >= self.reserved_memory_rows);
         std.debug.assert(self.touched_words.capacity >= reserved_words);
         std.debug.assert(self.order_tallies.capacity >= maxRangeCount(@min(self.reserved_think_rows, reserved_words), ai_memory_order_range_alignment_items));
         std.debug.assert(self.member_words.bit_length >= self.reserved_memory_rows);
@@ -449,7 +508,8 @@ const OrderJob = struct {
 
 // Range `[start, end)` of the ascending touched row words: each word's member rows,
 // ascending, into the range's window of `word_bits` slots per word, and each one's filed
-// perception row at the same slot of its perception window. Reads the touched list, the
+// perception row at the same slot of its perception window. `diverged` is set when any
+// filed perception row differs from that memory row. Reads the touched list, the
 // row bits, and the filed rows within each word; writes only its windows and tally.
 // Scalar: bit iteration and compaction.
 fn orderJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -461,6 +521,7 @@ fn orderJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const window = job.out[range.start * word_bits .. range.end * word_bits];
     const perception_window = job.out_perception[range.start * word_bits .. range.end * word_bits];
     var kept: usize = 0;
+    var diverged = false;
     for (job.touched[range.start..range.end]) |word| {
         const row_base = @as(usize, word) * word_bits;
         const members = WordSet{ .mask = job.words[word] };
@@ -468,12 +529,14 @@ fn orderJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         while (member_rows.next()) |row_bit| {
             const row = row_base + row_bit;
             // Below the memory store length, itself below `maxInt(u32)`.
+            const perception_row = job.perception_by_row[row];
             window[kept] = @intCast(row);
-            perception_window[kept] = job.perception_by_row[row];
+            perception_window[kept] = perception_row;
+            if (perception_row != @as(u32, @intCast(row))) diverged = true;
             kept += 1;
         }
     }
-    job.tallies[range.index].value.kept = kept;
+    job.tallies[range.index].value = .{ .kept = kept, .diverged = diverged };
 }
 
 const AiMemoryDecayContext = struct {
@@ -638,57 +701,137 @@ fn applyLostEvent(
     memory_slice.staleness[memory_index] = 0;
 }
 
+const VisibleMode = enum { prefix, shared_index, pack };
+
 const VisibleJob = struct {
     memory: AiMemorySlice,
     perception: ConstPerceptionSlice,
     rows: []const u32,
     perception_rows: []const u32,
+    mode: VisibleMode,
+    perception_diverged: bool,
+    scratch_visible: []bool,
+    scratch_threat: []EntityId,
+    scratch_x: []f32,
+    scratch_y: []f32,
     /// Dispatched range count; asserted against `range.index` at job entry.
     range_count: usize = 0,
 };
 
-// The visibility pass over one range of the ascending member rows: each row reads the
-// post-event state and writes only itself. Scalar: a branchy ring upsert.
+// One range of the visibility pass. Diverged perception columns are copied into the
+// member window first. Prefix streams at the store index, including that scratch.
+// Shared index uses the memory row for both. Pack writes memory at `rows[k]`.
+// Scalar: a branchy ring upsert.
 fn visibleJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *VisibleJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end and range.end <= job.rows.len and job.perception_rows.len == job.rows.len);
-    refreshVisibleTargets(&job.memory, job.perception, job.rows[range.start..range.end], job.perception_rows[range.start..range.end]);
+    std.debug.assert(job.mode != .pack or job.perception_diverged);
+    std.debug.assert(job.mode != .shared_index or !job.perception_diverged);
+    const perception = job.perception;
+    var target_visible = perception.target_visible;
+    var nearest_threat = perception.nearest_threat;
+    var last_seen_x = perception.last_seen_x;
+    var last_seen_y = perception.last_seen_y;
+    if (job.perception_diverged) {
+        const src_visible = perception.target_visible;
+        const src_threat = perception.nearest_threat;
+        const src_x = perception.last_seen_x;
+        const src_y = perception.last_seen_y;
+        const dest_visible = job.scratch_visible;
+        const dest_threat = job.scratch_threat;
+        const dest_x = job.scratch_x;
+        const dest_y = job.scratch_y;
+        const perception_rows = job.perception_rows;
+        std.debug.assert(range.end <= dest_visible.len and range.end <= dest_threat.len and range.end <= dest_x.len and range.end <= dest_y.len);
+        for (range.start..range.end) |k| {
+            const src: usize = perception_rows[k];
+            dest_visible[k] = src_visible[src];
+            dest_threat[k] = src_threat[src];
+            dest_x[k] = src_x[src];
+            dest_y[k] = src_y[src];
+        }
+        target_visible = dest_visible;
+        nearest_threat = dest_threat;
+        last_seen_x = dest_x;
+        last_seen_y = dest_y;
+    }
+    var memory_rows: ?[]const u32 = null;
+    switch (job.mode) {
+        .prefix => {
+            if (range.start != range.end) std.debug.assert(job.rows[range.start] == @as(u32, @intCast(range.start)));
+        },
+        .shared_index, .pack => memory_rows = job.rows,
+    }
+    refreshVisibleTargets(&job.memory, target_visible, nearest_threat, last_seen_x, last_seen_y, memory_rows, job.perception_rows, job.mode, range.start, range.end);
 }
 
-/// For each gathered memory row still reporting the same visible identity as
-/// `last_known_target`: keep `last_known_x/y` in lockstep with perception
-/// `last_seen_*`, hold `staleness` at 0, raise familiarity, and refresh the
-/// matching ring contact. Runs after event refresh so a same-step acquire
-/// already has `last_known_target` set before this pass. `perception_rows[k]` is
-/// the perception row of `memory_dense_indices[k]`'s entity.
+/// Visibility over `[start, end)`. The prefix streams both stores at `i`; a divergent
+/// perception row was packed to `k` before this call. A null memory index means the row
+/// is the loop index; otherwise the row is `memory_rows[k]`. Shared-index mode reads and
+/// writes that memory row, and its perception row matches.
 fn refreshVisibleTargets(
     memory_slice: *AiMemorySlice,
-    perception_slice: ConstPerceptionSlice,
-    memory_dense_indices: []const u32,
+    target_visible: []const bool,
+    nearest_threat: []const EntityId,
+    last_seen_x: []const f32,
+    last_seen_y: []const f32,
+    memory_rows: ?[]const u32,
     perception_rows: []const u32,
+    mode: VisibleMode,
+    start: usize,
+    end: usize,
 ) void {
-    for (memory_dense_indices, perception_rows) |memory_index_u32, perception_index_u32| {
-        const memory_index: usize = memory_index_u32;
-        const perception_index: usize = perception_index_u32;
-        if (!perception_slice.target_visible[perception_index]) continue;
-        const threat = perception_slice.nearest_threat[perception_index];
-        if (!threat.isValid()) continue;
-        const last = memory_slice.last_known_target[memory_index];
-        if (!last.matches(threat.index, threat.generation)) continue;
-
-        const last_seen_x = perception_slice.last_seen_x[perception_index];
-        const last_seen_y = perception_slice.last_seen_y[perception_index];
-        memory_slice.last_known_x[memory_index] = last_seen_x;
-        memory_slice.last_known_y[memory_index] = last_seen_y;
-        memory_slice.staleness[memory_index] = 0;
-        memory_slice.familiarity[memory_index] = math.clamp(
-            memory_slice.familiarity[memory_index] + ai_memory_familiarity_gain_rate,
-            0,
-            max_ai_memory_familiarity,
-        );
-        upsertRingContact(memory_slice, memory_index, threat, last_seen_x, last_seen_y);
+    std.debug.assert(start <= end);
+    switch (mode) {
+        .prefix => {
+            std.debug.assert(memory_rows == null);
+            for (start..end) |i| refreshVisibleRow(memory_slice, target_visible, nearest_threat, last_seen_x, last_seen_y, i, i);
+        },
+        .shared_index => {
+            const rows = memory_rows.?;
+            if (start != end) {
+                std.debug.assert(perception_rows[start] == rows[start]);
+                std.debug.assert(perception_rows[end - 1] == rows[end - 1]);
+            }
+            for (start..end) |k| {
+                const row: usize = rows[k];
+                refreshVisibleRow(memory_slice, target_visible, nearest_threat, last_seen_x, last_seen_y, row, row);
+            }
+        },
+        .pack => {
+            const rows = memory_rows.?;
+            for (start..end) |k| refreshVisibleRow(memory_slice, target_visible, nearest_threat, last_seen_x, last_seen_y, k, rows[k]);
+        },
     }
+}
+
+inline fn refreshVisibleRow(
+    memory_slice: *AiMemorySlice,
+    target_visible: []const bool,
+    nearest_threat: []const EntityId,
+    last_seen_x: []const f32,
+    last_seen_y: []const f32,
+    read: usize,
+    row: usize,
+) void {
+    if (!target_visible[read]) return;
+    const threat = nearest_threat[read];
+    if (!threat.isValid()) return;
+    const last = memory_slice.last_known_target[row];
+    if (!last.matches(threat.index, threat.generation)) return;
+
+    const seen_x = last_seen_x[read];
+    const seen_y = last_seen_y[read];
+    memory_slice.last_known_x[row] = seen_x;
+    memory_slice.last_known_y[row] = seen_y;
+    memory_slice.staleness[row] = 0;
+    memory_slice.familiarity[row] = math.clamp(
+        memory_slice.familiarity[row] + ai_memory_familiarity_gain_rate,
+        0,
+        max_ai_memory_familiarity,
+    );
+    upsertRingContact(memory_slice, row, threat, seen_x, seen_y);
 }
 
 /// Dedup-scans the ring for `target`: an existing contact updates in place
@@ -750,6 +893,7 @@ fn updateInline(system: *AiMemorySystem, ai_agents: ConstAiAgentSlice, data: *Da
 }
 
 const data_test_support = @import("../data_system/test_support.zig");
+const SimulationScopeSystem = @import("simulation_scope.zig").SimulationScopeSystem;
 
 test "AiMemorySystem refreshes from a perception-acquired event and snapshots on lost" {
     var data = DataSystem.init(testing.allocator);
@@ -867,6 +1011,194 @@ test "AiMemorySystem continuous visibility refreshes last_known to latest last_s
     try testing.expectEqual(final_x, memory.last_known_x);
     try testing.expectEqual(final_y, memory.last_known_y);
     try testing.expectEqual(@as(f32, 1), memory.staleness);
+}
+
+// `perm[i]` is the perception row copied into row `i`. Retie follows the move.
+fn permutePerception(data: *DataSystem, perm: []const u32) !void {
+    _ = try data.ai_perceptions.ensurePackImage(testing.allocator, perm.len);
+    data.ai_perceptions.copyToPack(0, perm.len, perm);
+    data.ai_perceptions.copyPackToRows(0, perm.len);
+    for (0..perm.len) |index| data.retiePackedRow(.perception, @intCast(index));
+}
+
+// Cognition `0 .. count - 1` on an inline thread system, so pack restores store order.
+fn packThinkPrefix(data: *DataSystem, count: usize) !void {
+    var scope = SimulationScopeSystem.init(testing.allocator);
+    defer scope.deinit();
+    try scope.ai_cognition_indices.ensureTotalCapacity(testing.allocator, count);
+    scope.ai_cognition_indices.items.len = count;
+    for (scope.ai_cognition_indices.items, 0..) |*index, k| index.* = @intCast(k);
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    try scope.packThinkSpan(data, &threads, .{});
+}
+
+const LockstepPair = struct {
+    data: DataSystem,
+    frame: SimulationFrame,
+    a: EntityId,
+    b: EntityId,
+    target: EntityId,
+
+    fn deinit(self: *LockstepPair) void {
+        self.frame.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+// A at memory row 0, B at row 1, then perception swapped (`perm = {1, 0}`) and retied.
+fn lockstepPair() !LockstepPair {
+    var data = DataSystem.init(testing.allocator);
+    errdefer data.deinit();
+    const target = try data.createEntity();
+    const a = try addAgentWithPerceptionAndMemory(&data, 0, 0, .{
+        .target_visible = true,
+        .nearest_threat = target,
+        .last_seen_x = 3,
+        .last_seen_y = 4,
+    }, .{ .last_known_target = target });
+    const b = try addAgentWithPerceptionAndMemory(&data, 0, 0, .{
+        .target_visible = false,
+        .last_seen_x = 1,
+        .last_seen_y = 1,
+    }, .{});
+    var frame = SimulationFrame.init(testing.allocator);
+    errdefer frame.deinit();
+    try frame.reserveStreams(1, 4, 0, 0, 0, 0);
+    const perm = [_]u32{ 1, 0 };
+    try permutePerception(&data, &perm);
+    return .{ .data = data, .frame = frame, .a = a, .b = b, .target = target };
+}
+
+fn writeDivergedPair(pair: *LockstepPair) void {
+    const a_row = pair.data.aiPerceptionDenseIndex(pair.a).?;
+    var perception = pair.data.perceptionSlice();
+    perception.target_visible[a_row] = true;
+    perception.nearest_threat[a_row] = pair.target;
+    perception.last_seen_x[a_row] = 8;
+    perception.last_seen_y[a_row] = 9;
+    perception.target_visible[0] = false;
+    perception.last_seen_x[0] = 1;
+    perception.last_seen_y[0] = 1;
+}
+
+fn expectPairKnown(pair: *const LockstepPair, a_x: f32, a_y: f32) !void {
+    const memory_a = data_test_support.aiMemory(&pair.data, pair.a).?;
+    try testing.expectEqual(a_x, memory_a.last_known_x);
+    try testing.expectEqual(a_y, memory_a.last_known_y);
+    try testing.expectEqual(@as(f32, 0), memory_a.staleness);
+    const memory_b = data_test_support.aiMemory(&pair.data, pair.b).?;
+    try testing.expectEqual(@as(f32, 0), memory_b.last_known_x);
+    try testing.expectEqual(@as(f32, 0), memory_b.last_known_y);
+}
+
+test "AiMemorySystem visibility packed prefix restores last_known" {
+    var pair = try lockstepPair();
+    defer pair.deinit();
+    try packThinkPrefix(&pair.data, 2);
+    var sys = AiMemorySystem.init(testing.allocator);
+    defer sys.deinit();
+    pair.frame.beginStep();
+    _ = try updateInline(&sys, pair.data.aiAgentSliceConst(), &pair.data, &pair.frame, .{});
+    try expectPairKnown(&pair, 3, 4);
+}
+
+test "AiMemorySystem visibility diverged perception follows the perception row" {
+    var pair = try lockstepPair();
+    defer pair.deinit();
+    try testing.expectEqual(@as(usize, 1), pair.data.aiPerceptionDenseIndex(pair.a).?);
+    writeDivergedPair(&pair);
+    var sys = AiMemorySystem.init(testing.allocator);
+    defer sys.deinit();
+    pair.frame.beginStep();
+    _ = try updateInline(&sys, pair.data.aiAgentSliceConst(), &pair.data, &pair.frame, .{});
+    try expectPairKnown(&pair, 8, 9);
+}
+
+test "AiMemorySystem visibility pack is bit-identical inline and threaded" {
+    const count = 2 * ai_memory_visible_range_alignment_items;
+    try testing.expect(std.math.gcd(37, count) == 1);
+
+    var inline_world = try shuffledVisibilityWorld(count);
+    defer inline_world.deinit();
+    var threaded_world = try shuffledVisibilityWorld(count);
+    defer threaded_world.deinit();
+
+    var inline_sys = AiMemorySystem.init(testing.allocator);
+    defer inline_sys.deinit();
+    inline_world.frame.beginStep();
+    _ = try updateInline(&inline_sys, inline_world.data.aiAgentSliceConst(), &inline_world.data, &inline_world.frame, .{});
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var threaded_sys = AiMemorySystem.init(testing.allocator);
+    defer threaded_sys.deinit();
+    threaded_world.frame.beginStep();
+    _ = try threaded_sys.update(threaded_world.data.aiAgentSliceConst(), &threaded_world.data, &threaded_world.frame, &threads, .{
+        .items_per_range = ai_memory_visible_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    const left = inline_world.data.aiMemorySliceConst();
+    const right = threaded_world.data.aiMemorySliceConst();
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(left.last_known_x), std.mem.sliceAsBytes(right.last_known_x));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(left.last_known_y), std.mem.sliceAsBytes(right.last_known_y));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(left.staleness), std.mem.sliceAsBytes(right.staleness));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(left.familiarity), std.mem.sliceAsBytes(right.familiarity));
+}
+
+test "AiMemorySystem visibility diverged update allocates nothing after reserve" {
+    var pair = try lockstepPair();
+    defer pair.deinit();
+    try testing.expectEqual(@as(usize, 1), pair.data.aiPerceptionDenseIndex(pair.a).?);
+    writeDivergedPair(&pair);
+
+    var sys = AiMemorySystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(2);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    sys.allocator = failing.allocator();
+    pair.frame.beginStep();
+    _ = try updateInline(&sys, pair.data.aiAgentSliceConst(), &pair.data, &pair.frame, .{});
+    try expectPairKnown(&pair, 8, 9);
+}
+
+const VisibilityWorld = struct {
+    data: DataSystem,
+    frame: SimulationFrame,
+
+    fn deinit(self: *VisibilityWorld) void {
+        self.frame.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+// Lockstep agents whose perception rows are stride-shuffled and retied, not packed.
+fn shuffledVisibilityWorld(count: usize) !VisibilityWorld {
+    var data = DataSystem.init(testing.allocator);
+    errdefer data.deinit();
+    const target = try data.createEntity();
+    for (0..count) |k| {
+        const at: f32 = @floatFromInt(k);
+        _ = try addAgentWithPerceptionAndMemory(&data, at, 0, .{
+            .target_visible = k % 2 == 0,
+            .nearest_threat = if (k % 2 == 0) target else EntityId.invalid,
+            .last_seen_x = at,
+            .last_seen_y = at + 1,
+        }, .{ .last_known_target = target });
+    }
+    const perm = try testing.allocator.alloc(u32, count);
+    defer testing.allocator.free(perm);
+    shuffledThinkRows(perm);
+    try permutePerception(&data, perm);
+    var frame = SimulationFrame.init(testing.allocator);
+    errdefer frame.deinit();
+    try frame.reserveStreams(1, 4, 0, 0, 0, 0);
+    return .{ .data = data, .frame = frame };
 }
 
 test "AiMemorySystem familiarity rises under sustained same-identity visibility" {
