@@ -305,6 +305,13 @@ pub const MovementBodyStore = struct {
         }
     }
 
+    /// Links `index` when its visual flag is unset. The slot is already reserved. Allocates nothing.
+    pub fn linkReservedVisual(self: *MovementBodyStore, index: usize) void {
+        if (self.rows.slice().items(.has_primitive_visual)[index]) return;
+        self.placeReservedDrawable(index);
+        self.rows.slice().items(.has_primitive_visual)[index] = true;
+    }
+
     /// Mirrors `bounds` onto row `index` and marks it bounded.
     pub fn setCollisionBounds(self: *MovementBodyStore, index: usize, bounds: CollisionBounds) void {
         const s = self.rows.slice();
@@ -629,6 +636,11 @@ pub const MovementBodyStore = struct {
         return self.run_of.get(drawableKey(level, chunk_x, chunk_y));
     }
 
+    pub fn drawableReservedExtra(self: *const MovementBodyStore, level: u16, chunk_x: i32, chunk_y: i32) u32 {
+        const index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)) orelse return 0;
+        return self.runs.items[index].reserved_extra;
+    }
+
     pub fn drawableRunLength(self: *const MovementBodyStore, run_index: u32) usize {
         return self.runs.items[run_index].rows.len;
     }
@@ -742,6 +754,16 @@ pub const MovementBodyStore = struct {
         if (level != std.math.maxInt(u16)) try self.reserveDrawableDestination(allocator, level + 1, chunk_x, chunk_y);
     }
 
+    // `placeDrawable` without the neighbor reserves. The slot is already reserved.
+    fn placeReservedDrawable(self: *MovementBodyStore, index: usize) void {
+        const movement = self.rows.slice();
+        if (movement.items(.drawable_run)[index] != no_drawable) return;
+        const level = movement.items(.level)[index];
+        const chunk_x = movement.items(.chunk_x)[index];
+        const chunk_y = movement.items(.chunk_y)[index];
+        self.commitDrawableLink(index, level, chunk_x, chunk_y);
+    }
+
     /// Reserves the runs a level change from this row would move into, so that change allocates nothing.
     pub fn reserveDrawableNeighborLevels(self: *MovementBodyStore, allocator: std.mem.Allocator, index: usize) !void {
         const movement = self.rows.slice();
@@ -767,6 +789,42 @@ pub const MovementBodyStore = struct {
             return err;
         };
         run.reserved_extra = slots;
+    }
+
+    /// Reserves `count` unlinked slots. True when this call created the run.
+    /// Overflow or a failed grow releases that new run and leaves `reserved_extra` as it was.
+    pub fn reserveDrawableSlots(self: *MovementBodyStore, allocator: std.mem.Allocator, level: u16, chunk_x: i32, chunk_y: i32, count: u32) !bool {
+        const key = drawableKey(level, chunk_x, chunk_y);
+        const created = self.run_of.get(key) == null;
+        const run_index = try self.runForKey(allocator, key);
+        const run = &self.runs.items[run_index];
+        const extra = std.math.add(u32, run.reserved_extra, count) catch {
+            if (created) self.releaseRun(run_index);
+            return error.OutOfMemory;
+        };
+        const row_count = std.math.cast(u32, run.rows.len) orelse {
+            if (created) self.releaseRun(run_index);
+            return error.OutOfMemory;
+        };
+        const slots = std.math.add(u32, row_count, extra) catch {
+            if (created) self.releaseRun(run_index);
+            return error.OutOfMemory;
+        };
+        run.rows.ensureTotalCapacity(allocator, slots) catch |err| {
+            if (created) self.releaseRun(run_index);
+            return err;
+        };
+        run.reserved_extra = extra;
+        return created;
+    }
+
+    /// Returns `count` slots from `reserveDrawableSlots`. Releases the run when `created` and it is empty with none left.
+    pub fn unreserveDrawableSlots(self: *MovementBodyStore, level: u16, chunk_x: i32, chunk_y: i32, count: u32, created: bool) void {
+        const run_index = self.run_of.get(drawableKey(level, chunk_x, chunk_y)).?;
+        const run = &self.runs.items[run_index];
+        std.debug.assert(run.reserved_extra >= count);
+        run.reserved_extra -= count;
+        if (created and run.rows.len == 0 and run.reserved_extra == 0) self.releaseRun(run_index);
     }
 
     /// Unlinks `index` and links it into a destination `reserveDrawableDestination` already reserved.
@@ -803,6 +861,12 @@ pub const MovementBodyStore = struct {
             }
         }
         try self.reserveDrawableDestination(allocator, level, chunk_x, chunk_y);
+        self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
+    }
+
+    /// Moves a visual whose slot was reserved ahead of the commit. Allocates nothing.
+    pub fn retargetReservedDrawable(self: *MovementBodyStore, index: usize, level: u16, chunk_x: i32, chunk_y: i32) void {
+        if (!self.rows.slice().items(.has_primitive_visual)[index]) return;
         self.relinkReservedDrawable(index, level, chunk_x, chunk_y);
     }
 
@@ -1151,4 +1215,50 @@ test "relink keeps a reserved drawable run when its last occupant leaves first" 
     try std.testing.expectEqual(departed, store.rows.slice().items(.drawable_run)[leaving_index]);
     try std.testing.expectEqual(@as(u32, 0), store.runs.items[entered].reserved_extra);
     try std.testing.expectEqual(@as(u32, 0), store.runs.items[departed].reserved_extra);
+}
+
+test "a failed drawable slot reserve leaves the standing run" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const occupant = try EntityId.init(0, 1);
+    const index: usize = try store.append(std.testing.allocator, occupant, .{});
+    try store.setHasPrimitiveVisual(std.testing.allocator, index, true);
+    const standing = store.drawableRunIndex(0, 0, 0).?;
+    const created = try store.reserveDrawableSlots(std.testing.allocator, 0, 0, 0, 1);
+    try std.testing.expect(!created);
+    const extra = store.drawableReservedExtra(0, 0, 0);
+    try std.testing.expect(extra != 0);
+    const length = store.drawableRunLength(standing);
+    try std.testing.expect(store.drawableRunSlice(standing).entity[0].eql(occupant));
+
+    // Run list and map already hold the new key, so the induced failure is its row grow.
+    try store.runs.ensureTotalCapacity(std.testing.allocator, store.runs.items.len + 1);
+    try store.free_runs.ensureTotalCapacity(std.testing.allocator, store.runs.items.len + 2);
+    try store.run_of.ensureUnusedCapacity(std.testing.allocator, 1);
+    const free_before = store.free_runs.items.len;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    try std.testing.expectError(error.OutOfMemory, store.reserveDrawableSlots(failing.allocator(), 4, 1, 2, 1));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(store.drawableRunIndex(4, 1, 2) == null);
+    try std.testing.expectEqual(free_before + 1, store.free_runs.items.len);
+    try std.testing.expectEqual(standing, store.drawableRunIndex(0, 0, 0).?);
+    try std.testing.expectEqual(length, store.drawableRunLength(standing));
+    try std.testing.expect(store.drawableRunSlice(standing).entity[0].eql(occupant));
+    try std.testing.expectEqual(extra, store.drawableReservedExtra(0, 0, 0));
+
+    const rows = &store.runs.items[standing].rows;
+    const used = rows.len + @as(usize, extra);
+    try std.testing.expect(rows.capacity >= used);
+    const count: u32 = @intCast(rows.capacity - used + 1);
+    failing.has_induced_failure = false;
+    try std.testing.expectError(error.OutOfMemory, store.reserveDrawableSlots(failing.allocator(), 0, 0, 0, count));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(standing, store.drawableRunIndex(0, 0, 0).?);
+    try std.testing.expectEqual(length, store.drawableRunLength(standing));
+    try std.testing.expect(store.drawableRunSlice(standing).entity[0].eql(occupant));
+    try std.testing.expectEqual(extra, store.drawableReservedExtra(0, 0, 0));
 }

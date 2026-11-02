@@ -568,6 +568,15 @@ pub const DataSystem = struct {
     }
 
     pub fn setMovementBody(self: *DataSystem, id: EntityId, body: MovementBody) !void {
+        try self.setMovementBodyMode(id, body, false);
+    }
+
+    /// `setMovementBody` when the commit's drawable slots are already reserved.
+    pub fn setMovementBodyReserved(self: *DataSystem, id: EntityId, body: MovementBody) !void {
+        try self.setMovementBodyMode(id, body, true);
+    }
+
+    fn setMovementBodyMode(self: *DataSystem, id: EntityId, body: MovementBody, reserved: bool) !void {
         try validateMovementBody(body);
         // Public set* calls are upserts: existing component rows are overwritten,
         // while missing rows are appended and registered in the entity slot.
@@ -578,7 +587,7 @@ pub const DataSystem = struct {
             // The flag follows a successful sync, same as the create path.
             if (slot.world_level_index) |world_level_index| {
                 const level = self.world_levels.get(@intCast(world_level_index));
-                try self.syncScopeLevelFromWorldLevel(id, level);
+                try self.syncScopeLevelFromWorldLevel(id, level, reserved);
                 self.movement_bodies.setHasWorldLevel(index, true);
             }
             return;
@@ -596,7 +605,7 @@ pub const DataSystem = struct {
         // body re-added after being destroyed while the visual persisted) — sync
         // the new row's flag so render collect doesn't skip it.
         if (slot.primitive_visual_index != null) {
-            try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(dense_index), true);
+            try self.linkMovementVisual(dense_index, reserved);
             // Before the level sync, so a failed sync cannot leave a linked row of defaults.
             self.mirrorDrawableAppearance(id);
         }
@@ -619,11 +628,20 @@ pub const DataSystem = struct {
         // sync it onto the new scope row.
         if (slot.world_level_index) |world_level_index| {
             const level = self.world_levels.get(@intCast(world_level_index));
-            try self.syncScopeLevelFromWorldLevel(id, level);
+            try self.syncScopeLevelFromWorldLevel(id, level, reserved);
             self.movement_bodies.setHasWorldLevel(dense_index, true);
         }
         // An existing body write does not change static membership. A new body can.
         self.syncDynamicBounds(id);
+    }
+
+    fn linkMovementVisual(self: *DataSystem, movement_index: u32, reserved: bool) !void {
+        const index: usize = movement_index;
+        if (reserved) {
+            self.movement_bodies.linkReservedVisual(index);
+        } else {
+            try self.movement_bodies.setHasPrimitiveVisual(self.allocator, index, true);
+        }
     }
 
     pub fn movementBodyPtr(self: *DataSystem, id: EntityId) ?MovementBodyPtr {
@@ -689,12 +707,21 @@ pub const DataSystem = struct {
     }
 
     pub fn setPrimitiveVisual(self: *DataSystem, id: EntityId, visual: PrimitiveVisual) !void {
+        try self.setPrimitiveVisualMode(id, visual, false);
+    }
+
+    /// `setPrimitiveVisual` when the commit's drawable slots are already reserved.
+    pub fn setPrimitiveVisualReserved(self: *DataSystem, id: EntityId, visual: PrimitiveVisual) !void {
+        try self.setPrimitiveVisualMode(id, visual, true);
+    }
+
+    fn setPrimitiveVisualMode(self: *DataSystem, id: EntityId, visual: PrimitiveVisual, reserved: bool) !void {
         try validatePrimitiveVisual(visual);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.primitive_visual_index) |index| {
             self.primitive_visuals.set(@intCast(index), visual);
             if (slot.movement_body_index) |movement_index| {
-                try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(movement_index), true);
+                try self.linkMovementVisual(movement_index, reserved);
             }
             self.mirrorDrawableAppearance(id);
             return;
@@ -704,7 +731,7 @@ pub const DataSystem = struct {
         slot.primitive_visual_index = dense_index;
         slot.addComponent(.primitive_visual);
         if (slot.movement_body_index) |movement_index| {
-            try self.movement_bodies.setHasPrimitiveVisual(self.allocator, @intCast(movement_index), true);
+            try self.linkMovementVisual(movement_index, reserved);
         }
         self.mirrorDrawableAppearance(id);
     }
@@ -892,6 +919,15 @@ pub const DataSystem = struct {
     }
 
     pub fn setWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
+        try self.setWorldLevelMode(id, level, false);
+    }
+
+    /// `setWorldLevel` when the commit's drawable slots are already reserved.
+    pub fn setWorldLevelReserved(self: *DataSystem, id: EntityId, level: u16) !void {
+        try self.setWorldLevelMode(id, level, true);
+    }
+
+    fn setWorldLevelMode(self: *DataSystem, id: EntityId, level: u16, reserved: bool) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.world_level_index) |index| {
             self.world_levels.set(@intCast(index), level);
@@ -900,7 +936,7 @@ pub const DataSystem = struct {
             slot.world_level_index = dense_index;
             slot.addComponent(.world_level);
         }
-        try self.syncScopeLevelFromWorldLevel(id, level);
+        try self.syncScopeLevelFromWorldLevel(id, level, reserved);
         if (slot.movement_body_index) |movement_index| {
             self.movement_bodies.setHasWorldLevel(@intCast(movement_index), true);
         }
@@ -1056,13 +1092,17 @@ pub const DataSystem = struct {
     }
 
     // Rewrites only the scope row's level; the rest of the row is as stored.
-    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
+    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16, reserved: bool) !void {
         const slot = self.resolveSlotConst(id) orelse return;
         const di: usize = slot.movement_body_index orelse return;
         var metadata = self.movement_bodies.scopeMetadataAt(di);
         if (metadata.level == level) return;
         // Level lands after the row is linked, so a failed retarget keeps the old level and a retry moves it.
-        try self.movement_bodies.retargetDrawable(self.allocator, di, level, metadata.chunk.x, metadata.chunk.y);
+        if (reserved) {
+            self.movement_bodies.retargetReservedDrawable(di, level, metadata.chunk.x, metadata.chunk.y);
+        } else {
+            try self.movement_bodies.retargetDrawable(self.allocator, di, level, metadata.chunk.x, metadata.chunk.y);
+        }
         metadata.level = level;
         self.movement_bodies.setScopeMetadata(di, metadata);
         self.snapInterpolationIfStill(di, metadata.tier);
@@ -1988,6 +2028,181 @@ test "a reserved stagger batch of two new cells puts both phases without allocat
     try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, created[1]).?.stagger_phase);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "a reserved drawable batch of two visual creates links both runs without allocating" {
+    const visual: PrimitiveVisual = .{
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = 0.25, .g = 0.5, .b = 0.75, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+    const creates = [_]StructuralCommand{
+        .{ .create_entity = .{ .movement_body = .{}, .primitive_visual = visual } },
+        .{ .create_entity = .{ .movement_body = .{}, .primitive_visual = visual } },
+    };
+    const Arm = struct {
+        failing: *std.testing.FailingAllocator,
+        pub fn prepare(self: *@This(), _: usize) !void {
+            self.failing.allocations = 0;
+            self.failing.fail_index = self.failing.alloc_index;
+            self.failing.resize_fail_index = self.failing.resize_index;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    {
+        var data = DataSystem.init(failing.allocator());
+        defer data.deinit();
+        var scratch = structural.StructuralPlanScratch.init(failing.allocator());
+        defer scratch.deinit();
+        var arm = Arm{ .failing = &failing };
+        var sink = structural.NullStructuralChangeSink{};
+        _ = try data.applyStructuralCommandsPrepared(&creates, &scratch, &arm, &sink);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        try std.testing.expect(!failing.has_induced_failure);
+        const bodies = data.movementBodySliceConst();
+        try std.testing.expectEqual(@as(usize, 2), bodies.entities.len);
+        try std.testing.expect(data.isAlive(bodies.entities[0]));
+        try std.testing.expect(data.isAlive(bodies.entities[1]));
+        try std.testing.expect(bodies.has_primitive_visual[0]);
+        try std.testing.expect(bodies.has_primitive_visual[1]);
+        const levels = data.scopeColumnsSliceConst().level;
+        try std.testing.expectEqual(@as(u16, 0), levels[0]);
+        try std.testing.expectEqual(@as(u16, 0), levels[1]);
+        const run_index = data.movement_bodies.drawableRunIndex(0, 0, 0).?;
+        try std.testing.expectEqual(@as(usize, 2), data.movement_bodies.drawableRunLength(run_index));
+        const drawn = data.movement_bodies.drawableRunSlice(run_index);
+        try std.testing.expect(drawn.entity[0].eql(bodies.entities[0]));
+        try std.testing.expect(drawn.entity[1].eql(bodies.entities[1]));
+    }
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    {
+        var data = DataSystem.init(failing.allocator());
+        defer data.deinit();
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{});
+        try data.setPrimitiveVisual(entity, visual);
+        try data.setWorldLevel(entity, 0);
+        var scratch = structural.StructuralPlanScratch.init(failing.allocator());
+        defer scratch.deinit();
+        var arm = Arm{ .failing = &failing };
+        var sink = structural.NullStructuralChangeSink{};
+        const move = [_]StructuralCommand{
+            .{ .set_world_level = .{ .entity = entity, .level = 4 } },
+        };
+        _ = try data.applyStructuralCommandsPrepared(&move, &scratch, &arm, &sink);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(?u16, 4), data.worldLevelConst(entity));
+        try std.testing.expectEqual(@as(u16, 4), data.scopeColumnsSliceConst().level[0]);
+        const run_index = data.movement_bodies.drawableRunIndex(4, 0, 0).?;
+        try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.drawableRunLength(run_index));
+        try std.testing.expect(data.movement_bodies.drawableRunSlice(run_index).entity[0].eql(entity));
+    }
+
+    var failures: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        const entity = try data.createEntity();
+        try data.setPrimitiveVisual(entity, visual);
+        try data.setMovementBody(entity, .{});
+        try data.setWorldLevel(entity, 0);
+        const mask = data.componentMaskFor(entity);
+        const row = data.movementBodyDenseIndex(entity).?;
+        const scope_level = data.scopeColumnsSliceConst().level[row];
+        const level0 = data.movement_bodies.drawableRunIndex(0, 0, 0).?;
+        try std.testing.expect(data.movement_bodies.drawableRunIndex(1, 0, 0) != null);
+        try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+        try std.testing.expect(data.movement_bodies.drawableRunSlice(level0).entity[0].eql(entity));
+
+        const original = data.allocator;
+        var loop_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        data.allocator = loop_failing.allocator();
+        defer data.allocator = original;
+        var scratch = structural.StructuralPlanScratch.init(loop_failing.allocator());
+        defer scratch.deinit();
+        var preparer = structural.NullStructuralCommitPreparer{};
+        var sink = structural.NullStructuralChangeSink{};
+        if (data.applyStructuralCommandsPrepared(&creates, &scratch, &preparer, &sink)) |_| {
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failures += 1;
+            try std.testing.expect(data.isAlive(entity));
+            try std.testing.expectEqual(mask, data.componentMaskFor(entity));
+            try std.testing.expectEqual(scope_level, data.scopeColumnsSliceConst().level[row]);
+            try std.testing.expectEqual(level0, data.movement_bodies.drawableRunIndex(0, 0, 0).?);
+            try std.testing.expect(data.movement_bodies.drawableRunSlice(level0).entity[0].eql(entity));
+            try std.testing.expect(data.movement_bodies.drawableRunIndex(1, 0, 0) != null);
+            try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+        }
+    }
+    if (failures == 0) return error.TestUnexpectedResult;
+}
+
+test "a level-1 place keeps the drawable spare" {
+    const visual = testVisual();
+    {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        const anchor = try data.createEntity();
+        try data.setMovementBody(anchor, .{});
+        try data.setPrimitiveVisual(anchor, visual);
+        const placer = try data.createEntity();
+        try data.setMovementBody(placer, .{});
+        try data.setWorldLevel(placer, 1);
+        const placer_row = data.movementBodyDenseIndex(placer).?;
+        try std.testing.expectEqual(@as(u16, 1), data.scopeColumnsSliceConst().level[placer_row]);
+        try std.testing.expect(!data.movementBodySliceConst().has_primitive_visual[placer_row]);
+        try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.drawableReservedExtra(1, 0, 0));
+
+        var scratch = StructuralPlanScratch.init(std.testing.allocator);
+        defer scratch.deinit();
+        var preparer = structural.NullStructuralCommitPreparer{};
+        var sink = structural.NullStructuralChangeSink{};
+        const place = [_]StructuralCommand{
+            .{ .set_primitive_visual = .{ .entity = placer, .visual = visual } },
+        };
+        _ = try data.applyStructuralCommandsPrepared(&place, &scratch, &preparer, &sink);
+        try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.drawableReservedExtra(1, 0, 0));
+        const run_index = data.movement_bodies.drawableRunIndex(1, 0, 0).?;
+        try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.drawableRunLength(run_index));
+        try std.testing.expect(data.movement_bodies.drawableRunSlice(run_index).entity[0].eql(placer));
+    }
+    {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        const level0 = try data.createEntity();
+        try data.setMovementBody(level0, .{});
+        const level1 = try data.createEntity();
+        try data.setMovementBody(level1, .{});
+        try data.setWorldLevel(level1, 1);
+        const level1_row = data.movementBodyDenseIndex(level1).?;
+        try std.testing.expectEqual(@as(u16, 1), data.scopeColumnsSliceConst().level[level1_row]);
+        try std.testing.expect(!data.movementBodySliceConst().has_primitive_visual[level1_row]);
+        try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.drawableReservedExtra(1, 0, 0));
+
+        var scratch = StructuralPlanScratch.init(std.testing.allocator);
+        defer scratch.deinit();
+        var preparer = structural.NullStructuralCommitPreparer{};
+        var sink = structural.NullStructuralChangeSink{};
+        const places = [_]StructuralCommand{
+            .{ .set_primitive_visual = .{ .entity = level0, .visual = visual } },
+            .{ .set_primitive_visual = .{ .entity = level1, .visual = visual } },
+        };
+        _ = try data.applyStructuralCommandsPrepared(&places, &scratch, &preparer, &sink);
+        try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.drawableReservedExtra(1, 0, 0));
+        const run_index = data.movement_bodies.drawableRunIndex(1, 0, 0).?;
+        try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.drawableRunLength(run_index));
+        try std.testing.expect(data.movement_bodies.drawableRunSlice(run_index).entity[0].eql(level1));
+    }
 }
 
 test "a simulation metadata write takes the level from the entity's world level row" {

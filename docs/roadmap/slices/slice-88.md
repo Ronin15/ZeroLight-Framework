@@ -160,14 +160,12 @@ in its owning slice.
       cost, handle and generation churn, and per-step walks a store forces on
       its consumers. Each finding is an item below. Row layout, component-row
       growth, and per-step consumer walks were clean.
-- [ ] A structural commit can still allocate a drawable run after mutation
-      has started (`structural.zig:324` commits after preflight;
-      `setHasPrimitiveVisual` calls `placeDrawable`, `system.zig:599`,
-      `system.zig:707`, `movement.zig:300`, `movement.zig:731`;
-      `setWorldLevel` writes the level, then `retargetDrawable`,
-      `system.zig:903`, `system.zig:1065`, `movement.zig:796`; a create
-      places the visual before the level, `structural.zig:739`,
-      `structural.zig:763`). Failure: an out-of-memory error on a later
+- [x] A structural commit can still allocate a drawable run after mutation
+      has started (`applyStructuralCommandsPrepared`, `structural.zig:362`;
+      reserved setters `setMovementBodyReserved` `system.zig:575`,
+      `setPrimitiveVisualReserved` `system.zig:714`, `setWorldLevelReserved`
+      `system.zig:926`; a create applies them in `applyTemplateComponents`,
+      `structural.zig:929`). Failure: an out-of-memory error on a later
       create or level change leaves earlier commands applied and does not
       retry. Pass: a reserve that fails before mutation leaves every prior
       entity, mask, scope level, and drawable run as they were; a commit

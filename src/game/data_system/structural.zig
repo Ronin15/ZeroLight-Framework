@@ -200,19 +200,47 @@ const StructuralCommitPlan = struct {
 };
 
 const ProjectedEntityState = struct {
-    // Scratch copy of just the liveness and component membership needed for
-    // preflight. Dense row indices are irrelevant until the real commit pass.
+    // Liveness, mask, and the drawable cursor. Dense row indices stay off this copy.
     alive: bool,
     component_mask: ComponentMask,
+    scope_level: u16,
+    chunk_x: i32,
+    chunk_y: i32,
+    linked: bool,
+    world_level: u16,
 
     fn init(data: *const DataSystem, entity: EntityId) ProjectedEntityState {
         // resolveSlotConst is private to system.zig; isAlive+componentMaskFor are
         // the equivalent already-pub accessors (same result, one extra lookup,
         // off the movement/collision hot path).
-        if (!data.isAlive(entity)) return .{ .alive = false, .component_mask = 0 };
+        if (!data.isAlive(entity)) return .{
+            .alive = false,
+            .component_mask = 0,
+            .scope_level = 0,
+            .chunk_x = 0,
+            .chunk_y = 0,
+            .linked = false,
+            .world_level = 0,
+        };
+        const world_level = data.worldLevelConst(entity) orelse 0;
+        const movement = data.movementBodyDenseIndex(entity) orelse return .{
+            .alive = true,
+            .component_mask = data.componentMaskFor(entity),
+            .scope_level = 0,
+            .chunk_x = 0,
+            .chunk_y = 0,
+            .linked = false,
+            .world_level = world_level,
+        };
+        const metadata = data.movement_bodies.scopeMetadataAt(movement);
         return .{
             .alive = true,
             .component_mask = data.componentMaskFor(entity),
+            .scope_level = metadata.level orelse 0,
+            .chunk_x = metadata.chunk.x,
+            .chunk_y = metadata.chunk.y,
+            .linked = data.movementBodySliceConst().has_primitive_visual[movement],
+            .world_level = world_level,
         };
     }
 
@@ -230,11 +258,25 @@ const ProjectedEntityState = struct {
     }
 };
 
+const DrawablePlanKey = struct {
+    level: u16,
+    chunk_x: i32,
+    chunk_y: i32,
+};
+
+const DrawablePlanEntry = struct {
+    added: u32 = 0,
+    consumed: u32 = 0,
+    applied: bool = false,
+    created: bool = false,
+};
+
 /// Reusable scratch for prepared structural commits. Simulation pipelines keep
 /// this around to avoid per-step hash-map allocation churn.
 pub const StructuralPlanScratch = struct {
     allocator: std.mem.Allocator,
     projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
+    drawable_plan: std.AutoHashMapUnmanaged(DrawablePlanKey, DrawablePlanEntry) = .{},
 
     pub fn init(allocator: std.mem.Allocator) StructuralPlanScratch {
         return .{ .allocator = allocator };
@@ -242,11 +284,20 @@ pub const StructuralPlanScratch = struct {
 
     pub fn deinit(self: *StructuralPlanScratch) void {
         self.projected_entities.deinit(self.allocator);
+        self.drawable_plan.deinit(self.allocator);
         self.projected_entities = .{};
+        self.drawable_plan = .{};
     }
 
     pub fn clearRetainingCapacity(self: *StructuralPlanScratch) void {
         self.projected_entities.clearRetainingCapacity();
+        self.drawable_plan.clearRetainingCapacity();
+    }
+
+    fn drawableEntry(self: *StructuralPlanScratch, key: DrawablePlanKey) !*DrawablePlanEntry {
+        const result = try self.drawable_plan.getOrPut(self.allocator, key);
+        if (!result.found_existing) result.value_ptr.* = .{};
+        return result.value_ptr;
     }
 
     fn projectedState(
@@ -318,7 +369,10 @@ pub fn applyStructuralCommandsPrepared(
     // Prepared commits split allocation/preparation from mutation so callers
     // can reuse scratch and reserve their own event buffers ahead of time.
     const plan = try preflightStructuralCommands(self, commands, scratch);
-    try preparer.prepare(plan.structural_event_count);
+    preparer.prepare(plan.structural_event_count) catch |err| {
+        abortAppliedDrawablePlan(self, scratch);
+        return err;
+    };
     // No allocations or event-capacity failures should occur after this
     // point; the commit loop can mutate DataSystem in command order.
     return try commitStructuralCommands(self, commands, change_sink);
@@ -369,7 +423,7 @@ fn commitStructuralCommands(
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 const inserting_body = self.movementBodyDenseIndex(set.entity) == null;
-                try self.setMovementBody(set.entity, set.body);
+                try self.setMovementBodyReserved(set.entity, set.body);
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .movement_body, was_static_navigation_obstacle);
                 if (inserting_body) try self.commitReservedStaggerPhase(set.entity);
@@ -390,7 +444,7 @@ fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
-                try self.setPrimitiveVisual(set.entity, set.visual);
+                try self.setPrimitiveVisualReserved(set.entity, set.visual);
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .primitive_visual, was_static_navigation_obstacle);
             },
@@ -452,7 +506,7 @@ fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
-                try self.setWorldLevel(set.entity, set.level);
+                try self.setWorldLevelReserved(set.entity, set.level);
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .world_level, was_static_navigation_obstacle);
             },
@@ -551,6 +605,7 @@ pub fn preflightStructuralCommands(
                 try projection.addTemplate(template);
                 if (template.movement_body != null and template.ai_agent != null) stagger_arrivals += 1;
                 structural_event_count = try addCapacity(structural_event_count, 1 + templateComponentCount(template));
+                try planTemplateDrawable(self, scratch, template);
             },
             .destroy_entity => |entity| {
                 const state = try scratch.projectedState(self, entity);
@@ -563,12 +618,18 @@ pub fn preflightStructuralCommands(
             },
             .set_movement_body => |set| {
                 const state = try scratch.projectedState(self, set.entity);
-                const inserts_ai_arrival = state.alive and !state.hasComponent(.movement_body) and state.hasComponent(.ai_agent);
+                const inserting = state.alive and !state.hasComponent(.movement_body);
+                const inserts_ai_arrival = inserting and state.hasComponent(.ai_agent);
                 try preflightSetComponent(self, set.entity, .movement_body, scratch, &projection, &structural_event_count);
                 if (inserts_ai_arrival) stagger_arrivals += 1;
+                try planMovementDrawable(self, scratch, set.entity, inserting);
             },
             .set_facing => |set| try preflightSetComponent(self, set.entity, .facing, scratch, &projection, &structural_event_count),
-            .set_primitive_visual => |set| try preflightSetComponent(self, set.entity, .primitive_visual, scratch, &projection, &structural_event_count),
+            .set_primitive_visual => |set| {
+                try preflightSetComponent(self, set.entity, .primitive_visual, scratch, &projection, &structural_event_count);
+                const state = try scratch.projectedState(self, set.entity);
+                if (state.alive and state.hasComponent(.movement_body) and !state.linked) try cursorPlace(self, scratch, state);
+            },
             .set_asset_reference => |set| try preflightSetComponent(self, set.entity, .asset_reference, scratch, &projection, &structural_event_count),
             .set_collision_bounds => |set| try preflightSetComponent(self, set.entity, .collision_bounds, scratch, &projection, &structural_event_count),
             .set_collision_response => |set| try preflightSetComponent(self, set.entity, .collision_response, scratch, &projection, &structural_event_count),
@@ -579,7 +640,13 @@ pub fn preflightStructuralCommands(
                 if (adds_ai_arrival) stagger_arrivals += 1;
             },
             .set_steering_agent => |set| try preflightSetComponent(self, set.entity, .steering_agent, scratch, &projection, &structural_event_count),
-            .set_world_level => |set| try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count),
+            .set_world_level => |set| {
+                const state = try scratch.projectedState(self, set.entity);
+                if (state.alive) state.world_level = set.level;
+                try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count);
+                const live = try scratch.projectedState(self, set.entity);
+                if (live.alive and live.hasComponent(.movement_body)) try cursorSync(self, scratch, live, set.level);
+            },
             .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
             .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, &projection, &structural_event_count),
             .set_ai_memory => |set| try preflightSetComponent(self, set.entity, .ai_memory, scratch, &projection, &structural_event_count),
@@ -605,7 +672,140 @@ pub fn preflightStructuralCommands(
     if (stagger_arrivals != 0 and self.movement_bodies.cells_x != 0 and self.movement_bodies.cells_y != 0) {
         try self.movement_bodies.ensureStaggerMapCapacity(self.allocator, stagger_arrivals);
     }
+    try applyDrawablePlan(self, scratch);
     return plan;
+}
+
+fn planTemplateDrawable(self: *DataSystem, scratch: *StructuralPlanScratch, template: EntityTemplate) !void {
+    // Movement, then the visual place, then the world-level sync: `applyTemplateComponents` order.
+    var cursor = ProjectedEntityState{
+        .alive = true,
+        .component_mask = 0,
+        .scope_level = 0,
+        .chunk_x = 0,
+        .chunk_y = 0,
+        .linked = false,
+        .world_level = 0,
+    };
+    if (template.movement_body != null) {
+        cursor.scope_level = 0;
+        cursor.chunk_x = 0;
+        cursor.chunk_y = 0;
+        cursor.linked = false;
+        cursor.addComponent(.movement_body);
+    }
+    if (template.primitive_visual != null and cursor.hasComponent(.movement_body)) try cursorPlace(self, scratch, &cursor);
+    if (template.world_level) |level| {
+        cursor.world_level = level;
+        if (cursor.hasComponent(.movement_body)) try cursorSync(self, scratch, &cursor, level);
+    }
+}
+
+fn planMovementDrawable(self: *DataSystem, scratch: *StructuralPlanScratch, entity: EntityId, inserting: bool) !void {
+    const state = try scratch.projectedState(self, entity);
+    if (!state.alive) return;
+    if (inserting) {
+        state.scope_level = 0;
+        state.chunk_x = 0;
+        state.chunk_y = 0;
+        state.linked = false;
+        if (state.hasComponent(.primitive_visual)) try cursorPlace(self, scratch, state);
+        if (state.hasComponent(.world_level)) try cursorSync(self, scratch, state, state.world_level);
+        return;
+    }
+    if (state.hasComponent(.world_level)) try cursorSync(self, scratch, state, state.world_level);
+}
+
+fn cursorPlace(self: *DataSystem, scratch: *StructuralPlanScratch, cursor: *ProjectedEntityState) !void {
+    // Reserve the link slot, then spend it, so a standing spare on this key remains.
+    const key: DrawablePlanKey = .{
+        .level = cursor.scope_level,
+        .chunk_x = cursor.chunk_x,
+        .chunk_y = cursor.chunk_y,
+    };
+    try planEnsure(self, scratch, key);
+    try planConsume(self, scratch, key);
+    if (cursor.scope_level > 0) {
+        try planEnsure(self, scratch, .{
+            .level = cursor.scope_level - 1,
+            .chunk_x = cursor.chunk_x,
+            .chunk_y = cursor.chunk_y,
+        });
+    }
+    if (cursor.scope_level != std.math.maxInt(u16)) {
+        try planEnsure(self, scratch, .{
+            .level = cursor.scope_level + 1,
+            .chunk_x = cursor.chunk_x,
+            .chunk_y = cursor.chunk_y,
+        });
+    }
+    cursor.linked = true;
+}
+
+fn cursorSync(self: *DataSystem, scratch: *StructuralPlanScratch, cursor: *ProjectedEntityState, level: u16) !void {
+    if (!cursor.hasComponent(.movement_body) or cursor.scope_level == level) return;
+    if (cursor.linked) {
+        try planConsume(self, scratch, .{
+            .level = level,
+            .chunk_x = cursor.chunk_x,
+            .chunk_y = cursor.chunk_y,
+        });
+    }
+    cursor.scope_level = level;
+}
+
+fn planEnsure(self: *DataSystem, scratch: *StructuralPlanScratch, key: DrawablePlanKey) !void {
+    const entry = try scratch.drawableEntry(key);
+    const base = self.movement_bodies.drawableReservedExtra(key.level, key.chunk_x, key.chunk_y);
+    const summed = std.math.add(u32, base, entry.added) catch return error.OutOfMemory;
+    if (summed == std.math.maxInt(u32)) return error.OutOfMemory;
+    entry.added += 1;
+}
+
+fn planConsume(self: *DataSystem, scratch: *StructuralPlanScratch, key: DrawablePlanKey) !void {
+    const pending_empty = blk: {
+        const entry = try scratch.drawableEntry(key);
+        const base = self.movement_bodies.drawableReservedExtra(key.level, key.chunk_x, key.chunk_y);
+        const summed = std.math.add(u32, base, entry.added) catch return error.OutOfMemory;
+        std.debug.assert(summed >= entry.consumed);
+        break :blk summed == entry.consumed;
+    };
+    if (pending_empty) try planEnsure(self, scratch, key);
+    scratch.drawable_plan.getPtr(key).?.consumed += 1;
+}
+
+fn applyDrawablePlan(self: *DataSystem, scratch: *StructuralPlanScratch) !void {
+    var it = scratch.drawable_plan.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.added == 0) continue;
+        const created = self.movement_bodies.reserveDrawableSlots(
+            self.allocator,
+            entry.key_ptr.level,
+            entry.key_ptr.chunk_x,
+            entry.key_ptr.chunk_y,
+            entry.value_ptr.added,
+        ) catch |err| {
+            abortAppliedDrawablePlan(self, scratch);
+            return err;
+        };
+        entry.value_ptr.applied = true;
+        entry.value_ptr.created = created;
+    }
+}
+
+fn abortAppliedDrawablePlan(self: *DataSystem, scratch: *StructuralPlanScratch) void {
+    var it = scratch.drawable_plan.iterator();
+    while (it.next()) |entry| {
+        if (!entry.value_ptr.applied) continue;
+        self.movement_bodies.unreserveDrawableSlots(
+            entry.key_ptr.level,
+            entry.key_ptr.chunk_x,
+            entry.key_ptr.chunk_y,
+            entry.value_ptr.added,
+            entry.value_ptr.created,
+        );
+        entry.value_ptr.applied = false;
+    }
 }
 
 fn preflightSetComponent(
@@ -729,7 +929,7 @@ fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: 
 fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: EntityTemplate) !usize {
     var components_set: usize = 0;
     if (template.movement_body) |body| {
-        try self.setMovementBody(entity, body);
+        try self.setMovementBodyReserved(entity, body);
         components_set += 1;
     }
     if (template.facing) |facing| {
@@ -737,7 +937,7 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
         components_set += 1;
     }
     if (template.primitive_visual) |visual| {
-        try self.setPrimitiveVisual(entity, visual);
+        try self.setPrimitiveVisualReserved(entity, visual);
         components_set += 1;
     }
     if (template.asset_reference) |asset_ref| {
@@ -761,7 +961,7 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
         components_set += 1;
     }
     if (template.world_level) |level| {
-        try self.setWorldLevel(entity, level);
+        try self.setWorldLevelReserved(entity, level);
         components_set += 1;
     }
     if (template.faction) |entity_faction| {
