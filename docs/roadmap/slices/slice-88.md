@@ -155,10 +155,82 @@ in its owning slice.
       the H5 order, so the pass reads both as forward streams; an
       `ai-memory` variant with a shuffled perception store is within spread
       of the co-ordered one.
-- [ ] `DataSystem` and its non-AI stores against the cost model and the
+- [x] `DataSystem` and its non-AI stores against the cost model and the
       rules: row layout and growth seams, the structural applier's per-commit
       cost, handle and generation churn, and per-step walks a store forces on
-      its consumers. Each finding becomes an item here.
+      its consumers. Each finding is an item below. Row layout, component-row
+      growth, and per-step consumer walks were clean.
+- [ ] A structural commit can still allocate a drawable run after mutation
+      has started (`structural.zig:324` commits after preflight;
+      `setHasPrimitiveVisual` calls `placeDrawable`, `system.zig:599`,
+      `system.zig:707`, `movement.zig:300`, `movement.zig:731`;
+      `setWorldLevel` writes the level, then `retargetDrawable`,
+      `system.zig:903`, `system.zig:1065`, `movement.zig:796`; a create
+      places the visual before the level, `structural.zig:739`,
+      `structural.zig:763`). Failure: an out-of-memory error on a later
+      create or level change leaves earlier commands applied and does not
+      retry. Pass: a reserve that fails before mutation leaves every prior
+      entity, mask, scope level, and drawable run as they were; a commit
+      that gets past that reserve allocates nothing while it applies. The
+      proof is two visual creates, and one `set_world_level` that changes
+      level (`.grok/rules/budgets-capacities.md`,
+      `.grok/rules/simulation.md` § Events and streams).
+- [ ] Neighbor drawable reservations are a shared count on the run
+      (`reserved_extra`, `movement.zig:190`; `placeDrawable`
+      `movement.zig:731`, `unlinkDrawable` `movement.zig:728`,
+      `retargetDrawable` `movement.zig:799`). Failure: attaching N visuals
+      at the default chunk (a new row is level 0, chunk (0, 0),
+      `movement.zig:239-241`) grows an empty neighbor run to a capacity of
+      at least N, and that capacity stays after they move or are destroyed
+      (unlink releases a run only when the count is also zero; destroy
+      unlinks only the live run, `system.zig:1122`); a later retarget can
+      consume another row's count (`movement.zig:800`); a failed reserve
+      clears every run's standing count (`movement.zig:936`). Pass: an
+      empty neighbor run's memory follows the rows that reserved it and is
+      gone after those rows are destroyed or leave that chunk; one row
+      cannot consume another's reservation; a failed reserve leaves every
+      other row's standing reservation as it was
+      (`.grok/rules/engine-design.md` § Cost model,
+      `.grok/rules/budgets-capacities.md`).
+- [ ] The structural projection map is sized to every command and cleared
+      to its retained capacity every step (preflight clear and ensure,
+      `structural.zig:531`, `structural.zig:539`; `set_simulation_tier`
+      inserts nothing, `structural.zig:588`; the step clears the same map,
+      `simulation.zig:731`). Failure scenario (derived): one population-sized
+      tier wave, which inserts nothing, leaves every later step, including
+      a step with no commands, walking that capacity on the main thread.
+      Pass: a step with no projecting commands does not allocate and does
+      not walk a retained capacity; a step that projects K entities costs
+      O(K), and the following empty step does not walk that capacity
+      (`.grok/rules/engine-design.md` § Cost model).
+- [ ] `nextGeneration` wraps to 1 (`system.zig:1379`). Failure scenario
+      (derived): after `2^32 - 1` reuses of one slot, a stale id resolves
+      to the new occupant (`system.zig:221` stores the wrapped generation;
+      `system.zig:1090` accepts it). Pass: a slot whose generation would
+      wrap is not reused, the failure is `OutOfMemory`, and an id from the
+      previous cycle does not resolve
+      (`.grok/rules/budgets-capacities.md`).
+- [ ] Releasing one stagger world scans every movement row, and an
+      out-of-memory error returns without releasing it (`system.zig:329`,
+      `arrival_holds` `movement.zig:215`). Failure: dropping one dungeon
+      walks every row in every world (`system.zig:331`, and again
+      `movement.zig:607`), and a failed reserve leaves that world's rows
+      and maps in place with no error to the caller (`system.zig:336`
+      returns before `system.zig:350`). Pass: releasing world W destroys
+      only W's holders and touches no other world's rows; a forced
+      out-of-memory error before the first destroy leaves W's rows and maps
+      unchanged, and the caller receives `OutOfMemory`
+      (`.grok/rules/engine-design.md` § Cost model,
+      `.grok/rules/budgets-capacities.md`).
+- [ ] `validateAiAgent` (`agents.zig:29`) does not check `last_score` or
+      `commitment_remaining`, and does not upper-bound `sticky_bonus`
+      (`agents.zig:37` requires it finite and at least 0; `append` stores
+      the three, `agents.zig:140`). Failure: a create template with a
+      non-finite score, a remaining commitment above
+      `max_ai_commitment_max_steps` (`types.zig:660`), or an unbounded
+      sticky bonus is stored and read on later steps. Pass: those three are
+      bounded the way the gains are, and a payload outside that is
+      `InvalidAiAgent` (`.grok/rules/zig-style.md` § Errors and resources).
 - [x] A store's `u32` row cap fails as `OutOfMemory` at its growth seam
       (`.grok/rules/budgets-capacities.md`; `fce97cd`). No `TooMany*` member
       remains in `src/game/data_system/` or `dig_controller.zig`; cap tests at
@@ -173,7 +245,7 @@ in its owning slice.
       past the share fails before mutation (`simulation.zig:483-484`) and the
       error fails the step (`SimulationPipeline.commitStructuralAndReact`,
       called from `applyStructuralCommandsAndPostCommitEvents`,
-      `game_demo_state.zig:633`).
+      `game_demo_state.zig:640`).
       Failure scenario (derived, no bench): a kill burst, collapse, or
       explosion over the share stops the step. Pass: a contract test where an
       over-share burst defers and the step succeeds, identical serial and
