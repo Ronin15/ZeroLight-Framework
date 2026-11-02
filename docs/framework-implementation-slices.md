@@ -460,7 +460,7 @@ order.
 8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
 8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22).
 9. **87** Render Collect By Visible Chunks — programming landed (core-systems branch). Vulkan `gpu-smoke` passed; other machines are not a gate.
-9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — storage items landed; contracts, pipeline, and kernels still open (after 87).
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — storage items and the commit-share deferral landed; step contracts, pipeline, and kernels still open (after 87).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.
 9c. **87's render backend pass** — landed with the slice checklist. It does not wait on 9b.
 10. **76** Cave-Ins — after 64G, 88.
