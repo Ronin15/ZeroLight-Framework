@@ -335,28 +335,23 @@ pub const DataSystem = struct {
         try self.movement_bodies.setStaggerWorldGrid(self.allocator, world_id, cell_size, cells_x, cells_y);
     }
 
-    /// Destroys every row that holds `world_id`'s residue so `removeAt` drops the claim, then
-    /// frees that id's arrival map and level origins. Other ids' rows and phases stay. A failed
-    /// reserve leaves every row and both maps.
-    pub fn releaseStaggerWorld(self: *DataSystem, world_id: u32) void {
-        var holders: usize = 0;
-        for (self.movement_bodies.arrival_holds.items) |hold| {
-            if (hold.held and hold.world == world_id) holders += 1;
-        }
+    /// Destroys `world_id`'s holders in reverse commit order, then frees that id's arrival map,
+    /// level origins, and holder list. Other ids' rows and maps stay. `error.OutOfMemory` returns
+    /// before the first destroy and leaves this id's rows and maps unchanged.
+    pub fn releaseStaggerWorld(self: *DataSystem, world_id: u32) error{OutOfMemory}!void {
+        const holders = self.movement_bodies.staggerHolderCount(world_id);
         if (holders != 0) {
             const need = self.collision_allow_records.items.len + holders * 2;
-            self.collision_allow_records.ensureTotalCapacity(self.allocator, need) catch return;
-            var index: usize = 0;
-            while (index < self.movement_bodies.arrival_holds.items.len) {
-                const hold = self.movement_bodies.arrival_holds.items[index];
-                if (!hold.held or hold.world != world_id) {
-                    index += 1;
-                    continue;
-                }
-                const entity = self.movement_bodies.sliceConst().entities[index];
+            try self.collision_allow_records.ensureTotalCapacity(self.allocator, need);
+            const entities = self.movement_bodies.sliceConst().entities;
+            while (self.movement_bodies.lastStaggerHolder(world_id)) |row| {
+                const before = self.movement_bodies.staggerHolderCount(world_id);
+                // `row` is a live movement index below the sliced length.
+                const entity = entities[@intCast(row)];
                 // Two allow records per holder were reserved above, so the removal cannot allocate.
                 const removed = self.destroyEntity(entity) catch unreachable; // lint:allow catch-unreachable: collision-allow records were reserved for every holder
                 std.debug.assert(removed);
+                std.debug.assert(self.movement_bodies.staggerHolderCount(world_id) == before - 1);
             }
         }
         self.movement_bodies.releaseStaggerWorld(self.allocator, world_id);
@@ -2121,12 +2116,167 @@ test "a second stagger world keeps its own cell grid and releases without touchi
     try std.testing.expect(world1.arrivals.get(@as(u128, 3) << 32) != null);
     try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
 
-    data.releaseStaggerWorld(1);
+    try data.releaseStaggerWorld(1);
     try std.testing.expect(!data.isAlive(direct));
     try std.testing.expect(data.movement_bodies.other_worlds.getPtr(1) == null);
     try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
     try std.testing.expectEqual(phase0, data_test_support.simulationMetadata(&data, world0).?.stagger_phase);
     try data.setStaggerWorldGrid(1, 8, 2, 2);
+}
+
+test "releasing one stagger world destroys only that world's holders" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+    try data.setStaggerWorldGrid(1, 16, 4, 4);
+
+    const world0 = try createStaggerBody(&data, 0, 0, 0, true);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, world0).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.arrival_holder_rows.items.len);
+
+    const inert = try createStaggerBody(&data, 0, 0, 0, false);
+    try std.testing.expect(data.isAlive(inert));
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.arrival_holder_rows.items.len);
+
+    const first = try data.createEntity();
+    try data.setMovementBody(first, .{
+        .position = .{ .x = 49, .y = 0 },
+        .previous_position = .{ .x = 49, .y = 0 },
+    });
+    try data.setAiAgent(first, .{});
+    try data.commitStaggerPhaseForWorld(first, 1);
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, first).?.stagger_phase);
+    const world1 = data.movement_bodies.other_worlds.getPtr(1).?;
+    try std.testing.expect(world1.arrivals.get(@as(u128, 3) << 32) != null);
+
+    const second = try data.createEntity();
+    try data.setMovementBody(second, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+    });
+    try data.setAiAgent(second, .{});
+    try data.commitStaggerPhaseForWorld(second, 1);
+    try std.testing.expectEqual(@as(u8, 1), data_test_support.simulationMetadata(&data, second).?.stagger_phase);
+    try std.testing.expect(world1.arrivals.get(@as(u128, 0)) != null);
+    try std.testing.expectEqual(@as(u32, 2), world1.arrivals.count());
+    try std.testing.expectEqual(@as(u32, 2), world1.level_origins.get(0).?);
+    try std.testing.expectEqual(@as(usize, 2), world1.arrival_holder_rows.items.len);
+
+    const allow_need = data.collision_allow_records.items.len + 2 * 3;
+    if (data.collision_allow_records.capacity < allow_need) {
+        try data.collision_allow_records.ensureTotalCapacity(failing.allocator(), allow_need);
+    }
+    failing.allocations = 0;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try data.releaseStaggerWorld(1);
+    try std.testing.expect(!data.isAlive(first));
+    try std.testing.expect(!data.isAlive(second));
+    try std.testing.expect(data.isAlive(world0));
+    try std.testing.expect(data.isAlive(inert));
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, world0).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+    try std.testing.expect(data.movement_bodies.other_worlds.getPtr(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.arrival_holder_rows.items.len);
+
+    try data.releaseStaggerWorld(0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(!data.isAlive(world0));
+    try std.testing.expect(data.isAlive(inert));
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.level_origins.count());
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.arrival_holder_rows.items.len);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.other_worlds.count());
+}
+
+test "releasing a stagger world reties the dense tail holder's row" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+    try data.setStaggerWorldGrid(1, 16, 4, 4);
+
+    const world1 = try data.createEntity();
+    try data.setMovementBody(world1, .{
+        .position = .{ .x = 49, .y = 0 },
+        .previous_position = .{ .x = 49, .y = 0 },
+    });
+    try data.setAiAgent(world1, .{});
+    try data.commitStaggerPhaseForWorld(world1, 1);
+
+    const world0 = try createStaggerBody(&data, 0, 0, 0, true);
+
+    try data.releaseStaggerWorld(1);
+    try std.testing.expect(data.isAlive(world0));
+    try std.testing.expect(data.movement_bodies.other_worlds.getPtr(1) == null);
+    try std.testing.expectEqualSlices(u32, &.{0}, data.movement_bodies.arrival_holder_rows.items);
+
+    try data.releaseStaggerWorld(0);
+    try std.testing.expect(!data.isAlive(world0));
+}
+
+test "a stagger world release returns OutOfMemory before the first destroy" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+    data.setStaggerCellGrid(32, 8, 8);
+    try data.setStaggerWorldGrid(1, 16, 4, 4);
+
+    const world0 = try createStaggerBody(&data, 0, 0, 0, true);
+    const direct = try data.createEntity();
+    try data.setMovementBody(direct, .{
+        .position = .{ .x = 49, .y = 0 },
+        .previous_position = .{ .x = 49, .y = 0 },
+    });
+    try data.setAiAgent(direct, .{});
+    try data.commitStaggerPhaseForWorld(direct, 1);
+
+    data.collision_allow_records.clearAndFree(failing.allocator());
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, data.releaseStaggerWorld(1));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(data.isAlive(world0));
+    try std.testing.expect(data.isAlive(direct));
+    try std.testing.expectEqual(@as(u8, 0), data_test_support.simulationMetadata(&data, world0).?.stagger_phase);
+    try std.testing.expectEqual(@as(u32, 1), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.arrival_holder_rows.items.len);
+    const world1 = data.movement_bodies.other_worlds.getPtr(1).?;
+    try std.testing.expectEqual(@as(u32, 1), world1.arrivals.count());
+    try std.testing.expect(world1.arrivals.get(@as(u128, 3) << 32) != null);
+    try std.testing.expectEqual(@as(u32, 1), world1.level_origins.count());
+    try std.testing.expectEqual(@as(usize, 1), world1.arrival_holder_rows.items.len);
+    try std.testing.expectEqual(@as(usize, 0), data.collision_allow_records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), data.collision_allow_records.capacity);
+}
+
+test "a stagger holder reserve failure leaves the row unsettled and inserts no arrival key" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+        .resize_fail_index = std.math.maxInt(usize),
+    });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+
+    const entity = try createStaggerBody(&data, 0, 0, 0, true);
+    data.setStaggerCellGrid(32, 8, 8);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, data.commitStaggerPhase(entity));
+    try std.testing.expect(data.isAlive(entity));
+    try std.testing.expect(!data.movement_bodies.rows.slice().items(.stagger_settled)[0]);
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.arrivals.count());
+    try std.testing.expectEqual(@as(u32, 0), data.movement_bodies.level_origins.count());
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.arrival_holder_rows.items.len);
 }
 
 test "a structural set that first completes an unsettled AI arrival takes the cell residue" {

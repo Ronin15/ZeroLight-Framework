@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const config = @import("../config.zig");
+const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
@@ -463,7 +464,11 @@ pub const GameDemoState = struct {
         self.allocator.free(self.test_squares);
         self.scene_prep.deinit();
         self.particles.deinit();
-        self.data.releaseStaggerWorld(self.world.stagger_world);
+        self.data.releaseStaggerWorld(self.world.stagger_world) catch |err| switch (err) {
+            error.OutOfMemory => {
+                if (comptime logging.enabled(.err)) logging.game.err("stagger world release failed", .{});
+            },
+        };
         self.world.deinit();
         self.pipeline.deinit();
         self.simulation_frame.deinit();
@@ -1353,7 +1358,8 @@ test "a direct stagger spawn that cannot reserve its arrival key leaves no entit
         try data.collision_allow_records.ensureTotalCapacity(alloc, allow_need);
     }
 
-    failing.fail_index = failing.alloc_index + 1;
+    // Holder slot, then the level origin, then the arrival key.
+    failing.fail_index = failing.alloc_index + 2;
     try std.testing.expectError(error.OutOfMemory, spawnDemoMover(&data, &world, spec, 0));
     try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.len());
     try std.testing.expect(!data.slots.items[0].alive);

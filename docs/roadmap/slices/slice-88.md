@@ -215,14 +215,13 @@ in its owning slice.
       generation would wrap is not reused, the failure is `OutOfMemory`,
       and an id from the previous cycle does not resolve
       (`.grok/rules/budgets-capacities.md`).
-- [ ] Releasing one stagger world scans every movement row, and an
-      out-of-memory error returns without releasing it (`system.zig:329`,
-      `arrival_holds` `movement.zig:215`). Failure: dropping one dungeon
-      walks every row in every world (`system.zig:331`, and again
-      `movement.zig:607`), and a failed reserve leaves that world's rows
-      and maps in place with no error to the caller (`system.zig:336`
-      returns before `system.zig:350`). Pass: releasing world W destroys
-      only W's holders and touches no other world's rows; a forced
+- [x] Releasing one stagger world destroys only that world's holders
+      (`releaseStaggerWorld`, `system.zig:341`; holder list
+      `movement.zig:220`; the allow-record reserve is `system.zig:344`,
+      before the first destroy). Failure: dropping one dungeon walks every
+      row in every world, and a failed reserve leaves that world's rows and
+      maps in place with no error to the caller. Pass: releasing world W
+      destroys only W's holders and touches no other world's rows; a forced
       out-of-memory error before the first destroy leaves W's rows and maps
       unchanged, and the caller receives `OutOfMemory`
       (`.grok/rules/engine-design.md` § Cost model,

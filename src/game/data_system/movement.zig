@@ -43,6 +43,8 @@ const ArrivalHold = struct {
     world: u32 = 0,
     key: u128 = 0,
     held: bool = false,
+    // Unread unless `held`.
+    holder_slot: u32 = 0,
 };
 
 const OtherStaggerWorld = struct {
@@ -51,6 +53,7 @@ const OtherStaggerWorld = struct {
     cells_y: u32 = 0,
     arrivals: std.AutoHashMapUnmanaged(u128, ArrivalCount) = .empty,
     level_origins: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+    arrival_holder_rows: std.ArrayList(u32) = .empty,
 };
 
 const MovementBodyRow = struct {
@@ -213,6 +216,8 @@ pub const MovementBodyStore = struct {
     arrivals: std.AutoHashMapUnmanaged(u128, ArrivalCount) = .empty,
     // Next origin for a level's first AI arrival in a cell. Absent means 0.
     level_origins: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+    // World 0's holder row indexes, in commit order. Length is the live holds.
+    arrival_holder_rows: std.ArrayList(u32) = .empty,
     cell_size: f32 = 0,
     cells_x: u32 = 0,
     cells_y: u32 = 0,
@@ -401,10 +406,13 @@ pub const MovementBodyStore = struct {
         installStaggerScalars(&world.cell_size, &world.cells_x, &world.cells_y, world.arrivals.count(), world.level_origins.count(), cell_size, cells_x, cells_y);
     }
 
-    /// Reserves one new arrival key and one level origin per structural AI arrival on world 0.
-    /// The commit inserts at most that many; cells that already have a residue insert none.
+    /// Reserves one new arrival key, one level origin, and one holder slot per structural AI
+    /// arrival on world 0. The commit inserts at most that many keys; every arrival appends
+    /// one holder. `additional == 0` reserves nothing.
     pub fn ensureStaggerMapCapacity(self: *MovementBodyStore, allocator: std.mem.Allocator, additional: usize) !void {
+        if (additional == 0) return;
         try ensureStaggerMaps(allocator, &self.level_origins, &self.arrivals, additional);
+        try self.arrival_holder_rows.ensureTotalCapacity(allocator, self.arrival_holder_rows.items.len + additional);
     }
 
     fn ensureStaggerMaps(
@@ -428,22 +436,34 @@ pub const MovementBodyStore = struct {
     /// Settles an AI row `index` on `world_id`'s grid. A missing grid, a settled row, or a row
     /// with no AI does nothing: no AI row keeps its placeholder and takes no residue. The first
     /// AI body in a cell takes the level origin; later bodies take that cell's next residue.
-    /// `assume_capacity` puts a new level origin and arrival key into capacity already reserved.
-    /// Otherwise those two slots are reserved before either put. A failed reserve inserts neither
-    /// key and does not advance the origin. A residue also records the row's hold.
+    /// `assume_capacity` puts a new level origin and arrival key, and appends the holder row,
+    /// into capacity already reserved. Otherwise one holder slot is reserved before the residue,
+    /// and a new key reserves its level origin and arrival slot before either put. A failed
+    /// reserve inserts no key, does not advance the origin, and does not append the holder.
     pub fn commitStagger(self: *MovementBodyStore, allocator: std.mem.Allocator, world_id: u32, index: usize, level: u16, has_ai: bool, assume_capacity: bool) !void {
         const grid = self.staggerWorldMaps(world_id) orelse return;
         if (self.rows.slice().items(.stagger_settled)[index]) return;
         if (!has_ai) return;
+        const holders = self.holderRows(world_id);
+        if (!assume_capacity) try holders.ensureTotalCapacity(allocator, holders.items.len + 1);
         const s = self.rows.slice();
         const cell_x = math.worldPosToCell(s.items(.previous_x)[index], grid.cell_size, grid.cells_x);
         const cell_y = math.worldPosToCell(s.items(.previous_y)[index], grid.cell_size, grid.cells_y);
         const key: u128 = (@as(u128, level) << 64) | (@as(u128, cell_x) << 32) | cell_y;
         const phase = try nextStaggerResidue(allocator, grid.level_origins, grid.arrivals, level, key, assume_capacity);
         const row = self.rows.slice();
+        // `index` is a movement row below the `u32` cap; the slot is this list's new length.
+        const row_index: u32 = @intCast(index);
+        const slot: u32 = @intCast(holders.items.len);
         row.items(.stagger_phase)[index] = phase;
         row.items(.stagger_settled)[index] = true;
-        self.arrival_holds.items[index] = .{ .world = world_id, .key = key, .held = true };
+        self.arrival_holds.items[index] = .{
+            .world = world_id,
+            .key = key,
+            .held = true,
+            .holder_slot = slot,
+        };
+        holders.appendAssumeCapacity(row_index);
     }
 
     fn nextStaggerResidue(
@@ -496,6 +516,13 @@ pub const MovementBodyStore = struct {
         const last = self.rows.len - 1;
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
         self.rows.swapRemove(index);
+        if (index != last) {
+            const moved = self.arrival_holds.items[index];
+            if (moved.held) {
+                // `holder_slot` indexes the moved row's world list; `index` is below the `u32` cap.
+                self.holderRows(moved.world).items[@intCast(moved.holder_slot)] = @intCast(index);
+            }
+        }
         return moved_entity;
     }
 
@@ -576,10 +603,12 @@ pub const MovementBodyStore = struct {
         self.arrival_holds.clearRetainingCapacity();
         self.arrivals.clearRetainingCapacity();
         self.level_origins.clearRetainingCapacity();
+        self.arrival_holder_rows.clearRetainingCapacity();
         var worlds = self.other_worlds.iterator();
         while (worlds.next()) |entry| {
             entry.value_ptr.arrivals.clearRetainingCapacity();
             entry.value_ptr.level_origins.clearRetainingCapacity();
+            entry.value_ptr.arrival_holder_rows.clearRetainingCapacity();
         }
         self.run_of.clearRetainingCapacity();
         self.free_runs.clearRetainingCapacity();
@@ -605,32 +634,36 @@ pub const MovementBodyStore = struct {
         while (worlds.next()) |entry| {
             entry.value_ptr.arrivals.deinit(allocator);
             entry.value_ptr.level_origins.deinit(allocator);
+            entry.value_ptr.arrival_holder_rows.deinit(allocator);
         }
         self.other_worlds.deinit(allocator);
         self.arrivals.deinit(allocator);
         self.level_origins.deinit(allocator);
+        self.arrival_holder_rows.deinit(allocator);
         self.rows.deinit(allocator);
         self.* = .{};
     }
 
-    /// Frees `world_id`'s arrival map and level origins. A live hold for that id still owns a
-    /// key: the caller destroys those rows first so `removeAt` drops the claims. Id 0's maps
-    /// are left empty; any other id's record is removed. Rows that did not hold this id stay.
+    /// Frees `world_id`'s arrival map, level origins, and holder list. The caller destroys that
+    /// id's holders first, so the list length is 0. Id 0's three buffers are left empty; any
+    /// other id's record is removed. An absent id does nothing.
     pub fn releaseStaggerWorld(self: *MovementBodyStore, allocator: std.mem.Allocator, world_id: u32) void {
-        for (self.arrival_holds.items) |hold| {
-            std.debug.assert(!(hold.held and hold.world == world_id));
-        }
         if (world_id == 0) {
+            std.debug.assert(self.arrival_holder_rows.items.len == 0);
             self.arrivals.deinit(allocator);
             self.level_origins.deinit(allocator);
+            self.arrival_holder_rows.deinit(allocator);
             self.arrivals = .empty;
             self.level_origins = .empty;
+            self.arrival_holder_rows = .empty;
             return;
         }
         if (self.other_worlds.fetchRemove(world_id)) |removed| {
+            std.debug.assert(removed.value.arrival_holder_rows.items.len == 0);
             var world = removed.value;
             world.arrivals.deinit(allocator);
             world.level_origins.deinit(allocator);
+            world.arrival_holder_rows.deinit(allocator);
         }
     }
 
@@ -1202,6 +1235,28 @@ pub const MovementBodyStore = struct {
         };
     }
 
+    /// Live holders of `world_id`. An id with no record is 0.
+    pub fn staggerHolderCount(self: *const MovementBodyStore, world_id: u32) usize {
+        if (world_id == 0) return self.arrival_holder_rows.items.len;
+        const world = self.other_worlds.get(world_id) orelse return 0;
+        return world.arrival_holder_rows.items.len;
+    }
+
+    /// Last holder row of `world_id`, or null when that id has none.
+    pub fn lastStaggerHolder(self: *const MovementBodyStore, world_id: u32) ?u32 {
+        const rows = if (world_id == 0)
+            self.arrival_holder_rows
+        else
+            (self.other_worlds.get(world_id) orelse return null).arrival_holder_rows;
+        if (rows.items.len == 0) return null;
+        return rows.items[rows.items.len - 1];
+    }
+
+    fn holderRows(self: *MovementBodyStore, world_id: u32) *std.ArrayList(u32) {
+        if (world_id == 0) return &self.arrival_holder_rows;
+        return &self.other_worlds.getPtr(world_id).?.arrival_holder_rows;
+    }
+
     fn dropArrivalHold(self: *MovementBodyStore, hold: ArrivalHold) void {
         const arrivals = if (hold.world == 0)
             &self.arrivals
@@ -1211,6 +1266,14 @@ pub const MovementBodyStore = struct {
         std.debug.assert(count.live > 0);
         count.live -= 1;
         if (count.live == 0) std.debug.assert(arrivals.remove(hold.key));
+        const holders = self.holderRows(hold.world);
+        // `holder_slot` is an index below this list's length.
+        const hole: usize = @intCast(hold.holder_slot);
+        _ = holders.swapRemove(hole);
+        if (hole < holders.items.len) {
+            const sibling: usize = @intCast(holders.items[hole]);
+            self.arrival_holds.items[sibling].holder_slot = hold.holder_slot;
+        }
     }
 };
 
