@@ -226,15 +226,14 @@ in its owning slice.
       unchanged, and the caller receives `OutOfMemory`
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/budgets-capacities.md`).
-- [ ] `validateAiAgent` (`agents.zig:29`) does not check `last_score` or
-      `commitment_remaining`, and does not upper-bound `sticky_bonus`
-      (`agents.zig:37` requires it finite and at least 0; `append` stores
-      the three, `agents.zig:140`). Failure: a create template with a
-      non-finite score, a remaining commitment above
-      `max_ai_commitment_max_steps` (`types.zig:660`), or an unbounded
-      sticky bonus is stored and read on later steps. Pass: those three are
-      bounded the way the gains are, and a payload outside that is
-      `InvalidAiAgent` (`.grok/rules/zig-style.md` § Errors and resources).
+- [x] `validateAiAgent` bounds `last_score`, `commitment_remaining`, and
+      `sticky_bonus` the way the gains are (`agents.zig:37-41`;
+      `max_ai_commitment_max_steps`, `types.zig:666`). Failure: a create
+      template with a non-finite score, a remaining commitment above
+      `max_ai_commitment_max_steps`, or an unbounded sticky bonus is stored
+      and read on later steps. Pass: those three are bounded the way the
+      gains are, and a payload outside that is `InvalidAiAgent`
+      (`.grok/rules/zig-style.md` § Errors and resources).
 - [x] A store's `u32` row cap fails as `OutOfMemory` at its growth seam
       (`.grok/rules/budgets-capacities.md`; `fce97cd`). No `TooMany*` member
       remains in `src/game/data_system/` or `dig_controller.zig`; cap tests at

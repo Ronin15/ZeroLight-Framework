@@ -34,8 +34,11 @@ pub fn validateAiAgent(agent: AiAgent) !void {
     if (!std.math.isFinite(agent.wander_amplitude) or agent.wander_amplitude < 0 or agent.wander_amplitude > max_ai_wander_amplitude) {
         return error.InvalidAiAgent;
     }
-    if (!std.math.isFinite(agent.sticky_bonus) or agent.sticky_bonus < 0) return error.InvalidAiAgent;
+    if (!std.math.isFinite(agent.sticky_bonus) or agent.sticky_bonus < 0 or agent.sticky_bonus > max_ai_gain) return error.InvalidAiAgent;
     if (agent.commitment_max_steps > types.max_ai_commitment_max_steps) return error.InvalidAiAgent;
+    if (agent.commitment_remaining > types.max_ai_commitment_max_steps) return error.InvalidAiAgent;
+    // Ingress seed; the think write does not call this.
+    if (!std.math.isFinite(agent.last_score) or agent.last_score < 0 or agent.last_score > max_ai_gain) return error.InvalidAiAgent;
 }
 
 pub fn validateSteeringAgent(agent: SteeringAgent) !void {
@@ -512,6 +515,29 @@ test "validateAiAgent rejects out-of-range wander_amplitude and sticky_bonus" {
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = std.math.inf(f32) }));
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .commitment_max_steps = types.max_ai_commitment_max_steps + 1 }));
     try validateAiAgent(.{ .commitment_max_steps = types.max_ai_commitment_max_steps });
+}
+
+test "validateAiAgent bounds last_score, commitment_remaining, and sticky_bonus like the gains" {
+    try validateAiAgent(.{ .last_score = 0 });
+    try validateAiAgent(.{ .last_score = max_ai_gain });
+    try validateAiAgent(.{ .commitment_remaining = 0 });
+    try validateAiAgent(.{ .commitment_remaining = types.max_ai_commitment_max_steps });
+    try validateAiAgent(.{ .sticky_bonus = 0 });
+    try validateAiAgent(.{ .sticky_bonus = max_ai_gain });
+    try validateAiAgent(.{
+        .last_score = max_ai_gain,
+        .commitment_remaining = types.max_ai_commitment_max_steps,
+        .sticky_bonus = max_ai_gain,
+    });
+
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .last_score = -0.01 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .last_score = max_ai_gain + 1.0 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .last_score = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .last_score = -std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .last_score = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .last_score = std.math.floatMax(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .commitment_remaining = types.max_ai_commitment_max_steps + 1 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = max_ai_gain + 1.0 }));
 }
 
 test "AiAgentStore.set retunes only cold personality fields, preserving hot arbitration state" {

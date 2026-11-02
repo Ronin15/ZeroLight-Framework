@@ -3626,6 +3626,73 @@ test "structural commands prevalidate ai agents before mutating" {
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
 }
 
+test "validateAiAgent rejects a create template outside the gain bounds and a later read sees only an accepted payload" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(existing, .{ .last_score = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(existing, .{ .commitment_remaining = 601 }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(existing, .{ .sticky_bonus = max_ai_gain + 1.0 }));
+    try std.testing.expect(data_test_support.aiAgent(&data, existing) == null);
+    try std.testing.expectEqual(@as(usize, 0), data.aiAgentSliceConst().entities.len);
+
+    try data.setAiAgent(existing, .{
+        .last_score = max_ai_gain,
+        .commitment_remaining = 600,
+        .sticky_bonus = max_ai_gain,
+    });
+    const accepted = data_test_support.aiAgent(&data, existing).?;
+    try std.testing.expectEqual(max_ai_gain, accepted.last_score);
+    try std.testing.expectEqual(@as(u16, 600), accepted.commitment_remaining);
+    try std.testing.expectEqual(max_ai_gain, accepted.sticky_bonus);
+
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(existing, .{ .sticky_bonus = max_ai_gain + 1.0 }));
+    const kept = data_test_support.aiAgent(&data, existing).?;
+    try std.testing.expectEqual(max_ai_gain, kept.last_score);
+    try std.testing.expectEqual(@as(u16, 600), kept.commitment_remaining);
+    try std.testing.expectEqual(max_ai_gain, kept.sticky_bonus);
+
+    const outside = [_]AiAgent{
+        .{ .last_score = std.math.nan(f32) },
+        .{ .commitment_remaining = 601 },
+        .{ .sticky_bonus = max_ai_gain + 1.0 },
+    };
+    for (outside) |agent| {
+        const commands = [_]StructuralCommand{
+            .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
+            .{ .create_entity = .{
+                .movement_body = testBody(2),
+                .ai_agent = agent,
+            } },
+        };
+        try std.testing.expectError(error.InvalidAiAgent, data.applyStructuralCommands(&commands));
+        try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+        try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+        try std.testing.expectEqual(@as(usize, 1), data.aiAgentSliceConst().entities.len);
+    }
+
+    const created_commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = testBody(2),
+            .ai_agent = .{
+                .last_score = max_ai_gain,
+                .commitment_remaining = 600,
+                .sticky_bonus = max_ai_gain,
+            },
+        } },
+    };
+    _ = try data.applyStructuralCommands(&created_commands);
+    const movement = data.movementBodySliceConst().entities;
+    const created = if (movement[0].eql(existing)) movement[1] else movement[0];
+    const created_agent = data_test_support.aiAgent(&data, created).?;
+    try std.testing.expectEqual(max_ai_gain, created_agent.last_score);
+    try std.testing.expectEqual(@as(u16, 600), created_agent.commitment_remaining);
+    try std.testing.expectEqual(max_ai_gain, created_agent.sticky_bonus);
+}
+
 test "structural commands prevalidate steering agents before mutating" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
