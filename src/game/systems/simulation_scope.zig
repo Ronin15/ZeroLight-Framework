@@ -479,9 +479,10 @@ pub const SimulationScopeSystem = struct {
         const n = self.ai_cognition_indices.items.len;
         if (n == 0) return;
         const grew = try data.ai_agents.ensureOrderImage(data.allocator, n);
-        const perception_grew = try data.ai_perceptions.ensurePackImage(data.allocator, n);
-        const memory_grew = try data.ai_memories.ensurePackImage(data.allocator, n);
-        const affect_grew = try data.ai_affects.ensurePackImage(data.allocator, n);
+        // Listed rows are a subset of the store. The image is reserved with the store.
+        const perception_grew = try data.ai_perceptions.ensurePackImage(data.allocator, data.ai_perceptions.len());
+        const memory_grew = try data.ai_memories.ensurePackImage(data.allocator, data.ai_memories.len());
+        const affect_grew = try data.ai_affects.ensurePackImage(data.allocator, data.ai_affects.len());
         try self.ensureThinkScratch(data.ai_agents.len());
         if (grew or perception_grew or memory_grew or affect_grew) self.noteThinkScratchGrow(n);
         // The image fill and the prefix copies are rounds of this pack. One sample.

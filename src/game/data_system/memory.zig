@@ -222,6 +222,7 @@ pub const AiMemoryStore = struct {
 
     pub fn ensureCapacity(self: *AiMemoryStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
+        try types.matchImageCapacity(AiMemoryRow, &self.pack_image, &self.rows, allocator);
     }
 };
 

@@ -304,12 +304,10 @@ pub const AiAgentStore = struct {
         return types.ensureGeometricImage(AiAgentRow, &self.order_image, allocator, count);
     }
 
-    /// Sizes the image for `live` sorted rows, at least the live store's capacity, so a swap
-    /// does not shrink the store. Returns whether the image capacity grew.
+    /// Sizes both lists to one capacity that holds `live` rows, so publishing by swap
+    /// does not shrink the store. Returns whether either capacity grew.
     pub fn prepareOrderImage(self: *AiAgentStore, allocator: std.mem.Allocator, live: usize) !bool {
-        // Exact capacity on both lists, so publishing by swap does not shrink either and
-        // the next step does not allocate.
-        const target = hotStoreCapacity(@max(live, @max(self.rows.capacity, self.order_image.capacity)));
+        const target = @max(live, @max(self.rows.capacity, self.order_image.capacity));
         if (self.order_image.len > target) self.order_image.len = target;
         var grew = false;
         if (self.order_image.capacity < target) {
@@ -356,6 +354,7 @@ pub const AiAgentStore = struct {
 
     pub fn ensureCapacity(self: *AiAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
+        try types.matchImageCapacity(AiAgentRow, &self.order_image, &self.rows, allocator);
     }
 };
 

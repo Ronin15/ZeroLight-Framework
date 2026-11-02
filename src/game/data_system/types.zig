@@ -50,6 +50,19 @@ pub fn ensureGeometricImage(comptime Row: type, image: *std.MultiArrayList(Row),
     return image.capacity > before;
 }
 
+/// Sets `image` capacity to `rows.capacity` when `image` is smaller.
+/// A failed `setCapacity` leaves `image` unchanged.
+pub fn matchImageCapacity(
+    comptime Row: type,
+    image: *std.MultiArrayList(Row),
+    rows: *const std.MultiArrayList(Row),
+    allocator: std.mem.Allocator,
+) !void {
+    const target = rows.capacity;
+    if (image.capacity >= target) return;
+    try image.setCapacity(allocator, target);
+}
+
 /// `u32` row index widened to a slice index. The store's growth seam rejects a longer list.
 pub fn u32Index(items: []const u32, index: usize) usize {
     return @intCast(items[index]);

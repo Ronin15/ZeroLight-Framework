@@ -213,6 +213,7 @@ pub const PerceptionStore = struct {
 
     pub fn ensureCapacity(self: *PerceptionStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
+        try types.matchImageCapacity(PerceptionRow, &self.pack_image, &self.rows, allocator);
     }
 };
 

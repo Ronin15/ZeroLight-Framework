@@ -245,6 +245,7 @@ pub const AiAffectStore = struct {
 
     pub fn ensureCapacity(self: *AiAffectStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
+        try types.matchImageCapacity(AffectRow, &self.pack_image, &self.rows, allocator);
     }
 };
 
