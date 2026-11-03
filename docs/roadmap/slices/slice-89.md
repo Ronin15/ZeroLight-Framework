@@ -141,8 +141,11 @@ fixture and grouped by chunk only if they cost there.
       targeted groups.
 - [ ] Every tuned case settles or its tuner merges or is removed. Measured
       (Debug suite, `6b7138e`): 21 `settled=no` cases, 15 of them
-      `production-step`; not rerun at four times the default pre-measure. Pass:
-      each rerun at four times the default pre-measure
+      `production-step`. Those 15 were rerun at four times the default
+      pre-measure (Debug, `x86_64_v2`, `--warmup 484`, code at `9bf93b0`
+      against `5d5a089`, `benchmark_outputs/ab-20261103-072747`) and stayed
+      `settled=no` on every config. The other six from `6b7138e` were not in
+      that run. Pass: each rerun at four times the default pre-measure
       (`.grok/rules/tests-benchmarks.md`); a tuner still unsettled is merged
       or removed (`.grok/rules/threading.md` § Building a stage), or, for a
       bench-only revert instance, the fixture fixed.

@@ -322,4 +322,12 @@ in its owning slice.
       `5d5a089` on any config; touched groups within run-to-run spread
       (tuned-versus-control measured after slice 89's tuner change, which gets
       its own whole-suite run; the `750ce0a` baseline predates it).
+      Measured (Debug, `x86_64_v2`, code at `9bf93b0`,
+      `benchmark_outputs/ab-20261103-072747`): the tuned case at four times
+      the default pre-measure (`--warmup 484`, 30 iterations) stayed
+      `settled=no` on all 15 configs, so those step times and main shares are
+      not judged (`.grok/rules/tests-benchmarks.md`). The three `stacked`
+      configs have no base at `5d5a089`. The default-warmup grid is
+      `benchmark_outputs/ab-20261103-072301`; its tuned rows were the same
+      `settled=no`.
 - [ ] `zig build verify` passes.
