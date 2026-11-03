@@ -49,8 +49,9 @@ model) or **local**, with its fix direction. A stated local fix on the
 landing under review routes to zig-specialist. A finding filed as a new
 slice item routes to zig-design-specialist, then zig-specialist. An open
 choice routes to design. A cost-model or data-layout miss in the code
-under review is fixed in that landing before commit. It is not left for
-a later slice. Structural goes to design, then implement. The redesign
+under review is sent back and fixed in that landing before commit.
+It is never passed on or left for a later slice. Structural goes to
+design, then implement. The redesign
 uses the decision criteria and does not keep today's shape because the
 edit is smaller.
 

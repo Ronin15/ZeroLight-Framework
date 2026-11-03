@@ -70,8 +70,8 @@ the step.
 Check the finished plan against the loaded rules for the steps it cites.
 The close checks in `zig-design-specialist.md` apply here too: the
 largest count passed into each reserved buffer, and each dispatch's
-begin count against `shapeBatch`. A cost-model miss is reworked in this
-branch, not deferred. A choice out of line uses the decision criteria
+begin count against `shapeBatch`. A cost-model miss is sent back and reworked, never passed on or
+carved out. A choice out of line uses the decision criteria
 and does not keep today's shape or the smaller edit.
 A failure goes back to the step it came from and is fixed there. Owner
 questions are `AGENTS.md` § Decision criteria. A rule that blocks the

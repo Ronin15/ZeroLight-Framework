@@ -49,6 +49,8 @@ Every design, and every fix touching storage or per-change work, states:
   a dense one-step change (an explosion region); creating or destroying a
   world, level, or dungeon; a population's per-step load (its requests,
   queries, and updates in every world). Concrete sizes only illustrate.
+- A miss of this cost model is sent back and reworked. It is not passed
+  on, carved out of the change that found it, or deferred.
 - Pass: local-change cost depends only on what changed, except reachability
   maintenance (`budgets-capacities.md`); a population's per-step load is O(1)
   per requester plus the distinct work requested (goals, regions, chunks),

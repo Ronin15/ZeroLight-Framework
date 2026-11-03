@@ -67,8 +67,10 @@ range count, and use the number at that line. Check the finished plan
 against the loaded rules for the steps it cites, the same check as the
 long path.
 
-A plan that misses the cost model does not close. Rework it in this
-branch. Do not defer the miss. A choice that is out of line is made by
+A plan that misses the cost model does not close. The miss is sent
+back and reworked. It is never passed on, carved out, or deferred.
+"Not reopened" and "not this item" do not close a miss the plan
+found. A choice that is out of line is made by
 the decision criteria: uniformity, scalability, best practice,
 efficiency, and speed. Do not keep a shape because it is what the code
 does today or because the edit is smaller. A departure from a rule's
