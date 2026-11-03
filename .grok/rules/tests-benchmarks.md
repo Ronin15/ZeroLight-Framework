@@ -7,9 +7,7 @@ The standard Zig layout; every change, plan, and review follows it.
 1. Production code holds only what production runs: no entry point,
    parameter, branch, field, stage, hook, path, or work that only tests or
    benches use, and no separate serial entry (the serial path:
-   `threading.md` § What runs where). A core primitive's SIMD twin is
-   production even when no hot loop calls it yet; the bench is updated to
-   measure it. The one sanctioned seam is
+   `threading.md` § What runs where). The one sanctioned seam is
    `ThreadSystem`'s fixed-shape dispatch options (`adaptive = false`,
    `items_per_range`, `batches_per_participant`, `max_worker_threads`),
    which tests and benches set to force a shape; production code never sets
@@ -120,12 +118,11 @@ The standard Zig layout; every change, plan, and review follows it.
 - Benches read production defaults, constants, layouts, and byte bounds
   (§ Test and production code, 3), never copies; a memory estimate is checked
   whole against live bytes.
-- A bench runs the production function on the target-scale shape that
-  function should hit. The demo and today's callers are not that shape.
-  When the fixture still shows the demo's call pattern, the bench is
-  changed to the wanted shape before its numbers are read. Code is tuned
-  for that shape. A bench that diverges from it is fixed before its
-  numbers are read.
+- A bench runs the production function on the shape that function hits in
+  play. A fixture that never reaches that shape is not a measure of the
+  path and is changed or removed. Code is tuned for the production step at
+  target scale, never toward a bench path production does not take; a bench
+  that diverges from production is fixed before its numbers are read.
 - Each group's doc states what it measures and its pass shape, and its
   asserts check that shape; exception: a branch's measuring landing states
   each finding's pass shape in the group doc and asserts only fixture

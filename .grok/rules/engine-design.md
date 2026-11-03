@@ -19,8 +19,7 @@ decisions are not reopened.
 - Engine core for a fully simulated, growing, multi-world colony simulator. A
   player entity is optional; one observer is targeted (the camera focus, or
   the player). The demo is a test harness: its sizes, populations, and counts
-  are never design, sizing, or acceptance inputs. Its call pattern is not a
-  reason to reject a target-scale shape.
+  are never design, sizing, or acceptance inputs.
 - Everything that exists keeps advancing, in every world: distance from the
   observer lowers fidelity, never progress (far-off AI thinks on slower ticks;
   cheap processors such as movement stay near full rate). Dormant is only for
@@ -61,11 +60,7 @@ Every design, and every fix touching storage or per-change work, states:
 - The serial and threaded paths (`threading.md`), and per hot loop SIMD via
   `src/core/simd.zig` or scalar with the reason (`memory-performance.md`
   § SIMD and core math), reusing the engine's proven SIMD and threaded SIMD
-  patterns. Threading and SIMD are standard, never optional. A design is
-  judged against that target-scale shape, not against the demo and not
-  against which callers exist today. A correct SIMD pair is not rejected
-  because no current loop calls the lane form. The bench for that shape
-  is part of the change (`tests-benchmarks.md`).
+  patterns. Threading and SIMD are standard, never optional.
 - Each order marked measured (bench group) or derived; a derived number is
   never presented as measured. Scaling benches measure each hot-path order at
   the worst-case shape its bound names (thin, long, deep, dense), not only

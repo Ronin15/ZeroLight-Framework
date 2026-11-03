@@ -67,12 +67,8 @@ range count, and use the number at that line. Check the finished plan
 against the loaded rules for the steps it cites, the same check as the
 long path.
 
-A plan is sorted against the target-scale shape, not against the demo
-and not against the callers that exist today. Rejecting a correct SIMD
-pair because nothing calls the lane form yet is a miss. The plan names
-the bench change that measures that shape. A plan that misses the cost
-model does not close. The miss is sent back and reworked. It is never
-passed on, carved out, or deferred.
+A plan that misses the cost model does not close. The miss is sent
+back and reworked. It is never passed on, carved out, or deferred.
 "Not reopened" and "not this item" do not close a miss the plan
 found. A choice that is out of line is made by
 the decision criteria: uniformity, scalability, best practice,
