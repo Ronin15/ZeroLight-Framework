@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), and the step-contract audit. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the intent and path-request reserves, the pipeline, the kernels, and acceptance. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, and the intent and path-request reserves. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the pipeline, and the kernels. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -243,9 +243,9 @@ in its owning slice.
       `finishWrite` cost. Event caps, `finishWrite`, and the other reserves
       follow the rows or fixed ceilings that write them (derived, no bench).
       The one miss is the item below.
-- [ ] Navigation, movement, and path-request reserves follow the rows that
+- [x] Navigation, movement, and path-request reserves follow the rows that
       write them, not `population()` (`reserveFrame`,
-      `simulation_pipeline.zig:1048-1051`; `PopulationRowCounts.population`,
+      `simulation_pipeline.zig:1061-1064`; `PopulationRowCounts.population`,
       `data_system/types.zig:161`). Navigation intents are one per AI think
       row (`ai.zig:470`). Movement intents and path requests are one per
       selected steering row (`steering/avoidance.zig:61`). Failure: bodies or

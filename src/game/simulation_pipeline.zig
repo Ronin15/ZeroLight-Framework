@@ -428,9 +428,10 @@ comptime {
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
 pub const SimulationPipelineConfig = struct {
     contact_capacity: usize = 0,
-    /// Initial population size for every population-sized capacity (scope, spatial
-    /// index, collision, steering, cognition gathers, plane scratch, event shares).
-    /// `init` raises it to the committed `DataSystem` rows; afterwards only
+    /// Initial size for the body-sized capacities (scope, collision, the spatial
+    /// index, steering scratch, cognition scratch, structural commands). Not
+    /// navigation intents, movement intents, or path requests. `init` raises it to
+    /// the committed `DataSystem` rows; afterwards only
     /// `SimulationPipeline.syncPopulationCapacity` grows it.
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
@@ -864,9 +865,18 @@ pub const SimulationPipeline = struct {
     plane_entry: PlaneEntrySystem,
     destructible: DestructibleController,
     audio_controller: AudioController,
-    /// Tracked logical population capacity: every population-sized pipeline capacity is
-    /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
+    /// Tracked logical capacity for the body-sized pipeline capacities: scope,
+    /// collision, the spatial index, steering scratch, cognition scratch, and
+    /// structural commands. Navigation intents, movement intents, and path requests
+    /// are not among them. Grown only by `syncPopulationCapacity`.
     movement_body_capacity: usize,
+    /// `frame.navigation_intents` value capacity: the committed AI rows at init,
+    /// then `grownPopulationCapacity` of those rows at the population seam.
+    navigation_intent_capacity: usize,
+    /// `frame.intents` and `frame.path_requests` value capacity: the committed
+    /// steering rows at init, then `grownPopulationCapacity` of those rows at the
+    /// population seam.
+    steering_stream_capacity: usize,
     /// Once-only flag for the first population-seam growth log.
     population_growth_logged: bool = false,
     /// Once-only flag for the first stored-trigger contact bound growth log.
@@ -1024,6 +1034,8 @@ pub const SimulationPipeline = struct {
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .movement_body_capacity = population,
+            .navigation_intent_capacity = rows.ai_agents,
+            .steering_stream_capacity = rows.steering_agents,
             .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
             .affect_max_events_per_step = affect_events_per_row_max * rows.ai_affects,
             .structural_headroom = config.structural_headroom,
@@ -1036,19 +1048,20 @@ pub const SimulationPipeline = struct {
         };
     }
 
-    /// Reserves `frame` for the tracked capacities: every population-sized stream the
-    /// pipeline's stages write (navigation and movement intents, structural commands,
-    /// path requests), each to the most ranges its writers dispatch at
-    /// `movement_body_capacity`, then `reserve` at that population (the event limit, the
+    /// Reserves `frame` for the tracked capacities. `navigation_intents` follow
+    /// `navigation_intent_capacity`, `intents` and path requests follow
+    /// `steering_stream_capacity`, and structural commands follow
+    /// `movement_body_capacity`, each to the most ranges its writers dispatch at
+    /// that capacity. Then `reserve` at the body capacity (the event limit, the
     /// cognition scratch, and the contact streams over the stored trigger pairs).
-    /// Grow-only. The production entry: state init calls it once after `init`, and the
-    /// population seam after each growth.
+    /// Grow-only. State init calls it once after `init`. The population seam calls it
+    /// when bodies or an event share grew; a stream-only growth does not.
     pub fn reserveFrame(self: *SimulationPipeline, frame: *SimulationFrame) !void {
         const body = self.movement_body_capacity;
-        try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), body);
-        try frame.intents.reserve(self.steeringStreamRangeCount(), body);
+        try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), self.navigation_intent_capacity);
+        try frame.intents.reserve(self.steeringStreamRangeCount(), self.steering_stream_capacity);
         try frame.structural_commands.reserve(self.structuralCommandRangeCount(), body + self.structuralCommandHeadroom());
-        try frame.reservePathRequests(self.steeringStreamRangeCount(), body);
+        try frame.reservePathRequests(self.steeringStreamRangeCount(), self.steering_stream_capacity);
         try self.reserve(frame, body);
     }
 
@@ -1130,16 +1143,16 @@ pub const SimulationPipeline = struct {
     }
 
     /// The most ranges steering's avoidance pass appends to `frame.intents` and to
-    /// `frame.path_requests` in one step at the tracked population (one of each per pass
-    /// range): the range count to reserve both streams to.
+    /// `frame.path_requests` in one step at `steering_stream_capacity` (one of each per
+    /// pass range): the range count to reserve both streams to.
     fn steeringStreamRangeCount(self: *const SimulationPipeline) usize {
-        return maxRangeCount(self.movement_body_capacity, steering_range_alignment_items);
+        return maxRangeCount(self.steering_stream_capacity, steering_range_alignment_items);
     }
 
-    // The most ranges `ai_decide` appends to `frame.navigation_intents` in one step at the
-    // tracked population.
+    // The most ranges `ai_decide` appends to `frame.navigation_intents` in one step at
+    // `navigation_intent_capacity`.
     fn navigationIntentRangeCount(self: *const SimulationPipeline) usize {
-        return maxRangeCount(self.movement_body_capacity, ai_intent_range_alignment_items);
+        return maxRangeCount(self.navigation_intent_capacity, ai_intent_range_alignment_items);
     }
 
     // The most ranges one step appends to `frame.structural_commands` at the tracked
@@ -1187,10 +1200,10 @@ pub const SimulationPipeline = struct {
         };
     }
 
-    /// Population growth seam, on main after the structural commit: O(1) unless the
-    /// population grew, then re-reserves every population-sized capacity. The only growth
-    /// point; grow-only, sized from committed row counts, so capacity never changes
-    /// behavior. After an error the tracked values are restored and the next seam retries.
+    /// Population growth seam, on main after the structural commit: O(1) unless a
+    /// tracked capacity is short, then grows it. The only growth point; grow-only,
+    /// sized from committed row counts, so capacity never changes behavior. After an
+    /// error the tracked values are restored and the next seam retries.
     pub fn syncPopulationCapacity(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
@@ -1199,6 +1212,8 @@ pub const SimulationPipeline = struct {
         const rows = data.populationRowCounts();
         const population = rows.population();
         if (population <= self.movement_body_capacity and
+            rows.ai_agents <= self.navigation_intent_capacity and
+            rows.steering_agents <= self.steering_stream_capacity and
             rows.ai_perceptions * perception_events_per_observer_max <= self.perception_max_events_per_step and
             rows.ai_affects * affect_events_per_row_max <= self.affect_max_events_per_step and
             self.pathfinding.coversAgentCount(rows.steering_agents))
@@ -1218,6 +1233,10 @@ pub const SimulationPipeline = struct {
         const population = rows.population();
         const old_body = self.movement_body_capacity;
         const body = if (population > old_body) grownPopulationCapacity(population) else old_body;
+        const old_navigation = self.navigation_intent_capacity;
+        const navigation = if (rows.ai_agents > old_navigation) grownPopulationCapacity(rows.ai_agents) else old_navigation;
+        const old_steering = self.steering_stream_capacity;
+        const steering = if (rows.steering_agents > old_steering) grownPopulationCapacity(rows.steering_agents) else old_steering;
         const old_perception_share = self.perception_max_events_per_step;
         const old_affect_share = self.affect_max_events_per_step;
         const perception_share = if (rows.ai_perceptions * perception_events_per_observer_max > old_perception_share)
@@ -1234,6 +1253,8 @@ pub const SimulationPipeline = struct {
         errdefer {
             self.collision.reserved_pair_bound = old_pair_bound;
             self.movement_body_capacity = old_body;
+            self.navigation_intent_capacity = old_navigation;
+            self.steering_stream_capacity = old_steering;
             self.perception_max_events_per_step = old_perception_share;
             self.affect_max_events_per_step = old_affect_share;
         }
@@ -1251,21 +1272,29 @@ pub const SimulationPipeline = struct {
         }
 
         self.movement_body_capacity = body;
+        self.navigation_intent_capacity = navigation;
+        self.steering_stream_capacity = steering;
         const shares_grew = perception_share != old_perception_share or affect_share != old_affect_share;
         self.perception_max_events_per_step = perception_share;
         self.affect_max_events_per_step = affect_share;
 
+        const streams_grew = navigation != old_navigation or steering != old_steering;
         if (body_grew or shares_grew) {
-            // The streams at `body`, the raised event limit, the cognition reserves, and the
-            // contact streams + response reserves to the grown pair bound.
+            // Frame streams, the event limit, the cognition reserves, and the contact
+            // streams at the tracked capacities.
             try self.reserveFrame(frame);
+        } else if (streams_grew) {
+            // `perception.reserve` writes one slot per body-cap range. Only these grew.
+            try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), self.navigation_intent_capacity);
+            try frame.intents.reserve(self.steeringStreamRangeCount(), self.steering_stream_capacity);
+            try frame.reservePathRequests(self.steeringStreamRangeCount(), self.steering_stream_capacity);
         }
 
         try growPathfindingForAgents(&self.pathfinding, rows.steering_agents);
 
-        if (body_grew or shares_grew) {
+        if (body_grew or shares_grew or streams_grew) {
             stats.grew = true;
-            if (!self.population_growth_logged) {
+            if ((body_grew or shares_grew) and !self.population_growth_logged) {
                 self.population_growth_logged = true;
                 if (comptime logging.enabled(.info)) logging.game.info(
                     "population seam grew pipeline capacity to {d} bodies",
@@ -7093,6 +7122,161 @@ test "population sync at an unchanged population allocates nothing" {
     swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
     try std.testing.expect(!(try unchanged).grew);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "population sync does not grow navigation, movement, or path-request streams when bodies or bounds exceed AI and steering rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..2) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+    try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.navigationIntentRangeCount());
+    try std.testing.expectEqual(@as(usize, 1), pipeline.steeringStreamRangeCount());
+
+    for (0..30) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    }
+    for (0..8) |_| {
+        const entity = try data.createEntity();
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    }
+    const navigation_values = frame.navigation_intents.values.capacity;
+    const navigation_counts = frame.navigation_intents.counts.capacity;
+    const intent_values = frame.intents.values.capacity;
+    const intent_counts = frame.intents.counts.capacity;
+    const request_values = frame.path_requests.values.capacity;
+    const request_counts = frame.path_requests.counts.capacity;
+
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.steeringStreamRangeCount());
+    try std.testing.expectEqual(navigation_values, frame.navigation_intents.values.capacity);
+    try std.testing.expectEqual(navigation_counts, frame.navigation_intents.counts.capacity);
+    try std.testing.expectEqual(intent_values, frame.intents.values.capacity);
+    try std.testing.expectEqual(intent_counts, frame.intents.counts.capacity);
+    try std.testing.expectEqual(request_values, frame.path_requests.values.capacity);
+    try std.testing.expectEqual(request_counts, frame.path_requests.counts.capacity);
+    try std.testing.expect(frame.structural_commands.values.capacity >= pipeline.movement_body_capacity + pipeline.structuralCommandHeadroom());
+}
+
+test "population sync grows navigation streams from AI rows and movement and path-request streams from steering rows under a larger body capacity" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..2) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 80,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+
+    for (0..10) |_| {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+    const intent_values = frame.intents.values.capacity;
+    const request_values = frame.path_requests.values.capacity;
+    const structural_values = frame.structural_commands.values.capacity;
+    const navigation_sync = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expect(navigation_sync.grew);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.navigationIntentRangeCount());
+    try std.testing.expect(frame.navigation_intents.values.capacity >= 48);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(intent_values, frame.intents.values.capacity);
+    try std.testing.expectEqual(request_values, frame.path_requests.values.capacity);
+    try std.testing.expectEqual(structural_values, frame.structural_commands.values.capacity);
+
+    const navigation_values = frame.navigation_intents.values.capacity;
+    for (0..10) |_| {
+        const entity = try data.createEntity();
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    const steering_sync = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expect(steering_sync.grew);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 3), pipeline.steeringStreamRangeCount());
+    try std.testing.expect(frame.intents.values.capacity >= 48);
+    try std.testing.expect(frame.path_requests.values.capacity >= 48);
+    try std.testing.expect(frame.intents.counts.capacity >= 3);
+    try std.testing.expect(frame.path_requests.counts.capacity >= 3);
+    try std.testing.expectEqual(navigation_values, frame.navigation_intents.values.capacity);
+}
+
+test "population sync that runs out of memory growing a stream capacity keeps the old capacities and the retry grows them" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..2) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 80,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+
+    for (0..10) |_| {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    swap.install(targets, .uniform(failing.allocator()));
+    const failed = pipeline.syncPopulationCapacity(&frame, &data);
+    swap.restore(targets);
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.navigation_intent_capacity);
+    try std.testing.expect(frame.navigation_intents.values.capacity >= 48);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
 }
 
 test "a population growth that fails after the collision reserve restores the declared pair bound" {
