@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, and the frame-log gate. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, and the stagger spread. Open: the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -37,49 +37,20 @@ in its owning slice.
 
 ### Checklist
 
-- [ ] Every agent keeps a spread stagger phase. Landed in `5c4babb`: the
-      overwrite is fixed; `stagger_phase` defaults to `keep_stagger_phase`
-      (`src/game/simulation_scope.zig:16`, `:158`), so
-      `setSimulationMetadata` without a phase keeps the append-assigned phase
-      (tests `a simulation metadata write keeps the row's stagger phase and
-      level unless it names them` and `a simulation metadata write takes the
-      level from the entity's world level row`,
-      `src/game/data_system/system.zig:1416`, `:1444`). Still open, the
-      assignment: the append stripes `stagger_phase = dense_index %
-      cognition_stagger_n` (`data_system/movement.zig:86`, n = 4,
-      `src/game/simulation_scope.zig:12`), which aliases with any spawn order
-      whose period shares a factor with n. The `production-step` spread
-      fixture places agents round-robin over levels (`level = agent %
-      fields.levels`, `src/benchmarks/production_step.zig:298`), so with 8
-      levels every agent on one level gets the same phase. Measured (Debug,
-      `production-step --items 1024008002048`, spread, 2,048 agents, 2,053
-      rows, serial, 3 iterations, tree at `0bcaa2f`,
-      `benchmark_outputs/ab-20261017-135307/tree_production-step_serial-direct_1.txt`):
-      cognition-tier rows 137, `scope_ai_stage_entities=1`,
-      `scope_stagger_skips=119`: the observer level's cognition lands on one
-      step in four. Failure scenario: a spawner with a period such as a
-      squad, a wave, or a per-level round-robin puts a whole group's
-      cognition on one phase, giving the per-step spike the stagger exists to
-      remove, and the `production-step` think counts that 75 and 88 cite
-      describe that step. Pass: phases spread within each group that thinks
-      together (level, cell), whatever the spawn order; a test with a
-      spawn order whose period shares a factor with
-      `cognition_stagger_n` that would fail with the index stripe
-      (`.grok/rules/tests-benchmarks.md` § Tests); serial == threaded; the
-      `production-step` bench samples whole stagger cycles (a sample of
-      fewer steps than one cycle, such as 3 iterations < 4, depends on which
-      steps it lands on) and reports per-step ai/steering max (or spread)
-      and thinking per step (`--details` prints only per-stage means today,
-      so a per-step spike cannot be read), so "max falls, mean unchanged" is
-      checkable. Phase is the think set's one membership test
-      (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`, over the
-      phase the index stores, `src/game/systems/spatial_index.zig:392`), so
-      spreading the phases changes membership only; per-entity phases stay
-      (`src/game/simulation_scope.zig:153-158`).
-      Neighbor-block sharing per step then falls to agents per cell ÷
-      `cognition_stagger_n` (derived: about 2.3 per key at the `ai` density,
-      whose benches think every agent; `production-step`'s census reports the
-      real figure).
+- [x] Every agent keeps a spread stagger phase. `append`
+      (`movement.zig:252`) stores `dense_index % cognition_stagger_n`
+      with `stagger_settled = false`. `commitStagger` (`:443`)
+      overwrites that from `nextStaggerResidue` (`:469`): the first AI
+      arrival in a `(level, cell)` takes that level's origin, and each
+      later arrival takes that cell's next residue. `cognitionJob`
+      (`systems/simulation_scope.zig:1975`) filters the index copy of
+      that phase. The spread test (`system.zig:1965`) expects `0..n-1`
+      where the stripe would alias. Item `1024008001024` printed
+      `thinking_step=24-24` on `serial-direct` and
+      `thread-adaptive-tuned-range`
+      (`.grok/rules/engine-design.md` § Cost model,
+      `.grok/rules/tests-benchmarks.md` § Benchmarks). Assignment is
+      derived. The balance is measured. Not the hot-pass layout item.
 - [ ] DataSystem hot-pass data layout (contiguity audit H5): the stores stay
       dense SoA; the stagger assignment and the cross-store reads are fixed in
       the layout (`.grok/rules/memory-performance.md` § Data-oriented
