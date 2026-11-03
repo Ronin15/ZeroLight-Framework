@@ -116,8 +116,7 @@
   sqrt, normalize, trig, interpolation, clamp, saturating conversion), and
   never add a helper that only wraps plain arithmetic.
 - Add a missing primitive to `core` as a paired scalar and SIMD form with
-  parity tests. The lane form lands in the same change as the production
-  loop that calls it.
+  parity tests. The lane form is not omitted because no loop calls it yet.
   A one-system kernel built from `core` primitives may stay
   local until reused.
 - Dense uniform float math over SoA columns uses `simd.zig` helpers, and its

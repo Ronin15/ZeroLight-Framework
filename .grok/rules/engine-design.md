@@ -63,10 +63,9 @@ Every design, and every fix touching storage or per-change work, states:
   § SIMD and core math), reusing the engine's proven SIMD and threaded SIMD
   patterns. Threading and SIMD are standard, never optional. A design is
   judged against that target-scale shape, not against the demo and not
-  against which callers exist today. The lane form and the production
-  caller that uses it land together. The bench measures that caller. A
-  form whose only caller is a bench does not land. The demo is not a
-  reason to omit the caller (`tests-benchmarks.md`).
+  against which callers exist today. A correct SIMD pair is not rejected
+  because no current loop calls the lane form. The bench for that shape
+  is part of the change (`tests-benchmarks.md`).
 - Each order marked measured (bench group) or derived; a derived number is
   never presented as measured. Scaling benches measure each hot-path order at
   the worst-case shape its bound names (thin, long, deep, dense), not only
