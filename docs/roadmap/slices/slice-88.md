@@ -310,11 +310,12 @@ in its owning slice.
 - [ ] The population seam sizes the neighbor index and the per-AI scratch by
       AI rows, never every movement body (code audit M2; the index is 84's).
       Failure: `spatial_index.reserve` takes the movement body capacity at
-      init and at the growth seam (`simulation_pipeline.zig:995`, `:1266`),
+      init and at the growth seam (`simulation_pipeline.zig:1000`, `:1277`),
       which is the max of bodies, steering, AI, and bounds
       (`PopulationRowCounts.population`, `data_system/types.zig:161`); the
       index only ever holds AI halo rows, and the perception, AI, affect, and
-      AI-memory scratch reserve the same (`:1075-1078`)
+      AI-memory scratch reserve the same (init `:1019-1022`, `reserve`
+      `:1081-1084`)
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/budgets-capacities.md`). Failure scenario (derived): a
       colony with 1M items at rest and 10k agents reserves index storage for
