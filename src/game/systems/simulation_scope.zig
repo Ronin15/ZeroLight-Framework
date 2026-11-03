@@ -173,7 +173,7 @@ pub const SimulationScopeSystem = struct {
     affect_pack: IndexList = .empty,
     band_moves: SlotList(BandMoveSlot) = .empty,
     pack_range_counts: SlotList(PackWindowCounts) = .empty,
-    // Run bounds from the last `orderThinkPhases`. Empty until that pass.
+    // Sorted think-key run prefixes from the last `orderThinkPhases`, not a row walk. Empty until that pass.
     aa_begin: u32 = 0,
     aa_halo_end: u32 = 0,
     aa_end: u32 = 0,
@@ -192,7 +192,7 @@ pub const SimulationScopeSystem = struct {
 
     /// Kept only with `runtime_perf_log.enabled`: the last think set's indexed halo entities
     /// whose stagger_phase did not match its step, and the out-of-halo suffixes of the
-    /// think-set runs (`publishRunBounds`).
+    /// sorted think-key run prefixes (`publishRunBounds`), not a row walk.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         stagger_skips: usize = 0,
         chunk_filtered_entities: usize = 0,
@@ -452,7 +452,8 @@ pub const SimulationScopeSystem = struct {
     };
 
     /// Orders every AI row into an always-active run and one run per stagger phase, cell-major
-    /// within each run, and publishes those bounds. One place dispatch and one sort dispatch.
+    /// within each run, and publishes those bounds as the sorted think key's run prefixes, not
+    /// a row walk. One place dispatch and one sort dispatch.
     /// Grows scratch on this thread before either dispatch; workers do not allocate.
     pub fn orderThinkPhases(
         self: *SimulationScopeSystem,
@@ -539,7 +540,7 @@ pub const SimulationScopeSystem = struct {
         data.ai_agents.publishOrderImage();
         self.compactBandMoves();
         if (self.move_dest.items.len != 0) self.dispatchAiRetie(data, thread_system, config, &self.think_order_retie_tuner);
-        self.publishRunBounds(data, cognition_region);
+        self.publishRunBounds();
     }
 
     /// Packs `ai_cognition_indices` into one span of the same entities, in that order, and
@@ -660,23 +661,50 @@ pub const SimulationScopeSystem = struct {
         return ThinkSort.splittersFromSamples(samples[0..count]);
     }
 
-    fn publishRunBounds(self: *SimulationScopeSystem, data: *const DataSystem, region: ?ActiveRegion) void {
-        const ai = data.aiAgentSliceConst();
-        const n: u32 = @intCast(ai.entities.len);
-        var i: u32 = 0;
+    fn publishRunBounds(self: *SimulationScopeSystem) void {
+        const keys = self.think_keys.items;
+        // One key per AI row. `ThinkKey.source` stores that row as u32.
+        const n: u32 = @intCast(keys.len);
         self.aa_begin = 0;
-        while (i < n and ai.always_active[i] and rowInHalo(ai.tier[i], true, ai.chunk_x[i], ai.chunk_y[i], region)) : (i += 1) {}
-        self.aa_halo_end = i;
-        while (i < n and ai.always_active[i]) : (i += 1) {}
-        self.aa_end = i;
-        for (0..4) |phase| {
+        var edge = thinkRunEdge(keys, true, 0, false);
+        self.aa_halo_end = edge;
+        edge = thinkRunEdge(keys, false, 0, true);
+        self.aa_end = edge;
+        self.phase_begin[0] = edge;
+        for (0..3) |phase| {
             const phase_id: u8 = @intCast(phase);
-            self.phase_begin[phase] = i;
-            while (i < n and !ai.always_active[i] and ai.stagger_phase[i] == phase_id and rowInHalo(ai.tier[i], false, ai.chunk_x[i], ai.chunk_y[i], region)) : (i += 1) {}
-            self.phase_halo_end[phase] = i;
-            while (i < n and !ai.always_active[i] and ai.stagger_phase[i] == phase_id) : (i += 1) {}
-            self.phase_end[phase] = i;
+            edge = thinkRunEdge(keys, false, phase_id, false);
+            self.phase_halo_end[phase] = edge;
+            edge = thinkRunEdge(keys, false, phase_id + 1, true);
+            self.phase_end[phase] = edge;
+            self.phase_begin[phase + 1] = edge;
         }
+        edge = thinkRunEdge(keys, false, 3, false);
+        self.phase_halo_end[3] = edge;
+        self.phase_end[3] = n;
+        var previous: u32 = 0;
+        const edges = [_]u32{
+            self.aa_begin,
+            self.aa_halo_end,
+            self.aa_end,
+            self.phase_begin[0],
+            self.phase_halo_end[0],
+            self.phase_end[0],
+            self.phase_begin[1],
+            self.phase_halo_end[1],
+            self.phase_end[1],
+            self.phase_begin[2],
+            self.phase_halo_end[2],
+            self.phase_end[2],
+            self.phase_begin[3],
+            self.phase_halo_end[3],
+            self.phase_end[3],
+        };
+        for (edges) |bound| {
+            std.debug.assert(previous <= bound);
+            previous = bound;
+        }
+        std.debug.assert(self.phase_end[3] == n);
         if (comptime runtime_perf_log.enabled) {
             // The in-halo prefixes are the gather. The suffixes are the rows the halo drops.
             var out_of_halo: usize = @intCast(self.aa_end - self.aa_halo_end);
@@ -1531,11 +1559,27 @@ fn rowInHalo(tier: SimulationTier, always_active: bool, chunk_x: i32, chunk_y: i
     return true;
 }
 
-fn packThinkKey(always_active: bool, phase: u8, in_halo: bool, level: u16, chunk_x: u32, chunk_y: u32, local_x: u32, local_y: u32, faction: u32, entity: u32) u128 {
+// Bits 127..124: always-active (0), stagger phase, in-halo (0).
+fn thinkGroupPrefix(always_active: bool, phase: u8, in_halo: bool) u128 {
+    std.debug.assert(cognition_stagger_n <= 4);
+    if (!always_active) std.debug.assert(phase < cognition_stagger_n);
     const aa_bit: u128 = if (always_active) 0 else 1;
     const phase_bits: u128 = if (always_active) 0 else phase;
     const halo_bit: u128 = if (in_halo) 0 else 1;
-    return (aa_bit << 127) | (phase_bits << 125) | (halo_bit << 124) |
+    return (aa_bit << 127) | (phase_bits << 125) | (halo_bit << 124);
+}
+
+fn orderThinkKey(prefix: u128, item: ThinkKey) std.math.Order {
+    return std.math.order(prefix, item.key);
+}
+
+fn thinkRunEdge(keys: []const ThinkKey, always_active: bool, phase: u8, in_halo: bool) u32 {
+    // The probe index is a row, and `ThinkKey.source` stores rows as u32.
+    return @intCast(std.sort.lowerBound(ThinkKey, keys, thinkGroupPrefix(always_active, phase, in_halo), orderThinkKey));
+}
+
+fn packThinkKey(always_active: bool, phase: u8, in_halo: bool, level: u16, chunk_x: u32, chunk_y: u32, local_x: u32, local_y: u32, faction: u32, entity: u32) u128 {
+    return thinkGroupPrefix(always_active, phase, in_halo) |
         (@as(u128, level) << 108) | (@as(u128, chunk_y & 0x7fff_ffff) << 77) | (@as(u128, chunk_x & 0x7fff_ffff) << 46) |
         (@as(u128, local_y) << 40) | (@as(u128, local_x) << 34) | (@as(u128, faction) << 32) | entity;
 }
@@ -3432,6 +3476,81 @@ test "think set phase runs are contiguous and cell-major" {
     for (halo) |index| try std.testing.expect(!agents.entities[index].eql(outside));
 }
 
+test "think order phase runs bound empty and split groups" {
+    const allocator = std.testing.allocator;
+    var threads = try inlineThreads();
+    defer threads.deinit();
+
+    var empty = DataSystem.init(allocator);
+    defer empty.deinit();
+    var empty_sys = SimulationScopeSystem.init(allocator);
+    defer empty_sys.deinit();
+    try empty_sys.orderThinkPhases(&empty, null, testThinkGrid(), &threads, .{});
+    _ = try empty_sys.gatherAiPopulations(&empty, null, &threads, .{});
+    try std.testing.expectEqual(@as(u32, 0), empty_sys.aa_begin);
+    try std.testing.expectEqual(@as(u32, 0), empty_sys.aa_halo_end);
+    try std.testing.expectEqual(@as(u32, 0), empty_sys.aa_end);
+    try std.testing.expectEqual([4]u32{ 0, 0, 0, 0 }, empty_sys.phase_begin);
+    try std.testing.expectEqual([4]u32{ 0, 0, 0, 0 }, empty_sys.phase_halo_end);
+    try std.testing.expectEqual([4]u32{ 0, 0, 0, 0 }, empty_sys.phase_end);
+
+    const Spec = struct {
+        tier: SimulationTier,
+        always_active: bool,
+        phase: u8,
+        chunk_x: i32,
+        chunk_y: i32,
+        previous_x: f32,
+        previous_y: f32,
+        at: usize,
+    };
+    // Created out of run order. `at` is the row after `orderThinkPhases`.
+    const specs = [_]Spec{
+        .{ .tier = .cognition, .always_active = false, .phase = 3, .chunk_x = 3, .chunk_y = 3, .previous_x = 0, .previous_y = 0, .at = 6 },
+        .{ .tier = .locomotion, .always_active = true, .phase = 0, .chunk_x = 1, .chunk_y = 1, .previous_x = 0, .previous_y = 0, .at = 2 },
+        .{ .tier = .cognition, .always_active = false, .phase = 2, .chunk_x = 30, .chunk_y = 30, .previous_x = 0, .previous_y = 0, .at = 5 },
+        .{ .tier = .cognition, .always_active = false, .phase = 0, .chunk_x = 0, .chunk_y = 0, .previous_x = 0, .previous_y = 0, .at = 3 },
+        .{ .tier = .cognition, .always_active = true, .phase = 0, .chunk_x = 40, .chunk_y = 40, .previous_x = 320, .previous_y = 320, .at = 1 },
+        .{ .tier = .cognition, .always_active = false, .phase = 2, .chunk_x = 2, .chunk_y = 2, .previous_x = 0, .previous_y = 0, .at = 4 },
+        .{ .tier = .cognition, .always_active = true, .phase = 0, .chunk_x = 1, .chunk_y = 1, .previous_x = 0, .previous_y = 0, .at = 0 },
+    };
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    var ids: [specs.len]EntityId = undefined;
+    for (specs) |spec| {
+        const id = try data.createEntity();
+        try data.setMovementBody(id, .{
+            .position = .{ .x = spec.previous_x, .y = spec.previous_y },
+            .previous_position = .{ .x = spec.previous_x, .y = spec.previous_y },
+        });
+        try data.setAiAgent(id, .{});
+        try data.setSimulationMetadata(id, .{
+            .tier = spec.tier,
+            .chunk = .{ .x = spec.chunk_x, .y = spec.chunk_y },
+            .stagger_phase = spec.phase,
+            .always_active = spec.always_active,
+        });
+        ids[spec.at] = id;
+    }
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    try sys.orderThinkPhases(&data, region, testThinkGrid(), &threads, .{});
+    const agents = data.aiAgentSliceConst();
+    try std.testing.expectEqual(ids.len, agents.entities.len);
+    for (ids, 0..) |id, row| try std.testing.expect(agents.entities[row].eql(id));
+    try std.testing.expectEqual(@as(u32, 0), sys.aa_begin);
+    try std.testing.expectEqual(@as(u32, 2), sys.aa_halo_end);
+    try std.testing.expectEqual(@as(u32, 3), sys.aa_end);
+    try std.testing.expectEqual([4]u32{ 3, 4, 4, 6 }, sys.phase_begin);
+    try std.testing.expectEqual([4]u32{ 4, 4, 5, 7 }, sys.phase_halo_end);
+    try std.testing.expectEqual([4]u32{ 4, 4, 6, 7 }, sys.phase_end);
+    try phaseRunIsCellMajor(&data, region, sys.aa_begin, sys.aa_end);
+    for (0..4) |phase| try phaseRunIsCellMajor(&data, region, sys.phase_begin[phase], sys.phase_end[phase]);
+    const halo = (try sys.gatherAiPopulations(&data, region, &threads, .{})).halo;
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 3, 4, 6 }, halo);
+}
+
 test "think scratch growth warns once" {
     const allocator = std.testing.allocator;
     var data = DataSystem.init(allocator);
@@ -3716,6 +3835,12 @@ test "threaded think order matches serial" {
     const fixed = ScopeConfig{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
     try serial_sys.orderThinkPhases(&serial_data, null, testThinkGrid(), &inline_threads, .{});
     try threaded_sys.orderThinkPhases(&threaded_data, null, testThinkGrid(), &workers, fixed);
+    try std.testing.expectEqual(serial_sys.aa_begin, threaded_sys.aa_begin);
+    try std.testing.expectEqual(serial_sys.aa_halo_end, threaded_sys.aa_halo_end);
+    try std.testing.expectEqual(serial_sys.aa_end, threaded_sys.aa_end);
+    try std.testing.expectEqual(serial_sys.phase_begin, threaded_sys.phase_begin);
+    try std.testing.expectEqual(serial_sys.phase_halo_end, threaded_sys.phase_halo_end);
+    try std.testing.expectEqual(serial_sys.phase_end, threaded_sys.phase_end);
     try std.testing.expectEqualSlices(EntityId, serial_data.aiAgentSliceConst().entities, threaded_data.aiAgentSliceConst().entities);
     const serial_halo = (try serial_sys.gatherAiPopulations(&serial_data, null, &inline_threads, .{})).halo;
     var serial_index = try testHaloIndex(&serial_data, serial_halo);
