@@ -826,6 +826,18 @@ pub inline fn dotFloat4(ax: Float4, ay: Float4, bx: Float4, by: Float4) Float4 {
     return addFloat4(mulFloat4(ax, bx), mulFloat4(ay, by));
 }
 
+/// Per-lane sine and cosine.
+pub const SinCos4 = struct {
+    sin: Float4,
+    cos: Float4,
+};
+
+/// SIMD counterpart of `math.sinCos`. Every lane is evaluated. A non-finite
+/// lane is NaN in both results; the caller masks the store.
+pub inline fn sinCosFloat4(angles: Float4) SinCos4 {
+    return .{ .sin = @sin(angles), .cos = @cos(angles) };
+}
+
 fn expectFloatArrayApprox(actual: [lane_count]f32, expected: [lane_count]f32) !void {
     for (actual, expected) |actual_value, expected_value| {
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 0.001);
@@ -1313,6 +1325,38 @@ test "lengthDirection2Float4 matches math.lengthDirection in every lane" {
             }
         }
     }
+}
+
+test "sinCosFloat4 matches math.sinCos lane-for-lane" {
+    const pi: f32 = std.math.pi;
+    const finite = [_]Float4{
+        float4(0, 0.35, -0.2, 1.1),
+        float4(-0.0, pi / 2.0, -pi / 2.0, pi),
+        float4(-2.5, 1.0e6, pi + 0.5, -pi),
+    };
+    for (finite) |angles| {
+        const lanes = sinCosFloat4(angles);
+        const sines = toFloatArray(lanes.sin);
+        const cosines = toFloatArray(lanes.cos);
+        const angle_lanes = toFloatArray(angles);
+        for (0..lane_count) |lane| {
+            const expected = math.sinCos(angle_lanes[lane]);
+            try std.testing.expectEqual(@as(u32, @bitCast(expected.sin)), @as(u32, @bitCast(sines[lane])));
+            try std.testing.expectEqual(@as(u32, @bitCast(expected.cos)), @as(u32, @bitCast(cosines[lane])));
+        }
+    }
+
+    const mixed = float4(std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 0);
+    const mixed_lanes = sinCosFloat4(mixed);
+    const mixed_sines = toFloatArray(mixed_lanes.sin);
+    const mixed_cosines = toFloatArray(mixed_lanes.cos);
+    for (mixed_sines[0 .. lane_count - 1], mixed_cosines[0 .. lane_count - 1]) |sine, cosine| {
+        try std.testing.expect(std.math.isNan(sine));
+        try std.testing.expect(std.math.isNan(cosine));
+    }
+    const zero = math.sinCos(0);
+    try std.testing.expectEqual(@as(u32, @bitCast(zero.sin)), @as(u32, @bitCast(mixed_sines[lane_count - 1])));
+    try std.testing.expectEqual(@as(u32, @bitCast(zero.cos)), @as(u32, @bitCast(mixed_cosines[lane_count - 1])));
 }
 
 test "lerpVec2Float4 matches scalar math.lerpVec2 lane-for-lane with distinct per-lane amounts" {

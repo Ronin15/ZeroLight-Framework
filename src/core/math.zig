@@ -158,7 +158,7 @@ pub const SinCos = struct {
     cos: f32,
 };
 
-/// Evaluates `@sin`/`@cos` of `angle` (radians) together.
+/// `@sin`/`@cos` of one angle (radians). The per-lane form is `simd.sinCosFloat4`.
 pub fn sinCos(angle: f32) SinCos {
     return .{ .sin = @sin(angle), .cos = @cos(angle) };
 }

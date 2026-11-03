@@ -791,17 +791,11 @@ fn writeSpriteLanes(columns: *const PreparedSpriteColumns, base: usize, count: u
     std.debug.assert(base + count <= columns.rotation.len);
     std.debug.assert((base + count) * 6 <= out.positions.len);
 
-    // simd.zig has no sin/cos, and each sprite has its own angle, so only live
-    // lanes are evaluated and then packed. A dead lane is not sined.
-    var sine_lanes = [_]f32{ 0, 0, 0, 0 };
-    var cosine_lanes = [_]f32{ 0, 0, 0, 0 };
-    for (0..count) |lane| {
-        const angle = math.sinCos(columns.rotation[base + lane]);
-        sine_lanes[lane] = angle.sin;
-        cosine_lanes[lane] = angle.cos;
-    }
-    const sine = simd.loadFloat4Lanes(&sine_lanes, count);
-    const cosine = simd.loadFloat4Lanes(&cosine_lanes, count);
+    // One lane sin/cos of the loaded rotation; inactive lanes are the prefix
+    // fill and are not stored.
+    const rotation = simd.sinCosFloat4(simd.loadFloat4Lanes(columns.rotation[base..], count));
+    const sine = rotation.sin;
+    const cosine = rotation.cos;
 
     const origin_x = simd.loadFloat4Lanes(columns.origin_x[base..], count);
     const origin_y = simd.loadFloat4Lanes(columns.origin_y[base..], count);

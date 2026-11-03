@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, and the index-key tail. Open: the run-bounds scan, stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, sprite sin/cos lanes, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, and the sprite sin/cos lanes. Open: the run-bounds scan, stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -335,15 +335,13 @@ in its owning slice.
       Slot resolve inside a group stays scalar
       (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
       no bench.
-- [ ] Sprite lanes use a core sin/cos lane primitive (`writeSpriteLanes`,
-      `sprite_batch.zig:794`). `simd.zig` has no sin/cos lanes, so each
-      sprite calls `math.sinCos`. Failure: every sprite batch evaluates
-      trig outside the lane kernel. Pass: per-sprite sin/cos is a core
-      lane primitive with a scalar twin and a parity test, and
-      `writeSpriteLanes` uses it for every live lane. The 6-vertex store
-      stays as slice 87 landed (`.grok/rules/memory-performance.md`
-      § SIMD and core math). Derived, no bench. How is open.
-      `writeSpriteQuad` stays the one-angle scalar call.
+- [x] Sprite lanes use a core sin/cos lane primitive (`sinCosFloat4`,
+      `simd.zig:837`; `writeSpriteLanes`, `sprite_batch.zig:789`). One
+      call per group, tail included. Finite lanes match `math.sinCos`
+      (`math.zig:162`). Inactive lanes are not stored. `writeSpriteQuad`
+      stays the one-angle scalar call. The 6-vertex store is unchanged
+      (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
+      no bench.
 - [ ] The saturating ceil is a core primitive (`cellScanRadius`,
       `spatial_index.zig:1299`). It is `lossyCast` of `@ceil`. `floorToI32`
       is the floor twin. Every neighbor query and each perception gather
