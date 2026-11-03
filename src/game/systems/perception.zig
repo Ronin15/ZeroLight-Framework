@@ -59,7 +59,6 @@ const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborLanes = spatial_index_mod.NeighborLanes;
 const LaneStop = spatial_index_mod.LaneStop;
 const capLanes = spatial_index_mod.capLanes;
-const cellScanRadius = spatial_index_mod.cellScanRadius;
 const FactionSet = @import("../faction.zig").FactionSet;
 
 /// Range alignment of the compute stage, which writes its rows' facing and
@@ -522,7 +521,7 @@ const PerceptionGatherInputs = struct {
             .faction = self.ai_agents.faction[i],
             .level = self.ai_agents.level[i],
             // Non-negative: the vision range is at least 0.
-            .scan_box = @intCast(cellScanRadius(vision_range, self.cell_size)),
+            .scan_box = @intCast(math.ceilToI32(vision_range / self.cell_size)),
             .perception_dense_index = perception_index,
             .facing_x = perception.facing_x[perception_index],
             .facing_y = perception.facing_y[perception_index],
@@ -1680,6 +1679,36 @@ test "observers with interleaved vision boxes in one cell each read their own bo
         try testing.expectEqual(range == 200, perception.target_visible);
         try testing.expect(perception.nearest_threat.eql(if (range == 200) far else EntityId.invalid));
     }
+}
+
+test "a kept gather row's vision box ceils 16, 32, and 48 and saturates a huge range" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    _ = try addObserver(&data, 10, 10, 0, 0, .player, .{ .vision_range = 16 });
+    _ = try addObserver(&data, 10, 10, 0, 0, .player, .{ .vision_range = 32 });
+    _ = try addObserver(&data, 10, 10, 0, 0, .player, .{ .vision_range = 48 });
+    const huge = try addObserver(&data, 20, 10, 0, 0, .player, .{ .vision_range = 32 });
+    const dense = data.aiPerceptionDenseIndex(huge).?;
+    const perception_rows = data.ai_perceptions.rows.slice();
+    perception_rows.items(.vision_range)[dense] = 1.0e30;
+
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    try testing.expectEqual(@as(f32, 32), spatial_sys.view().cell_size);
+    var world = try minimalWorld(testing.allocator, 16, 16, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    try testing.expectEqual(@as(usize, 4), sys.rows.len);
+    const scan_box = sys.rows.slice().items(.scan_box);
+    try testing.expectEqual(@as(u32, 1), scan_box[0]);
+    try testing.expectEqual(@as(u32, 1), scan_box[1]);
+    try testing.expectEqual(@as(u32, 2), scan_box[2]);
+    try testing.expectEqual(@as(u32, @intCast(std.math.maxInt(i32))), scan_box[3]);
 }
 
 test "an observer behind 256 allies finds the hostile past them" {

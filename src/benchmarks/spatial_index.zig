@@ -486,7 +486,7 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .field => @as(f32, @floatFromInt(fields.axis)) * chunk_world / 4,
         .dense_cell => cell_size,
     };
-    const box_cells: u32 = 2 * @as(u32, @intFromFloat(@ceil(radius / cell_size))) + 1;
+    const box_cells: u32 = 2 * @as(u32, @intCast(math.ceilToI32(radius / cell_size))) + 1;
     switch (fields.shape) {
         .field => {
             const stated_chunks = statedBoxChunks(fields.axis) orelse return error.UnstatedQueryRadius;
@@ -640,7 +640,7 @@ fn queryOrder(allocator: std.mem.Allocator, index: SpatialIndexView) ![]u32 {
 // itself, and its visits of its factions.
 fn checkQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, order: []const u32, radius: f32, factions: FactionSet, counts: *const FactionCellCounts) void {
     const index = system.view();
-    const scan_radius: u32 = @intFromFloat(@ceil(radius / index.cell_size));
+    const scan_radius: u32 = @as(u32, @intCast(math.ceilToI32(radius / index.cell_size)));
     var block = QueryBlock{};
     for (order) |slot| {
         const query = slotQuery(fixture, slot, radius, factions);

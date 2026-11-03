@@ -94,7 +94,6 @@ const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
 const separation_radius = @import("../game/systems/ai.zig").separation_radius;
 const boxAxisCells = @import("../game/systems/spatial_index.zig").boxAxisCells;
-const cellScanRadius = @import("../game/systems/spatial_index.zig").cellScanRadius;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
@@ -579,7 +578,7 @@ fn checkStaggerBalance(item_count: usize, summary: *const suite.ProductionStepSu
 }
 
 fn checkStackedSeparation(allocator: std.mem.Allocator, summary: *suite.ProductionStepSummary, fields: StepFields, record: *const CellSpanRecord) !void {
-    const scan_radius: u32 = @intCast(cellScanRadius(separation_radius, record.cell_size));
+    const scan_radius: u32 = @intCast(math.ceilToI32(separation_radius / record.cell_size));
     const bound = try record.oneLevelBoxBound(allocator, fields.levels, scan_radius);
     summary.separation_check_bound = bound;
     summary.max_cell_drift = record.maxDrift();

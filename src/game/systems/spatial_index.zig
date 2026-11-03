@@ -550,7 +550,7 @@ fn blockKey(view: *const SpatialIndexView, query: NeighborQuery) BlockKey {
     const wanted = query.factions.bits.intersectWith(view.factions.bits);
     if (wanted.mask == 0 or query.level >= view.level_slots.len) return empty_key;
     // Non-negative and below maxInt(i32).
-    const scan_box: u32 = @intCast(cellScanRadius(query.radius, view.cell_size));
+    const scan_box: u32 = @intCast(math.ceilToI32(query.radius / view.cell_size));
     const own_x = math.worldPosToCell(query.x, view.cell_size, view.cells_x);
     const own_y = math.worldPosToCell(query.y, view.cell_size, view.cells_y);
     return (@as(BlockKey, query.level) << block_key_level_shift) | (@as(BlockKey, own_y) << block_key_own_y_shift) |
@@ -1294,11 +1294,6 @@ fn cellTotal(tallies: [band_count]BandTally) usize {
 }
 
 // ---- Build stages -------------------------------------------------------------
-
-/// ceil(radius / cell_size) cells, saturated at maxInt(i32): a query's scan box half-width.
-pub fn cellScanRadius(radius: f32, cell_size: f32) i32 {
-    return std.math.lossyCast(i32, @ceil(radius / cell_size));
-}
 
 // A key's bits below its cell: the slot.
 const cell_low_bits: SortKey = (@as(SortKey, 1) << key_cell_shift) - 1;
@@ -2854,7 +2849,7 @@ const BruteCandidate = struct {
 fn bruteForceVisits(index: SpatialIndexView, tags: *const EntryTags, query: NeighborQuery, expected: *RecordingVisitor) NeighborQueryStats {
     var candidates: [512]BruteCandidate = undefined;
     var candidate_count: usize = 0;
-    const scan = cellScanRadius(query.radius, index.cell_size);
+    const scan = math.ceilToI32(query.radius / index.cell_size);
     const own_x = math.worldPosToCell(query.x, index.cell_size, index.cells_x);
     const own_y = math.worldPosToCell(query.y, index.cell_size, index.cells_y);
     for (0..index.x.len) |entry| {
@@ -3347,9 +3342,6 @@ test "a scan box axis spans its radius either side of its cell, clamped to the g
 }
 
 test "a radius of 1e30 scans the whole level without overflow" {
-    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), cellScanRadius(1e30, 32));
-    for ([_]f32{ 0, 16, 32, 48 }, [_]i32{ 0, 1, 1, 2 }) |radius, cells| try testing.expectEqual(cells, cellScanRadius(radius, 32));
-
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     try fillBruteForceLayout(&data);

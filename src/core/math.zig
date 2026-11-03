@@ -37,6 +37,13 @@ pub fn floorToI32(value: f32) i32 {
     return std.math.lossyCast(i32, @floor(value));
 }
 
+/// Ceils `value` to an `i32`, saturating non-finite and out-of-range inputs,
+/// the same `@intFromFloat` guard as `floorToI32` (NaN becomes 0, either `i32`
+/// limit sticks).
+pub fn ceilToI32(value: f32) i32 {
+    return std.math.lossyCast(i32, @ceil(value));
+}
+
 /// World-space coordinate → tile/cell index, clamped to `[0, max_cells - 1]`.
 /// Clamps before narrowing so inf/NaN/out-of-range positions can never reach
 /// the integer cast — the single safe chokepoint for world-pos → grid math.
@@ -191,6 +198,25 @@ test "floorToI32 floors finite values and saturates non-finite ones" {
     try std.testing.expectEqual(std.math.maxInt(i32), floorToI32(std.math.inf(f32)));
     try std.testing.expectEqual(std.math.minInt(i32), floorToI32(-std.math.inf(f32)));
     try std.testing.expectEqual(std.math.maxInt(i32), floorToI32(1.0e30));
+}
+
+test "ceilToI32 ceils finite values and saturates non-finite ones" {
+    try std.testing.expectEqual(@as(i32, 4), ceilToI32(3.2));
+    try std.testing.expectEqual(@as(i32, -3), ceilToI32(-3.2));
+    try std.testing.expectEqual(@as(i32, 3), ceilToI32(3.0));
+    try std.testing.expectEqual(@as(i32, -3), ceilToI32(-3.0));
+    try std.testing.expectEqual(@as(i32, 0), ceilToI32(0));
+    try std.testing.expectEqual(@as(i32, 0), ceilToI32(-0.0));
+    try std.testing.expectEqual(@as(i32, 0), ceilToI32(std.math.nan(f32)));
+    try std.testing.expectEqual(std.math.maxInt(i32), ceilToI32(std.math.inf(f32)));
+    try std.testing.expectEqual(std.math.minInt(i32), ceilToI32(-std.math.inf(f32)));
+    try std.testing.expectEqual(std.math.maxInt(i32), ceilToI32(1.0e30));
+    try std.testing.expectEqual(std.math.minInt(i32), ceilToI32(-1.0e30));
+    try std.testing.expectEqual(@as(i32, 0), ceilToI32(0.0 / 32.0));
+    try std.testing.expectEqual(@as(i32, 1), ceilToI32(16.0 / 32.0));
+    try std.testing.expectEqual(@as(i32, 1), ceilToI32(32.0 / 32.0));
+    try std.testing.expectEqual(@as(i32, 2), ceilToI32(48.0 / 32.0));
+    try std.testing.expectEqual(std.math.maxInt(i32), ceilToI32(1.0e30 / 32.0));
 }
 
 test "worldPosToCell clamps and saturates before narrowing" {

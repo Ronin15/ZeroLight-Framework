@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, and the run-bounds scan. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, and the saturating ceil. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -341,15 +341,14 @@ in its owning slice.
       stays the one-angle scalar call. The 6-vertex store is unchanged
       (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
       no bench.
-- [ ] The saturating ceil is a core primitive (`cellScanRadius`,
-      `spatial_index.zig:1299`). It is `lossyCast` of `@ceil`. `floorToI32`
-      is the floor twin. Every neighbor query and each perception gather
-      row calls it. Failure: a non-finite or huge radius depends on this
-      copy staying aligned with `floorToI32`. Pass: the query and the
-      gather use a core primitive with `floorToI32`'s saturation contract.
-      A lane form is required only if a dense column loop evaluates it
-      (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
-      no bench. How is open.
+- [x] The saturating ceil is `ceilToI32` (`math.zig:43`), `lossyCast`
+      of `@ceil`, the same saturation contract as `floorToI32`.
+      `cellScanRadius` is gone. `blockKey` (`spatial_index.zig:553`) and
+      `gatherRow` (`perception.zig:524`) each call it once on the
+      quotient. A query ceils once, before its candidate loop. A kept
+      gather row ceils once. No dense column of radii, so no lane form
+      (`.grok/rules/memory-performance.md` § SIMD and core math).
+      Derived, no bench.
 - [ ] Contact loudness uses a core clamp (`penetrationScale`,
       `contact_query.zig:30`). It calls `std.math.clamp`. Failure: a
       non-finite penetration takes that result instead of the core clamp.

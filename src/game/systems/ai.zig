@@ -3031,7 +3031,7 @@ test "ai computeBoundedSeparation matches a one-cell lane-order reference bit-fo
 
 // The index's default cell size, which `testSpatialIndex` builds at.
 const test_cell_size: f32 = (spatial_index.SpatialIndexConfig{}).cell_size;
-const test_separation_scan_radius: i32 = @intFromFloat(@ceil(separation_radius / test_cell_size));
+const test_separation_scan_radius: i32 = math.ceilToI32(separation_radius / test_cell_size);
 
 // Reconstructs the index's order from raw positions: with one faction, one level, and one
 // chunk it is (cell_y, cell_x, index), one stream whose lanes count every in-box entry, self
