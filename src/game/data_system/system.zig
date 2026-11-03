@@ -1380,13 +1380,43 @@ pub const DataSystem = struct {
         }
     }
 
-    /// Rewrites every AI row's slot index and its movement row's `ai_row` after a full reorder.
-    pub fn retieAiRows(self: *DataSystem) void {
+    /// Points each listed row's entity slot and AI component column at that row.
+    /// Scalar: each write addresses another row's slot or back-pointer.
+    pub fn retiePackedIndices(self: *DataSystem, column: PackedColumn, indices: []const u32) void {
+        const entities = switch (column) {
+            .perception => self.ai_perceptions.sliceConst().entities,
+            .memory => self.ai_memories.sliceConst().entities,
+            .affect => self.ai_affects.sliceConst().entities,
+        };
+        const ai_rows = self.ai_agents.rows.slice();
+        const ai_column = switch (column) {
+            .perception => ai_rows.items(.perception_row),
+            .memory => ai_rows.items(.memory_row),
+            .affect => ai_rows.items(.affect_row),
+        };
+        for (indices) |index| {
+            const entity = entities[index];
+            const slot = &self.slots.items[@intCast(entity.index)];
+            switch (column) {
+                .perception => slot.ai_perception_index = index,
+                .memory => slot.ai_memory_index = index,
+                .affect => slot.ai_affect_index = index,
+            }
+            if (slot.ai_agent_index) |ai| ai_column[ai] = index;
+        }
+    }
+
+    /// Points each listed AI row's entity slot and movement `ai_row` at that row.
+    /// Scalar: each write addresses another row's slot or back-pointer.
+    pub fn retieAiIndices(self: *DataSystem, indices: []const u32) void {
         const rows = self.ai_agents.sliceConst();
         const movement_ai = self.movement_bodies.aiRowColumn();
-        for (rows.entities, rows.movement_row, 0..) |entity, movement, i| {
-            self.slots.items[@intCast(entity.index)].ai_agent_index = @intCast(i);
-            if (movement != no_component_row) movement_ai[movement] = @intCast(i);
+        for (indices) |index| {
+            const row: usize = index;
+            const entity = rows.entities[row];
+            self.slots.items[@intCast(entity.index)].ai_agent_index = index;
+            const movement = rows.movement_row[row];
+            if (movement != no_component_row) movement_ai[movement] = index;
         }
     }
 

@@ -36,6 +36,7 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
@@ -150,6 +151,12 @@ pub const SimulationScopeSystem = struct {
     think_order_place_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     think_order_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     think_pack_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // Order and pack retie are different populations, so they do not share a tuner.
+    // Hole classify and optional retie are rounds of their own passes.
+    think_order_retie_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    think_pack_retie_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    think_pack_hole_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    optional_retie_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     think_keys: ThinkKeyList = .empty,
     think_staging: ThinkKeyList = .empty,
     think_offsets: SlotList(BandOffsets) = .empty,
@@ -157,6 +164,15 @@ pub const SimulationScopeSystem = struct {
     pack_stamp_id: u32 = 1,
     pack_holes: IndexList = .empty,
     pack_outside: IndexList = .empty,
+    /// Moved dense indexes. Order regions are aligned per band; the pack retie list
+    /// appends outside indexes after the moved destinations.
+    move_dest: IndexList = .empty,
+    move_source: IndexList = .empty,
+    perception_pack: IndexList = .empty,
+    memory_pack: IndexList = .empty,
+    affect_pack: IndexList = .empty,
+    band_moves: SlotList(BandMoveSlot) = .empty,
+    pack_range_counts: SlotList(PackWindowCounts) = .empty,
     // Run bounds from the last `orderThinkPhases`. Empty until that pass.
     aa_begin: u32 = 0,
     aa_halo_end: u32 = 0,
@@ -190,10 +206,21 @@ pub const SimulationScopeSystem = struct {
             .think_order_place_tuner = AdaptiveWorkTuner.init(.{}),
             .think_order_tuner = AdaptiveWorkTuner.init(.{}),
             .think_pack_tuner = AdaptiveWorkTuner.init(.{}),
+            .think_order_retie_tuner = AdaptiveWorkTuner.init(.{}),
+            .think_pack_retie_tuner = AdaptiveWorkTuner.init(.{}),
+            .think_pack_hole_tuner = AdaptiveWorkTuner.init(.{}),
+            .optional_retie_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
     pub fn deinit(self: *SimulationScopeSystem) void {
+        self.pack_range_counts.deinit(self.allocator);
+        self.band_moves.deinit(self.allocator);
+        self.affect_pack.deinit(self.allocator);
+        self.memory_pack.deinit(self.allocator);
+        self.perception_pack.deinit(self.allocator);
+        self.move_source.deinit(self.allocator);
+        self.move_dest.deinit(self.allocator);
         self.pack_outside.deinit(self.allocator);
         self.pack_holes.deinit(self.allocator);
         self.pack_stamp.deinit(self.allocator);
@@ -226,6 +253,7 @@ pub const SimulationScopeSystem = struct {
         try self.pack_stamp.ensureTotalCapacity(self.allocator, capacity);
         try self.pack_holes.ensureTotalCapacity(self.allocator, capacity);
         try self.pack_outside.ensureTotalCapacity(self.allocator, capacity);
+        try self.ensureMoveScratch(capacity);
     }
 
     /// Increment the step counter. Call once at the top of each fixed step.
@@ -445,6 +473,8 @@ pub const SimulationScopeSystem = struct {
                 .range_alignment_items = think_column_alignment,
                 .adaptive = config.adaptive,
             });
+            setSlotCount(BandMoveSlot, &self.band_moves, banded_sort.band_count);
+            self.placeBandMoveRegions(&starts);
             var sort_job = ThinkSortJob{
                 .source = .{
                     .staging = self.think_staging.items,
@@ -455,6 +485,8 @@ pub const SimulationScopeSystem = struct {
                 .starts = starts,
                 .agents = &data.ai_agents,
                 .range_count = selection.range_count,
+                .move_dest = self.move_dest.items,
+                .bands = self.band_moves.items,
             };
             _ = thread_system.parallelForWithOptions(n, &sort_job, thinkSortJob, .{
                 .max_worker_threads = selection.worker_threads,
@@ -464,7 +496,8 @@ pub const SimulationScopeSystem = struct {
             });
         }
         data.ai_agents.publishOrderImage();
-        data.retieAiRows();
+        self.compactBandMoves();
+        if (self.move_dest.items.len != 0) self.dispatchAiRetie(data, thread_system, config, &self.think_order_retie_tuner);
         self.publishRunBounds(data, cognition_region);
     }
 
@@ -493,15 +526,36 @@ pub const SimulationScopeSystem = struct {
             .adaptive = config.adaptive,
         }), n, think_column_alignment);
         const items_per_range = rounds.selection.?.items_per_range;
+        const pack_ranges = rounds.selection.?.range_count;
+        self.growStamp(data.ai_agents.len());
+        const stamp = self.bumpStamp();
+        self.prepareAiPackWindows(n, pack_ranges);
         var copy_job = ThinkPackJob{
             .agents = &data.ai_agents,
             .perm = self.ai_cognition_indices.items,
             .items_per_range = items_per_range,
+            .prefix = @intCast(n),
+            .stamp = self.pack_stamp.items,
+            .stamp_id = stamp,
+            .move_dest = self.move_dest.items,
+            .move_source = self.move_source.items,
+            .perception = self.perception_pack.items,
+            .memory = self.memory_pack.items,
+            .affect = self.affect_pack.items,
+            .counts = self.pack_range_counts.items,
         };
         var copy = ThinkCopy{ .rounds = &rounds, .items_per_range = items_per_range };
-        copy.dispatch(n, &copy_job, thinkPackJob);
-        try self.installThinkSpan(data, n, &copy);
+        const copy_ranges = copy.dispatch(n, &copy_job, thinkPackJob);
+        std.debug.assert(copy_ranges == pack_ranges);
+        var side = ThinkPackSide{
+            .thread_system = thread_system,
+            .config = config,
+            .span = n,
+        };
+        try self.installThinkSpan(data, n, &copy, &side, copy_ranges);
         _ = rounds.finish(n);
+        if (side.hole) |*hole| _ = hole.finish(n);
+        if (side.optional_retie) |*retie| _ = retie.finish(n);
     }
 
     fn clearThinkRuns(self: *SimulationScopeSystem) void {
@@ -516,12 +570,29 @@ pub const SimulationScopeSystem = struct {
 
     fn ensureThinkScratch(self: *SimulationScopeSystem, count: usize) !void {
         const before = self.think_keys.capacity;
+        const move_before = self.move_dest.capacity;
         try self.think_keys.ensureTotalCapacity(self.allocator, count);
         try self.think_staging.ensureTotalCapacity(self.allocator, count);
         try self.pack_stamp.ensureTotalCapacity(self.allocator, count);
         try self.pack_holes.ensureTotalCapacity(self.allocator, count);
         try self.pack_outside.ensureTotalCapacity(self.allocator, count);
-        if (self.think_keys.capacity > before) self.noteThinkScratchGrow(count);
+        try self.ensureMoveScratch(count);
+        if (self.think_keys.capacity > before or self.move_dest.capacity > move_before) self.noteThinkScratchGrow(count);
+    }
+
+    // `count` rows, one aligned region per band, and the outside indexes appended onto the retie list.
+    fn moveIndexSlots(count: usize) usize {
+        return count + banded_sort.band_count * think_column_alignment + count;
+    }
+
+    fn ensureMoveScratch(self: *SimulationScopeSystem, count: usize) !void {
+        try self.move_dest.ensureTotalCapacity(self.allocator, moveIndexSlots(count));
+        try self.move_source.ensureTotalCapacity(self.allocator, count);
+        try self.perception_pack.ensureTotalCapacity(self.allocator, count);
+        try self.memory_pack.ensureTotalCapacity(self.allocator, count);
+        try self.affect_pack.ensureTotalCapacity(self.allocator, count);
+        try self.band_moves.ensureTotalCapacityPrecise(self.allocator, banded_sort.band_count);
+        try self.pack_range_counts.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(count, think_column_alignment));
     }
 
     fn noteThinkScratchGrow(self: *SimulationScopeSystem, count: usize) void {
@@ -581,43 +652,192 @@ pub const SimulationScopeSystem = struct {
         return n;
     }
 
-    fn installThinkSpan(self: *SimulationScopeSystem, data: *DataSystem, n: usize, copy: *ThinkCopy) !void {
-        const sources = self.ai_cognition_indices.items[0..n];
-        const ai_len = data.ai_agents.len();
-        try self.ensureThinkScratch(ai_len);
-        self.growStamp(ai_len);
-        const stamp = self.bumpStamp();
-        for (sources) |source| self.pack_stamp.items[source] = stamp;
-        self.pack_holes.clearRetainingCapacity();
-        self.pack_outside.clearRetainingCapacity();
-        var hole_i: u32 = 0;
-        while (hole_i < n) : (hole_i += 1) {
-            if (self.pack_stamp.items[hole_i] != stamp) self.pack_holes.appendAssumeCapacity(hole_i);
-        }
-        for (sources) |source| {
-            if (source >= n) self.pack_outside.appendAssumeCapacity(source);
-        }
-        std.debug.assert(self.pack_holes.items.len == self.pack_outside.items.len);
-        const moved = self.pack_holes.items.len;
-        if (moved > 0) {
-            var scatter = ThinkScatterJob{
-                .agents = &data.ai_agents,
-                .dest_index = self.pack_outside.items,
-                .src_index = self.pack_holes.items,
-                .items_per_range = copy.items_per_range,
-            };
-            copy.dispatch(moved, &scatter, thinkScatterJob);
+    fn installThinkSpan(self: *SimulationScopeSystem, data: *DataSystem, n: usize, copy: *ThinkCopy, side: *ThinkPackSide, copy_ranges: usize) !void {
+        const items_per_range = copy.items_per_range;
+        const counts = self.pack_range_counts.items[0..copy_ranges];
+        compactCounted(&self.move_dest, counts, items_per_range, .moves);
+        compactCounted(&self.move_source, counts, items_per_range, .moves);
+        compactCounted(&self.perception_pack, counts, items_per_range, .perception);
+        compactCounted(&self.memory_pack, counts, items_per_range, .memory);
+        compactCounted(&self.affect_pack, counts, items_per_range, .affect);
+        const moves = self.move_dest.items.len;
+        if (moves != 0) {
+            self.filterHoles(side, moves, @intCast(n));
+            std.debug.assert(self.pack_holes.items.len == self.pack_outside.items.len);
+            if (self.pack_holes.items.len > 0) {
+                var scatter = ThinkScatterJob{
+                    .agents = &data.ai_agents,
+                    .dest_index = self.pack_outside.items,
+                    .src_index = self.pack_holes.items,
+                    .items_per_range = items_per_range,
+                };
+                _ = copy.dispatch(self.pack_holes.items.len, &scatter, thinkScatterJob);
+            }
         }
         var apply = ThinkApplyJob{
             .agents = &data.ai_agents,
-            .items_per_range = copy.items_per_range,
+            .items_per_range = items_per_range,
         };
-        copy.dispatch(n, &apply, thinkApplyJob);
-        data.retieAiRows();
-        for (sources, 0..) |_, k| sources[k] = @intCast(k);
-        try self.packOptionalColumn(data, n, .perception, copy);
-        try self.packOptionalColumn(data, n, .memory, copy);
-        try self.packOptionalColumn(data, n, .affect, copy);
+        _ = copy.dispatch(n, &apply, thinkApplyJob);
+        if (moves != 0) {
+            self.appendRetieOutside();
+            self.dispatchAiRetie(data, side.thread_system, side.config, &self.think_pack_retie_tuner);
+        }
+        try self.packOptionalColumn(data, .perception, copy, side);
+        try self.packOptionalColumn(data, .memory, copy, side);
+        try self.packOptionalColumn(data, .affect, copy, side);
+    }
+
+    fn placeBandMoveRegions(self: *SimulationScopeSystem, starts: *const [banded_sort.band_count + 1]u32) void {
+        var cursor: usize = 0;
+        for (self.band_moves.items, 0..) |*slot, band| {
+            const aligned = std.mem.alignForward(usize, cursor, think_column_alignment);
+            const band_len: usize = starts[band + 1] - starts[band];
+            slot.value.cursor = aligned;
+            slot.value.count = 0;
+            cursor = aligned + band_len;
+        }
+        std.debug.assert(cursor <= self.move_dest.capacity);
+        self.move_dest.items.len = cursor;
+    }
+
+    fn compactBandMoves(self: *SimulationScopeSystem) void {
+        var dst: usize = 0;
+        for (self.band_moves.items) |slot| {
+            const src = slot.value.cursor;
+            const count: usize = slot.value.count;
+            std.debug.assert(dst <= src);
+            if (dst != src and count != 0) {
+                @memmove(self.move_dest.items[dst..][0..count], self.move_dest.items[src..][0..count]);
+            }
+            dst += count;
+        }
+        self.move_dest.items.len = dst;
+    }
+
+    fn setIndexLen(list: *IndexList, len: usize) void {
+        std.debug.assert(list.capacity >= len);
+        list.items.len = len;
+    }
+
+    fn setPackRangeCount(self: *SimulationScopeSystem, ranges: usize) void {
+        std.debug.assert(self.pack_range_counts.capacity >= ranges);
+        setSlotCount(PackWindowCounts, &self.pack_range_counts, ranges);
+    }
+
+    fn prepareAiPackWindows(self: *SimulationScopeSystem, n: usize, ranges: usize) void {
+        self.setPackRangeCount(ranges);
+        setIndexLen(&self.move_dest, n);
+        setIndexLen(&self.move_source, n);
+        setIndexLen(&self.perception_pack, n);
+        setIndexLen(&self.memory_pack, n);
+        setIndexLen(&self.affect_pack, n);
+    }
+
+    fn prepareMoveWindows(self: *SimulationScopeSystem, n: usize, ranges: usize) void {
+        self.setPackRangeCount(ranges);
+        setIndexLen(&self.move_dest, n);
+        setIndexLen(&self.move_source, n);
+    }
+
+    fn prepareHoleWindows(self: *SimulationScopeSystem, n: usize, ranges: usize) void {
+        self.setPackRangeCount(ranges);
+        setIndexLen(&self.pack_holes, n);
+        setIndexLen(&self.pack_outside, n);
+    }
+
+    fn dispatchAiRetie(self: *SimulationScopeSystem, data: *DataSystem, thread_system: *ThreadSystem, config: ScopeConfig, tuner: *AdaptiveWorkTuner) void {
+        const indices = self.move_dest.items;
+        if (indices.len == 0) return;
+        const selection = thread_system.selectBatchProfile(tuner, .{
+            .item_count = indices.len,
+            .items_per_range = config.items_per_range,
+            .batches_per_participant = config.batches_per_participant,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = think_column_alignment,
+            .adaptive = config.adaptive,
+        });
+        var job = AiRetieJob{
+            .data = data,
+            .indices = indices,
+            .items_per_range = selection.items_per_range,
+            .range_count = selection.range_count,
+        };
+        _ = thread_system.parallelForWithOptions(indices.len, &job, aiRetieJob, .{
+            .max_worker_threads = selection.worker_threads,
+            .range_alignment_items = think_column_alignment,
+            .adaptive_tuner = selection.active_tuner,
+            .selected_profile = selection.profile,
+        });
+    }
+
+    fn beginHoleRounds(self: *SimulationScopeSystem, side: *ThinkPackSide) void {
+        if (side.hole != null) return;
+        side.hole = RoundDispatch.beginAligned(Dispatch.init(side.thread_system, &self.think_pack_hole_tuner, .{
+            .items_per_range = side.config.items_per_range,
+            .batches_per_participant = side.config.batches_per_participant,
+            .max_worker_threads = side.config.max_worker_threads,
+            .adaptive = side.config.adaptive,
+        }), side.span, think_column_alignment);
+    }
+
+    fn filterHoles(self: *SimulationScopeSystem, side: *ThinkPackSide, moves: usize, prefix: u32) void {
+        self.beginHoleRounds(side);
+        const hole = &side.hole.?;
+        const items_per_range = hole.selection.?.items_per_range;
+        const ranges = rangeCount(moves, items_per_range);
+        self.prepareHoleWindows(moves, ranges);
+        var job = ThinkHoleJob{
+            .dest = self.move_dest.items,
+            .source = self.move_source.items,
+            .stamp = self.pack_stamp.items,
+            .stamp_id = self.pack_stamp_id,
+            .prefix = prefix,
+            .holes = self.pack_holes.items,
+            .outside = self.pack_outside.items,
+            .counts = self.pack_range_counts.items,
+            .items_per_range = items_per_range,
+        };
+        var actual: usize = 0;
+        hole.run(moves, &job, &actual, thinkHoleJob);
+        std.debug.assert(actual == ranges);
+        const counts = self.pack_range_counts.items[0..actual];
+        compactCounted(&self.pack_holes, counts, items_per_range, .moves);
+        compactCounted(&self.pack_outside, counts, items_per_range, .perception);
+    }
+
+    fn appendRetieOutside(self: *SimulationScopeSystem) void {
+        const outside = self.pack_outside.items.len;
+        if (outside == 0) return;
+        std.debug.assert(self.move_dest.capacity >= self.move_dest.items.len + outside);
+        self.move_dest.appendSliceAssumeCapacity(self.pack_outside.items);
+    }
+
+    // One round. `indices` is at most the span this dispatch began at, so the
+    // inline range width still matches. A zero side does not run.
+    fn dispatchOptionalRetie(self: *SimulationScopeSystem, data: *DataSystem, column: DataSystem.PackedColumn, side: *ThinkPackSide, indices: []const u32) void {
+        if (indices.len == 0) return;
+        std.debug.assert(indices.len <= side.span);
+        if (side.optional_retie == null) {
+            side.optional_retie = RoundDispatch.beginAligned(Dispatch.init(side.thread_system, &self.optional_retie_tuner, .{
+                .items_per_range = side.config.items_per_range,
+                .batches_per_participant = side.config.batches_per_participant,
+                .max_worker_threads = side.config.max_worker_threads,
+                .adaptive = side.config.adaptive,
+            }), side.span, think_column_alignment);
+        }
+        const retie = &side.optional_retie.?;
+        const items_per_range = retie.selection.?.items_per_range;
+        var job = OptionalRetieJob{
+            .data = data,
+            .column = column,
+            .indices = indices,
+            .items_per_range = items_per_range,
+            .range_count = rangeCount(indices.len, items_per_range),
+        };
+        var actual: usize = 0;
+        retie.run(indices.len, &job, &actual, optionalRetieJob);
+        std.debug.assert(actual == job.range_count);
     }
 
     fn growStamp(self: *SimulationScopeSystem, len: usize) void {
@@ -636,88 +856,75 @@ pub const SimulationScopeSystem = struct {
         return self.pack_stamp_id;
     }
 
-    fn packOptionalColumn(self: *SimulationScopeSystem, data: *DataSystem, n: usize, column: DataSystem.PackedColumn, copy: *ThinkCopy) !void {
-        const agents = data.aiAgentSliceConst();
-        self.pack_holes.clearRetainingCapacity();
-        for (0..n) |k| {
-            const row = switch (column) {
-                .perception => agents.perception_row[k],
-                .memory => agents.memory_row[k],
-                .affect => agents.affect_row[k],
-            };
-            if (row != no_component_row) self.pack_holes.appendAssumeCapacity(row);
-        }
-        const listed = self.pack_holes.items.len;
+    fn packOptionalColumn(self: *SimulationScopeSystem, data: *DataSystem, column: DataSystem.PackedColumn, copy: *ThinkCopy, side: *ThinkPackSide) !void {
+        const listed = switch (column) {
+            .perception => self.perception_pack.items.len,
+            .memory => self.memory_pack.items.len,
+            .affect => self.affect_pack.items.len,
+        };
         if (listed == 0) return;
         const store_len: usize = switch (column) {
             .perception => data.ai_perceptions.len(),
             .memory => data.ai_memories.len(),
             .affect => data.ai_affects.len(),
         };
-        // Size for the store before the slice is captured. `installOptionalRows` ensures
-        // the same count; a later grow would free this slice under the stamp walk.
-        const outside_before = self.pack_outside.capacity;
-        try self.pack_outside.ensureTotalCapacity(self.allocator, @max(store_len, listed));
-        if (self.pack_outside.capacity > outside_before) self.noteThinkScratchGrow(store_len);
-        self.pack_outside.clearRetainingCapacity();
-        self.pack_outside.appendSliceAssumeCapacity(self.pack_holes.items);
-        const old_sources = self.pack_outside.items;
+        try self.ensureThinkScratch(@max(store_len, listed));
+        self.growStamp(store_len);
+        const stamp = self.bumpStamp();
+        const perm = switch (column) {
+            .perception => self.perception_pack.items,
+            .memory => self.memory_pack.items,
+            .affect => self.affect_pack.items,
+        };
+        const items_per_range = copy.items_per_range;
+        const ranges = rangeCount(listed, items_per_range);
+        self.prepareMoveWindows(listed, ranges);
         var image = OptionalPackJob{
             .data = data,
             .column = column,
             .mode = .to_image,
-            .perm = old_sources,
-            .items_per_range = copy.items_per_range,
+            .perm = perm,
+            .items_per_range = items_per_range,
+            .prefix = @intCast(listed),
+            .stamp = self.pack_stamp.items,
+            .stamp_id = stamp,
+            .move_dest = self.move_dest.items,
+            .move_source = self.move_source.items,
+            .counts = self.pack_range_counts.items,
         };
-        copy.dispatch(listed, &image, optionalPackJob);
-        try self.installOptionalRows(data, old_sources, column, copy);
-    }
-
-    fn installOptionalRows(self: *SimulationScopeSystem, data: *DataSystem, sources: []const u32, column: DataSystem.PackedColumn, copy: *ThinkCopy) !void {
-        const n = sources.len;
-        const store_len: usize = switch (column) {
-            .perception => data.ai_perceptions.len(),
-            .memory => data.ai_memories.len(),
-            .affect => data.ai_affects.len(),
-        };
-        try self.ensureThinkScratch(@max(store_len, n));
-        self.growStamp(store_len);
-        const stamp = self.bumpStamp();
-        for (sources) |source| self.pack_stamp.items[source] = stamp;
-        self.pack_holes.clearRetainingCapacity();
-        var hole_i: u32 = 0;
-        while (hole_i < n) : (hole_i += 1) {
-            if (self.pack_stamp.items[hole_i] != stamp) self.pack_holes.appendAssumeCapacity(hole_i);
-        }
-        if (self.think_keys.items.len < n) self.think_keys.items.len = n;
-        var outside_count: usize = 0;
-        for (sources) |source| {
-            if (source >= n) {
-                self.think_keys.items[outside_count].source = source;
-                outside_count += 1;
+        const actual = copy.dispatch(listed, &image, optionalPackJob);
+        std.debug.assert(actual == ranges);
+        const counts = self.pack_range_counts.items[0..actual];
+        compactCounted(&self.move_dest, counts, items_per_range, .moves);
+        compactCounted(&self.move_source, counts, items_per_range, .moves);
+        const move_count = self.move_dest.items.len;
+        if (move_count != 0) {
+            self.filterHoles(side, move_count, @intCast(listed));
+            std.debug.assert(self.pack_holes.items.len == self.pack_outside.items.len);
+            if (self.pack_holes.items.len > 0) {
+                var scatter = OptionalPackJob{
+                    .data = data,
+                    .column = column,
+                    .mode = .scatter,
+                    .holes = self.pack_holes.items,
+                    .outside = self.pack_outside.items,
+                    .items_per_range = items_per_range,
+                };
+                _ = copy.dispatch(self.pack_holes.items.len, &scatter, optionalPackJob);
             }
-        }
-        std.debug.assert(outside_count == self.pack_holes.items.len);
-        if (outside_count > 0) {
-            var scatter = OptionalPackJob{
-                .data = data,
-                .column = column,
-                .mode = .scatter,
-                .holes = self.pack_holes.items,
-                .slots = self.think_keys.items,
-                .items_per_range = copy.items_per_range,
-            };
-            copy.dispatch(outside_count, &scatter, optionalPackJob);
         }
         var apply = OptionalPackJob{
             .data = data,
             .column = column,
             .mode = .from_image,
-            .items_per_range = copy.items_per_range,
+            .items_per_range = items_per_range,
         };
-        copy.dispatch(n, &apply, optionalPackJob);
-        for (0..outside_count) |j| data.retiePackedRow(column, self.think_keys.items[j].source);
-        for (0..n) |k| data.retiePackedRow(column, @intCast(k));
+        _ = copy.dispatch(listed, &apply, optionalPackJob);
+        // Destinations, then outside. Not one list: together they can exceed the span.
+        if (move_count != 0) {
+            self.dispatchOptionalRetie(data, column, side, self.move_dest.items);
+            self.dispatchOptionalRetie(data, column, side, self.pack_outside.items);
+        }
     }
 
     // ---- AI halo gather and think set (threaded compactions) -----------------
@@ -1149,6 +1356,114 @@ fn scanTierPolicy(
     return count;
 }
 
+const BandMoveSlot = struct {
+    cursor: usize = 0,
+    count: u32 = 0,
+};
+
+const PackWindowCounts = struct {
+    moves: u32 = 0,
+    perception: u32 = 0,
+    memory: u32 = 0,
+    affect: u32 = 0,
+};
+
+const PackWindowCountSlot = PaddedSlot(PackWindowCounts);
+
+const CountField = enum { moves, perception, memory, affect };
+
+fn countField(counts: PackWindowCounts, field: CountField) usize {
+    return switch (field) {
+        .moves => counts.moves,
+        .perception => counts.perception,
+        .memory => counts.memory,
+        .affect => counts.affect,
+    };
+}
+
+fn compactCounted(list: *IndexList, slots: []const PackWindowCountSlot, items_per_range: usize, field: CountField) void {
+    var dst: usize = 0;
+    for (slots, 0..) |*slot, range_index| {
+        const count = countField(slot.value, field);
+        const src = range_index * items_per_range;
+        std.debug.assert(dst <= src);
+        if (dst != src and count != 0) @memmove(list.items[dst..][0..count], list.items[src..][0..count]);
+        dst += count;
+    }
+    list.items.len = dst;
+}
+
+const ThinkPackSide = struct {
+    thread_system: *ThreadSystem,
+    config: ScopeConfig,
+    span: usize,
+    hole: ?RoundDispatch = null,
+    optional_retie: ?RoundDispatch = null,
+};
+
+const AiRetieJob = struct {
+    data: *DataSystem,
+    indices: []const u32,
+    items_per_range: usize,
+    range_count: usize,
+};
+
+fn aiRetieJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *AiRetieJob = @ptrCast(@alignCast(context));
+    assertRangeWindow(range, job.items_per_range, job.range_count, job.indices.len);
+    job.data.retieAiIndices(job.indices[range.start..range.end]);
+}
+
+const ThinkHoleJob = struct {
+    dest: []const u32,
+    source: []const u32,
+    stamp: []const u32,
+    stamp_id: u32,
+    prefix: u32,
+    holes: []u32,
+    outside: []u32,
+    counts: []PackWindowCountSlot,
+    items_per_range: usize,
+};
+
+fn thinkHoleJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ThinkHoleJob = @ptrCast(@alignCast(context));
+    assertRangeWindow(range, job.items_per_range, job.counts.len, job.dest.len);
+    std.debug.assert(range.end <= job.source.len and range.end <= job.holes.len and range.end <= job.outside.len);
+    var holes: u32 = 0;
+    var outside: u32 = 0;
+    const base = range.start;
+    for (range.start..range.end) |i| {
+        const dest = job.dest[i];
+        const source = job.source[i];
+        if (source >= job.prefix) {
+            job.outside[base + outside] = source;
+            outside += 1;
+        }
+        std.debug.assert(dest < job.stamp.len);
+        // `moves` is the hole count and `perception` the outside count.
+        if (job.stamp[dest] != job.stamp_id) {
+            job.holes[base + holes] = dest;
+            holes += 1;
+        }
+    }
+    job.counts[range.index].value = .{ .moves = holes, .perception = outside };
+}
+
+const OptionalRetieJob = struct {
+    data: *DataSystem,
+    column: DataSystem.PackedColumn,
+    indices: []const u32,
+    items_per_range: usize,
+    range_count: usize,
+};
+
+fn optionalRetieJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *OptionalRetieJob = @ptrCast(@alignCast(context));
+    assertRangeWindow(range, job.items_per_range, job.range_count, job.indices.len);
+    job.data.retiePackedIndices(job.column, job.indices[range.start..range.end]);
+}
+
 const ThinkKey = struct {
     key: u128,
     source: u32,
@@ -1277,14 +1592,12 @@ const ThinkSortJob = struct {
     starts: [banded_sort.band_count + 1]u32,
     agents: *@import("../data_system/agents.zig").AiAgentStore,
     range_count: usize,
+    move_dest: []u32,
+    bands: []PaddedSlot(BandMoveSlot),
 };
 
 fn thinkSourceAt(keys: []ThinkKey, index: usize) usize {
     // `source` is a row index stored as u32.
-    return @intCast(keys[index].source);
-}
-
-fn thinkSlotAt(keys: []const ThinkKey, index: usize) usize {
     return @intCast(keys[index].source);
 }
 
@@ -1305,21 +1618,83 @@ fn thinkSortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         spans[span_count] = .{ start, end };
         span_count += 1;
     }
-    if (span_count == 0) return;
-    job.agents.writeOrderSpans(spans[0..span_count], job.keys, thinkSourceAt);
+    if (span_count != 0) job.agents.writeOrderSpans(spans[0..span_count], job.keys, thinkSourceAt);
+    var moves = banded_sort.OwnedBands.init(&job.starts, range.start, range.end);
+    while (moves.next()) |band| {
+        const region = job.bands[band].value.cursor;
+        const band_start: usize = job.starts[band];
+        const band_end: usize = job.starts[band + 1];
+        std.debug.assert(region + (band_end - band_start) <= job.move_dest.len);
+        var count: u32 = 0;
+        for (band_start..band_end) |i| {
+            if (job.keys[i].source != @as(u32, @intCast(i))) {
+                job.move_dest[region + count] = @intCast(i);
+                count += 1;
+            }
+        }
+        job.bands[band].value.count = count;
+    }
 }
 
 const ThinkPackJob = struct {
     agents: *@import("../data_system/agents.zig").AiAgentStore,
-    perm: []const u32,
+    perm: []u32,
     items_per_range: usize,
+    prefix: u32,
+    stamp: []u32,
+    stamp_id: u32,
+    move_dest: []u32,
+    move_source: []u32,
+    perception: []u32,
+    memory: []u32,
+    affect: []u32,
+    counts: []PackWindowCountSlot,
 };
 
 fn thinkPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *ThinkPackJob = @ptrCast(@alignCast(context));
-    std.debug.assert(range.start == range.index * job.items_per_range);
-    std.debug.assert(range.start <= range.end and range.end <= job.perm.len);
+    assertRangeWindow(range, job.items_per_range, job.counts.len, job.perm.len);
+    std.debug.assert(range.end <= job.move_dest.len and range.end <= job.move_source.len);
+    std.debug.assert(range.end <= job.perception.len and range.end <= job.memory.len and range.end <= job.affect.len);
     job.agents.writeOrderImage(range.start, range.end, job.perm);
+    const rows = job.agents.sliceConst();
+    const base = range.start;
+    var moves: u32 = 0;
+    var perception: u32 = 0;
+    var memory: u32 = 0;
+    var affect: u32 = 0;
+    for (range.start..range.end) |k| {
+        const at: u32 = @intCast(k);
+        const source = job.perm[k];
+        if (source != at) {
+            job.move_dest[base + moves] = at;
+            job.move_source[base + moves] = source;
+            moves += 1;
+            if (source < job.prefix) job.stamp[source] = job.stamp_id;
+            job.perm[k] = at;
+        }
+        const perception_row = rows.perception_row[source];
+        if (perception_row != no_component_row) {
+            job.perception[base + perception] = perception_row;
+            perception += 1;
+        }
+        const memory_row = rows.memory_row[source];
+        if (memory_row != no_component_row) {
+            job.memory[base + memory] = memory_row;
+            memory += 1;
+        }
+        const affect_row = rows.affect_row[source];
+        if (affect_row != no_component_row) {
+            job.affect[base + affect] = affect_row;
+            affect += 1;
+        }
+    }
+    job.counts[range.index].value = .{
+        .moves = moves,
+        .perception = perception,
+        .memory = memory,
+        .affect = affect,
+    };
 }
 
 const ThinkScatterJob = struct {
@@ -1356,8 +1731,14 @@ const OptionalPackJob = struct {
     mode: OptionalPackMode,
     perm: []const u32 = &.{},
     holes: []const u32 = &.{},
-    slots: []const ThinkKey = &.{},
+    outside: []const u32 = &.{},
     items_per_range: usize,
+    prefix: u32 = 0,
+    stamp: []u32 = &.{},
+    stamp_id: u32 = 0,
+    move_dest: []u32 = &.{},
+    move_source: []u32 = &.{},
+    counts: []PackWindowCountSlot = &.{},
 };
 
 fn optionalPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -1366,19 +1747,33 @@ fn optionalPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void 
     std.debug.assert(range.start <= range.end);
     switch (job.mode) {
         .to_image => {
-            std.debug.assert(range.end <= job.perm.len);
+            assertRangeWindow(range, job.items_per_range, job.counts.len, job.perm.len);
+            std.debug.assert(range.end <= job.move_dest.len and range.end <= job.move_source.len);
             switch (job.column) {
                 .perception => job.data.ai_perceptions.copyToPack(range.start, range.end, job.perm),
                 .memory => job.data.ai_memories.copyToPack(range.start, range.end, job.perm),
                 .affect => job.data.ai_affects.copyToPack(range.start, range.end, job.perm),
             }
+            const base = range.start;
+            var moves: u32 = 0;
+            for (range.start..range.end) |k| {
+                const at: u32 = @intCast(k);
+                const source = job.perm[k];
+                if (source != at) {
+                    job.move_dest[base + moves] = at;
+                    job.move_source[base + moves] = source;
+                    moves += 1;
+                    if (source < job.prefix) job.stamp[source] = job.stamp_id;
+                }
+            }
+            job.counts[range.index].value = .{ .moves = moves };
         },
         .scatter => {
-            std.debug.assert(range.end <= job.holes.len and range.end <= job.slots.len);
+            std.debug.assert(range.end <= job.holes.len and range.end <= job.outside.len);
             switch (job.column) {
-                .perception => job.data.ai_perceptions.scatterRows(range.start, range.end, job.slots, job.holes, thinkSlotAt, u32Index),
-                .memory => job.data.ai_memories.scatterRows(range.start, range.end, job.slots, job.holes, thinkSlotAt, u32Index),
-                .affect => job.data.ai_affects.scatterRows(range.start, range.end, job.slots, job.holes, thinkSlotAt, u32Index),
+                .perception => job.data.ai_perceptions.scatterRows(range.start, range.end, job.outside, job.holes, u32Index, u32Index),
+                .memory => job.data.ai_memories.scatterRows(range.start, range.end, job.outside, job.holes, u32Index, u32Index),
+                .affect => job.data.ai_affects.scatterRows(range.start, range.end, job.outside, job.holes, u32Index, u32Index),
             }
         },
         .from_image => switch (job.column) {
@@ -1395,10 +1790,11 @@ const ThinkCopy = struct {
     rounds: *RoundDispatch,
     items_per_range: usize,
 
-    fn dispatch(self: *ThinkCopy, item_count: usize, context: *anyopaque, job_fn: JobFn) void {
-        if (item_count == 0) return;
-        var range_count: usize = 0;
-        self.rounds.run(item_count, context, &range_count, job_fn);
+    fn dispatch(self: *ThinkCopy, item_count: usize, context: *anyopaque, job_fn: JobFn) usize {
+        if (item_count == 0) return 0;
+        var dispatched: usize = 0;
+        self.rounds.run(item_count, context, &dispatched, job_fn);
+        return dispatched;
     }
 };
 
@@ -3088,6 +3484,167 @@ test "optional pack keeps listed rows when the component store outgrows the ai s
     try sys.packThinkSpan(&data, &threads, .{});
     const packed_rows = data.aiPerceptionSliceConst();
     for (expected.items, 0..) |entity, k| try std.testing.expect(packed_rows.entities[k].eql(entity));
+}
+
+fn expectTiedAiRows(data: *const DataSystem) !void {
+    const agents = data.aiAgentSliceConst();
+    for (agents.entities, agents.movement_row, 0..) |entity, movement, row| {
+        try std.testing.expectEqual(@as(?u32, @intCast(row)), data.slots.items[entity.index].ai_agent_index);
+        if (movement != no_component_row) {
+            try std.testing.expectEqual(@as(u32, @intCast(row)), data.movement_bodies.aiRowAt(movement));
+        }
+    }
+}
+
+fn expectPerceptionRowsTied(data: *const DataSystem) !void {
+    const agents = data.aiAgentSliceConst();
+    for (data.aiPerceptionSliceConst().entities, 0..) |entity, row| {
+        const ai = data.slots.items[entity.index].ai_agent_index orelse continue;
+        try std.testing.expectEqual(@as(u32, @intCast(row)), agents.perception_row[ai]);
+    }
+}
+
+test "threaded think order retie matches serial" {
+    const allocator = std.testing.allocator;
+    var serial_data = DataSystem.init(allocator);
+    defer serial_data.deinit();
+    var threaded_data = DataSystem.init(allocator);
+    defer threaded_data.deinit();
+    try fillCognitionPopulation(&serial_data, 24);
+    try fillCognitionPopulation(&threaded_data, 24);
+    var inline_threads = try inlineThreads();
+    defer inline_threads.deinit();
+    var workers = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer workers.deinit();
+    var serial_sys = SimulationScopeSystem.init(allocator);
+    defer serial_sys.deinit();
+    var threaded_sys = SimulationScopeSystem.init(allocator);
+    defer threaded_sys.deinit();
+    const fixed = ScopeConfig{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
+    try serial_sys.orderThinkPhases(&serial_data, null, testThinkGrid(), &inline_threads, .{});
+    try threaded_sys.orderThinkPhases(&threaded_data, null, testThinkGrid(), &workers, fixed);
+    try std.testing.expectEqualSlices(EntityId, serial_data.aiAgentSliceConst().entities, threaded_data.aiAgentSliceConst().entities);
+    try expectTiedAiRows(&serial_data);
+    try expectTiedAiRows(&threaded_data);
+    const serial_halo = (try serial_sys.gatherAiPopulations(&serial_data, null, &inline_threads, .{})).halo;
+    var serial_index = try testHaloIndex(&serial_data, serial_halo);
+    defer serial_index.deinit();
+    const threaded_halo = (try threaded_sys.gatherAiPopulations(&threaded_data, null, &workers, fixed)).halo;
+    var threaded_index = try testHaloIndex(&threaded_data, threaded_halo);
+    defer threaded_index.deinit();
+    const serial_think = try compactCognitionInline(&serial_sys, &serial_index.view(), 0, false);
+    const threaded_think = try compactCognitionInline(&threaded_sys, &threaded_index.view(), 0, false);
+    try std.testing.expectEqual(serial_think.cognition.len, threaded_think.cognition.len);
+    try serial_sys.packThinkSpan(&serial_data, &inline_threads, .{});
+    try threaded_sys.packThinkSpan(&threaded_data, &workers, fixed);
+    try std.testing.expectEqualSlices(EntityId, serial_data.aiAgentSliceConst().entities, threaded_data.aiAgentSliceConst().entities);
+    try expectTiedAiRows(&serial_data);
+    try expectTiedAiRows(&threaded_data);
+    for (serial_sys.ai_cognition_indices.items, 0..) |index, k| try std.testing.expectEqual(@as(u32, @intCast(k)), index);
+    for (threaded_sys.ai_cognition_indices.items, 0..) |index, k| try std.testing.expectEqual(@as(u32, @intCast(k)), index);
+}
+
+test "packed think span and optional pack keep an undisplaced row" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const phase: u8 = 0;
+    var thinkers: [2]EntityId = undefined;
+    for (&thinkers) |*entity| {
+        entity.* = try data.createEntity();
+        try data.setMovementBody(entity.*, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(entity.*, .{});
+        try data.setAiPerception(entity.*, .{});
+        try data.setSimulationMetadata(entity.*, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .stagger_phase = phase });
+    }
+    for (0..200) |_| {
+        const extra = try data.createEntity();
+        try data.setAiPerception(extra, .{});
+    }
+    const outside = try data.createEntity();
+    try data.setMovementBody(outside, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+    try data.setAiAgent(outside, .{});
+    try data.setSimulationMetadata(outside, .{ .tier = .cognition, .chunk = .{ .x = 30, .y = 30 }, .stagger_phase = phase });
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    try sys.orderThinkPhases(&data, region, testThinkGrid(), &threads, .{});
+    const halo = (try sys.gatherAiPopulations(&data, region, &threads, .{})).halo;
+    var index = try testHaloIndex(&data, halo);
+    defer index.deinit();
+    const before = try compactCognitionInline(&sys, &index.view(), 0, false);
+    const agents_before = data.aiAgentSliceConst();
+    var outside_row: usize = 0;
+    var found = false;
+    for (agents_before.entities, 0..) |entity, row| {
+        if (!entity.eql(outside)) continue;
+        outside_row = row;
+        found = true;
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(outside_row >= before.cognition.len);
+    const perception_before = data.aiPerceptionSliceConst();
+    const last = perception_before.entities.len - 1;
+    const last_entity = perception_before.entities[last];
+    const last_perception = data.slots.items[last_entity.index].ai_perception_index;
+    try sys.packThinkSpan(&data, &threads, .{});
+    try std.testing.expect(data.aiAgentSliceConst().entities[outside_row].eql(outside));
+    try std.testing.expectEqual(@as(?u32, @intCast(outside_row)), data.slots.items[outside.index].ai_agent_index);
+    const perception_after = data.aiPerceptionSliceConst();
+    try std.testing.expect(perception_after.entities[last].eql(last_entity));
+    try std.testing.expectEqual(last_perception, data.slots.items[last_entity.index].ai_perception_index);
+    for (perception_after.entities, 0..) |entity, row| {
+        try std.testing.expectEqual(@as(?u32, @intCast(row)), data.slots.items[entity.index].ai_perception_index);
+    }
+    try expectPerceptionRowsTied(&data);
+}
+
+test "optional pack reties listed rows that sit past the prefix" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const count = 2;
+    const phase: u8 = 0;
+    // Outside the region, created first, so their perception rows occupy the prefix.
+    for (0..count) |_| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(entity, .{});
+        try data.setAiPerception(entity, .{});
+        try data.setSimulationMetadata(entity, .{ .tier = .cognition, .chunk = .{ .x = 30, .y = 30 }, .stagger_phase = phase });
+    }
+    for (0..count) |_| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = 8, .y = 8 }, .previous_position = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(entity, .{});
+        try data.setAiPerception(entity, .{});
+        try data.setSimulationMetadata(entity, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .stagger_phase = phase });
+    }
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var threads = try inlineThreads();
+    defer threads.deinit();
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    try sys.orderThinkPhases(&data, region, testThinkGrid(), &threads, .{});
+    const halo = (try sys.gatherAiPopulations(&data, region, &threads, .{})).halo;
+    var index = try testHaloIndex(&data, halo);
+    defer index.deinit();
+    const before = try compactCognitionInline(&sys, &index.view(), 0, false);
+    const span = before.cognition.len;
+    try std.testing.expect(span > 0);
+    const agents_before = data.aiAgentSliceConst();
+    for (before.cognition) |ai_row| {
+        const perception_row = agents_before.perception_row[ai_row];
+        try std.testing.expect(perception_row != no_component_row);
+        try std.testing.expect(@as(usize, perception_row) >= span);
+    }
+    for (data.aiPerceptionSliceConst().entities[0..span]) |entity| {
+        try std.testing.expect(data.slots.items[entity.index].ai_agent_index != null);
+    }
+    try sys.packThinkSpan(&data, &threads, .{});
+    try expectPerceptionRowsTied(&data);
 }
 
 test "threaded think order matches serial" {
