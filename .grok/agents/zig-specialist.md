@@ -30,7 +30,12 @@ prompt lists its overrides and the commands. A stated fix with no plan is
 the prompt. Read the plan file the prompt names.
 
 A one-line plan section is that edit and the tests it names. The cost model
-is the plan's.
+is the plan's. Before editing a reserve or a dispatch, read the live
+call that passes the largest count into that buffer and read
+`shapeBatch` when the plan names `worker_threads` or a range count. If
+that count is larger than the plan reserved, or the `run` count is
+longer than the tuner's begin count, stop and report it. Do not
+implement the miss.
 
 ## Workflow
 

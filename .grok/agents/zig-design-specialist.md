@@ -55,9 +55,24 @@ this change retains. Retained capacity a later smaller change still walks
 is not the order of what that change touched. The plan does not close an
 order on a reopen condition that leaves one of those orders out. The
 proof fails when an order is violated. A proof of only the call that
-grew the storage does not prove the next call. Check the finished plan
+grew the storage does not prove the next call. Before the plan closes,
+name the production call that passes the largest count into each buffer
+this change reserves or ensures, with that call's `file:line` and the
+count expression. The reserve is at least that count. A proof that only
+grows the rows the reserve was named for does not cover a later call
+that passes a different count. For each dispatch, the count passed to
+`run` is the count the tuner was begun with. A longer list is not one
+`run`. Read `shapeBatch` before the plan writes `worker_threads` or a
+range count, and use the number at that line. Check the finished plan
 against the loaded rules for the steps it cites, the same check as the
 long path.
+
+A plan that misses the cost model does not close. Rework it in this
+branch. Do not defer the miss. A choice that is out of line is made by
+the decision criteria: uniformity, scalability, best practice,
+efficiency, and speed. Do not keep a shape because it is what the code
+does today or because the edit is smaller. A departure from a rule's
+letter is reported.
 
 A settle, merge, or remove the slice names is the plan. A new tuner
 architecture, a new stage pattern, or a rule edit is reported. An
