@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, and the intent and path-request reserves. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the pipeline, and the kernels. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, and the pipeline audit. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the think-row retie, the subset-store reserves, and the kernels. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -264,9 +264,35 @@ in its owning slice.
       explosion over the share stops the step. Pass: an over-share burst
       defers and the step succeeds, identical serial and threaded
       (`.grok/rules/budgets-capacities.md`).
-- [ ] Pipeline scheduler: per-step work in `update` and the growth seam
+- [x] Pipeline scheduler: per-step work in `update` and the growth seam
       outside the stages, and any per-item work on main between stages.
-      Each finding becomes an item here.
+      `update` and the steady seam do not walk rows (derived, no bench).
+      The two misses are the items below.
+- [ ] Think-order and think-pack retie every AI row on the main thread
+      (`orderThinkPhases`, `simulation_pipeline.zig:1715`, calls
+      `retieAiRows` at `simulation_scope.zig:467`; `packThinkSpan`,
+      `simulation_pipeline.zig:1750`, calls it again at
+      `simulation_scope.zig:616`, then scans the think span). Failure:
+      every step with AI rows walks all of those rows twice on main,
+      including rows outside this step's think set, then walks the think
+      span. Pass: that maintenance costs the rows whose index changed,
+      and it is not per-item work on the main thread. Serial and threaded
+      results stay identical (`.grok/rules/threading.md` § What runs where,
+      `.grok/rules/engine-design.md` § Cost model). Derived, no bench.
+      How is open. Not the hot-pass layout item.
+- [ ] The growth seam sizes the scope AI lists, the steering scratch, and
+      the goal table to every body (`growPopulationCapacity`,
+      `simulation_pipeline.zig:1264`, `:1270`, `:1271`; init
+      `simulation_pipeline.zig:992`, `:942`, `:946`). Those lists hold AI
+      rows, steering rows, and navigation intents. Failure: bodies or
+      bounds above those rows grow all three. Pass: they follow AI rows,
+      steering rows, and navigation intents. A reserve where bodies or
+      bounds are the larger count does not grow them. Collision indices,
+      tier commands, chunk-change windows, plane-entry windows, and the
+      plane scratch stay with movement rows
+      (`.grok/rules/engine-design.md` § Cost model,
+      `.grok/rules/budgets-capacities.md`). Derived, no bench. How is
+      open. Not the neighbor-index item.
 - [ ] Core kernels (`simd.zig`, `math.zig`, `rng.zig`; and `logging.zig`
       against `.grok/rules/zig-style.md` § Logging, which no other pass
       covers; docs audit L5): primitive coverage
@@ -276,11 +302,11 @@ in its owning slice.
 - [ ] The population seam sizes the neighbor index and the per-AI scratch by
       AI rows, never every movement body (code audit M2; the index is 84's).
       Failure: `spatial_index.reserve` takes the movement body capacity at
-      init and at the growth seam (`simulation_pipeline.zig:976`, `:1236`),
+      init and at the growth seam (`simulation_pipeline.zig:995`, `:1266`),
       which is the max of bodies, steering, AI, and bounds
       (`PopulationRowCounts.population`, `data_system/types.zig:161`); the
       index only ever holds AI halo rows, and the perception, AI, affect, and
-      AI-memory scratch reserve the same (`:995-998`)
+      AI-memory scratch reserve the same (`:1075-1078`)
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/budgets-capacities.md`). Failure scenario (derived): a
       colony with 1M items at rest and 10k agents reserves index storage for
