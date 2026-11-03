@@ -26,9 +26,9 @@ pub fn midpoint(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
 }
 
 /// Loudness scale shared by impact stimuli and collision SFX gain.
-/// `clamp(penetration / 18, 0.25, 1)`.
+/// `math.clamp(penetration / 18, 0.25, 1)`. A NaN penetration stays NaN.
 pub fn penetrationScale(penetration: f32) f32 {
-    return std.math.clamp(penetration / 18.0, 0.25, 1.0);
+    return math.clamp(penetration / 18.0, 0.25, 1.0);
 }
 
 test "penetrationScale matches the shared impact curve" {
@@ -37,4 +37,10 @@ test "penetrationScale matches the shared impact curve" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), penetrationScale(9), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1), penetrationScale(18), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1), penetrationScale(40), 0.0001);
+}
+
+test "penetrationScale keeps a non-finite penetration on the core clamp" {
+    try std.testing.expectEqual(@as(f32, 1), penetrationScale(std.math.inf(f32)));
+    try std.testing.expectEqual(@as(f32, 0.25), penetrationScale(-std.math.inf(f32)));
+    try std.testing.expect(std.math.isNan(penetrationScale(std.math.nan(f32))));
 }
