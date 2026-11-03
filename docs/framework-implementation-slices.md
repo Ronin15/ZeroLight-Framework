@@ -209,7 +209,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
 | [**87**](roadmap/slices/slice-87.md) | Programming landed | Render Collect By Visible Chunks — Vulkan `gpu-smoke` passed; other machines are not a gate |
-| [**88**](roadmap/slices/slice-88.md) | In progress | Storage items, the commit-share deferral, the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, the kernels audit, the facing tail, and the index-key tail landed; four kernel findings and the layout, index, bench, and doc items still open |
+| [**88**](roadmap/slices/slice-88.md) | In progress | Storage items, the commit-share deferral, the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, the kernels audit, the facing tail, and the index-key tail landed; the run-bounds scan is sent back; four kernel findings and the layout, index, bench, and doc items still open |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; four items recorded | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); four items stay recorded |
 
 **Recently settled (archive only):** 85, 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
@@ -460,7 +460,7 @@ order.
 8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
 8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22).
 9. **87** Render Collect By Visible Chunks — programming landed (core-systems branch). Vulkan `gpu-smoke` passed; other machines are not a gate.
-9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — storage items, the commit-share deferral, the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, the kernels audit, the facing tail, and the index-key tail landed; four kernel findings and the layout, index, bench, and doc items still open (after 87).
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — storage items, the commit-share deferral, the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, the kernels audit, the facing tail, and the index-key tail landed; the run-bounds scan is sent back; four kernel findings and the layout, index, bench, and doc items still open (after 87).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.
 9c. **87's render backend pass** — landed with the slice checklist. It does not wait on 9b.
 10. **76** Cave-Ins — after 64G, 88.

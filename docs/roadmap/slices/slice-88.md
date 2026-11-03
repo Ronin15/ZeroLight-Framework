@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, and the index-key tail. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, sprite sin/cos lanes, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, and the index-key tail. Open: the run-bounds scan, stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, sprite sin/cos lanes, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -275,14 +275,24 @@ in its owning slice.
       `simulation_scope.zig:506`; optional rounds are
       `dispatchOptionalRetie`, `:818`). Inverse writes are
       `retieAiIndices` (`data_system/system.zig:1411`) for the rows whose
-      dense index changed, on workers. `publishRunBounds` still scans
-      every AI row on main. Pass: that maintenance costs the rows whose
+      dense index changed, on workers. The full-row scan in
+      `publishRunBounds` is the open item below. Pass: that maintenance
+      costs the rows whose
       index changed and is not per-item work on the main thread. Serial
       and threaded results stay identical (`.grok/rules/threading.md`
       § What runs where, `.grok/rules/engine-design.md` § Cost model).
       Derived, no bench. Retie writes are not bucketed by destination: a
       destination sort is a worse order, and no later loop streams the
       slot table. Not a rule edit. Not the hot-pass layout item.
+- [ ] `publishRunBounds` does not walk every AI row on main
+      (`simulation_scope.zig:663`). It scans `always_active`, tier, chunk,
+      and `stagger_phase` for every AI row to publish the run prefixes.
+      Failure: every step with AI rows walks all of those rows on main
+      after the think order already grouped them. Pass: publishing the
+      run bounds is not a per-item walk of every AI row on the main
+      thread (`.grok/rules/threading.md` § What runs where,
+      `.grok/rules/engine-design.md` § Cost model). Derived, no bench.
+      How is open. Sent back. Not the hot-pass layout item.
 - [x] The growth seam sizes the scope AI lists, the steering scratch, and
       the goal table to every body. Scope AI lists follow AI rows
       (`reserveAiRows`, `simulation_scope.zig:256`; seam
