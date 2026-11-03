@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, and the subset-store reserves. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, and the kernels. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the facing tail, the index-key tail, sprite sin/cos lanes, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -301,12 +301,66 @@ in its owning slice.
       § Cost model, `.grok/rules/budgets-capacities.md`,
       `.grok/rules/memory-performance.md` § Hot paths). Derived, no
       bench. Not the neighbor-index item.
-- [ ] Core kernels (`simd.zig`, `math.zig`, `rng.zig`; and `logging.zig`
+- [x] Core kernels (`simd.zig`, `math.zig`, `rng.zig`; and `logging.zig`
       against `.grok/rules/zig-style.md` § Logging, which no other pass
       covers; docs audit L5): primitive coverage
       for the reworked hot loops of 84–87, scalar/SIMD parity tests, and any
-      hand-rolled primitive left in a system. Each finding becomes an item
-      here.
+      hand-rolled primitive left in a system. The reworked loops that already
+      use one lane kernel pass (derived, no bench). The six misses are the
+      items below.
+- [ ] Perception facing's tail is the lane kernel (`computeFacingRange`,
+      `perception.zig:669`). The remainder calls `computeFacingScalar`
+      (`:560`). Failure: a span whose length is not a multiple of the lane
+      count normalizes the last rows on a second formula. Pass: the
+      remainder is that lane kernel with a mask, and inactive lanes are not
+      stored. Serial and threaded facing stay identical
+      (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
+      no bench. How is open.
+- [ ] Index key fill's tail is the lane kernel (`spatial_index.zig:1372`).
+      The remainder calls `keyForPosition` (`:1308`). Failure: a bucket
+      range whose slot count is not a multiple of the lane count builds
+      the last keys on the scalar path. Pass: the remainder is the lane
+      key kernel on one masked batch. Keys stay bit-identical to
+      `keyForPosition`, including a short tail
+      (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
+      no bench. How is open. Slot resolve inside a group stays scalar.
+- [ ] Sprite lanes use a core sin/cos lane primitive (`writeSpriteLanes`,
+      `sprite_batch.zig:794`). `simd.zig` has no sin/cos lanes, so each
+      sprite calls `math.sinCos`. Failure: every sprite batch evaluates
+      trig outside the lane kernel. Pass: per-sprite sin/cos is a core
+      lane primitive with a scalar twin and a parity test, and
+      `writeSpriteLanes` uses it for every live lane. The 6-vertex store
+      stays as slice 87 landed (`.grok/rules/memory-performance.md`
+      § SIMD and core math). Derived, no bench. How is open.
+      `writeSpriteQuad` stays the one-angle scalar call.
+- [ ] The saturating ceil is a core primitive (`cellScanRadius`,
+      `spatial_index.zig:1299`). It is `lossyCast` of `@ceil`. `floorToI32`
+      is the floor twin. Every neighbor query and each perception gather
+      row calls it. Failure: a non-finite or huge radius depends on this
+      copy staying aligned with `floorToI32`. Pass: the query and the
+      gather use a core primitive with `floorToI32`'s saturation contract.
+      A lane form is required only if a dense column loop evaluates it
+      (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
+      no bench. How is open.
+- [ ] Contact loudness uses a core clamp (`penetrationScale`,
+      `contact_query.zig:30`). It calls `std.math.clamp`. Failure: a
+      non-finite penetration takes that result instead of the core clamp.
+      Pass: this scale goes through a core clamp. The NaN choice between
+      `clamp` and `clampMinMax` is not made here
+      (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
+      no bench. How is open.
+- [ ] Frame warns sit behind the level gate (`renderer.zig:903`, called
+      from `endFrame` at `:969`). A zero-size swapchain logs `warn` with
+      no `logging.enabled` check, and ReleaseFast and ReleaseSmall keep
+      warn. Also once per flag, still ungated: `world/render.zig:937` and
+      `:967`, and `audio.zig:344`. Failure: a window that acquires a 0×0
+      swapchain every frame logs that warn every frame in a shipping
+      build. Pass: every non-trivial log on the frame, update, draw, and
+      command paths is inside `comptime logging.enabled`. A shipping
+      build does no log formatting on the steady frame, including a
+      repeated zero-size acquire. A once-only warn stays once and is
+      still behind the gate (`.grok/rules/zig-style.md` § Logging).
+      Derived, no bench. How is open.
 - [ ] The population seam sizes the neighbor index and the per-AI scratch by
       AI rows, never every movement body (code audit M2; the index is 84's).
       Failure: `spatial_index.reserve` takes the movement body capacity at
