@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), and `validateAiAgent` bounds (`961c9b7`). Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, step contracts, the pipeline, the kernels, and acceptance. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), and the step-contract audit. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the intent and path-request reserves, the pipeline, the kernels, and acceptance. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -238,9 +238,24 @@ in its owning slice.
       (`.grok/rules/budgets-capacities.md`; `fce97cd`). No `TooMany*` member
       remains in `src/game/data_system/` or `dig_controller.zig`; cap tests at
       `structural.zig:772-774`.
-- [ ] Step contracts (`simulation.zig`): per-step stream capacity and reserve
+- [x] Step contracts (`simulation.zig`): per-step stream capacity and reserve
       against population and per-world load, event caps that simulation reads,
-      `finishWrite` cost. Each finding becomes an item here.
+      `finishWrite` cost. Event caps, `finishWrite`, and the other reserves
+      follow the rows or fixed ceilings that write them (derived, no bench).
+      The one miss is the item below.
+- [ ] Navigation, movement, and path-request reserves follow the rows that
+      write them, not `population()` (`reserveFrame`,
+      `simulation_pipeline.zig:1048-1051`; `PopulationRowCounts.population`,
+      `data_system/types.zig:161`). Navigation intents are one per AI think
+      row (`ai.zig:470`). Movement intents and path requests are one per
+      selected steering row (`steering/avoidance.zig:61`). Failure: bodies or
+      bounds above the AI and steering rows size all three streams to that
+      larger count. Pass: `navigation_intents` follow AI rows, and `intents`
+      and `path_requests` follow steering rows, summed over worlds; a reserve
+      where bodies or bounds exceed those rows does not grow the three
+      streams (`.grok/rules/engine-design.md` § Cost model,
+      `.grok/rules/budgets-capacities.md`). Derived, no bench. Not the
+      neighbor-index item.
 - [x] Commands past the `.structural_commit` share defer to a later step
       (`reserveDeferredStructural`, `simulation.zig:870`;
       `commitStructuralAndReact`, `simulation_pipeline.zig:1366`; the nav
@@ -263,7 +278,7 @@ in its owning slice.
       Failure: `spatial_index.reserve` takes the movement body capacity at
       init and at the growth seam (`simulation_pipeline.zig:976`, `:1236`),
       which is the max of bodies, steering, AI, and bounds
-      (`PopulationRowCounts.population`, `data_system/types.zig:46`); the
+      (`PopulationRowCounts.population`, `data_system/types.zig:161`); the
       index only ever holds AI halo rows, and the perception, AI, affect, and
       AI-memory scratch reserve the same (`:995-998`)
       (`.grok/rules/engine-design.md` § Cost model,
