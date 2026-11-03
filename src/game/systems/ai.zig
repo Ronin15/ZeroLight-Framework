@@ -1248,6 +1248,7 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
 
 const testSpatialIndex = @import("spatial_index_test_support.zig").testSpatialIndex;
 const testHaloIndex = @import("spatial_index_test_support.zig").testHaloIndex;
+const buildInline = @import("spatial_index_test_support.zig").buildInline;
 
 fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !void {
     const count = rows.len;
@@ -1329,11 +1330,39 @@ test "ai gather reads faction and level from the think row" {
     try std.testing.expectEqual(@as(u16, 3), gathered.items(.level)[0]);
 }
 
-// The unstaggered think set over `view`, compacted inline.
-fn thinkSetInline(scope: *SimulationScopeSystem, view: *const SpatialIndexView) ![]const u32 {
+fn thinkTestGeometry() spatial_index.IndexGeometry {
+    return .{
+        .tile_size = 32,
+        .chunk_size_tiles = @import("../world/system.zig").default_chunk_size_tiles,
+        .chunks_x = 64,
+        .chunks_y = 64,
+        .level_count = 1,
+    };
+}
+
+fn thinkTestGrid() SimulationScopeSystem.ThinkCellGrid {
+    const geometry = thinkTestGeometry();
+    const grid = spatial_index.cellGrid(geometry, 32);
+    const per_chunk: u32 = if (geometry.chunks_x == 0) 1 else @max(grid.cells_x / geometry.chunks_x, 1);
+    return .{
+        .cell_size = grid.cell_size,
+        .cells_x = grid.cells_x,
+        .cells_y = grid.cells_y,
+        .cells_per_chunk = per_chunk,
+    };
+}
+
+// The unstaggered think set: order, halo, index, merge. Inline.
+fn thinkSetInline(scope: *SimulationScopeSystem, data: *DataSystem) ![]const u32 {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    return (try scope.compactCognition(view, 0, false, &threads, .{})).cognition;
+    try scope.reserveAiRows(data.ai_agents.len());
+    try scope.orderThinkPhases(data, null, thinkTestGrid(), &threads, .{});
+    const halo = (try scope.gatherAiPopulations(data, null, &threads, .{})).halo;
+    var index = spatial_index.SpatialIndexSystem.init(std.testing.allocator);
+    defer index.deinit();
+    _ = try buildInline(&index, data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, thinkTestGeometry(), .{});
+    return scope.mergeThinkSet(data, 0, false);
 }
 
 const data_test_support = @import("../data_system/test_support.zig");
@@ -2616,7 +2645,7 @@ test "ai serial and real threaded workers produce identical rows and intents on 
     var scope = SimulationScopeSystem.init(std.testing.allocator);
     defer scope.deinit();
     // The think set in the index's cell-major order, as the pipeline orders it.
-    const think_set = try thinkSetInline(&scope, &serial_view);
+    const think_set = try thinkSetInline(&scope, &serial_data);
     try std.testing.expect(think_set.len > 100);
 
     const base_cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .focus_target = .{ .x = 300, .y = 200 }, .scope_dense_indices = think_set };
@@ -2645,6 +2674,12 @@ test "ai serial and real threaded workers produce identical rows and intents on 
         try fillParityAgents(&threaded_data);
         var threaded_spatial = try testSpatialIndex(&threaded_data);
         defer threaded_spatial.deinit();
+        var threaded_scope = SimulationScopeSystem.init(std.testing.allocator);
+        defer threaded_scope.deinit();
+        var order_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+        defer order_threads.deinit();
+        try threaded_scope.reserveAiRows(threaded_data.ai_agents.len());
+        try threaded_scope.orderThinkPhases(&threaded_data, null, thinkTestGrid(), &order_threads, .{});
         var cfg = base_cfg;
         cfg.items_per_range = items_per_range;
         cfg.max_worker_threads = 2;
@@ -2729,7 +2764,7 @@ test "separation and cohere give each row the same result in cell-major and cell
     const view = spatial_sys.view();
     var scope = SimulationScopeSystem.init(std.testing.allocator);
     defer scope.deinit();
-    const think_set = try thinkSetInline(&scope, &view);
+    const think_set = try thinkSetInline(&scope, &data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(2, 0, 16, 0, 0, 0);

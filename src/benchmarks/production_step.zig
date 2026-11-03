@@ -38,7 +38,8 @@
 //! of `cognition_stagger_n` (0 stays 0) and warmup does not. `thinking_step=` is that
 //! window's per-step AI-row min-max, and `ai_step=` / `steering_step=` the per-step
 //! `pipeline_ai` / `pipeline_steering` wall min-max. On item `1024008001024` the stagger
-//! balance pass is that minimum not 0 and that maximum not the whole halo.
+//! balance pass is that minimum not 0 and a non-zero mean of the other in-halo phase
+//! run lengths (`stagger_skips`). Adding those lengths to the AI rows is not the indexed halo.
 //!
 //! Every case runs the same pre-measure steps (the warmup plus the adaptive settle limit), so
 //! the serial and tuned cases measure the same simulated state. The tuned case then reports
@@ -52,8 +53,9 @@
 //! per advancing row stays flat; flat in inert rows; `stacked` separation checks and samples
 //! per thinking row flat in levels, since a query reads only its own level. On
 //! `1024008001024` (spread, 1,024 agents, the base side and level count) `thinking_step`'s
-//! minimum is not 0 and its maximum is not the whole halo (the step's AI rows plus its
-//! stagger skips). Asserts check
+//! minimum is not 0 and the mean `stagger_skips` is not 0. Those skips are the other
+//! in-halo phase run lengths, so adding them to the AI rows is not the indexed halo
+//! while a bodiless row can sit in an in-halo run. Asserts check
 //! the committed population and that every step finishes; on `stacked`, separation checks
 //! per thinking row within `check_bound=`, the most rows of one level any query's scan box
 //! holds at the measured steps' index input (the pre-measure snapshot, each row widened by
@@ -568,11 +570,13 @@ const CellSpanRecord = struct {
 // budget, so a query that also reads other levels fails it.
 // Spread at 1,024 agents on the base world (`1024008001024`): thinking stays off zero and
 // off the whole cognition halo. Other items are not this shape (`stacked` thinks every row).
+// Pass: some row thinks, and another in-halo phase run has length. `stagger_skips` is
+// those run lengths, a bodiless row included, so it is not added back into an indexed halo.
 fn checkStaggerBalance(item_count: usize, summary: *const suite.ProductionStepSummary) !void {
     if (item_count != stagger_balance_item or summary.measured_steps == 0) return;
-    const halo = summary.metrics.get(.scope_ai_stage_entities) + summary.metrics.get(.scope_stagger_skips);
-    if (summary.thinking_min != 0 and summary.thinking_max != halo) return;
-    std.debug.print("production-step: stagger thinking_step={}-{} halo={}\n", .{ summary.thinking_min, summary.thinking_max, halo });
+    const other_phase_runs = summary.metrics.get(.scope_stagger_skips);
+    if (summary.thinking_min != 0 and other_phase_runs != 0) return;
+    std.debug.print("production-step: stagger thinking_step={}-{} other_phase_runs={}\n", .{ summary.thinking_min, summary.thinking_max, other_phase_runs });
     if (summary.thinking_min == 0) return error.StaggerThinkingEmpty;
     return error.StaggerThinkingIsTheHalo;
 }

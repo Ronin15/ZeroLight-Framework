@@ -13,10 +13,10 @@
 //!   `perception`'s.
 //! - `perception-scattered-dense-index`: `perception_dense_index` shuffled, so worker ranges
 //!   write interleaved `PerceptionStore` slots. Pass shape: within spread of `perception`.
-//! - `perception-cell-ordered`: the pairs created in the think set's order, so every
-//!   `PerceptionStore` access ascends with the rows. Pass shape: `perception` within spread
-//!   of it; asserts check the store slots ascend.
-//! These four assert at most one neighbor-block fill per run of observer rows sharing a cell,
+//! Production packs the think set to an ascending prefix before the timed gather, and
+//! `perception-cell-ordered` is gone. The scattered group re-applies its stride shuffle
+//! after that pack.
+//! These three assert at most one neighbor-block fill per run of observer rows sharing a cell,
 //! level, and faction, plus one per range. They print `sensed=`, `los_checks=`, `los_blocked=`,
 //! `found=` (observers with a nearest threat), `events=` (perceived plus lost),
 //! `dropped_events=`, and `block_fills=`; `--details` adds `main=` with `main_per_item=` and
@@ -79,14 +79,6 @@ pub const scattered_dense_index_group = suite.BenchmarkGroup{
     .item_label = "perception agents",
     .item_counts = &suite.event_scale_counts,
     .runCase = runScatteredDenseIndexCase,
-    .write_workload = writePerceptionWorkload,
-};
-
-pub const cell_ordered_group = suite.BenchmarkGroup{
-    .name = "perception-cell-ordered",
-    .item_label = "perception agents",
-    .item_counts = &suite.event_scale_counts,
-    .runCase = runCellOrderedCase,
     .write_workload = writePerceptionWorkload,
 };
 
@@ -182,11 +174,6 @@ fn addObserver(data: *DataSystem, pos_x: f32, pos_y: f32, velocity_x: f32, veloc
 }
 
 fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_sparse_tiles: usize) !Fixture {
-    return createFixtureInOrder(allocator, io, count, extra_sparse_tiles, null);
-}
-
-// `createFixture`'s pairs created in `order` (pair `order[k]` k-th), or in pair order.
-fn createFixtureInOrder(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_sparse_tiles: usize, order: ?[]const u32) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -200,10 +187,8 @@ fn createFixtureInOrder(allocator: std.mem.Allocator, io: std.Io, count: usize, 
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
-    std.debug.assert(order == null or order.?.len == pair_count);
-    var step: usize = 0;
-    while (step < pair_count) : (step += 1) {
-        const pair_index: usize = if (order) |pairs| pairs[step] else step;
+    var pair_index: usize = 0;
+    while (pair_index < pair_count) : (pair_index += 1) {
         const gx = @as(f32, @floatFromInt(pair_index % pair_grid_columns)) * tile_size;
         const gy = (@as(f32, @floatFromInt(pair_index / pair_grid_columns)) + pair_row_center) * tile_size;
         _ = try addAgent(&data, gx, gy, 0, 0, .hostile);
@@ -272,11 +257,11 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
 }
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseImpl(allocator, io, options, case, item_count, buildDefaultFixture);
+    return runCaseImpl(allocator, io, options, case, item_count, buildDefaultFixture, false);
 }
 
 pub fn runLosDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    const stats = try runCaseImpl(allocator, io, options, case, item_count, buildLosDenseFixture);
+    const stats = try runCaseImpl(allocator, io, options, case, item_count, buildLosDenseFixture, false);
     if (stats.status == .skipped) return stats;
     // The extra tiles change no count.
     const plain = try untimedCounts(allocator, io, item_count);
@@ -295,66 +280,74 @@ fn untimedCounts(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !P
     defer system.deinit();
     var events = SimulationEvents.init(allocator);
     defer events.deinit();
-    var spatial_sys = SpatialIndexSystem.init(allocator);
-    defer spatial_sys.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), &setup_threads, .{});
-    const spatial_view = spatial_sys.view();
-    var scope = SimulationScopeSystem.init(allocator);
-    defer scope.deinit();
-    const think_set = (try scope.compactCognition(&spatial_view, 0, false, &setup_threads, .{})).cognition;
-    return runOnce(&system, &fixture, spatial_view, think_set, &events, &setup_threads, suite.serial_cases[0]);
+    var prepared = try prepareThinkSet(allocator, &fixture.data, &fixture.world, &setup_threads, false);
+    defer prepared.deinit();
+    return runOnce(&system, &fixture, prepared.view(), prepared.thinkSet(), &events, &setup_threads, suite.serial_cases[0]);
 }
 
 pub fn runScatteredDenseIndexCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseImpl(allocator, io, options, case, item_count, buildScatteredDenseIndexFixture);
+    return runCaseImpl(allocator, io, options, case, item_count, buildScatteredDenseIndexFixture, true);
 }
 
-pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    const stats = try runCaseImpl(allocator, io, options, case, item_count, buildCellOrderedFixture);
-    if (stats.status == .skipped) return stats;
-    // The same pairs: the same counts as the default order.
-    const plain = try untimedCounts(allocator, io, item_count);
-    std.debug.assert(stats.sample_count == plain.perf.sensed_count and stats.output_count == plain.perf.nearest_threat_found_count);
-    return stats;
+const PreparedThink = struct {
+    scope: SimulationScopeSystem,
+    index: SpatialIndexSystem,
+
+    fn deinit(self: *PreparedThink) void {
+        self.index.deinit();
+        self.scope.deinit();
+    }
+
+    fn view(self: *const PreparedThink) SpatialIndexView {
+        return self.index.view();
+    }
+
+    fn thinkSet(self: *const PreparedThink) []const u32 {
+        return self.scope.ai_cognition_indices.items;
+    }
+};
+
+fn thinkGrid(geometry: IndexGeometry) SimulationScopeSystem.ThinkCellGrid {
+    const grid = spatial_index_mod.cellGrid(geometry, 32);
+    const per_chunk: u32 = if (geometry.chunks_x == 0) 1 else @max(grid.cells_x / geometry.chunks_x, 1);
+    return .{
+        .cell_size = grid.cell_size,
+        .cells_x = grid.cells_x,
+        .cells_y = grid.cells_y,
+        .cells_per_chunk = per_chunk,
+    };
 }
 
-// The default fixture's pairs in its think set's observer order: an observer's AI row is its
-// pair's second (`addAgent` hostile, then observer).
-fn buildCellOrderedFixture(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !Fixture {
-    var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
-    defer setup_threads.deinit();
-    var plain = try buildDefaultFixture(allocator, io, item_count);
-    defer plain.deinit();
-    var spatial_sys = SpatialIndexSystem.init(allocator);
-    defer spatial_sys.deinit();
-    _ = try spatial_sys.build(&plain.data, .{ .entities = plain.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&plain.world), &setup_threads, .{});
-    const view = spatial_sys.view();
+fn prepareThinkSet(allocator: std.mem.Allocator, data: *DataSystem, world: *const WorldSystem, threads: *ThreadSystem, scatter_perception: bool) !PreparedThink {
     var scope = SimulationScopeSystem.init(allocator);
-    defer scope.deinit();
-    const think_set = (try scope.compactCognition(&view, 0, false, &setup_threads, .{})).cognition;
-    const order = try allocator.alloc(u32, item_count / 2);
-    defer allocator.free(order);
-    var observers: usize = 0;
-    for (think_set) |row| {
-        if (row % 2 == 0) continue;
-        order[observers] = row / 2;
-        observers += 1;
-    }
-    std.debug.assert(observers == order.len);
-    var fixture = try createFixtureInOrder(allocator, io, item_count, 0, order);
-    errdefer fixture.deinit();
-    // The new think set walks the observers, so their store slots, in creation order.
-    var ordered_index = SpatialIndexSystem.init(allocator);
-    defer ordered_index.deinit();
-    _ = try ordered_index.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), &setup_threads, .{});
-    const ordered_view = ordered_index.view();
-    var next_observer: u32 = 1;
-    for ((try scope.compactCognition(&ordered_view, 0, false, &setup_threads, .{})).cognition) |row| {
-        if (row % 2 == 0) continue;
-        std.debug.assert(row == next_observer);
-        next_observer += 2;
-    }
-    return fixture;
+    errdefer scope.deinit();
+    try scope.reserveAiRows(data.ai_agents.len());
+    const geometry = IndexGeometry.ofWorld(world);
+    try scope.orderThinkPhases(data, null, thinkGrid(geometry), threads, .{});
+    const halo = (try scope.gatherAiPopulations(data, null, threads, .{})).halo;
+    var index = SpatialIndexSystem.init(allocator);
+    errdefer index.deinit();
+    _ = try index.build(data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, geometry, threads, .{});
+    _ = scope.mergeThinkSet(data, 0, false);
+    try scope.packThinkSpan(data, threads, .{});
+    const think_set = scope.ai_cognition_indices.items;
+    for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
+    if (scatter_perception) try reshufflePerception(allocator, data);
+    return .{ .scope = scope, .index = index };
+}
+
+fn reshufflePerception(allocator: std.mem.Allocator, data: *DataSystem) !void {
+    const count = data.ai_perceptions.len();
+    if (count <= 1) return;
+    const perm = try fixtures.strideShuffledRows(allocator, count);
+    defer allocator.free(perm);
+    _ = try data.ai_perceptions.ensurePackImage(allocator, count);
+    data.ai_perceptions.copyToPack(0, count, perm);
+    data.ai_perceptions.copyPackToRows(0, count);
+    const indices = try allocator.alloc(u32, count);
+    defer allocator.free(indices);
+    for (indices, 0..) |*index, row| index.* = @intCast(row);
+    data.retiePackedIndices(.perception, indices);
 }
 
 fn buildDefaultFixture(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !Fixture {
@@ -376,6 +369,7 @@ fn runCaseImpl(
     case: suite.BenchmarkCase,
     item_count: usize,
     buildFixture: *const fn (std.mem.Allocator, std.Io, usize) anyerror!Fixture,
+    scatter_perception: bool,
 ) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
@@ -391,14 +385,11 @@ fn runCaseImpl(
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    // Positions never change, so the shared index is built once, untimed.
-    var spatial_sys = SpatialIndexSystem.init(allocator);
-    defer spatial_sys.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), &threads, .{ .adaptive = false });
-    const spatial_view = spatial_sys.view();
-    var scope = SimulationScopeSystem.init(allocator);
-    defer scope.deinit();
-    const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
+    // Positions never change, so the shared index and the packed think set are built once, untimed.
+    var prepared = try prepareThinkSet(allocator, &fixture.data, &fixture.world, &threads, scatter_perception);
+    defer prepared.deinit();
+    const spatial_view = prepared.view();
+    const think_set = prepared.thinkSet();
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.nextSettled(stageTunerSettle(&system))) {
@@ -594,15 +585,12 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    // Positions never change, so the shared index is built once, untimed.
-    var spatial_sys = SpatialIndexSystem.init(allocator);
-    defer spatial_sys.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), &threads, .{ .adaptive = false });
-    const spatial_view = spatial_sys.view();
+    // Positions never change, so the shared index and the packed think set are built once, untimed.
+    var prepared = try prepareThinkSet(allocator, &fixture.data, &fixture.world, &threads, false);
+    defer prepared.deinit();
+    const spatial_view = prepared.view();
+    const think_set = prepared.thinkSet();
     const thread_ptr = &threads;
-    var scope = SimulationScopeSystem.init(allocator);
-    defer scope.deinit();
-    const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.nextSettled(stageTunerSettle(&system))) {

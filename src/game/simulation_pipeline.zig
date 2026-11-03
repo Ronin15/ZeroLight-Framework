@@ -215,8 +215,8 @@ fn stageContract(stage: StageId) StageContract {
             .carried = resources(&.{ .movement_positions, .world_level }),
         },
         // The think set in the index's cell-major order, so rows sharing a neighborhood
-        // are adjacent in every think-set stage.
-        .ai_cognition_order => .{ .reads = resources(&.{.spatial_index}), .writes = resources(&.{.ai_cognition_indices}) },
+        // are adjacent in every think-set stage. `orderThinkPhases` publishes the run bounds.
+        .ai_cognition_order => .{ .reads = resources(&.{.ai_halo_indices}), .writes = resources(&.{.ai_cognition_indices}) },
         // Queries the spatial index for hostile candidates and writes sensed
         // state for this step's observers (think set); also emits acquisition/loss
         // transition events. Reads world_tiles for line-of-sight /
@@ -1759,16 +1759,13 @@ pub const SimulationPipeline = struct {
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
     }
 
-    /// The think set: the indexed halo rows on this step's stagger phase (every row with no
-    /// cognition region), in the index's cell-major order.
+    /// The think set: the halo rows on this step's stagger phase (every row with no
+    /// cognition region), in the index's cell-major order, packed to a prefix.
     fn stageAiCognitionOrder(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const cognition_order_timer = BenchStageTimer.start(context.perf);
-        const index = self.spatial_index.view();
-        const result = try self.scope.compactCognition(&index, step.stagger_step, step.cognition_region != null, context.thread_system, .{});
+        step.ai_cognition_indices = self.scope.mergeThinkSet(context.data, step.stagger_step, step.cognition_region != null);
         try self.scope.packThinkSpan(context.data, context.thread_system, .{});
-        step.ai_cognition_indices = result.cognition;
-        if (comptime runtime_perf_log.enabled) step.perf.scope_cognition = result.perf.batch;
         cognition_order_timer.stop(context.perf, .pipeline_cognition_order);
     }
 
@@ -8961,9 +8958,11 @@ test "a full-template create costs max_structural_events_per_create events" {
     try std.testing.expectEqual(@as(usize, 0), frame.deferredStructuralItems().len);
 }
 
-test "the think-set stage reads the built index and writes the think set every cognition stage reads" {
+test "the think-set stage reads the halo and writes the think set every cognition stage reads" {
     const order = stageContract(.ai_cognition_order);
-    try std.testing.expect(order.reads.contains(.spatial_index));
+    try std.testing.expect(!order.reads.contains(.spatial_index));
+    try std.testing.expect(!order.writes.contains(.spatial_index));
+    try std.testing.expect(order.reads.contains(.ai_halo_indices));
     try std.testing.expect(order.writes.contains(.ai_cognition_indices));
     try std.testing.expect(!stageContract(.scope_advance_and_ai_gather).writes.contains(.ai_cognition_indices));
     const order_at = std.mem.indexOfScalar(StageId, &stage_order, .ai_cognition_order).?;

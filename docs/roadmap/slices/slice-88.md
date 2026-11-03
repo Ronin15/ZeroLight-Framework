@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, and the stagger spread. Open: the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout. Open: plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -51,49 +51,20 @@ in its owning slice.
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/tests-benchmarks.md` § Benchmarks). Assignment is
       derived. The balance is measured. Not the hot-pass layout item.
-- [ ] DataSystem hot-pass data layout (contiguity audit H5): the stores stay
-      dense SoA; the stagger assignment and the cross-store reads are fixed in
-      the layout (`.grok/rules/memory-performance.md` § Data-oriented
-      design). Failure: every component store appends and swap-removes
-      (`data_system/movement.zig:67`, `:189`, `agents.zig:160`,
-      `faction_level.zig:57`, `:110`), so no store is ordered by the keys
-      tiered passes filter on. Tier, stagger phase, chunk, and level sit in
-      the movement scope columns (the scope level is kept equal to
-      `world_level`, `data_system/system.zig:944-950`); faction and
-      `world_level` are separate stores (`faction_level.zig:17`, `:22`); each
-      cross-store read resolves through the entity slot table
-      (`data_system/system.zig:445-455`, `:756-760`). Consumers: the
-      windowed threaded gathers `gatherAiData` (`systems/ai.zig:502`) and
-      `gatherPerceptionData` (`perception.zig:362`), the think-set compaction
-      `compactCognition` (`systems/simulation_scope.zig:338`, which reads only index
-      columns), `collisionGatherJob` and `aiGatherJob`
-      (`:663`, `:693`), collision `packFillRange` (`collision.zig:2706`), the
-      world gate's lane pass (`world_gate.zig:248`; its bounds columns are
-      already mirrored on the movement rows), and render collect (87). Failure scenario (derived): with phases striped by row, each
-      step's P/4 think set touches every cache line of each AI and movement
-      column it reads and uses a quarter of each, plus a slot-table, faction,
-      and `world_level` lookup per row; swap-remove churn scrambles phase and
-      chunk order further, and the scope index lists inherit the scatter.
-      Pass: each phase is a contiguous row run the think set reads in order;
-      no consumer above reads another store per row outside a once-per-stage
-      gather (`.grok/rules/memory-performance.md` § Data-oriented design); a
-      structural command's apply cost stays independent of population
-      (`.grok/rules/engine-design.md` § Cost model); serial == threaded and
-      deterministic. Measured skew (hypothesis, untested): in the
-      `production-step` census fixture the think set fills 2 of 4 stagger
-      phases, since the phase is `dense_index % cognition_stagger_n`
-      (`simulation_scope.zig:153-154`) and AI rows sit on alternate movement
-      rows, so step load is uneven. Coordinates with 75 (tier and cadence), 73 (think
-      interval), 68A (gathers off main), 86 (collision gather), and 35
-      (`world_gate`). The think set arrives in the index's cell-major order
-      (level, chunk, local cell, faction, slot; `docs/architecture.md`), so
-      the order within a phase follows it, faction after the cell: no
-      think-set pass filters on faction. A phase-ordered store may replace
-      `compactCognition` with an O(think rows) producer of the same order;
-      the consumers do not change. Once production writes ascend,
-      `ai-cell-ordered` and `perception-cell-ordered` measure the same stream
-      as `ai` and `perception` and go; `ai-memory-shuffled` and
-      `ai-affect-shuffled` stay as the swap-remove churn shape.
+- [x] The AI store stays in think-key order. `mergeThinkSet`
+      (`simulation_scope.zig:1047`) replaces `compactCognition`. One
+      live run is copied (`copyThinkRun`, `:1599`) with no cell-prefix
+      load. Two or more live runs compare cell prefixes
+      (`thinkCellPrefix`, `:1614`); the next head depends on the last
+      compare, so that merge stays scalar. `packThinkSpan` rewrites
+      the think list to `0 .. think_len`. Movement, collision,
+      faction, world level, and drawable runs are not phase-ordered.
+      `scope-cognition` `1004096`, both inline: base 14.0 us, tree
+      5.2 us, `indexed=4096 thinking=1024`
+      (`.grok/rules/memory-performance.md` § Data-oriented design,
+      § SIMD and core math). `ai-cell-ordered` and
+      `perception-cell-ordered` are gone. `ai-memory-shuffled` and
+      `ai-affect-shuffled` stay.
 - [ ] Plane entry gathers by movement row from the bounds columns. Failure:
       `gatherRange` (`plane_entry.zig:329`) resolves `movementVisualDenseIndices`
       per lane for every AI row (two slot resolves per row, a lookup into other

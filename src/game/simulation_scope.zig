@@ -183,8 +183,10 @@ pub const SimulationScopeStats = struct {
     steering_stage_entities: usize = 0,
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`: indexed halo entities the stagger skipped
-    /// this step, and cognition entities excluded because their chunk is outside the halo.
+    /// Kept only with `runtime_perf_log.enabled`. `stagger_skips` is the sum of the other
+    /// in-halo phase run lengths this step (a bodiless row counts), not the indexed halo.
+    /// `chunk_filtered_entities` is cognition entities excluded because their chunk is
+    /// outside the halo.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         stagger_skips: usize = 0,
         chunk_filtered_entities: usize = 0,

@@ -3,17 +3,15 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! - `ai`: the per-step AI decision (gather, separation, cohere, arbitration, intents) over
-//!   a fixed-density grid, with the shared index and the think set (every agent, in the
-//!   index's cell-major order, as production orders it) built untimed. Pass shape: time
-//!   linear in agents; separation checks per agent at most `max_separation_candidate_checks`
-//!   and neighbor samples at most `max_separation_neighbors`; neighbor-block fills at most
-//!   the rows' cell runs plus the ranges, per query kind; the tuned case within spread of
-//!   the best control; the main thread's time (the gather's window merge) flat per agent.
-//!   Asserts check the check, sample, and fill bounds.
-//! - `ai-cell-ordered`: the same agents created in the think set's order, so every per-row
-//!   store read and write (`ai_agent_hot` by AI index) ascends. Pass shape: `ai` within
-//!   spread of it, the scattered-write control; asserts check the think set ascends.
-//! Both print `separation_checks=`, `intents=`, `separation_fills=`, and `cohere_fills=`
+//!   a fixed-density grid, with the shared index and the think set built untimed. Production
+//!   packs the think set to an ascending prefix before the timed gather, and `ai-cell-ordered`
+//!   is gone. Pass shape: time linear in agents; separation checks per agent at most
+//!   `max_separation_candidate_checks` and neighbor samples at most `max_separation_neighbors`;
+//!   neighbor-block fills at most the rows' cell runs plus the ranges, per query kind; the
+//!   tuned case within spread of the best control; the main thread's time (the gather's
+//!   window merge) flat per agent. Asserts check the check, sample, and fill bounds, and
+//!   `think_set[k] == k`.
+//! Prints `separation_checks=`, `intents=`, `separation_fills=`, and `cohere_fills=`
 //! (neighbor-block fills per query kind); the summary adds the behavior histogram, and
 //! `--details` adds `main=` with `main_per_item=` (per intent), `gather=` and `intent=` (stage
 //! shapes over the measured steps; the separation stage is the row's batch), `tuned=` when the
@@ -63,14 +61,6 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeAiWorkload,
 };
 
-pub const cell_ordered_group = suite.BenchmarkGroup{
-    .name = "ai-cell-ordered",
-    .item_label = "AI agents",
-    .item_counts = &suite.event_scale_counts,
-    .runCase = runCellOrderedCase,
-    .write_workload = writeAiWorkload,
-};
-
 const Fixture = struct {
     data: DataSystem,
     frame: SimulationFrame,
@@ -90,12 +80,6 @@ const Fixture = struct {
 };
 
 fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
-    return createFixtureInOrder(allocator, count, null);
-}
-
-// The fixture's agents created in `order` (agent `order[k]` k-th), or in index order.
-fn createFixtureInOrder(allocator: std.mem.Allocator, count: usize, order: ?[]const u32) !Fixture {
-    std.debug.assert(order == null or order.?.len == count);
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
@@ -109,8 +93,7 @@ fn createFixtureInOrder(allocator: std.mem.Allocator, count: usize, order: ?[]co
     const threat_marker = try data.createEntity();
     const focus_entity = try data.createEntity();
 
-    for (0..count) |step| {
-        const index: usize = if (order) |agents| agents[step] else step;
+    for (0..count) |index| {
         const entity = try data.createEntity();
         const position = math.Vec2{
             .x = @as(f32, @floatFromInt(index % grid_columns)) * grid_pitch_x,
@@ -167,6 +150,17 @@ fn createFixtureInOrder(allocator: std.mem.Allocator, count: usize, order: ?[]co
 }
 
 // The grid covering the fixture's `count` bodies, laid out `grid_columns` per row.
+fn thinkGrid(geometry: IndexGeometry) SimulationScopeSystem.ThinkCellGrid {
+    const grid = @import("../game/systems/spatial_index.zig").cellGrid(geometry, 32);
+    const per_chunk: u32 = if (geometry.chunks_x == 0) 1 else @max(grid.cells_x / geometry.chunks_x, 1);
+    return .{
+        .cell_size = grid.cell_size,
+        .cells_x = grid.cells_x,
+        .cells_y = grid.cells_y,
+        .cells_per_chunk = per_chunk,
+    };
+}
+
 fn fixtureIndexGeometry(count: usize) IndexGeometry {
     const rows = (count + grid_columns - 1) / grid_columns;
     return fixtures.indexGeometryCovering(@as(f32, @floatFromInt(grid_columns)) * grid_pitch_x, @as(f32, @floatFromInt(rows)) * grid_pitch_y, 1);
@@ -190,51 +184,35 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createFixture(allocator, item_count);
     defer fixture.deinit();
-    return runFixture(allocator, io, options, case, item_count, &fixture, false);
+    return runFixture(allocator, io, options, case, item_count, &fixture);
 }
 
-pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    // The default fixture's think set is the creation order, built inline.
-    var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
-    defer setup_threads.deinit();
-    const order = blk: {
-        var plain = try createFixture(allocator, item_count);
-        defer plain.deinit();
-        var index = SpatialIndexSystem.init(allocator);
-        defer index.deinit();
-        _ = try index.build(&plain.data, .{ .entities = plain.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), &setup_threads, .{});
-        const view = index.view();
-        var scope = SimulationScopeSystem.init(allocator);
-        defer scope.deinit();
-        break :blk try allocator.dupe(u32, (try scope.compactCognition(&view, 0, false, &setup_threads, .{})).cognition);
-    };
-    defer allocator.free(order);
-    var fixture = try createFixtureInOrder(allocator, item_count, order);
-    defer fixture.deinit();
-    return runFixture(allocator, io, options, case, item_count, &fixture, true);
-}
-
-// `think_ascends`: the fixture was created in its think set's order.
-fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *Fixture, think_ascends: bool) !suite.RunStats {
+fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *Fixture) !suite.RunStats {
     var system = AiSystem.init(allocator);
     defer system.deinit();
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    // Positions never change, so the index is built once, untimed (its own group times it).
-    var spatial_sys = SpatialIndexSystem.init(allocator);
-    defer spatial_sys.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), &threads, .{ .adaptive = false });
-    const spatial_view = spatial_sys.view();
+    // Positions never change, so the index and the packed think set are built once, untimed.
+    var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    defer setup_threads.deinit();
+    const geometry = fixtureIndexGeometry(item_count);
     var scope = SimulationScopeSystem.init(allocator);
     defer scope.deinit();
-    const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
+    try scope.reserveAiRows(item_count);
+    const grid = thinkGrid(geometry);
+    try scope.orderThinkPhases(&fixture.data, null, grid, &setup_threads, .{});
+    const halo = (try scope.gatherAiPopulations(&fixture.data, null, &setup_threads, .{})).halo;
+    var spatial_sys = SpatialIndexSystem.init(allocator);
+    defer spatial_sys.deinit();
+    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities, .rows = halo }, geometry, &setup_threads, .{});
+    const spatial_view = spatial_sys.view();
+    _ = scope.mergeThinkSet(&fixture.data, 0, false);
+    try scope.packThinkSpan(&fixture.data, &setup_threads, .{});
+    const think_set = scope.ai_cognition_indices.items;
     std.debug.assert(think_set.len == item_count);
-    if (think_ascends) {
-        for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
-    }
+    for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.nextSettled(stageTunerSettle(&system))) {

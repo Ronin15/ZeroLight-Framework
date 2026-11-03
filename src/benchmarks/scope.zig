@@ -2,30 +2,25 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `scope-cognition`: the think set alone (`compactCognition`) over a halo index built once
+//! `scope-cognition`: the think set alone (`mergeThinkSet`) over a halo index built once
 //!   untimed: `spread` over N entities on 16 x-chunks whose levels (`index % 5`) give a
 //!   mixed-tier population (cognition, locomotion, kinematic, dormant), `dense_chunk` with
-//!   every agent in one chunk (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
-//!   rows in both layouts. The tuned case follows the production tuner and stays inline while
-//!   its batch is under the gate; the main thread's share (the window merges) is flat per row.
-//!   Asserts check a fixed threaded case dispatches the pass to workers at one range per
-//!   aligned range of rows, one record for `dense_chunk`, every case's think set equal
-//!   to the serial pass's, and every indexed row counted once, thinking or skipped; on
-//!   `spread`, untimed after the measured passes, the collision bounds and AI halo gathers,
-//!   the tier policy, and the chunk derive at the case's controls dispatch the same way. Item
-//!   code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`). Prints `indexed=`
-//!   (H) and `thinking=`; `--details` adds `main=` with `main_per_item=` (per indexed row).
+//!   every agent in one chunk (one index record). The timed pass is the inline merge,
+//!   linear in thinking rows, not in indexed rows; dense and spread are the two shapes;
+//!   there is no cognition tuner and no worker dispatch. `indexed == agents` and one record
+//!   stay for `dense_chunk`. On `spread`, untimed after the measured passes, the collision
+//!   bounds and AI halo gathers, the tier policy, and the chunk derive at the case's
+//!   controls dispatch. Item code `layout * 10^6 + agents` (layout 0 `spread`, 1
+//!   `dense_chunk`). Prints `indexed=` (H) and `thinking=`; `--details` adds `main=` with
+//!   `main_per_item=` (per thinking row).
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
-const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
-const CognitionResult = @import("../game/systems/simulation_scope.zig").CognitionResult;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const ScopeConfig = @import("../game/systems/simulation_scope.zig").ScopeConfig;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
@@ -183,49 +178,39 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     const view = spatial_index.view();
     const indexed = view.entryCount();
     if (fields.layout == .dense_chunk) std.debug.assert(view.recordCount() == 1 and indexed == fields.agents);
-    // The inline pass's think set, untimed: every case must match it.
-    const serial_think = blk: {
-        var reference = SimulationScopeSystem.init(allocator);
-        defer reference.deinit();
-        break :blk try allocator.dupe(u32, (try reference.compactCognition(&view, 0, true, &setup_threads, .{})).cognition);
-    };
-    defer allocator.free(serial_think);
 
+    var first_think: ?[]u32 = null;
+    defer if (first_think) |rows| allocator.free(rows);
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(suite.tunerSettled(&scope.cognition_tuner))) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
-    const cognition_tuner_start = suite.TunerStart.of(&scope.cognition_tuner, case);
+    while (warm.next(true)) {
+        const cognition = runCognitionOnce(&scope, &data);
+        if (first_think == null) first_think = try allocator.dupe(u32, cognition);
+        std.debug.assert(std.mem.eql(u32, first_think.?, cognition));
+    }
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var think_rows: usize = 0;
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const result = try runCognitionOnce(&scope, &view, thread_ptr, case);
+        const cognition = runCognitionOnce(&scope, &data);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(scope_range_alignment_items), result.perf.batch);
-        try suite.checkFixedRangeCount(case, thread_ptr, case.stageItemsPerRange(scope_range_alignment_items), result.perf.batch);
-        accumulator.record(elapsed_ns, result.perf.batch);
-        main_total += elapsed_ns -| offMainNs(result.perf.batch);
-        std.debug.assert(std.mem.eql(u32, serial_think, result.cognition));
-        think_rows = result.cognition.len;
-        // Every indexed row thinks or is skipped, once, and each range scans exactly its own
-        // cell-major positions.
-        std.debug.assert(think_rows + scope.perf.stagger_skips == indexed);
-        std.debug.assert(result.perf.batch.range_count == scope.range_tallies.items.len);
-        for (scope.range_tallies.items, 0..) |slot, range_index| {
-            const range_start = range_index * result.perf.batch.items_per_range;
-            std.debug.assert(slot.value.count + slot.value.perf.stagger_skips == @min(result.perf.batch.items_per_range, indexed - range_start));
-        }
+        accumulator.record(elapsed_ns, .{});
+        main_total += elapsed_ns;
+        if (first_think == null) first_think = try allocator.dupe(u32, cognition);
+        std.debug.assert(std.mem.eql(u32, first_think.?, cognition));
+        think_rows = cognition.len;
     }
 
     if (fields.layout == .spread) try checkScopeStagesDispatched(allocator, &scope, &data, thread_ptr, case);
     var stats = accumulator.finish();
+    // Not a dispatch: leave the workers cell empty.
+    stats.batch_carried = false;
     stats.items_per_second = suite.itemsPerSecond(fields.agents, stats.mean_ns);
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = indexed;
     stats.output_count = think_rows;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&scope.cognition_tuner, cognition_tuner_start);
     return stats;
 }
 
@@ -249,16 +234,16 @@ fn checkScopeStagesDispatched(allocator: std.mem.Allocator, scope: *SimulationSc
     }
 }
 
-fn runCognitionOnce(scope: *SimulationScopeSystem, view: *const SpatialIndexView, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !CognitionResult {
-    return scope.compactCognition(view, 0, true, thread_system, scopeConfig(case));
+fn runCognitionOnce(scope: *SimulationScopeSystem, data: *const DataSystem) []const u32 {
+    return scope.mergeThinkSet(data, 0, true);
 }
 
 // `candidate_pairs` holds the indexed rows and `output_count` the rows that think; `main` is
-// the time outside the pass's worker dispatch.
+// the whole merge. There is no worker dispatch.
 fn writeCognitionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("indexed={} thinking={}", .{ stats.candidate_pairs, stats.output_count });
     if (view == .summary) return;
-    try suite.writeMainShare(writer, stats, stats.candidate_pairs);
+    try suite.writeMainShare(writer, stats, stats.output_count);
 }
 
 // Scope-pass threading config for a case: adaptive cases let the tuner train (null range);
