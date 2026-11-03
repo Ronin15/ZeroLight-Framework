@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the facing tail, the index-key tail, sprite sin/cos lanes, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, and the facing tail. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the index-key tail, sprite sin/cos lanes, the saturating ceil, contact clamp, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -308,14 +308,15 @@ in its owning slice.
       hand-rolled primitive left in a system. The reworked loops that already
       use one lane kernel pass (derived, no bench). The six misses are the
       items below.
-- [ ] Perception facing's tail is the lane kernel (`computeFacingRange`,
-      `perception.zig:669`). The remainder calls `computeFacingScalar`
-      (`:560`). Failure: a span whose length is not a multiple of the lane
-      count normalizes the last rows on a second formula. Pass: the
-      remainder is that lane kernel with a mask, and inactive lanes are not
-      stored. Serial and threaded facing stay identical
+- [x] Perception facing's tail is the lane kernel (`computeFacingRange`,
+      `perception.zig:669`). Each batch loads and stores with
+      `loadFloat4Lanes` and `storeFloat4Lanes`. A 1–3 row remainder is that
+      kernel, and inactive lanes are not stored. `computeFacingScalar`
+      (`:561`) is the finite reference only. A non-finite tail row keeps
+      its previous facing. Serial and threaded facing match. The threaded
+      fixture is two ranges and one worker: main runs the last 3-row batch
       (`.grok/rules/memory-performance.md` § SIMD and core math). Derived,
-      no bench. How is open.
+      no bench.
 - [ ] Index key fill's tail is the lane kernel (`spatial_index.zig:1372`).
       The remainder calls `keyForPosition` (`:1308`). Failure: a bucket
       range whose slot count is not a multiple of the lane count builds

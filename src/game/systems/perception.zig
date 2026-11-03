@@ -557,6 +557,7 @@ fn gatherPerceptionJob(context: *anyopaque, range: ParallelRange, _: WorkerId) v
     job.range_stats[range.index].value = .{ .kept = kept };
 }
 
+// Finite reference for the lane kernel, not the production tail.
 fn computeFacingScalar(vx: f32, vy: f32, prev_facing: math.Vec2) math.Vec2 {
     const speed2 = vx * vx + vy * vy;
     if (speed2 <= facing_speed_squared_threshold) return prev_facing;
@@ -663,29 +664,23 @@ fn observerCell(job: *const PerceptionJobContext, row: usize) [4]u32 {
     };
 }
 
-/// Unit facing from each row of `[start, end)`'s previous velocity, written to the row and
-/// scattered into `PerceptionStore`; near-stationary rows keep their facing. Ranges start on
-/// `perception_range_alignment_items`, so the lane batches and the tail match a whole pass.
+// Unit facing from each row's velocity. Near-stationary rows keep theirs. The last batch
+// is that kernel masked to the rows left; inactive lanes are not stored.
 fn computeFacingRange(job: *PerceptionJobContext, start: usize, end: usize) void {
     std.debug.assert(start <= end and end <= job.facing_x.len);
-    var i = start;
-    const vend = start + simd.vectorizedEnd(end - start);
     const threshold = simd.splatFloat4(facing_speed_squared_threshold);
-    while (i < vend) : (i += simd.lane_count) {
-        const vx = simd.loadFloat4(job.velocity_x[i..]);
-        const vy = simd.loadFloat4(job.velocity_y[i..]);
-        const prev_fx = simd.loadFloat4(job.facing_x[i..]);
-        const prev_fy = simd.loadFloat4(job.facing_y[i..]);
+    var i = start;
+    while (i < end) : (i += simd.lane_count) {
+        const count = end - i;
+        const vx = simd.loadFloat4Lanes(job.velocity_x[i..], count);
+        const vy = simd.loadFloat4Lanes(job.velocity_y[i..], count);
+        const prev_fx = simd.loadFloat4Lanes(job.facing_x[i..], count);
+        const prev_fy = simd.loadFloat4Lanes(job.facing_y[i..], count);
         const speed2 = simd.lengthSquared2Float4(vx, vy);
         const moving = simd.greaterThanFloat4(speed2, threshold);
         const normalized = simd.normalizeOrZero2Float4(vx, vy, facing_normalize_epsilon);
-        simd.storeFloat4Slice(job.facing_x[i..], simd.selectFloat4(moving, normalized.x, prev_fx));
-        simd.storeFloat4Slice(job.facing_y[i..], simd.selectFloat4(moving, normalized.y, prev_fy));
-    }
-    while (i < end) : (i += 1) {
-        const result = computeFacingScalar(job.velocity_x[i], job.velocity_y[i], .{ .x = job.facing_x[i], .y = job.facing_y[i] });
-        job.facing_x[i] = result.x;
-        job.facing_y[i] = result.y;
+        simd.storeFloat4Lanes(job.facing_x[i..], simd.selectFloat4(moving, normalized.x, prev_fx), count);
+        simd.storeFloat4Lanes(job.facing_y[i..], simd.selectFloat4(moving, normalized.y, prev_fy), count);
     }
     // Scalar scatter: one store per row into its own `PerceptionStore` slot.
     for (start..end) |row| {
@@ -1081,6 +1076,22 @@ fn addObserver(
     return entity;
 }
 
+// `setAiPerception` rejects a zero range. Gather reads these columns.
+fn writeZeroSenseRanges(data: *DataSystem, entity: EntityId) void {
+    const dense = data.aiPerceptionDenseIndex(entity).?;
+    const rows = data.ai_perceptions.rows.slice();
+    rows.items(.vision_range)[dense] = 0;
+    rows.items(.hearing_range)[dense] = 0;
+}
+
+// `setMovementBody` rejects a non-finite velocity. Gather reads the AI row's copy.
+fn writeAgentVelocity(data: *DataSystem, entity: EntityId, velocity_x: f32, velocity_y: f32) void {
+    const row = data_test_support.rowOf(data, entity, "ai_agent_index").?;
+    const agents = data.ai_agents.rows.slice();
+    agents.items(.velocity_x)[row] = velocity_x;
+    agents.items(.velocity_y)[row] = velocity_y;
+}
+
 const testSpatialIndex = @import("spatial_index_test_support.zig").testSpatialIndex;
 const testHaloIndex = @import("spatial_index_test_support.zig").testHaloIndex;
 
@@ -1210,51 +1221,121 @@ test "the in-lane FOV keeps exactly the capped candidates fovTestScalar passes, 
     }
 }
 
-test "the compute range's facing matches computeFacingScalar lane-for-lane, including the scalar tail" {
-    var data = DataSystem.init(testing.allocator);
-    defer data.deinit();
+const facing_case_velocity = [_][2]f32{ .{ 50, 0 }, .{ 0, 0 }, .{ 1, 0 }, .{ 0, -20 }, .{ -30, 40 } };
+const facing_case_previous = [_][2]f32{ .{ 0, 1 }, .{ 0, 1 }, .{ 0, 1 }, .{ 1, 0 }, .{ 1, 0 } };
+const facing_case_named = [_][2]f32{ .{ 1, 0 }, .{ 0, 1 }, .{ 0, 1 }, .{ 0, -1 } };
 
-    // 5 rows (not a multiple of lane_count 4): exercises the vectorized block
-    // and the one-row scalar tail in the same run. Mix of moving and
-    // near-stationary rows so both select branches are covered.
-    const velocities = [_][2]f32{ .{ 50, 0 }, .{ 0, 0 }, .{ -30, 40 }, .{ 0.01, 0 }, .{ 0, -20 } };
-    const prev_facings = [_][2]f32{ .{ 1, 0 }, .{ 0, 1 }, .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 } };
+test "facing lane batches, the masked tail included, match computeFacingScalar bit for bit" {
+    const spans = [_]struct { count: usize, nan_tail: bool }{
+        .{ .count = 1, .nan_tail = false },
+        .{ .count = 2, .nan_tail = false },
+        .{ .count = 3, .nan_tail = false },
+        .{ .count = 4, .nan_tail = false },
+        .{ .count = 5, .nan_tail = false },
+        .{ .count = 1, .nan_tail = true },
+        .{ .count = 5, .nan_tail = true },
+    };
+    for (spans) |span| {
+        var data = DataSystem.init(testing.allocator);
+        defer data.deinit();
+        var entities: [5]EntityId = undefined;
+        for (0..span.count) |i| {
+            const nan_row = span.nan_tail and i + 1 == span.count;
+            const velocity = if (nan_row) [2]f32{ 0, 0 } else facing_case_velocity[i];
+            entities[i] = try addObserver(&data, 0, 0, velocity[0], velocity[1], .neutral, .{});
+            if (nan_row) writeAgentVelocity(&data, entities[i], std.math.nan(f32), 0);
+            const previous = if (nan_row) [2]f32{ 0, 1 } else facing_case_previous[i];
+            const dense = data.aiPerceptionDenseIndex(entities[i]).?;
+            var perception_slice = data.perceptionSlice();
+            perception_slice.facing_x[dense] = previous[0];
+            perception_slice.facing_y[dense] = previous[1];
+        }
 
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
+        var spatial_sys = try testSpatialIndex(&data);
+        defer spatial_sys.deinit();
+        var world = try minimalWorld(testing.allocator, 8, 8, 32);
+        defer world.deinit();
+        var sys = PerceptionSystem.init(testing.allocator);
+        defer sys.deinit();
+        var events = SimulationEvents.init(testing.allocator);
+        defer events.deinit();
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    var entities: [velocities.len]EntityId = undefined;
-    for (velocities, 0..) |v, i| {
-        entities[i] = try addObserver(&data, @floatFromInt(i * 10), 0, v[0], v[1], .neutral, .{});
-    }
-
-    var spatial_sys = try testSpatialIndex(&data);
-    defer spatial_sys.deinit();
-
-    var events = SimulationEvents.init(testing.allocator);
-    defer events.deinit();
-
-    // Seed prev_facing via a direct perception-slice write (simulating a prior
-    // step's output) before the dense pass runs.
-    {
-        var perception_slice = data.perceptionSlice();
-        for (entities, 0..) |ent, i| {
-            const dense = data.aiPerceptionDenseIndex(ent).?;
-            perception_slice.facing_x[dense] = prev_facings[i][0];
-            perception_slice.facing_y[dense] = prev_facings[i][1];
+        for (0..span.count) |i| {
+            const perception = data_test_support.aiPerception(&data, entities[i]).?;
+            if (span.nan_tail and i + 1 == span.count) {
+                try testing.expectEqual(@as(f32, 0), perception.facing_x);
+                try testing.expectEqual(@as(f32, 1), perception.facing_y);
+            } else {
+                const scalar = computeFacingScalar(facing_case_velocity[i][0], facing_case_velocity[i][1], .{ .x = facing_case_previous[i][0], .y = facing_case_previous[i][1] });
+                if (i < facing_case_named.len) {
+                    try testing.expectEqual(facing_case_named[i][0], scalar.x);
+                    try testing.expectEqual(facing_case_named[i][1], scalar.y);
+                }
+                try testing.expectEqual(scalar.x, perception.facing_x);
+                try testing.expectEqual(scalar.y, perception.facing_y);
+            }
         }
     }
+}
 
+test "inactive facing lanes stay unset while live rows match computeFacingScalar" {
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
     var world = try minimalWorld(testing.allocator, 8, 8, 32);
     defer world.deinit();
+    for ([_]usize{ 1, 2, 3, 4, 5 }) |live| {
+        var data = DataSystem.init(testing.allocator);
+        defer data.deinit();
+        const total = live + simd.lane_count;
+        var entities: [5 + simd.lane_count]EntityId = undefined;
+        for (0..total) |i| {
+            const velocity = if (i < live) facing_case_velocity[i] else [2]f32{ 99, 99 };
+            entities[i] = try addObserver(&data, 0, 0, velocity[0], velocity[1], .neutral, .{});
+            writeZeroSenseRanges(&data, entities[i]);
+            const dense = data.aiPerceptionDenseIndex(entities[i]).?;
+            var perception_slice = data.perceptionSlice();
+            if (i < live) {
+                perception_slice.facing_x[dense] = facing_case_previous[i][0];
+                perception_slice.facing_y[dense] = facing_case_previous[i][1];
+            } else {
+                perception_slice.facing_x[dense] = 42;
+                perception_slice.facing_y[dense] = -7;
+            }
+        }
 
-    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+        var spatial_sys = try testSpatialIndex(&data);
+        defer spatial_sys.deinit();
+        var sys = PerceptionSystem.init(testing.allocator);
+        defer sys.deinit();
+        const spatial = spatial_sys.view();
+        const perception_slice = data.perceptionSlice();
+        _ = try sys.gatherPerceptionData(.{
+            .ai_agents = data.aiAgentSliceConst(),
+            .movement = data.movementBodySliceConst(),
+            .data = &data,
+            .perception_slice = perception_slice,
+            .scope_dense_indices = null,
+            .cell_size = spatial.cell_size,
+        }, &threads, .{});
+        var job = sys.buildJobContext(perception_slice, spatial, &world, null, &.{}, sys.range_stats.items.len);
+        computeFacingRange(&job, 0, live);
 
-    for (entities, velocities, prev_facings) |ent, v, prev| {
-        const expected = computeFacingScalar(v[0], v[1], .{ .x = prev[0], .y = prev[1] });
-        const perception = data_test_support.aiPerception(&data, ent).?;
-        try testing.expectEqual(expected.x, perception.facing_x);
-        try testing.expectEqual(expected.y, perception.facing_y);
+        for (0..live) |row| {
+            const scalar = computeFacingScalar(facing_case_velocity[row][0], facing_case_velocity[row][1], .{ .x = facing_case_previous[row][0], .y = facing_case_previous[row][1] });
+            try testing.expectEqual(scalar.x, job.facing_x[row]);
+            try testing.expectEqual(scalar.y, job.facing_y[row]);
+            const dense = job.perception_dense_index[row];
+            try testing.expectEqual(scalar.x, job.perception_slice.facing_x[dense]);
+            try testing.expectEqual(scalar.y, job.perception_slice.facing_y[dense]);
+        }
+        for (live..total) |row| {
+            try testing.expectEqual(@as(f32, 42), job.facing_x[row]);
+            try testing.expectEqual(@as(f32, -7), job.facing_y[row]);
+            const dense = job.perception_dense_index[row];
+            try testing.expectEqual(@as(f32, 42), job.perception_slice.facing_x[dense]);
+            try testing.expectEqual(@as(f32, -7), job.perception_slice.facing_y[dense]);
+        }
     }
 }
 
@@ -2685,6 +2766,81 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     const serial_merged = serial_events.mergedItems();
     const threaded_merged = threaded_events.mergedItems();
     try testing.expectEqualSlices(SimulationEvent, serial_merged, threaded_merged);
+}
+
+test "serial and threaded PerceptionSystem facing matches, the last range ending in the masked tail" {
+    const count = perception_range_alignment_items + 3;
+    var serial_data = DataSystem.init(testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = DataSystem.init(testing.allocator);
+    defer threaded_data.deinit();
+
+    var velocity_x: [perception_range_alignment_items + 3]f32 = undefined;
+    var velocity_y: [perception_range_alignment_items + 3]f32 = undefined;
+    var previous_x: [perception_range_alignment_items + 3]f32 = undefined;
+    var previous_y: [perception_range_alignment_items + 3]f32 = undefined;
+    var serial_ids: [perception_range_alignment_items + 3]EntityId = undefined;
+    var threaded_ids: [perception_range_alignment_items + 3]EntityId = undefined;
+    for (0..count) |i| {
+        const tail = i >= count - 3;
+        const tail_slot: usize = if (tail) i - (count - 3) else 0;
+        velocity_x[i] = if (!tail) 50 else if (tail_slot == 1) 1 else 0;
+        velocity_y[i] = if (tail and tail_slot == 2) -20 else 0;
+        previous_x[i] = if (tail and tail_slot == 2) 1 else 0;
+        previous_y[i] = if (tail and tail_slot == 2) 0 else 1;
+        serial_ids[i] = try addObserver(&serial_data, 0, 0, velocity_x[i], velocity_y[i], .neutral, .{});
+        threaded_ids[i] = try addObserver(&threaded_data, 0, 0, velocity_x[i], velocity_y[i], .neutral, .{});
+        writeZeroSenseRanges(&serial_data, serial_ids[i]);
+        writeZeroSenseRanges(&threaded_data, threaded_ids[i]);
+        const serial_dense = serial_data.aiPerceptionDenseIndex(serial_ids[i]).?;
+        const threaded_dense = threaded_data.aiPerceptionDenseIndex(threaded_ids[i]).?;
+        var serial_slice = serial_data.perceptionSlice();
+        var threaded_slice = threaded_data.perceptionSlice();
+        serial_slice.facing_x[serial_dense] = previous_x[i];
+        serial_slice.facing_y[serial_dense] = previous_y[i];
+        threaded_slice.facing_x[threaded_dense] = previous_x[i];
+        threaded_slice.facing_y[threaded_dense] = previous_y[i];
+    }
+
+    var world = try minimalWorld(testing.allocator, 8, 8, 32);
+    defer world.deinit();
+    var serial_spatial = try testSpatialIndex(&serial_data);
+    defer serial_spatial.deinit();
+    var serial_sys = PerceptionSystem.init(testing.allocator);
+    defer serial_sys.deinit();
+    var serial_events = SimulationEvents.init(testing.allocator);
+    defer serial_events.deinit();
+    _ = try updateInline(&serial_sys, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &world, &serial_data, &serial_events, .{});
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = perception_range_alignment_items });
+    defer threads.deinit();
+    var threaded_spatial = try testSpatialIndex(&threaded_data);
+    defer threaded_spatial.deinit();
+    var threaded_sys = PerceptionSystem.init(testing.allocator);
+    defer threaded_sys.deinit();
+    var threaded_events = SimulationEvents.init(testing.allocator);
+    defer threaded_events.deinit();
+    _ = try threaded_sys.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &world, &threaded_data, &threaded_events, &threads, .{
+        .items_per_range = perception_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    for (0..count) |i| {
+        const tail = i >= count - 3;
+        const tail_slot: usize = if (tail) i - (count - 3) else 0;
+        const scalar = computeFacingScalar(velocity_x[i], velocity_y[i], .{ .x = previous_x[i], .y = previous_y[i] });
+        const named_x: f32 = if (tail) 0 else 1;
+        const named_y: f32 = if (!tail) 0 else if (tail_slot == 2) -1 else 1;
+        const serial = data_test_support.aiPerception(&serial_data, serial_ids[i]).?;
+        const threaded = data_test_support.aiPerception(&threaded_data, threaded_ids[i]).?;
+        try testing.expectEqual(named_x, scalar.x);
+        try testing.expectEqual(named_y, scalar.y);
+        try testing.expectEqual(scalar.x, serial.facing_x);
+        try testing.expectEqual(scalar.y, serial.facing_y);
+        try testing.expectEqual(serial.facing_x, threaded.facing_x);
+        try testing.expectEqual(serial.facing_y, threaded.facing_y);
+    }
 }
 
 test "threaded PerceptionSystem update records one sample into the compute tuner" {
