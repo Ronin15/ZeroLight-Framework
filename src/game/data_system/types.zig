@@ -144,15 +144,14 @@ pub fn scatterColumns(
     }
 }
 
-/// Committed row counts of the component stores whose pipeline scratch, event
-/// shares, and pathfinding pools are population-sized. Read by the pipeline's
-/// population growth seam (`SimulationPipeline.syncPopulationCapacity`).
+/// Committed row counts read by `SimulationPipeline.syncPopulationCapacity`.
 pub const PopulationRowCounts = struct {
     movement_bodies: usize,
     steering_agents: usize,
     ai_agents: usize,
     collision_bounds: usize,
     ai_perceptions: usize,
+    ai_memories: usize,
     ai_affects: usize,
 
     /// Rows of every store whose pipeline scratch is sized by `movement_body_capacity`.
@@ -160,6 +159,11 @@ pub const PopulationRowCounts = struct {
     /// `setCollisionBounds` attach independently), so this is the max, not one store.
     pub fn population(self: PopulationRowCounts) usize {
         return @max(@max(self.movement_bodies, self.steering_agents), @max(self.ai_agents, self.collision_bounds));
+    }
+
+    /// Think-pack count: the max of AI, perception, memory, and affect rows. Not the body cap.
+    pub fn packScratchRows(self: PopulationRowCounts) usize {
+        return @max(@max(self.ai_agents, self.ai_perceptions), @max(self.ai_memories, self.ai_affects));
     }
 };
 

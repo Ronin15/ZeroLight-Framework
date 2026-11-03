@@ -159,6 +159,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var scope = SimulationScopeSystem.init(allocator);
     defer scope.deinit();
     try scope.reserve(fields.agents);
+    try scope.reserveAiRows(fields.agents);
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     const thread_ptr = &threads;

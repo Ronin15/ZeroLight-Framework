@@ -428,10 +428,10 @@ comptime {
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
 pub const SimulationPipelineConfig = struct {
     contact_capacity: usize = 0,
-    /// Initial size for the body-sized capacities (scope, collision, the spatial
-    /// index, steering scratch, cognition scratch, structural commands). Not
-    /// navigation intents, movement intents, or path requests. `init` raises it to
-    /// the committed `DataSystem` rows; afterwards only
+    /// Initial size for the body-sized capacities (scope movement lists, collision,
+    /// the spatial index, cognition scratch, structural commands). Not navigation
+    /// intents, movement intents, path requests, steering scratch, or think-pack
+    /// scratch. `init` raises it to the committed `DataSystem` rows; afterwards only
     /// `SimulationPipeline.syncPopulationCapacity` grows it.
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
@@ -865,14 +865,17 @@ pub const SimulationPipeline = struct {
     plane_entry: PlaneEntrySystem,
     destructible: DestructibleController,
     audio_controller: AudioController,
-    /// Tracked logical capacity for the body-sized pipeline capacities: scope,
-    /// collision, the spatial index, steering scratch, cognition scratch, and
-    /// structural commands. Navigation intents, movement intents, and path requests
-    /// are not among them. Grown only by `syncPopulationCapacity`.
+    /// Tracked logical capacity for the body-sized pipeline capacities: scope
+    /// movement lists, collision, the spatial index, cognition scratch, and
+    /// structural commands. Scope AI lists, steering scratch, the goal table, and
+    /// think-pack scratch are not among them. Grown only by `syncPopulationCapacity`.
     movement_body_capacity: usize,
     /// `frame.navigation_intents` value capacity: the committed AI rows at init,
     /// then `grownPopulationCapacity` of those rows at the population seam.
     navigation_intent_capacity: usize,
+    /// Think-pack scratch: `packScratchRows` at init, then `grownPopulationCapacity`
+    /// of that max at the population seam. Not a body-sized capacity.
+    pack_scratch_capacity: usize,
     /// `frame.intents` and `frame.path_requests` value capacity: the committed
     /// steering rows at init, then `grownPopulationCapacity` of those rows at the
     /// population seam.
@@ -939,11 +942,11 @@ pub const SimulationPipeline = struct {
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
         errdefer steering.deinit();
-        try steering.reserve(population);
+        try steering.reserveRows(rows.steering_agents, rows.ai_agents);
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
-        try pathfinding.reserveGoals(population);
+        try pathfinding.reserveGoals(rows.ai_agents);
         // The elastic pools cover the committed steering agents now, so the first update has
         // nothing to grow. A failure here or later frees them with the system.
         try growPathfindingForAgents(&pathfinding, rows.steering_agents);
@@ -990,6 +993,8 @@ pub const SimulationPipeline = struct {
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
         try scope.reserve(population);
+        try scope.reserveAiRows(rows.ai_agents);
+        try scope.reservePackRows(rows.packScratchRows());
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
         try spatial_index.reserve(population);
@@ -1035,6 +1040,7 @@ pub const SimulationPipeline = struct {
             .audio_controller = AudioController.init(),
             .movement_body_capacity = population,
             .navigation_intent_capacity = rows.ai_agents,
+            .pack_scratch_capacity = rows.packScratchRows(),
             .steering_stream_capacity = rows.steering_agents,
             .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
             .affect_max_events_per_step = affect_events_per_row_max * rows.ai_affects,
@@ -1216,6 +1222,7 @@ pub const SimulationPipeline = struct {
             rows.steering_agents <= self.steering_stream_capacity and
             rows.ai_perceptions * perception_events_per_observer_max <= self.perception_max_events_per_step and
             rows.ai_affects * affect_events_per_row_max <= self.affect_max_events_per_step and
+            rows.packScratchRows() <= self.pack_scratch_capacity and
             self.pathfinding.coversAgentCount(rows.steering_agents))
         {
             return .{};
@@ -1247,6 +1254,9 @@ pub const SimulationPipeline = struct {
             affect_events_per_row_max * grownPopulationCapacity(rows.ai_affects)
         else
             old_affect_share;
+        const old_pack = self.pack_scratch_capacity;
+        const pack_count = rows.packScratchRows();
+        const pack = if (pack_count > old_pack) grownPopulationCapacity(pack_count) else old_pack;
         // `collision.reserve` raises its declared pair bound; a later failure (the contact
         // streams in `reserve`) must not leave it declaring streams that were never sized.
         const old_pair_bound = self.collision.reserved_pair_bound;
@@ -1257,6 +1267,7 @@ pub const SimulationPipeline = struct {
             self.steering_stream_capacity = old_steering;
             self.perception_max_events_per_step = old_perception_share;
             self.affect_max_events_per_step = old_affect_share;
+            self.pack_scratch_capacity = old_pack;
         }
 
         const body_grew = body != old_body;
@@ -1267,13 +1278,20 @@ pub const SimulationPipeline = struct {
             try self.collision.reserve(body);
             try self.dig.ensurePlaneScratchReserve(body + 1);
             try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
-            try self.steering.reserve(body);
-            try self.pathfinding.reserveGoals(body);
         }
+        if (navigation != old_navigation) {
+            try self.scope.reserveAiRows(navigation);
+            try self.pathfinding.reserveGoals(navigation);
+        }
+        if (steering != old_steering or navigation != old_navigation) {
+            try self.steering.reserveRows(steering, navigation);
+        }
+        if (pack != old_pack) try self.scope.reservePackRows(pack);
 
         self.movement_body_capacity = body;
         self.navigation_intent_capacity = navigation;
         self.steering_stream_capacity = steering;
+        self.pack_scratch_capacity = pack;
         const shares_grew = perception_share != old_perception_share or affect_share != old_affect_share;
         self.perception_max_events_per_step = perception_share;
         self.affect_max_events_per_step = affect_share;
@@ -1292,7 +1310,8 @@ pub const SimulationPipeline = struct {
 
         try growPathfindingForAgents(&self.pathfinding, rows.steering_agents);
 
-        if (body_grew or shares_grew or streams_grew) {
+        const pack_grew = pack != old_pack;
+        if (body_grew or shares_grew or streams_grew or pack_grew) {
             stats.grew = true;
             if ((body_grew or shares_grew) and !self.population_growth_logged) {
                 self.population_growth_logged = true;
@@ -7231,6 +7250,469 @@ test "population sync grows navigation streams from AI rows and movement and pat
     try std.testing.expect(frame.intents.counts.capacity >= 3);
     try std.testing.expect(frame.path_requests.counts.capacity >= 3);
     try std.testing.expectEqual(navigation_values, frame.navigation_intents.values.capacity);
+}
+
+fn expectFailingSyncUpdate(
+    pipeline: *SimulationPipeline,
+    frame: *SimulationFrame,
+    data: *DataSystem,
+    world: *WorldSystem,
+    threads: *ThreadSystem,
+    player: *Player,
+) !void {
+    const goals = pipeline.pathfinding.goals.limit;
+    const ai_rows = pipeline.scope.ai_rows_reserved;
+    const agents = pipeline.steering.agents_reserved;
+    const intents = pipeline.steering.intents_reserved;
+    const think_keys = pipeline.scope.think_keys.capacity;
+    const move_dest = pipeline.scope.move_dest.capacity;
+    const pack_stamp = pipeline.scope.pack_stamp.capacity;
+    const pack_rows = pipeline.scope.pack_rows_reserved;
+    const runtime_rows = pipeline.steering.runtime_rows.capacity;
+    const intent_rows = pipeline.steering.intent_rows.capacity;
+    const context: SimulationPipelineUpdateContext = .{
+        .data = data,
+        .frame = frame,
+        .world = world,
+        .player = player,
+        .thread_system = threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(world),
+    };
+    // Scratch capacities must already hold this update. The next one allocates nothing.
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    try std.testing.expectEqual(goals, pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(ai_rows, pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(agents, pipeline.steering.agents_reserved);
+    try std.testing.expectEqual(intents, pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+    try std.testing.expectEqual(move_dest, pipeline.scope.move_dest.capacity);
+    try std.testing.expectEqual(pack_stamp, pipeline.scope.pack_stamp.capacity);
+    try std.testing.expectEqual(pack_rows, pipeline.scope.pack_rows_reserved);
+    try std.testing.expectEqual(runtime_rows, pipeline.steering.runtime_rows.capacity);
+    try std.testing.expectEqual(intent_rows, pipeline.steering.intent_rows.capacity);
+
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = pipeline, .frame = frame, .data = data, .world = world, .threads = threads };
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    _ = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(goals, pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(ai_rows, pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(agents, pipeline.steering.agents_reserved);
+    try std.testing.expectEqual(intents, pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+    try std.testing.expectEqual(move_dest, pipeline.scope.move_dest.capacity);
+    try std.testing.expectEqual(pack_stamp, pipeline.scope.pack_stamp.capacity);
+    try std.testing.expectEqual(pack_rows, pipeline.scope.pack_rows_reserved);
+    try std.testing.expectEqual(runtime_rows, pipeline.steering.runtime_rows.capacity);
+    try std.testing.expectEqual(intent_rows, pipeline.steering.intent_rows.capacity);
+}
+
+test "population sync does not grow scope AI lists, steering scratch, or the goal table when bodies or bounds exceed AI and steering rows" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    for (0..2) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    const think_keys = pipeline.scope.think_keys.capacity;
+    const pack_holes = pipeline.scope.pack_holes.capacity;
+    const pack_stamp = pipeline.scope.pack_stamp.capacity;
+    const move_dest = pipeline.scope.move_dest.capacity;
+    const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+    const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
+    const runtime_rows = pipeline.steering.runtime_rows.capacity;
+    const intent_rows = pipeline.steering.intent_rows.capacity;
+    const collision_before = pipeline.scope.collision_indices.capacity;
+    const plane_scratch_before = pipeline.dig.plane_scratch_reserved;
+
+    for (0..30) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    }
+    for (0..8) |_| {
+        const entity = try data.createEntity();
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    }
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.scope.pack_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+    try std.testing.expectEqual(pack_holes, pipeline.scope.pack_holes.capacity);
+    try std.testing.expectEqual(pack_stamp, pipeline.scope.pack_stamp.capacity);
+    try std.testing.expectEqual(move_dest, pipeline.scope.move_dest.capacity);
+    try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+    try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+    try std.testing.expectEqual(runtime_rows, pipeline.steering.runtime_rows.capacity);
+    try std.testing.expectEqual(intent_rows, pipeline.steering.intent_rows.capacity);
+    try std.testing.expect(pipeline.scope.collision_indices.capacity >= 80);
+    try std.testing.expect(pipeline.scope.collision_indices.capacity > collision_before);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.plane_entry.reserved_items);
+    try std.testing.expect(pipeline.dig.plane_scratch_reserved > plane_scratch_before);
+    try expectFailingSyncUpdate(&pipeline, &frame, &data, &world, &threads, &player);
+}
+
+test "population sync grows scope AI lists and the goal table from AI rows and steering scratch from its own rows under a larger body capacity" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    for (0..2) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 80,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.plane_entry.reserved_items);
+    try std.testing.expect(pipeline.scope.collision_indices.capacity >= 80);
+    try std.testing.expect(pipeline.scope.think_keys.capacity < 80);
+    try std.testing.expect(pipeline.steering.runtime_rows.capacity < 80);
+    try std.testing.expect(pipeline.steering.intent_rows.capacity < 80);
+
+    for (0..10) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+    const think_keys = pipeline.scope.think_keys.capacity;
+    const move_dest = pipeline.scope.move_dest.capacity;
+    const intent_rows = pipeline.steering.intent_rows.capacity;
+    const runtime_rows = pipeline.steering.runtime_rows.capacity;
+    const collision_indices = pipeline.scope.collision_indices.capacity;
+    const plane_items = pipeline.plane_entry.reserved_items;
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.scope.pack_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
+    try std.testing.expect(pipeline.scope.think_keys.capacity > think_keys);
+    try std.testing.expect(pipeline.scope.move_dest.capacity >= move_dest);
+    try std.testing.expect(pipeline.steering.intent_rows.capacity >= intent_rows);
+    try std.testing.expectEqual(runtime_rows, pipeline.steering.runtime_rows.capacity);
+    try std.testing.expectEqual(collision_indices, pipeline.scope.collision_indices.capacity);
+    try std.testing.expectEqual(plane_items, pipeline.plane_entry.reserved_items);
+    const think_keys_synced = pipeline.scope.think_keys.capacity;
+    const move_dest_synced = pipeline.scope.move_dest.capacity;
+    const intent_rows_synced = pipeline.steering.intent_rows.capacity;
+    try expectFailingSyncUpdate(&pipeline, &frame, &data, &world, &threads, &player);
+    try std.testing.expectEqual(think_keys_synced, pipeline.scope.think_keys.capacity);
+    try std.testing.expectEqual(move_dest_synced, pipeline.scope.move_dest.capacity);
+    try std.testing.expectEqual(intent_rows_synced, pipeline.steering.intent_rows.capacity);
+    try std.testing.expectEqual(runtime_rows, pipeline.steering.runtime_rows.capacity);
+    try std.testing.expectEqual(collision_indices, pipeline.scope.collision_indices.capacity);
+    try std.testing.expectEqual(plane_items, pipeline.plane_entry.reserved_items);
+
+    for (0..10) |_| {
+        const entity = try data.createEntity();
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    const intent_rows_held = pipeline.steering.intent_rows.capacity;
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.steering_stream_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.steering.agents_reserved);
+    try std.testing.expect(pipeline.steering.runtime_rows.capacity > runtime_rows);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.pathfinding.goals.limit);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.scope.ai_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.scope.pack_rows_reserved);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 48), pipeline.steering.intents_reserved);
+    try std.testing.expectEqual(intent_rows_held, pipeline.steering.intent_rows.capacity);
+    const runtime_rows_synced = pipeline.steering.runtime_rows.capacity;
+    try expectFailingSyncUpdate(&pipeline, &frame, &data, &world, &threads, &player);
+    try std.testing.expectEqual(runtime_rows_synced, pipeline.steering.runtime_rows.capacity);
+    try std.testing.expectEqual(intent_rows_held, pipeline.steering.intent_rows.capacity);
+    try std.testing.expectEqual(think_keys_synced, pipeline.scope.think_keys.capacity);
+    try std.testing.expectEqual(move_dest_synced, pipeline.scope.move_dest.capacity);
+}
+
+test "population sync reserves pack scratch from perception, memory, or affect without growing scope AI lists" {
+    // Perception on bodies, no new AI.
+    {
+        var world = try minimalSyncWorld();
+        defer world.deinit();
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var player = try Player.spawn(&data);
+        for (0..2) |index| {
+            const entity = try data.createEntity();
+            try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+            try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+            try data.setAiAgent(entity, .{ .active_behavior = .wander });
+            try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+        }
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+        defer threads.deinit();
+        var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+            .movement_body_capacity = 4,
+            .pathfinding = sync_test_pathfinding,
+        });
+        defer pipeline.deinit();
+        try pipeline.reserveFrame(&frame);
+        try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+        try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+        try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.pack_rows_reserved);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+
+        for (0..200) |index| {
+            const entity = try data.createEntity();
+            try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+            try data.setAiPerception(entity, .{});
+        }
+        try std.testing.expectEqual(@as(usize, 203), data.populationRowCounts().population());
+        const think_keys = pipeline.scope.think_keys.capacity;
+        const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+        const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
+        const pack_stamp = pipeline.scope.pack_stamp.capacity;
+        const sync = try pipeline.syncPopulationCapacity(&frame, &data);
+        try std.testing.expect(sync.grew);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.movement_body_capacity);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.scope.pack_rows_reserved);
+        try std.testing.expect(pipeline.scope.pack_stamp.capacity >= 320);
+        try std.testing.expect(pipeline.scope.pack_stamp.capacity > pack_stamp);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.steering.intents_reserved);
+        try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+        try std.testing.expect(pipeline.scope.collision_indices.capacity >= 320);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.plane_entry.reserved_items);
+        const pack_stamp_synced = pipeline.scope.pack_stamp.capacity;
+        const pack_rows_synced = pipeline.scope.pack_rows_reserved;
+        const pack_scratch_synced = pipeline.pack_scratch_capacity;
+        const ai_rows_synced = pipeline.scope.ai_rows_reserved;
+        try expectFailingSyncUpdate(&pipeline, &frame, &data, &world, &threads, &player);
+        try std.testing.expectEqual(pack_stamp_synced, pipeline.scope.pack_stamp.capacity);
+        try std.testing.expectEqual(pack_rows_synced, pipeline.scope.pack_rows_reserved);
+        try std.testing.expectEqual(pack_scratch_synced, pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(ai_rows_synced, pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+    }
+
+    // Memory, no new body and no AI.
+    {
+        var world = try minimalSyncWorld();
+        defer world.deinit();
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var player = try Player.spawn(&data);
+        for (0..2) |index| {
+            const entity = try data.createEntity();
+            try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+            try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+            try data.setAiAgent(entity, .{ .active_behavior = .wander });
+            try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+        }
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+        defer threads.deinit();
+        var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+            .movement_body_capacity = 80,
+            .pathfinding = sync_test_pathfinding,
+        });
+        defer pipeline.deinit();
+        try pipeline.reserveFrame(&frame);
+        try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+        try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+        try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+
+        for (0..200) |_| {
+            const entity = try data.createEntity();
+            try data.setAiMemory(entity, .{});
+        }
+        try std.testing.expectEqual(@as(usize, 3), data.populationRowCounts().population());
+        const think_keys = pipeline.scope.think_keys.capacity;
+        const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+        const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
+        const pack_stamp = pipeline.scope.pack_stamp.capacity;
+        const collision_indices = pipeline.scope.collision_indices.capacity;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        var swap: TestAllocatorSwap = .{};
+        const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+        swap.install(targets, .uniform(failing.allocator()));
+        const failed = pipeline.syncPopulationCapacity(&frame, &data);
+        swap.restore(targets);
+        try std.testing.expectError(error.OutOfMemory, failed);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.pack_rows_reserved);
+        try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+
+        const sync = try pipeline.syncPopulationCapacity(&frame, &data);
+        try std.testing.expect(sync.grew);
+        try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+        try std.testing.expectEqual(@as(usize, 3), data.populationRowCounts().population());
+        try std.testing.expectEqual(collision_indices, pipeline.scope.collision_indices.capacity);
+        try std.testing.expectEqual(@as(usize, 80), pipeline.plane_entry.reserved_items);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.steering.intents_reserved);
+        try std.testing.expectEqual(@as(usize, 0), pipeline.perception_max_events_per_step);
+        try std.testing.expectEqual(@as(usize, 0), pipeline.affect_max_events_per_step);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.scope.pack_rows_reserved);
+        try std.testing.expect(pipeline.scope.pack_stamp.capacity >= 320);
+        try std.testing.expect(pipeline.scope.pack_stamp.capacity > pack_stamp);
+        const pack_stamp_synced = pipeline.scope.pack_stamp.capacity;
+        const pack_rows_synced = pipeline.scope.pack_rows_reserved;
+        const pack_scratch_synced = pipeline.pack_scratch_capacity;
+        const ai_rows_synced = pipeline.scope.ai_rows_reserved;
+        try expectFailingSyncUpdate(&pipeline, &frame, &data, &world, &threads, &player);
+        try std.testing.expectEqual(pack_stamp_synced, pipeline.scope.pack_stamp.capacity);
+        try std.testing.expectEqual(pack_rows_synced, pipeline.scope.pack_rows_reserved);
+        try std.testing.expectEqual(pack_scratch_synced, pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(ai_rows_synced, pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+    }
+
+    // Affect, same body cap, no OOM leg.
+    {
+        var world = try minimalSyncWorld();
+        defer world.deinit();
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var player = try Player.spawn(&data);
+        for (0..2) |index| {
+            const entity = try data.createEntity();
+            try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+            try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+            try data.setAiAgent(entity, .{ .active_behavior = .wander });
+            try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+        }
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+        defer threads.deinit();
+        var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+            .movement_body_capacity = 80,
+            .pathfinding = sync_test_pathfinding,
+        });
+        defer pipeline.deinit();
+        try pipeline.reserveFrame(&frame);
+        try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+        try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+        try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+
+        for (0..200) |_| {
+            const entity = try data.createEntity();
+            try data.setAiAffect(entity, .{});
+        }
+        const think_keys = pipeline.scope.think_keys.capacity;
+        const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+        const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
+        const pack_stamp = pipeline.scope.pack_stamp.capacity;
+        const sync = try pipeline.syncPopulationCapacity(&frame, &data);
+        try std.testing.expect(sync.grew);
+        try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+        try std.testing.expectEqual(@as(usize, 3), data.populationRowCounts().population());
+        try std.testing.expectEqual(@as(usize, 0), pipeline.perception_max_events_per_step);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
+        try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(@as(usize, 320), pipeline.scope.pack_rows_reserved);
+        try std.testing.expect(pipeline.scope.pack_stamp.capacity >= 320);
+        try std.testing.expect(pipeline.scope.pack_stamp.capacity > pack_stamp);
+        const pack_stamp_synced = pipeline.scope.pack_stamp.capacity;
+        const pack_rows_synced = pipeline.scope.pack_rows_reserved;
+        const pack_scratch_synced = pipeline.pack_scratch_capacity;
+        const ai_rows_synced = pipeline.scope.ai_rows_reserved;
+        try expectFailingSyncUpdate(&pipeline, &frame, &data, &world, &threads, &player);
+        try std.testing.expectEqual(pack_stamp_synced, pipeline.scope.pack_stamp.capacity);
+        try std.testing.expectEqual(pack_rows_synced, pipeline.scope.pack_rows_reserved);
+        try std.testing.expectEqual(pack_scratch_synced, pipeline.pack_scratch_capacity);
+        try std.testing.expectEqual(ai_rows_synced, pipeline.scope.ai_rows_reserved);
+        try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
+    }
 }
 
 test "population sync that runs out of memory growing a stream capacity keeps the old capacities and the retry grows them" {

@@ -176,6 +176,10 @@ pub const SteeringSystem = struct {
     // Movement-intent order: place staging and one band-offset slot per place range.
     intent_order_staging: std.ArrayList(SimulationIntent) = .empty,
     intent_order_offsets: SlotList(BandOffsets) = .empty,
+    /// Steering rows and navigation intents the last `reserveRows` covered.
+    /// Assigned only after `ensureStepCapacity` succeeds.
+    agents_reserved: usize = 0,
+    intents_reserved: usize = 0,
     // One tuner per stage. `adaptive_tuner` drives the avoidance pass; place and sort
     // each have their own, over the merged movement intents.
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
@@ -209,15 +213,25 @@ pub const SteeringSystem = struct {
         self.* = undefined;
     }
 
-    /// Pre-sizes every per-step buffer for `max_agents` steering rows and as many navigation
-    /// intents, and each stage's per-range records for any partition of them, so a step
-    /// within that population allocates nothing. Grow-only; re-run by the population seam.
-    /// A count past `max_step_items` is `OutOfMemory` before any growth. Steering rows and a
-    /// step's navigation intents (one per AI row) stay within that width, so their u32
-    /// indices never overflow.
+    /// Pre-sizes agent scratch and intent scratch for `max_agents` of each. Grow-only.
+    /// `reserveRows` is the split; this is the equal-count wrapper.
     pub fn reserve(self: *SteeringSystem, max_agents: usize) !void {
-        if (max_agents > max_step_items) return error.OutOfMemory;
-        try ensureStepCapacity(self, max_agents, max_agents);
+        try self.reserveRows(max_agents, max_agents);
+    }
+
+    /// Agent scratch follows `agent_count`. Intent scratch follows `intent_count`.
+    /// Either count past `max_step_items` is `OutOfMemory` before any growth. Steering
+    /// rows and a step's navigation intents stay within that width, so their u32
+    /// indices never overflow. A call within both published counts returns before
+    /// ensuring. The counts are assigned only after `ensureStepCapacity` succeeds.
+    pub fn reserveRows(self: *SteeringSystem, agent_count: usize, intent_count: usize) !void {
+        if (agent_count > max_step_items or intent_count > max_step_items) return error.OutOfMemory;
+        if (agent_count <= self.agents_reserved and intent_count <= self.intents_reserved) return;
+        try ensureStepCapacity(self, agent_count, intent_count);
+        self.agents_reserved = @max(self.agents_reserved, agent_count);
+        self.intents_reserved = @max(self.intents_reserved, intent_count);
+        std.debug.assert(self.runtime_rows.capacity >= self.agents_reserved);
+        std.debug.assert(self.intent_rows.capacity >= hotStoreCapacity(self.intents_reserved));
     }
 
     /// One steering step. Every stage runs on `thread_system`'s workers as its tuner (or
@@ -763,6 +777,28 @@ test "steering reserve one past the step width returns OutOfMemory" {
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 0), steering.runtime_rows.capacity);
+}
+
+test "steering reserveRows sizes agent scratch to the agent count and intent scratch to the intent count" {
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserveRows(4, 32);
+    try std.testing.expectEqual(@as(usize, 4), steering.agents_reserved);
+    try std.testing.expectEqual(@as(usize, 32), steering.intents_reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var empty = SteeringSystem.init(failing.allocator());
+    defer empty.deinit();
+    try std.testing.expectError(error.OutOfMemory, empty.reserveRows(max_step_items + 1, 1));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), empty.agents_reserved);
+    try std.testing.expectEqual(@as(usize, 0), empty.intents_reserved);
+    try std.testing.expectError(error.OutOfMemory, empty.reserveRows(1, max_step_items + 1));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), empty.agents_reserved);
+    try std.testing.expectEqual(@as(usize, 0), empty.intents_reserved);
 }
 
 test "steering update is allocation-free after reserves from the first step" {

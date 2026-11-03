@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, and the think-row retie. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the subset-store reserves, and the kernels. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, and the subset-store reserves. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, and the kernels. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -283,19 +283,24 @@ in its owning slice.
       Derived, no bench. Retie writes are not bucketed by destination: a
       destination sort is a worse order, and no later loop streams the
       slot table. Not a rule edit. Not the hot-pass layout item.
-- [ ] The growth seam sizes the scope AI lists, the steering scratch, and
-      the goal table to every body (`growPopulationCapacity`,
-      `simulation_pipeline.zig:1264`, `:1270`, `:1271`; init
-      `simulation_pipeline.zig:992`, `:942`, `:946`). Those lists hold AI
-      rows, steering rows, and navigation intents. Failure: bodies or
-      bounds above those rows grow all three. Pass: they follow AI rows,
-      steering rows, and navigation intents. A reserve where bodies or
-      bounds are the larger count does not grow them. Collision indices,
-      tier commands, chunk-change windows, plane-entry windows, and the
-      plane scratch stay with movement rows
-      (`.grok/rules/engine-design.md` § Cost model,
-      `.grok/rules/budgets-capacities.md`). Derived, no bench. How is
-      open. Not the neighbor-index item.
+- [x] The growth seam sizes the scope AI lists, the steering scratch, and
+      the goal table to every body. Scope AI lists follow AI rows
+      (`reserveAiRows`, `simulation_scope.zig:256`; seam
+      `simulation_pipeline.zig:1283`). Steering agent scratch follows
+      steering rows and intent scratch follows navigation intents
+      (`reserveRows`, `steering/system.zig:227`; seam `:1287`). The goal
+      table follows navigation intents (`reserveGoals`, seam `:1284`).
+      Pack scratch follows the max of AI, perception, memory, and affect
+      (`packScratchRows`, `data_system/types.zig:165`; `reservePackRows`,
+      `simulation_scope.zig:277`; `pack_scratch_capacity`, seam `:1289`),
+      and that ensure does not pull the AI lists up with it. A body or
+      bounds increase that does not raise those counts does not grow
+      them. Collision indices, tier commands, chunk-change windows,
+      plane-entry windows, and the plane scratch stay on the body cap
+      (`scope.reserve`, seam `:1275`) (`.grok/rules/engine-design.md`
+      § Cost model, `.grok/rules/budgets-capacities.md`,
+      `.grok/rules/memory-performance.md` § Hot paths). Derived, no
+      bench. Not the neighbor-index item.
 - [ ] Core kernels (`simd.zig`, `math.zig`, `rng.zig`; and `logging.zig`
       against `.grok/rules/zig-style.md` § Logging, which no other pass
       covers; docs audit L5): primitive coverage

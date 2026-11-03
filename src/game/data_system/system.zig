@@ -168,6 +168,7 @@ pub const DataSystem = struct {
             .ai_agents = self.ai_agents.len(),
             .collision_bounds = self.collision_bounds.len(),
             .ai_perceptions = self.ai_perceptions.len(),
+            .ai_memories = self.ai_memories.len(),
             .ai_affects = self.ai_affects.len(),
         };
     }

@@ -184,6 +184,10 @@ pub const SimulationScopeSystem = struct {
     /// Think-set scratch grows. Not on `perf`: `advanceStep` and `gatherAiPopulations`
     /// replace that value with `.{}` every step.
     think_scratch_grows: u64 = 0,
+    /// AI rows the last `reserveAiRows` covered. Assigned only after every ensure succeeds.
+    ai_rows_reserved: usize = 0,
+    /// Rows the last `reservePackRows` covered. Assigned only after its ensure succeeds.
+    pack_rows_reserved: usize = 0,
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: the last think set's indexed halo entities
@@ -235,25 +239,62 @@ pub const SimulationScopeSystem = struct {
         self.collision_indices.deinit(self.allocator);
     }
 
-    /// Pre-sizes the per-step scratch index/command lists to `capacity` movement
-    /// bodies and the range tallies to `maxRangeCount(capacity)`, so the serial and
-    /// threaded gathers and tier policy are allocation-free after init under every
-    /// partition the tuner can pick (the outputs are item-count windows, not per-range
-    /// buffers). Grow-only; re-run by the pipeline's population seam.
+    /// Movement-row scratch only: collision indices, tier commands, chunk-change
+    /// windows, and the shared range tallies, for `capacity` movement bodies.
+    /// Grow-only; the pipeline's population seam re-runs it.
     pub fn reserve(self: *SimulationScopeSystem, capacity: usize) !void {
         try self.collision_indices.ensureTotalCapacity(self.allocator, capacity);
-        try self.ai_halo_indices.ensureTotalCapacity(self.allocator, capacity);
-        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
         try self.chunk_changes.ensureTotalCapacity(self.allocator, capacity);
         try self.range_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, scope_range_alignment_items));
-        try self.think_keys.ensureTotalCapacity(self.allocator, capacity);
-        try self.think_staging.ensureTotalCapacity(self.allocator, capacity);
-        try self.think_offsets.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, scope_range_alignment_items));
-        try self.pack_stamp.ensureTotalCapacity(self.allocator, capacity);
-        try self.pack_holes.ensureTotalCapacity(self.allocator, capacity);
-        try self.pack_outside.ensureTotalCapacity(self.allocator, capacity);
-        try self.ensureMoveScratch(capacity);
+    }
+
+    /// AI-row count: the scope AI lists and the pack buffers at that same count.
+    /// Optional stores longer than AI rows are `reservePackRows`. Grow-only. A count
+    /// at or under `ai_rows_reserved` returns before ensuring. `ai_rows_reserved` is
+    /// assigned only after every ensure succeeds.
+    pub fn reserveAiRows(self: *SimulationScopeSystem, count: usize) !void {
+        if (count <= self.ai_rows_reserved) return;
+        try self.ai_halo_indices.ensureTotalCapacity(self.allocator, count);
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, count);
+        try self.think_keys.ensureTotalCapacity(self.allocator, count);
+        try self.think_staging.ensureTotalCapacity(self.allocator, count);
+        try self.think_offsets.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(count, scope_range_alignment_items));
+        try self.ensurePackBuffers(count);
+        self.ai_rows_reserved = count;
+        std.debug.assert(self.think_keys.capacity >= self.ai_rows_reserved);
+        std.debug.assert(self.think_staging.capacity >= self.ai_rows_reserved);
+        std.debug.assert(self.ai_halo_indices.capacity >= self.ai_rows_reserved);
+        std.debug.assert(self.ai_cognition_indices.capacity >= self.ai_rows_reserved);
+        std.debug.assert(self.pack_stamp.capacity >= self.ai_rows_reserved);
+        std.debug.assert(self.move_dest.capacity >= moveIndexSlots(self.ai_rows_reserved));
+        std.debug.assert(self.think_offsets.capacity >= maxRangeCount(self.ai_rows_reserved, scope_range_alignment_items));
+    }
+
+    /// Pack buffers for `count` rows (`pack_stamp`, `pack_holes`, `pack_outside`, and the
+    /// move scratch). Grow-only. A count at or under `pack_rows_reserved` returns before
+    /// ensuring. `pack_rows_reserved` is assigned only after the ensure succeeds.
+    pub fn reservePackRows(self: *SimulationScopeSystem, count: usize) !void {
+        if (count <= self.pack_rows_reserved) return;
+        try self.ensurePackBuffers(count);
+        self.pack_rows_reserved = count;
+        std.debug.assert(self.pack_stamp.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.pack_holes.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.pack_outside.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.move_source.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.perception_pack.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.memory_pack.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.affect_pack.capacity >= self.pack_rows_reserved);
+        std.debug.assert(self.move_dest.capacity >= moveIndexSlots(self.pack_rows_reserved));
+        std.debug.assert(self.pack_range_counts.capacity >= maxRangeCount(self.pack_rows_reserved, think_column_alignment));
+    }
+
+    // Pack buffers only. Halo, cognition, think keys, and `think_offsets` stay put. No grow note.
+    fn ensurePackBuffers(self: *SimulationScopeSystem, count: usize) !void {
+        try self.pack_stamp.ensureTotalCapacity(self.allocator, count);
+        try self.pack_holes.ensureTotalCapacity(self.allocator, count);
+        try self.pack_outside.ensureTotalCapacity(self.allocator, count);
+        try self.ensureMoveScratch(count);
     }
 
     /// Increment the step counter. Call once at the top of each fixed step.
@@ -568,15 +609,13 @@ pub const SimulationScopeSystem = struct {
         if (comptime runtime_perf_log.enabled) self.perf.chunk_filtered_entities = 0;
     }
 
+    // AI length only: think keys and the pack buffers. One note when `think_keys` or `move_dest` grows.
     fn ensureThinkScratch(self: *SimulationScopeSystem, count: usize) !void {
         const before = self.think_keys.capacity;
         const move_before = self.move_dest.capacity;
         try self.think_keys.ensureTotalCapacity(self.allocator, count);
         try self.think_staging.ensureTotalCapacity(self.allocator, count);
-        try self.pack_stamp.ensureTotalCapacity(self.allocator, count);
-        try self.pack_holes.ensureTotalCapacity(self.allocator, count);
-        try self.pack_outside.ensureTotalCapacity(self.allocator, count);
-        try self.ensureMoveScratch(count);
+        try self.ensurePackBuffers(count);
         if (self.think_keys.capacity > before or self.move_dest.capacity > move_before) self.noteThinkScratchGrow(count);
     }
 
@@ -868,7 +907,11 @@ pub const SimulationScopeSystem = struct {
             .memory => data.ai_memories.len(),
             .affect => data.ai_affects.len(),
         };
-        try self.ensureThinkScratch(@max(store_len, listed));
+        const pack_count = @max(store_len, listed);
+        const stamp_before = self.pack_stamp.capacity;
+        const move_before = self.move_dest.capacity;
+        try self.ensurePackBuffers(pack_count);
+        if (self.pack_stamp.capacity > stamp_before or self.move_dest.capacity > move_before) self.noteThinkScratchGrow(pack_count);
         self.growStamp(store_len);
         const stamp = self.bumpStamp();
         const perm = switch (column) {
@@ -980,8 +1023,9 @@ pub const SimulationScopeSystem = struct {
     /// whose cognition phase (`cognition_phase`, written by the index build) is this step,
     /// all of them when `apply_stagger` is false, in the index's cell-major order. Runs on
     /// workers under `cognition_tuner` over the cell-major positions, so one chunk's entries
-    /// split across ranges like any others. `perf.stagger_skips` counts the rest. Allocates only
-    /// past `reserve`'s capacity, on the calling thread before dispatch.
+    /// split across ranges like any others. `perf.stagger_skips` counts the rest. The AI index
+    /// list follows `reserveAiRows`. `range_tallies` follow `reserve`. Both are required.
+    /// Allocation is on the calling thread before dispatch.
     pub fn compactCognition(
         self: *SimulationScopeSystem,
         index: *const SpatialIndexView,
@@ -1100,9 +1144,9 @@ pub const SimulationScopeSystem = struct {
     // ---- Shared threading helpers --------------------------------------------
 
     /// Sizes `out` to `item_count` window slots (range r owns `[r * items_per_range,
-    /// ...)`) and resets `range_count` tallies. Main thread, before dispatch. The ensures
-    /// are grow-only safety nets: after `reserve` at the population seam they never
-    /// allocate, whatever partition the tuner picked (`maxRangeCount`).
+    /// ...)`) and resets `range_count` tallies. Main thread, before dispatch. Movement
+    /// windows and `range_tallies` follow `reserve`. The AI index lists follow
+    /// `reserveAiRows`. Both are required.
     fn prepareRangeWindows(
         self: *SimulationScopeSystem,
         comptime T: type,
@@ -2945,9 +2989,8 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
 }
 
 test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges allocate nothing and match serial" {
-    // `reserve` alone (no warm pass) covers every partition the tuner can
-    // pick, because each pass writes per-range windows of one item-count buffer and the
-    // tallies are reserved to maxRangeCount. A retune to more ranges allocates nothing.
+    // Movement windows and `range_tallies` follow `reserve`. The AI index lists
+    // follow `reserveAiRows`. Both run before the failing allocator, with no warm pass.
     const allocator = std.testing.allocator;
 
     var data = DataSystem.init(allocator);
@@ -2989,6 +3032,7 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
     try sys.reserve(population);
+    try sys.reserveAiRows(population);
     try sys.orderThinkPhases(&data, ai_region, testThinkGrid(), &threads, .{});
     var stream = RangeOutputStream(StructuralCommand).init(allocator);
     defer stream.deinit();
@@ -3055,6 +3099,7 @@ test "scope reserve makes the first single-range threaded gathers and tier polic
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
     try sys.reserve(population);
+    try sys.reserveAiRows(population);
     var stream = RangeOutputStream(StructuralCommand).init(allocator);
     defer stream.deinit();
     try stream.reserve(1, population);
@@ -3283,6 +3328,7 @@ test "after reserve, the threaded think set at 32- then 16-item ranges allocates
     const serial = try compactCognitionInline(&serial_sys, &view, 1, true);
 
     try sys.reserve(population);
+    try sys.reserveAiRows(population);
     const original_sys_allocator = sys.allocator;
     const original_thread_allocator = threads.allocator;
     var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -3481,7 +3527,11 @@ test "optional pack keeps listed rows when the component store outgrows the ai s
         try expected.append(allocator, perception_before.entities[perception_row]);
     }
     try std.testing.expectEqual(@as(usize, thinker_count), expected.items.len);
+    const think_keys = sys.think_keys.capacity;
+    const pack_stamp = sys.pack_stamp.capacity;
     try sys.packThinkSpan(&data, &threads, .{});
+    try std.testing.expectEqual(think_keys, sys.think_keys.capacity);
+    try std.testing.expect(sys.pack_stamp.capacity > pack_stamp);
     const packed_rows = data.aiPerceptionSliceConst();
     for (expected.items, 0..) |entity, k| try std.testing.expect(packed_rows.entities[k].eql(entity));
 }
@@ -3694,14 +3744,27 @@ test "threaded think order allocates nothing after reserve" {
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
     try sys.reserve(64);
+    try sys.reserveAiRows(64);
+    const think_keys = sys.think_keys.capacity;
+    const move_dest = sys.move_dest.capacity;
+    const halo_indices = sys.ai_halo_indices.capacity;
     var threads = try inlineThreads();
     defer threads.deinit();
     try sys.orderThinkPhases(&data, null, testThinkGrid(), &threads, .{});
+    try std.testing.expectEqual(think_keys, sys.think_keys.capacity);
+    try std.testing.expectEqual(move_dest, sys.move_dest.capacity);
+    try std.testing.expectEqual(halo_indices, sys.ai_halo_indices.capacity);
     const halo = (try sys.gatherAiPopulations(&data, null, &threads, .{})).halo;
+    try std.testing.expectEqual(think_keys, sys.think_keys.capacity);
+    try std.testing.expectEqual(move_dest, sys.move_dest.capacity);
+    try std.testing.expectEqual(halo_indices, sys.ai_halo_indices.capacity);
     var index = try testHaloIndex(&data, halo);
     defer index.deinit();
     _ = try compactCognitionInline(&sys, &index.view(), 0, false);
     try sys.packThinkSpan(&data, &threads, .{});
+    try std.testing.expectEqual(think_keys, sys.think_keys.capacity);
+    try std.testing.expectEqual(move_dest, sys.move_dest.capacity);
+    try std.testing.expectEqual(halo_indices, sys.ai_halo_indices.capacity);
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const failing_allocator = failing.allocator();
