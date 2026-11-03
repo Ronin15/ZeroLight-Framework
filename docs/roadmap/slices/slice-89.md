@@ -145,10 +145,13 @@ fixture and grouped by chunk only if they cost there.
       pre-measure (Debug, `x86_64_v2`, `--warmup 484`, code at `9bf93b0`
       against `5d5a089`, `benchmark_outputs/ab-20261103-072747`) and stayed
       `settled=no` on every config. The other six from `6b7138e` were not in
-      that run. Pass: each rerun at four times the default pre-measure
-      (`.grok/rules/tests-benchmarks.md`); a tuner still unsettled is merged
-      or removed (`.grok/rules/threading.md` § Building a stage), or, for a
-      bench-only revert instance, the fixture fixed.
+      that run. Owner: that rerun is not evidence the bench is measuring the
+      production step correctly, and it does not authorize a merge or a
+      removal. No tuner is merged or removed unless that measurement is shown
+      correct and the owner approves the tuner and the reason. Pass: the
+      remaining unsettled cases rerun at four times the default pre-measure
+      (`.grok/rules/tests-benchmarks.md`). A still-unsettled tuner is not
+      removed from this run.
 - [ ] An inline tuned case matches serial. `pathfinding-link-fold` 1016032768
       ReleaseFast was tuned 13-16% slower than `serial-direct` (every stage
       inline, cause unmeasured) before the jump changes; not rerun in

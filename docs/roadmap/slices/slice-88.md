@@ -326,7 +326,8 @@ in its owning slice.
       `benchmark_outputs/ab-20261103-072747`): the tuned case at four times
       the default pre-measure (`--warmup 484`, 30 iterations) stayed
       `settled=no` on all 15 configs, so those step times and main shares are
-      not judged (`.grok/rules/tests-benchmarks.md`). The three `stacked`
+      not judged (`.grok/rules/tests-benchmarks.md`). That print is not a
+      tuner removal. The three `stacked`
       configs have no base at `5d5a089`. The default-warmup grid is
       `benchmark_outputs/ab-20261103-072301`; its tuned rows were the same
       `settled=no`.
