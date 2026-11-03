@@ -1303,8 +1303,7 @@ pub fn cellScanRadius(radius: f32, cell_size: f32) i32 {
 // A key's bits below its cell: the slot.
 const cell_low_bits: SortKey = (@as(SortKey, 1) << key_cell_shift) - 1;
 
-// The scalar key of a body on `level` at `(x, y)`, clamped to `grid`: bit for bit the lane
-// fill's.
+// The scalar key, bit for bit the lane fill. The splitter sample calls it, not the fill.
 fn keyForPosition(grid: Grid, level: u16, x: f32, y: f32, faction: usize, slot: u32) SortKey {
     const cell_x = math.worldPosToCell(x, grid.cell_size, grid.cells_x);
     const cell_y = math.worldPosToCell(y, grid.cell_size, grid.cells_y);
@@ -1366,9 +1365,9 @@ const FillContext = struct {
 };
 
 // Resolves slots `[start, end)` into their rows and writes a key to `keys` for each with a
-// movement body, in slot order; returns the key count. Clamped cells, their chunk and local
-// coordinates, and the key's words in lanes over the packed rows with a scalar tail, bit
-// for bit `keyForPosition`.
+// movement body, in slot order; returns the key count. Clamped cells and the key's words in
+// lanes over the packed rows, the last batch that kernel masked to the slots left, inactive
+// lanes not resolved and not stored, bit for bit `keyForPosition`.
 fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey) usize {
     std.debug.assert(start <= end and end <= fill.slot_rows.len and keys.len >= end - start);
     const grid = fill.grid;
@@ -1376,21 +1375,29 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey
     const per_chunk_lanes = simd.splatInt4(@intCast(grid.cells_per_chunk));
     var count: usize = 0;
     var slot = start;
-    const vector_end = start + simd.vectorizedEnd(end - start);
-    while (slot < vector_end) : (slot += simd.lane_count) {
+    while (slot < end) : (slot += simd.lane_count) {
+        const live = @min(simd.lane_count, end - slot);
         var x: [simd.lane_count]f32 = undefined;
         var y: [simd.lane_count]f32 = undefined;
         var level: [simd.lane_count]u32 = undefined;
         var faction: [simd.lane_count]u32 = undefined;
         var valid: [simd.lane_count]bool = undefined;
         inline for (0..simd.lane_count) |lane| {
-            const row = fill.resolveSlot(slot + lane);
-            x[lane] = row.x;
-            y[lane] = row.y;
-            level[lane] = row.level;
-            // A faction index is below `FactionSet.len` (4).
-            faction[lane] = @intCast(FactionSet.Indexer.indexOf(row.faction));
-            valid[lane] = row.entity.isValid();
+            if (lane < live) {
+                const row = fill.resolveSlot(slot + lane);
+                x[lane] = row.x;
+                y[lane] = row.y;
+                level[lane] = row.level;
+                // A faction index is below `FactionSet.len` (4).
+                faction[lane] = @intCast(FactionSet.Indexer.indexOf(row.faction));
+                valid[lane] = row.entity.isValid();
+            } else {
+                x[lane] = 0;
+                y[lane] = 0;
+                level[lane] = 0;
+                faction[lane] = 0;
+                valid[lane] = false;
+            }
         }
         const cell_x = simd.worldPosToCell4(simd.loadFloat4(&x), grid.cell_size, grid.cells_x);
         const cell_y = simd.worldPosToCell4(simd.loadFloat4(&y), grid.cell_size, grid.cells_y);
@@ -1408,19 +1415,12 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey
         // The key's u32 words store low word first.
         comptime std.debug.assert(builtin.cpu.arch.endian() == .little);
         inline for (0..simd.lane_count) |lane| {
-            if (valid[lane]) {
+            if (lane < live and valid[lane]) {
                 // A slot is below slot_count <= maxInt(u32).
                 keys[count] = @bitCast([4]u32{ @intCast(slot + lane), word1[lane], word2[lane], word3[lane] });
                 count += 1;
             }
         }
-    }
-    while (slot < end) : (slot += 1) {
-        const row = fill.resolveSlot(slot);
-        if (!row.entity.isValid()) continue;
-        // A slot is below slot_count <= maxInt(u32).
-        keys[count] = keyForPosition(grid, row.level, row.x, row.y, FactionSet.Indexer.indexOf(row.faction), @intCast(slot));
-        count += 1;
     }
     return count;
 }
@@ -2211,6 +2211,118 @@ test "serial and threaded index builds match across layouts, splitters, range si
     }
 }
 
+// One indexed slot. `bodied` false is an AI agent with no movement body.
+const LaneKeyRow = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    level: u16 = 0,
+    faction: Faction = .neutral,
+    bodied: bool = true,
+};
+
+// Each row is one AI agent, in slot order. The movement setter refuses a non-finite
+// position; the column write is how one arrives.
+fn addLaneKeyRows(data: *DataSystem, rows: []const LaneKeyRow) !void {
+    for (rows) |row| {
+        if (!row.bodied) {
+            _ = try addTestBodiless(data);
+            continue;
+        }
+        const x: f32 = if (std.math.isFinite(row.x)) row.x else 0;
+        const y: f32 = if (std.math.isFinite(row.y)) row.y else 0;
+        _ = try addTaggedBody(data, x, y, row.level, row.faction);
+    }
+    const movement = data.movementBodySlice();
+    for (rows, data.aiAgentSliceConst().entities) |row, entity| {
+        if (!row.bodied) continue;
+        const body = data.movementBodyDenseIndex(entity).?;
+        movement.previous_x[body] = row.x;
+        movement.previous_y[body] = row.y;
+    }
+}
+
+// Every bodied slot is one key, equal to `keyForPosition` of that row, and that entry's
+// position matches the row bit for bit. A bodiless slot has no key.
+fn expectLaneKeysMatch(system: *const SpatialIndexSystem, rows: []const LaneKeyRow) !void {
+    var bodied: usize = 0;
+    for (rows) |row| bodied += @intFromBool(row.bodied);
+    const index = system.view();
+    try testing.expectEqual(bodied, index.entryCount());
+    var seen_buf: [32]bool = @splat(false);
+    std.debug.assert(rows.len <= seen_buf.len);
+    const seen = seen_buf[0..rows.len];
+    for (system.keys.items[0..index.entryCount()], index.x, index.y) |key, entry_x, entry_y| {
+        const slot = keySlot(key);
+        try testing.expect(slot < rows.len);
+        const row = rows[slot];
+        try testing.expect(row.bodied);
+        try testing.expect(!seen[slot]);
+        seen[slot] = true;
+        try testing.expectEqual(keyForPosition(system.grid, row.level, row.x, row.y, factionIndex(row.faction), slot), key);
+        try testing.expectEqual(@as(u32, @bitCast(row.x)), @as(u32, @bitCast(entry_x)));
+        try testing.expectEqual(@as(u32, @bitCast(row.y)), @as(u32, @bitCast(entry_y)));
+    }
+    for (rows, seen) |row, was| try testing.expectEqual(row.bodied, was);
+}
+
+fn expectInlineLaneKeys(geometry: IndexGeometry, rows: []const LaneKeyRow) !void {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    try addLaneKeyRows(&data, rows);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
+    try expectLaneKeysMatch(&system, rows);
+}
+
+test "serial and threaded index keys match keyForPosition, the last range ending in the masked tail" {
+    const count = spatial_index_range_alignment_items + 3;
+    var rows: [spatial_index_range_alignment_items + 3]LaneKeyRow = undefined;
+    for (0..spatial_index_range_alignment_items) |slot| {
+        rows[slot] = .{
+            .x = @as(f32, @floatFromInt(slot % 23)) * 47.0 - 40.0,
+            .y = @as(f32, @floatFromInt(slot / 23)) * 405.0 - 20.0,
+            .level = @intCast(slot % 6),
+            .faction = @fromBackingInt(@intCast(slot % 4)),
+        };
+    }
+    rows[spatial_index_range_alignment_items] = .{ .x = 1.0e9, .y = -std.math.inf(f32), .level = 2, .faction = .ally };
+    rows[spatial_index_range_alignment_items + 1] = .{ .x = std.math.nan(f32), .y = 3, .level = 3, .faction = .hostile };
+    rows[spatial_index_range_alignment_items + 2] = .{ .bodied = false };
+
+    const geometry = IndexGeometry{ .tile_size = 32, .chunk_size_tiles = 16, .chunks_x = 2, .chunks_y = 2, .level_count = 1 };
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    try addLaneKeyRows(&data, &rows);
+    const population = aiPopulation(&data);
+
+    var serial = SpatialIndexSystem.init(testing.allocator);
+    defer serial.deinit();
+    _ = try buildInline(&serial, &data, population, geometry, .{});
+    try testing.expectEqual(@as(usize, 18), serial.view().entryCount());
+    try expectLaneKeysMatch(&serial, &rows);
+
+    var threaded = SpatialIndexSystem.init(testing.allocator);
+    defer threaded.deinit();
+    _ = try threaded.build(&data, population, geometry, &threads, .{ .items_per_range = spatial_index_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
+    try testing.expectEqual(@as(usize, 18), threaded.view().entryCount());
+    try expectLaneKeysMatch(&threaded, &rows);
+
+    const serial_index = serial.view();
+    const threaded_index = threaded.view();
+    try testing.expectEqual(count - 1, serial_index.entryCount());
+    for (0..serial_index.entryCount()) |entry| {
+        const slot = keySlot(serial.keys.items[entry]);
+        try testing.expect(slot != spatial_index_range_alignment_items + 2 and slot < count);
+        try testing.expect(keySlot(threaded.keys.items[entry]) != spatial_index_range_alignment_items + 2 and keySlot(threaded.keys.items[entry]) < count);
+        try testing.expectEqual(serial.keys.items[entry], threaded.keys.items[entry]);
+        try testing.expectEqual(@as(u32, @bitCast(serial_index.x[entry])), @as(u32, @bitCast(threaded_index.x[entry])));
+        try testing.expectEqual(@as(u32, @bitCast(serial_index.y[entry])), @as(u32, @bitCast(threaded_index.y[entry])));
+    }
+}
+
 test "the threaded index splits a one-row corridor, a cluster with a far outlier, and a one-row-part crowd across bands" {
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
@@ -2944,10 +3056,10 @@ test "row parts hold each chunk row's cells at their local x, and a chunk or row
     }
 }
 
-test "index keys in lanes match keyForPosition, including the scalar tail, at 12 and 16 cells per chunk" {
-    // 25 slots: six lane blocks and a one-slot tail, some outside the grid, on levels 0..5,
-    // of every faction. Cell size 32 gives 12 cells per 384-unit chunk and 16 per 512-unit
-    // chunk.
+test "index keys in lanes match keyForPosition, including a one-slot tail, at 12 and 16 cells per chunk" {
+    // 25 slots: six lane blocks and a one-slot tail, not a scalar tail. Some sit outside the
+    // grid, on levels 0..5, of every faction. Cell size 32 gives 12 cells per 384-unit chunk
+    // and 16 per 512-unit chunk.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..25) |slot| {
@@ -2968,6 +3080,37 @@ test "index keys in lanes match keyForPosition, including the scalar tail, at 12
             const expected = keyForPosition(system.grid, @intCast(slot % 6), @as(f32, @floatFromInt(slot % 23)) * 47.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 405.0 - 20.0, factionIndex(faction), slot);
             try testing.expectEqual(expected, key);
         }
+    }
+}
+
+test "index keys in lanes match keyForPosition for a short batch and for a masked tail after a full batch" {
+    const geometry = IndexGeometry{ .tile_size = 32, .chunk_size_tiles = 16, .chunks_x = 2, .chunks_y = 2, .level_count = 1 };
+    const finite = [_]LaneKeyRow{
+        .{ .x = 50, .y = 0, .level = 0, .faction = .neutral },
+        .{ .x = 80, .y = 40, .level = 1, .faction = .player },
+        .{ .x = 16, .y = -8, .level = 4, .faction = .neutral },
+        .{ .x = 200, .y = 8, .level = 5, .faction = .player },
+    };
+    const tail = [_]LaneKeyRow{
+        .{ .x = 1.0e9, .y = -std.math.inf(f32), .level = 2, .faction = .ally },
+        .{ .x = -40, .y = 10, .level = 1, .faction = .player },
+        .{ .x = std.math.nan(f32), .y = 3, .level = 3, .faction = .hostile },
+    };
+    // Tail prefixes of 1..3 slots, the 4-slot finite prefix, then that prefix plus 1..3 of the tail.
+    for (1..4) |slot_count| try expectInlineLaneKeys(geometry, tail[0..slot_count]);
+    try expectInlineLaneKeys(geometry, &finite);
+    for (1..4) |tail_count| {
+        var rows: [7]LaneKeyRow = undefined;
+        for (finite, 0..) |row, index| rows[index] = row;
+        for (tail[0..tail_count], 0..) |row, index| rows[finite.len + index] = row;
+        try expectInlineLaneKeys(geometry, rows[0 .. finite.len + tail_count]);
+    }
+    // The last slot has no movement body. The 1-slot build has no entries.
+    for (1..4) |slot_count| {
+        var rows: [3]LaneKeyRow = undefined;
+        for (tail[0 .. slot_count - 1], 0..) |row, index| rows[index] = row;
+        rows[slot_count - 1] = .{ .bodied = false };
+        try expectInlineLaneKeys(geometry, rows[0..slot_count]);
     }
 }
 
