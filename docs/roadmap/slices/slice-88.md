@@ -322,6 +322,7 @@ in its owning slice.
       `5d5a089` on any config; touched groups within run-to-run spread
       (tuned-versus-control measured after slice 89's tuner change, which gets
       its own whole-suite run; the `750ce0a` baseline predates it).
+      Owner: run this comparison when the slice's other items are done.
       Measured (Debug, `x86_64_v2`, code at `9bf93b0`,
       `benchmark_outputs/ab-20261103-072747`): the tuned case at four times
       the default pre-measure (`--warmup 484`, 30 iterations) stayed
