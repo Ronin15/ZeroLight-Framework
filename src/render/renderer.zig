@@ -532,6 +532,8 @@ pub const Renderer = struct {
     static_stream_growth_logged: bool = false,
     // The first growth of the dynamic batch streams past their reservation warns once.
     batch_stream_growth_logged: bool = false,
+    // The first zero-size acquire warns; later ones do not format.
+    zero_size_swapchain_warned: bool = false,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -901,11 +903,7 @@ pub const Renderer = struct {
         swapchain_acquired = true;
 
         if (width == 0 or height == 0) {
-            if (recovery) {
-                log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{} during recovery; submitting empty frame", .{ width, height });
-            } else {
-                log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{}; submitting empty frame", .{ width, height });
-            }
+            noteZeroSizeSwapchain(&self.zero_size_swapchain_warned, recovery, width, height);
             if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
                 command_buffer_finished = true;
                 return sdlError("SDL_SubmitGPUCommandBuffer");
@@ -922,6 +920,22 @@ pub const Renderer = struct {
             .width = width,
             .height = height,
         };
+    }
+
+    fn noteZeroSizeSwapchain(warned: *bool, recovery: bool, width: u32, height: u32) void {
+        if (warned.*) {
+            return;
+        } else {
+            @branchHint(.cold);
+            warned.* = true;
+            if (comptime logging.enabled(.warn)) {
+                if (recovery) {
+                    log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{} during recovery; submitting empty frame", .{ width, height });
+                } else {
+                    log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{}; submitting empty frame", .{ width, height });
+                }
+            }
+        }
     }
 
     /// Retires every tile store no owner claimed since the previous `endFrame`
@@ -2201,6 +2215,22 @@ test "null swapchain texture preserves skipped no swapchain result path" {
     try std.testing.expect(swapchainUnavailable(null));
     try std.testing.expect(!swapchainUnavailable(@ptrFromInt(1)));
     try std.testing.expectEqual(FrameResult.skipped_no_swapchain, FrameResult.skipped_no_swapchain);
+}
+
+test "a repeated zero-size swapchain warns once" {
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+
+    var warned = false;
+    try std.testing.expect(!warned);
+    Renderer.noteZeroSizeSwapchain(&warned, false, 0, 480);
+    try std.testing.expect(warned);
+    Renderer.noteZeroSizeSwapchain(&warned, true, 0, 0);
+    try std.testing.expect(warned);
+    warned = false;
+    Renderer.noteZeroSizeSwapchain(&warned, true, 640, 0);
+    try std.testing.expect(warned);
 }
 
 test "frame uniforms transform logical coordinates after acquisition" {

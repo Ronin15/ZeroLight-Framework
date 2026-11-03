@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, and the contact clamp. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the frame-log gate, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, and the frame-log gate. Open: stagger spread, the hot-pass layout, plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -355,18 +355,16 @@ in its owning slice.
       unchanged. No penetration column, so no `clampFloat4`
       (`.grok/rules/memory-performance.md` § SIMD and core math).
       Derived, no bench.
-- [ ] Frame warns sit behind the level gate (`renderer.zig:903`, called
-      from `endFrame` at `:969`). A zero-size swapchain logs `warn` with
-      no `logging.enabled` check, and ReleaseFast and ReleaseSmall keep
-      warn. Also once per flag, still ungated: `world/render.zig:937` and
-      `:967`, and `audio.zig:344`. Failure: a window that acquires a 0×0
-      swapchain every frame logs that warn every frame in a shipping
-      build. Pass: every non-trivial log on the frame, update, draw, and
-      command paths is inside `comptime logging.enabled`. A shipping
-      build does no log formatting on the steady frame, including a
-      repeated zero-size acquire. A once-only warn stays once and is
-      still behind the gate (`.grok/rules/zig-style.md` § Logging).
-      Derived, no bench. How is open.
+- [x] Frame warns sit behind `comptime logging.enabled(.warn)`. A
+      repeated 0×0 acquire returns at `noteZeroSizeSwapchain`
+      (`renderer.zig:926`) before formatting. The first warn is inside
+      the gate (`:931`). `endFrame` (`:983`) and
+      `submitSwapchainRecoveryFrame` (`:1112`) share
+      `zero_size_swapchain_warned`. The window-clip warn
+      (`world/render.zig:937`), the layer-drop warn (`:967`), and the
+      audio command and control warns (`audio.zig:347`, `:550`) format
+      inside the same gate. Their latches stay outside it
+      (`.grok/rules/zig-style.md` § Logging). Derived, no bench.
 - [ ] The population seam sizes the neighbor index and the per-AI scratch by
       AI rows, never every movement body (code audit M2; the index is 84's).
       Failure: `spatial_index.reserve` takes the movement body capacity at

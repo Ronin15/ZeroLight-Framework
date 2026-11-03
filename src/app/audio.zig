@@ -14,7 +14,8 @@ const manifest = @import("../assets/manifest.zig");
 const AudioAssetId = manifest.AudioAssetId;
 const AudioAssetKind = manifest.AudioAssetKind;
 const AudioConfig = @import("../config.zig").AudioConfig;
-const log = @import("../core/logging.zig").audio;
+const logging = @import("../core/logging.zig");
+const log = logging.audio;
 const math = @import("../core/math.zig");
 const sdl = @import("../platform/sdl.zig");
 const c = sdl.c;
@@ -342,8 +343,8 @@ pub const AudioService = struct {
             } else |err| {
                 const already_warned = if (self.last_warned_command_error) |last| last == err else false;
                 if (!already_warned) {
-                    log.warn("audio command ignored: {}", .{err});
                     self.last_warned_command_error = err;
+                    if (comptime logging.enabled(.warn)) log.warn("audio command ignored: {}", .{err});
                 }
             }
         }
@@ -545,8 +546,8 @@ pub const AudioService = struct {
         };
         const already_warned = if (self.last_warned_control_error) |last| last == err else false;
         if (!already_warned) {
-            log.warn("audio control op failed: {}", .{err});
             self.last_warned_control_error = err;
+            if (comptime logging.enabled(.warn)) log.warn("audio control op failed: {}", .{err});
         }
     }
 
@@ -1134,6 +1135,48 @@ test "audio command buffer enforces per-step command cap" {
     try std.testing.expectEqual(@as(usize, 1), commands.len());
     commands.beginStep();
     try std.testing.expectEqual(@as(usize, 0), commands.len());
+}
+
+test "audio command buffer warns once for a repeated command error" {
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+
+    var fake = FakeBackendContext.init(std.testing.allocator);
+    defer fake.deinit();
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(
+        std.testing.allocator,
+        asset_store,
+        .{ .enabled = true, .max_sfx_tracks = 1 },
+        FakeBackendContext.backend(),
+        @ptrCast(&fake),
+    );
+    defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .music, true));
+
+    var commands = AudioCommandBuffer.init(std.testing.allocator, 4);
+    defer commands.deinit();
+    try commands.playSfx(.{ .asset = .collision_sfx });
+    service.drain(&commands);
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidAudioAssetKind), service.last_warned_command_error);
+
+    commands.beginStep();
+    try commands.playSfx(.{ .asset = .collision_sfx });
+    service.drain(&commands);
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidAudioAssetKind), service.last_warned_command_error);
+
+    commands.beginStep();
+    try commands.setListener(.{ .x = 1, .y = 2 });
+    service.drain(&commands);
+    try std.testing.expectEqual(@as(?anyerror, null), service.last_warned_command_error);
+
+    service.noteControlResult(error.AudioBackendFailure);
+    try std.testing.expectEqual(@as(?anyerror, error.AudioBackendFailure), service.last_warned_control_error);
+    service.noteControlResult(error.AudioBackendFailure);
+    try std.testing.expectEqual(@as(?anyerror, error.AudioBackendFailure), service.last_warned_control_error);
+    service.noteControlResult(null);
+    try std.testing.expectEqual(@as(?anyerror, null), service.last_warned_control_error);
 }
 
 test "disabled audio backend context is stable after service move" {

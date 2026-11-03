@@ -934,7 +934,7 @@ pub fn planDenseGpuSync(self: *WorldSystem, active_level: u16) error{OutOfMemory
     if (!window.eql(visible) and !self.gpu_tiles.window_clip_reported) {
         @branchHint(.cold);
         self.gpu_tiles.window_clip_reported = true;
-        log.warn("render chunk window clipped to {d}x{d} chunks; store width", .{ window.width(), window.height() });
+        if (comptime logging.enabled(.warn)) log.warn("render chunk window clipped to {d}x{d} chunks; store width", .{ window.width(), window.height() });
     }
     const levels = RenderLevels{ .active_level = active_level, .window = self.render_window };
     const rederive = self.gpu_residency_dirty or
@@ -964,7 +964,7 @@ fn fitResidentLayers(desired: []const u32, fit: usize, reported: *bool) []const 
     if (resident.len < desired.len and !reported.*) {
         @branchHint(.cold);
         reported.* = true;
-        log.warn("{d} deepest window layers not drawn; store width", .{desired.len - resident.len});
+        if (comptime logging.enabled(.warn)) log.warn("{d} deepest window layers not drawn; store width", .{desired.len - resident.len});
     }
     return resident;
 }
