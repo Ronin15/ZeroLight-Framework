@@ -8565,6 +8565,8 @@ test "a nav-mark reserve OOM before plane traversal leaves world and nav intact 
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
+    // The plane entry is the collision box. A visual alone is not an entry.
+    try fixture.data.setCollisionBounds(fixture.player.entity, .{ .size = .{ .x = 32, .y = 32 } });
     // A hole at (6,3); the player then stands over it.
     try fixture.update(.hole);
     try fixture.seam();

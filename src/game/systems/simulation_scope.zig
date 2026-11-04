@@ -3164,7 +3164,10 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
     defer serial_sys.deinit();
     const col_serial = (try gatherCollisionInline(&serial_sys, &data)).?;
     const ai_serial = try gatherAiInline(&serial_sys, &data, ai_region);
-    try expectMergedThinkSet(&serial_sys, &data, ai_serial.halo, 0, true);
+    // `expectMergedThinkSet` reserves AI rows and can move `ai_halo_indices`.
+    const halo_serial = try allocator.dupe(u32, ai_serial.halo);
+    defer allocator.free(halo_serial);
+    try expectMergedThinkSet(&serial_sys, &data, halo_serial, 0, true);
     const think_serial = try allocator.dupe(u32, serial_sys.ai_cognition_indices.items);
     defer allocator.free(think_serial);
     var serial_stream = RangeOutputStream(StructuralCommand).init(allocator);
@@ -3201,7 +3204,7 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
         try std.testing.expectEqualSlices(u32, col_serial, collision.indices.?);
 
         const ai_result = try sys.gatherAiPopulations(&data, ai_region, &threads, config);
-        try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_result.halo);
+        try std.testing.expectEqualSlices(u32, halo_serial, ai_result.halo);
         try std.testing.expectEqualSlices(u32, think_serial, sys.mergeThinkSet(&data, 0, true));
 
         stream.clearRetainingCapacity();
