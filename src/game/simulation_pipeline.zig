@@ -3439,6 +3439,157 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
     }
 }
 
+const affect_gather_ai_count: usize = 48;
+
+const AffectGatherStep = struct {
+    rows_len: usize,
+    fear: [47]f32,
+    curiosity: [47]f32,
+    aggression: [47]f32,
+    fatigue: [47]f32,
+    above_threshold_mask: [47]u8,
+    event_count: usize,
+    item_count: usize,
+    sample_count: usize,
+    allocations: usize = 0,
+    rows_len_after: usize = 0,
+    agent_fear: f32,
+    agent_curiosity: f32,
+    agent_aggression: f32,
+    agent_fatigue: f32,
+};
+
+fn setAffectDecayZero(data: *DataSystem, entity: EntityId) !void {
+    try data.setAiAffect(entity, .{});
+    const row = data.aiAffectDenseIndex(entity) orelse return error.TestExpectedEqual;
+    data.ai_affects.set(row, .{
+        .decay_rate_fear = 0,
+        .decay_rate_curiosity = 0,
+        .decay_rate_aggression = 0,
+        .decay_rate_fatigue = 0,
+    });
+}
+
+fn runAffectGatherStep(max_worker_threads: usize) !AffectGatherStep {
+    var world = try shareTestWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const body = data.movementBodyPtr(player.entity).?;
+    body.previous_x.* = 0.0001;
+    body.previous_y.* = 0;
+    body.position_x.* = 0.0001;
+    body.position_y.* = 0;
+
+    var agents: [affect_gather_ai_count]EntityId = undefined;
+    for (&agents, 0..) |*agent, index| {
+        agent.* = try addShareTestAgent(&data, 0, .hostile, false);
+        if (index == 0) continue;
+        try setAffectDecayZero(&data, agent.*);
+    }
+    const sensed = agents[1];
+    try data.setAiPerception(sensed, .{
+        .target_visible = true,
+        .nearest_threat = player.entity,
+        .nearest_threat_dist = 0,
+        .vision_range = 100,
+    });
+    try data.setAiMemory(sensed, .{ .familiarity = 0 });
+    const ai_row = data_test_support.rowOf(&data, sensed, "ai_agent_index") orelse return error.TestExpectedEqual;
+    data.aiAgentSlice().active_behavior[ai_row] = .pursue;
+    try markAllAlwaysActive(&data);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    const affect = data.aiAffectSliceConst();
+    try std.testing.expectEqual(@as(usize, 47), affect.fear.len);
+    var observed: AffectGatherStep = .{
+        .rows_len = pipeline.affect.rows.len,
+        .fear = undefined,
+        .curiosity = undefined,
+        .aggression = undefined,
+        .fatigue = undefined,
+        .above_threshold_mask = undefined,
+        .event_count = frame.events.mergedItems().len,
+        .item_count = if (pipeline.affect.gather_tuner.last_request) |request| request.item_count else 0,
+        .sample_count = pipeline.affect.gather_tuner.sample_count,
+        .agent_fear = (data_test_support.aiAffect(&data, sensed) orelse return error.TestExpectedEqual).fear,
+        .agent_curiosity = (data_test_support.aiAffect(&data, sensed) orelse return error.TestExpectedEqual).curiosity,
+        .agent_aggression = (data_test_support.aiAffect(&data, sensed) orelse return error.TestExpectedEqual).aggression,
+        .agent_fatigue = (data_test_support.aiAffect(&data, sensed) orelse return error.TestExpectedEqual).fatigue,
+    };
+    @memcpy(observed.fear[0..], affect.fear);
+    @memcpy(observed.curiosity[0..], affect.curiosity);
+    @memcpy(observed.aggression[0..], affect.aggression);
+    @memcpy(observed.fatigue[0..], affect.fatigue);
+    @memcpy(observed.above_threshold_mask[0..], affect.above_threshold_mask);
+
+    if (max_worker_threads > 0) {
+        frame.beginStep();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        const saved = pipeline.affect.allocator;
+        pipeline.affect.allocator = failing.allocator();
+        const stepped = pipeline.update(context);
+        pipeline.affect.allocator = saved;
+        _ = try stepped;
+        observed.allocations = failing.allocations;
+        observed.rows_len_after = pipeline.affect.rows.len;
+    }
+    return observed;
+}
+
+test "affect gather updates are byte-identical serial and threaded on a pipeline step, and after reserve alone allocate nothing (FailingAllocator)" {
+    const serial = try runAffectGatherStep(0);
+    const threaded = try runAffectGatherStep(2);
+    try std.testing.expectEqual(@as(usize, 47), serial.rows_len);
+    try std.testing.expectEqual(@as(usize, 47), threaded.rows_len);
+    try std.testing.expectEqualSlices(f32, &serial.fear, &threaded.fear);
+    try std.testing.expectEqualSlices(f32, &serial.curiosity, &threaded.curiosity);
+    try std.testing.expectEqualSlices(f32, &serial.aggression, &threaded.aggression);
+    try std.testing.expectEqualSlices(f32, &serial.fatigue, &threaded.fatigue);
+    try std.testing.expectEqualSlices(u8, &serial.above_threshold_mask, &threaded.above_threshold_mask);
+    try std.testing.expectEqual(@as(usize, 0), serial.event_count);
+    try std.testing.expectEqual(@as(usize, 0), threaded.event_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), serial.agent_fear, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), serial.agent_aggression, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), serial.agent_curiosity, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), serial.agent_fatigue, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.15), threaded.agent_fear, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), threaded.agent_aggression, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), threaded.agent_curiosity, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), threaded.agent_fatigue, 1e-6);
+    try std.testing.expectEqual(@as(usize, 48), threaded.item_count);
+    try std.testing.expectEqual(@as(usize, 1), threaded.sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threaded.allocations);
+    try std.testing.expectEqual(@as(usize, 47), threaded.rows_len_after);
+}
+
 // The production commit seam (`commitStructuralAndReact`) on an inline thread system,
 // returning its population seam stats.
 fn commitSeamInline(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {

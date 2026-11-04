@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry. Open: the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather. Open: memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -77,16 +77,18 @@ in its owning slice.
       § SIMD and core math, `.grok/rules/simulation.md` § Controllers
       and processors, `.grok/rules/threading.md` § What runs where).
       Derived, no bench.
-- [ ] Affect's gather leaves main. Failure: `gatherScopedIndices`
-      (`systems/affect.zig:229-285`) walks the think set on the main thread,
-      resolving the affect, perception, and memory rows per entity and
-      appending one row each, per-item work beyond an ordered merge
-      (`.grok/rules/threading.md`); the AI, perception, and memory gathers
-      already run on workers. Failure scenario: once 75 thinks every agent,
-      main pays three slot lookups per agent in the world every step. Pass: a
-      windowed threaded gather merged in range order, serial == threaded, a
-      `FailingAllocator` proof on a multi-worker step, and the pipeline
-      workers test (`simulation_pipeline.zig:5445-5467`) covering it.
+- [x] Affect's gather leaves main. `gatherAffectData`
+      (`systems/affect.zig:259`) dispatches `gatherAffectJob` (`:376`)
+      over the think rows. Each range writes its window; `kept` is a
+      running skip, so the job stays scalar. `compactRowWindows`
+      (`thread_system.zig:2136`) merges in range order. The serial path
+      is that job inline (`shapeBatch`, `:2467`). The pipeline step
+      (`simulation_pipeline.zig:3567`) is serial == threaded, and after
+      `reserve` a failing affect allocator allocates nothing
+      (`.grok/rules/threading.md` § What runs where,
+      § Writes, capacity, and determinism,
+      `.grok/rules/memory-performance.md` § Data-oriented design,
+      § SIMD and core math). Derived, no bench.
 - [ ] AI memory's visibility pass reads perception in row order. Failure:
       `refreshVisibleTargets` (`systems/ai_memory.zig:664`) walks members
       in ascending memory row and reads `target_visible`, `nearest_threat`,
