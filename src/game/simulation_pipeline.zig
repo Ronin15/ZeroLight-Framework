@@ -429,10 +429,10 @@ comptime {
 pub const SimulationPipelineConfig = struct {
     contact_capacity: usize = 0,
     /// Initial size for the body-sized capacities (scope movement lists, collision,
-    /// the spatial index, cognition scratch, structural commands). Not navigation
-    /// intents, movement intents, path requests, steering scratch, or think-pack
-    /// scratch. `init` raises it to the committed `DataSystem` rows; afterwards only
-    /// `SimulationPipeline.syncPopulationCapacity` grows it.
+    /// structural commands). Not navigation intents, movement intents, path
+    /// requests, steering scratch, think-pack scratch, the neighbor index, or
+    /// cognition scratch. `init` raises it to the committed `DataSystem` rows;
+    /// afterwards only `SimulationPipeline.syncPopulationCapacity` grows it.
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
     /// Nav cell size for a world-less nav build. With `navigation_world`, nav cells are
@@ -866,13 +866,19 @@ pub const SimulationPipeline = struct {
     destructible: DestructibleController,
     audio_controller: AudioController,
     /// Tracked logical capacity for the body-sized pipeline capacities: scope
-    /// movement lists, collision, the spatial index, cognition scratch, and
-    /// structural commands. Scope AI lists, steering scratch, the goal table, and
+    /// movement lists, collision, and structural commands. Not the neighbor index
+    /// or cognition scratch. Scope AI lists, steering scratch, the goal table, and
     /// think-pack scratch are not among them. Grown only by `syncPopulationCapacity`.
     movement_body_capacity: usize,
-    /// `frame.navigation_intents` value capacity: the committed AI rows at init,
-    /// then `grownPopulationCapacity` of those rows at the population seam.
+    /// AI-row capacity: `frame.navigation_intents`, the neighbor index, the
+    /// perception, AI, and affect scratch, and the think side of the AI-memory
+    /// scratch. The committed AI rows at init, then `grownPopulationCapacity` of
+    /// those rows at the population seam.
     navigation_intent_capacity: usize,
+    /// Memory-row capacity for the memory side of the AI-memory scratch.
+    /// `rows.ai_memories` at init, then `grownPopulationCapacity` of those rows
+    /// at the seam. Not the body cap and not `pack_scratch_capacity`.
+    memory_scratch_capacity: usize,
     /// Think-pack scratch: `packScratchRows` at init, then `grownPopulationCapacity`
     /// of that max at the population seam. Not a body-sized capacity.
     pack_scratch_capacity: usize,
@@ -997,14 +1003,14 @@ pub const SimulationPipeline = struct {
         try scope.reservePackRows(rows.packScratchRows());
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
-        try spatial_index.reserve(population);
-        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
+        try spatial_index.reserve(rows.ai_agents);
+        // AI-row count, reserved below with `AiSystem`. Not `movement_body_capacity`.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
-        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
+        // Think side is the AI-row count; the memory side is `rows.ai_memories`.
         var ai_memory = AiMemorySystem.init(allocator);
         errdefer ai_memory.deinit();
-        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
+        // AI-row count, reserved below with `AiSystem`. Not `movement_body_capacity`.
         var affect = AffectSystem.init(allocator);
         errdefer affect.deinit();
         var dig = DigController.init(config.dig);
@@ -1016,10 +1022,10 @@ pub const SimulationPipeline = struct {
         var plane_entry = PlaneEntrySystem.init(allocator);
         errdefer plane_entry.deinit();
         try plane_entry.reserve(population);
-        try ai.reserve(population);
-        try perception.reserve(population);
-        try ai_memory.reserve(population);
-        try affect.reserve(population);
+        try ai.reserve(rows.ai_agents);
+        try perception.reserve(rows.ai_agents);
+        try ai_memory.reserve(rows.ai_agents, rows.ai_memories);
+        try affect.reserve(rows.ai_agents);
 
         return .{
             .movement = MovementSystem.init(),
@@ -1040,6 +1046,7 @@ pub const SimulationPipeline = struct {
             .audio_controller = AudioController.init(),
             .movement_body_capacity = population,
             .navigation_intent_capacity = rows.ai_agents,
+            .memory_scratch_capacity = rows.ai_memories,
             .pack_scratch_capacity = rows.packScratchRows(),
             .steering_stream_capacity = rows.steering_agents,
             .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
@@ -1058,29 +1065,33 @@ pub const SimulationPipeline = struct {
     /// `navigation_intent_capacity`, `intents` and path requests follow
     /// `steering_stream_capacity`, and structural commands follow
     /// `movement_body_capacity`, each to the most ranges its writers dispatch at
-    /// that capacity. Then `reserve` at the body capacity (the event limit, the
-    /// cognition scratch, and the contact streams over the stored trigger pairs).
-    /// Grow-only. State init calls it once after `init`. The population seam calls it
-    /// when bodies or an event share grew; a stream-only growth does not.
+    /// that capacity. Then `reserve`: the AI, perception, and affect scratch and
+    /// the AI-memory think side follow `navigation_intent_capacity`, and the memory
+    /// side follows `memory_scratch_capacity`. Contacts and events stay on the body
+    /// cap and the event shares. Grow-only. State init calls it once after `init`.
+    /// The population seam calls it when bodies or an event share grew; a stream-only
+    /// growth does not.
     pub fn reserveFrame(self: *SimulationPipeline, frame: *SimulationFrame) !void {
         const body = self.movement_body_capacity;
         try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), self.navigation_intent_capacity);
         try frame.intents.reserve(self.steeringStreamRangeCount(), self.steering_stream_capacity);
         try frame.structural_commands.reserve(self.structuralCommandRangeCount(), body + self.structuralCommandHeadroom());
         try frame.reservePathRequests(self.steeringStreamRangeCount(), self.steering_stream_capacity);
-        try self.reserve(frame, body);
+        try self.reserve(frame, self.navigation_intent_capacity);
     }
 
     /// Tops up frame events to the sum of producer budgets (`eventCapacitySum`),
-    /// reserves cognition gather scratch for `pop`, and reserves the contact-dependent
-    /// streams to the collision pair bound over the tracked `movement_body_capacity` plus
-    /// the stored trigger contacts, first growing that trigger bound to the stored pairs
+    /// reserves AI, perception, and affect scratch for `pop` AI rows and the
+    /// AI-memory scratch for `pop` think rows and `memory_scratch_capacity` memory
+    /// rows, and reserves the contact-dependent streams to the collision pair bound
+    /// over the tracked `movement_body_capacity` plus the stored trigger contacts,
+    /// first growing that trigger bound to the stored pairs
     /// (`topUpTriggerContactBound`, then `reserveContactStreams`). Does not lower an
-    /// existing higher event limit. `reserveFrame` runs it at the tracked population.
+    /// existing higher event limit. `reserveFrame` passes `navigation_intent_capacity`.
     fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
         try self.ai.reserve(pop);
         try self.perception.reserve(pop);
-        try self.ai_memory.reserve(pop);
+        try self.ai_memory.reserve(pop, self.memory_scratch_capacity);
         try self.affect.reserve(pop);
         try self.topUpTriggerContactBound(frame);
         try self.reserveContactStreams(frame);
@@ -1223,6 +1234,7 @@ pub const SimulationPipeline = struct {
             rows.ai_perceptions * perception_events_per_observer_max <= self.perception_max_events_per_step and
             rows.ai_affects * affect_events_per_row_max <= self.affect_max_events_per_step and
             rows.packScratchRows() <= self.pack_scratch_capacity and
+            rows.ai_memories <= self.memory_scratch_capacity and
             self.pathfinding.coversAgentCount(rows.steering_agents))
         {
             return .{};
@@ -1257,6 +1269,8 @@ pub const SimulationPipeline = struct {
         const old_pack = self.pack_scratch_capacity;
         const pack_count = rows.packScratchRows();
         const pack = if (pack_count > old_pack) grownPopulationCapacity(pack_count) else old_pack;
+        const old_memory = self.memory_scratch_capacity;
+        const memory = if (rows.ai_memories > old_memory) grownPopulationCapacity(rows.ai_memories) else old_memory;
         // `collision.reserve` raises its declared pair bound; a later failure (the contact
         // streams in `reserve`) must not leave it declaring streams that were never sized.
         const old_pair_bound = self.collision.reserved_pair_bound;
@@ -1268,13 +1282,13 @@ pub const SimulationPipeline = struct {
             self.perception_max_events_per_step = old_perception_share;
             self.affect_max_events_per_step = old_affect_share;
             self.pack_scratch_capacity = old_pack;
+            self.memory_scratch_capacity = old_memory;
         }
 
         const body_grew = body != old_body;
         if (body_grew) {
             try self.scope.reserve(body);
             try self.plane_entry.reserve(body);
-            try self.spatial_index.reserve(body);
             try self.collision.reserve(body);
             try self.dig.ensurePlaneScratchReserve(body + 1);
             try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
@@ -1282,14 +1296,20 @@ pub const SimulationPipeline = struct {
         if (navigation != old_navigation) {
             try self.scope.reserveAiRows(navigation);
             try self.pathfinding.reserveGoals(navigation);
+            try self.spatial_index.reserve(navigation);
+            try self.ai.reserve(navigation);
+            try self.perception.reserve(navigation);
+            try self.affect.reserve(navigation);
         }
         if (steering != old_steering or navigation != old_navigation) {
             try self.steering.reserveRows(steering, navigation);
         }
         if (pack != old_pack) try self.scope.reservePackRows(pack);
+        if (navigation != old_navigation or memory != old_memory) try self.ai_memory.reserve(navigation, memory);
 
         self.movement_body_capacity = body;
         self.navigation_intent_capacity = navigation;
+        self.memory_scratch_capacity = memory;
         self.steering_stream_capacity = steering;
         self.pack_scratch_capacity = pack;
         const shares_grew = perception_share != old_perception_share or affect_share != old_affect_share;
@@ -1302,7 +1322,10 @@ pub const SimulationPipeline = struct {
             // streams at the tracked capacities.
             try self.reserveFrame(frame);
         } else if (streams_grew) {
-            // `perception.reserve` writes one slot per body-cap range. Only these grew.
+            // Cognition scratch is not one slot per body-cap range. `reserveFrame`
+            // re-ensures it at `navigation_intent_capacity` and `memory_scratch_capacity`
+            // when the body cap or an event share grows. The navigation and memory
+            // branches size it when only those grow.
             try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), self.navigation_intent_capacity);
             try frame.intents.reserve(self.steeringStreamRangeCount(), self.steering_stream_capacity);
             try frame.reservePathRequests(self.steeringStreamRangeCount(), self.steering_stream_capacity);
@@ -1311,7 +1334,7 @@ pub const SimulationPipeline = struct {
         try growPathfindingForAgents(&self.pathfinding, rows.steering_agents);
 
         const pack_grew = pack != old_pack;
-        if (body_grew or shares_grew or streams_grew or pack_grew) {
+        if (body_grew or shares_grew or streams_grew or pack_grew or memory != old_memory) {
             stats.grew = true;
             if ((body_grew or shares_grew) and !self.population_growth_logged) {
                 self.population_growth_logged = true;
@@ -7861,6 +7884,200 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
     }
+}
+
+const ScratchTotals = struct {
+    index: usize,
+    ai: usize,
+    perception: usize,
+    affect: usize,
+    memory: usize,
+};
+
+fn listBytes(list: anytype) usize {
+    const child = @typeInfo(@TypeOf(list.items)).pointer.child;
+    return list.capacity * @sizeOf(child);
+}
+
+fn malBytes(list: anytype) usize {
+    return @TypeOf(list).capacityInBytes(list.capacity);
+}
+
+fn bitSetBytes(bits: std.bit_set.Dynamic) usize {
+    if (bits.bit_length == 0) return 0;
+    return (@divCeil(bits.bit_length, 64) + 1) * 8;
+}
+
+fn scratchTotals(pipeline: *const SimulationPipeline) ScratchTotals {
+    const index = &pipeline.spatial_index;
+    const memory = &pipeline.ai_memory;
+    var summary: usize = 0;
+    for (memory.summary_levels) |level| summary += bitSetBytes(level);
+    return .{
+        .index = listBytes(index.slot_rows) + listBytes(index.keys) + listBytes(index.staging) + malBytes(index.entries) + listBytes(index.band_cells) + listBytes(index.cells) + listBytes(index.rows) + listBytes(index.chunk_records) + listBytes(index.band_offsets) + listBytes(index.band_tallies),
+        .ai = malBytes(pipeline.ai.rows) + listBytes(pipeline.ai.range_tallies),
+        .perception = malBytes(pipeline.perception.rows) + listBytes(pipeline.perception.range_stats),
+        .affect = malBytes(pipeline.affect.rows) + listBytes(pipeline.affect.range_tallies),
+        .memory = listBytes(memory.think_rows) + listBytes(memory.memory_dense_indices) + listBytes(memory.touched_words) + listBytes(memory.order_tallies) + bitSetBytes(memory.member_words) + summary,
+    };
+}
+
+fn expectScratchStep(
+    pipeline: *SimulationPipeline,
+    frame: *SimulationFrame,
+    data: *DataSystem,
+    world: *WorldSystem,
+    threads: *ThreadSystem,
+    player: *Player,
+    totals: ScratchTotals,
+) !void {
+    const context: SimulationPipelineUpdateContext = .{
+        .data = data,
+        .frame = frame,
+        .world = world,
+        .player = player,
+        .thread_system = threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    try std.testing.expectEqual(totals, scratchTotals(pipeline));
+    try std.testing.expect(!pipeline.ai_memory.scratch_growth_logged);
+
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = pipeline, .frame = frame, .data = data, .world = world, .threads = threads };
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    _ = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(totals, scratchTotals(pipeline));
+    try std.testing.expect(!pipeline.ai_memory.scratch_growth_logged);
+}
+
+test "population sync sizes the neighbor index and AI scratch by AI rows and memory scratch by memory rows" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    for (0..2) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 80,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try pipeline.reserveFrame(&frame);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.memory_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 16), pipeline.ai_memory.reserved_think_rows);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.ai_memory.reserved_memory_rows);
+    try std.testing.expect(!pipeline.ai_memory.scratch_growth_logged);
+    const init_totals = scratchTotals(&pipeline);
+
+    for (0..200) |_| {
+        const entity = try data.createEntity();
+        try data.setAiPerception(entity, .{});
+    }
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.memory_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(perception_events_per_observer_max * 320, pipeline.perception_max_events_per_step);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.ai_memory.reserved_memory_rows);
+    try std.testing.expectEqual(@as(usize, 16), pipeline.ai_memory.reserved_think_rows);
+    try std.testing.expectEqual(init_totals, scratchTotals(&pipeline));
+    try expectScratchStep(&pipeline, &frame, &data, &world, &threads, &player, init_totals);
+
+    for (0..40) |_| {
+        const entity = try data.createEntity();
+        try data.setAiMemory(entity, .{});
+    }
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.memory_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.ai_memory.reserved_memory_rows);
+    try std.testing.expectEqual(@as(usize, 16), pipeline.ai_memory.reserved_think_rows);
+    const memory_40 = scratchTotals(&pipeline);
+    try std.testing.expectEqual(init_totals.index, memory_40.index);
+    try std.testing.expectEqual(init_totals.ai, memory_40.ai);
+    try std.testing.expectEqual(init_totals.perception, memory_40.perception);
+    try std.testing.expectEqual(init_totals.affect, memory_40.affect);
+    try std.testing.expect(memory_40.memory > init_totals.memory);
+    try expectScratchStep(&pipeline, &frame, &data, &world, &threads, &player, memory_40);
+
+    for (0..160) |_| {
+        const entity = try data.createEntity();
+        try data.setAiMemory(entity, .{});
+    }
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.memory_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.ai_memory.reserved_memory_rows);
+    try std.testing.expectEqual(@as(usize, 16), pipeline.ai_memory.reserved_think_rows);
+    const memory_200 = scratchTotals(&pipeline);
+    try std.testing.expectEqual(init_totals.index, memory_200.index);
+    try std.testing.expectEqual(init_totals.ai, memory_200.ai);
+    try std.testing.expectEqual(init_totals.perception, memory_200.perception);
+    try std.testing.expectEqual(init_totals.affect, memory_200.affect);
+    try std.testing.expect(memory_200.memory > memory_40.memory);
+    try expectScratchStep(&pipeline, &frame, &data, &world, &threads, &player, memory_200);
+
+    for (0..150) |_| {
+        const entity = try data.createEntity();
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    }
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 256), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.memory_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.ai_memory.reserved_memory_rows);
+    try std.testing.expectEqual(@as(usize, 16), pipeline.ai_memory.reserved_think_rows);
+    try std.testing.expectEqual(memory_200, scratchTotals(&pipeline));
+    try expectScratchStep(&pipeline, &frame, &data, &world, &threads, &player, memory_200);
+
+    for (0..38) |_| {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.navigation_intent_capacity);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.memory_scratch_capacity);
+    try std.testing.expectEqual(@as(usize, 256), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.ai_memory.reserved_think_rows);
+    try std.testing.expectEqual(@as(usize, 320), pipeline.ai_memory.reserved_memory_rows);
+    const ai_totals = scratchTotals(&pipeline);
+    try std.testing.expect(ai_totals.index > memory_200.index);
+    try std.testing.expect(ai_totals.ai > memory_200.ai);
+    try std.testing.expect(ai_totals.perception > memory_200.perception);
+    try std.testing.expect(ai_totals.affect > memory_200.affect);
+    try std.testing.expect(ai_totals.memory >= memory_200.memory);
+    try expectScratchStep(&pipeline, &frame, &data, &world, &threads, &player, ai_totals);
 }
 
 test "population sync that runs out of memory growing a stream capacity keeps the old capacities and the retry grows them" {

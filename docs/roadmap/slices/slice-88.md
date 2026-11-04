@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility. Open: the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch. Open: the AI-memory bench fixture, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -242,18 +242,18 @@ in its owning slice.
 - [x] The growth seam sizes the scope AI lists, the steering scratch, and
       the goal table to every body. Scope AI lists follow AI rows
       (`reserveAiRows`, `simulation_scope.zig:256`; seam
-      `simulation_pipeline.zig:1283`). Steering agent scratch follows
+      `simulation_pipeline.zig:1297`). Steering agent scratch follows
       steering rows and intent scratch follows navigation intents
-      (`reserveRows`, `steering/system.zig:227`; seam `:1287`). The goal
-      table follows navigation intents (`reserveGoals`, seam `:1284`).
+      (`reserveRows`, `steering/system.zig:227`; seam `:1305`). The goal
+      table follows navigation intents (`reserveGoals`, seam `:1298`).
       Pack scratch follows the max of AI, perception, memory, and affect
       (`packScratchRows`, `data_system/types.zig:165`; `reservePackRows`,
-      `simulation_scope.zig:277`; `pack_scratch_capacity`, seam `:1289`),
+      `simulation_scope.zig:277`; `pack_scratch_capacity`, seam `:1307`),
       and that ensure does not pull the AI lists up with it. A body or
       bounds increase that does not raise those counts does not grow
       them. Collision indices, tier commands, chunk-change windows,
       plane-entry windows, and the plane scratch stay on the body cap
-      (`scope.reserve`, seam `:1275`) (`.grok/rules/engine-design.md`
+      (`scope.reserve`, seam `:1290`) (`.grok/rules/engine-design.md`
       § Cost model, `.grok/rules/budgets-capacities.md`,
       `.grok/rules/memory-performance.md` § Hot paths). Derived, no
       bench. Not the neighbor-index item.
@@ -312,21 +312,26 @@ in its owning slice.
       audio command and control warns (`audio.zig:347`, `:550`) format
       inside the same gate. Their latches stay outside it
       (`.grok/rules/zig-style.md` § Logging). Derived, no bench.
-- [ ] The population seam sizes the neighbor index and the per-AI scratch by
+- [x] The population seam sizes the neighbor index and the per-AI scratch by
       AI rows, never every movement body (code audit M2; the index is 84's).
-      Failure: `spatial_index.reserve` takes the movement body capacity at
-      init and at the growth seam (`simulation_pipeline.zig:1000`, `:1277`),
-      which is the max of bodies, steering, AI, and bounds
-      (`PopulationRowCounts.population`, `data_system/types.zig:161`); the
-      index only ever holds AI halo rows, and the perception, AI, affect, and
-      AI-memory scratch reserve the same (init `:1019-1022`, `reserve`
-      `:1081-1084`)
+      `navigation_intent_capacity` (`simulation_pipeline.zig:877`) is the
+      committed AI rows, then `grownPopulationCapacity` of those rows
+      (`:1256`). Init reserves the index at `rows.ai_agents` (`:1006`) and
+      the AI, perception, and affect scratch the same (`:1025`, `:1026`,
+      `:1028`). The seam reserves that index and those three scratches at
+      `navigation` (`:1299-1302`). `reserveFrame` passes that capacity
+      (`:1080`); `reserve` sizes them to it (`:1092`, `:1093`, `:1095`).
+      The AI-memory think side uses the same count (`ai_memory.zig:171`,
+      `simulation_pipeline.zig:1094`). The memory side does not:
+      `memory_scratch_capacity` (`simulation_pipeline.zig:881`) is
+      `rows.ai_memories` at init (`:1049`) and `grownPopulationCapacity` of
+      those rows at the seam (`:1273`, `:1308`). A bounds increase or a
+      perception-only increase leaves the five scratch totals unchanged. A
+      memory-only increase grows only the memory side. An AI increase grows
+      the index and the AI, perception, and affect totals and leaves
+      `reserved_memory_rows` unchanged
       (`.grok/rules/engine-design.md` § Cost model,
-      `.grok/rules/budgets-capacities.md`). Failure scenario (derived): a
-      colony with 1M items at rest and 10k agents reserves index storage for
-      1M slots. Pass: a logical AI-row capacity at the seam sizes the index
-      and the per-AI scratch; a reserve test shows their bytes follow AI
-      rows.
+      `.grok/rules/budgets-capacities.md`). Derived, no bench.
 - [x] The runtime perf log carries only change-path cost-driver stages (code
       audit L1; `.grok/rules/threading.md`). Landed for `BatchStage`
       (`005cdae`): 11 change-path drivers, the rest `BenchBatchStage`
@@ -341,16 +346,14 @@ in its owning slice.
 - [ ] Benches at the worst-case shape each finding's bound names, with the
       shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
 - [ ] AI memory's scratch reserve covers the population it is reserved for.
-      Measured: the whole-suite Debug baseline at `750ce0a`
-      (`.claude/reports/bench-baseline-750ce0a.txt`) logs "reservation short of
-      the live population" 63 times, first in `ai-cell-ordered` (1,024 think /
-      1,024 memory rows grew to 1,536), from `growPastReserve`
-      (`systems/ai_memory.zig:355`, called at `:217`) after
-      `AiMemorySystem.reserve` (`:166`). Failure: either the reserve undersizes
-      what its population needs, or the bench fixtures reserve less than they
-      run. Pass: the cause attributed; a population reserved at the seam runs
-      with no scratch growth, or the fixture reserves its population; the warning
-      stays the once-per-system growth signal.
+      The production seam shortfall is closed: a memory count reserved at the
+      seam does not call `growPastReserve` (`systems/ai_memory.zig:353`,
+      called at `:218`). Still open is the bench fixture.
+      `src/benchmarks/ai_memory.zig` `runCaseImpl` (`:175`) never calls
+      `AiMemorySystem.reserve`: it inits the system (`:182`) and its first
+      step (`runOnce`, `:290`) still hits `growPastReserve`. Pass: that
+      fixture reserves its population; the warning stays the once-per-system
+      growth signal.
 - [ ] Docs: `docs/architecture.md` (DataSystem, pipeline);
       `docs/simulation-tiers-and-pipeline.md`.
 

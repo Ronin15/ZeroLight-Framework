@@ -154,9 +154,9 @@ pub const PopulationRowCounts = struct {
     ai_memories: usize,
     ai_affects: usize,
 
-    /// Rows of every store whose pipeline scratch is sized by `movement_body_capacity`.
-    /// DataSystem enforces no component dependency (`setSteeringAgent`/`setAiAgent`/
-    /// `setCollisionBounds` attach independently), so this is the max, not one store.
+    /// Body cap: the max of bodies, steering, AI, and bounds. Those components
+    /// attach independently. Sizes scope movement lists, collision, plane entry,
+    /// and structural commands. Not the neighbor index or the per-AI scratch.
     pub fn population(self: PopulationRowCounts) usize {
         return @max(@max(self.movement_bodies, self.steering_agents), @max(self.ai_agents, self.collision_bounds));
     }

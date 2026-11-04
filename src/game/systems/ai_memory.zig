@@ -165,11 +165,12 @@ pub const AiMemorySystem = struct {
     /// reservation.
     pub const Perf = if (runtime_perf_log.enabled) struct { scratch_grows: u64 = 0 } else struct {};
 
-    /// Sizes the scratch for `pop` think rows and `pop` memory rows under every partition
-    /// the tuners can pick. Grow-only; the pipeline calls it at its population seam.
-    pub fn reserve(self: *AiMemorySystem, pop: usize) !void {
-        if (pop == 0) return;
-        try self.growScratch(hotStoreCapacity(pop), hotStoreCapacity(pop));
+    /// Sizes the think scratch for `think_pop` rows and the memory scratch for
+    /// `memory_pop` rows under every partition the tuners can pick. Grow-only; the
+    /// pipeline calls it at its population seam.
+    pub fn reserve(self: *AiMemorySystem, think_pop: usize, memory_pop: usize) !void {
+        if (think_pop == 0 and memory_pop == 0) return;
+        try self.growScratch(hotStoreCapacity(think_pop), hotStoreCapacity(memory_pop));
     }
 
     pub fn init(allocator: std.mem.Allocator) AiMemorySystem {
@@ -1056,7 +1057,7 @@ test "AiMemorySystem visibility shared prefix streams both stores after swap-rem
 
     var threaded_sys = AiMemorySystem.init(testing.allocator);
     defer threaded_sys.deinit();
-    try threaded_sys.reserve(count);
+    try threaded_sys.reserve(count, count);
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     threaded_sys.allocator = failing.allocator();
     threaded_world.frame.beginStep();
@@ -1354,7 +1355,7 @@ test "AiMemorySystem serial has no steady-state allocation after warmup (Failing
     defer frame.deinit();
     try frame.reserveStreams(1, 4, 0, 0, 0, 0);
 
-    try sys.reserve(1);
+    try sys.reserve(1, 1);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;
@@ -1402,7 +1403,7 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
         .adaptive = false,
     };
 
-    try sys.reserve(agent_count);
+    try sys.reserve(agent_count, agent_count);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;
@@ -1700,7 +1701,7 @@ test "AiMemorySystem growth past reserve orders correctly and counts once" {
 
     var sys = AiMemorySystem.init(testing.allocator);
     defer sys.deinit();
-    try sys.reserve(8);
+    try sys.reserve(8, 8);
     try testing.expect(!sys.scratch_growth_logged);
 
     for (0..2) |_| {
@@ -1733,7 +1734,7 @@ test "AiMemorySystem scratch growth fails each allocation as OutOfMemory with st
     while (true) : (fail_index += 1) {
         var sys = AiMemorySystem.init(testing.allocator);
         defer sys.deinit();
-        try sys.reserve(8);
+        try sys.reserve(8, 8);
         const think_limit = sys.reserved_think_rows;
         const row_limit = sys.reserved_memory_rows;
         @memcpy(&staleness_before, data.aiMemorySliceConst().staleness);
@@ -1809,7 +1810,7 @@ test "AiMemorySystem orders members ascending across summary levels, inline and 
 
     var sys = AiMemorySystem.init(testing.allocator);
     defer sys.deinit();
-    try sys.reserve(row_count);
+    try sys.reserve(row_count, row_count);
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
