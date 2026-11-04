@@ -536,8 +536,9 @@ pub const SimulationScopeSystem = struct {
         self.publishRunBounds();
     }
 
-    /// Packs `ai_cognition_indices` into one span of the same entities, in that order, and
-    /// packs the perception, memory, and affect rows those agents name to the same order.
+    /// Packs `ai_cognition_indices` into one span of the same entities, in that order.
+    /// Paired perception and memory rows land at `0 .. paired - 1` in both stores; a
+    /// one-component row follows that prefix on its own column. Affect stays in cognition order.
     pub fn packThinkSpan(
         self: *SimulationScopeSystem,
         data: *DataSystem,
@@ -717,8 +718,8 @@ pub const SimulationScopeSystem = struct {
         const counts = self.pack_range_counts.items[0..copy_ranges];
         compactCounted(&self.move_dest, counts, items_per_range, .moves);
         compactCounted(&self.move_source, counts, items_per_range, .moves);
-        compactCounted(&self.perception_pack, counts, items_per_range, .perception);
-        compactCounted(&self.memory_pack, counts, items_per_range, .memory);
+        compactPairedPrefix(&self.perception_pack, counts, items_per_range, .perception, .perception_only, &self.pack_holes);
+        compactPairedPrefix(&self.memory_pack, counts, items_per_range, .memory, .memory_only, &self.pack_holes);
         compactCounted(&self.affect_pack, counts, items_per_range, .affect);
         const moves = self.move_dest.items.len;
         if (moves != 0) {
@@ -1449,11 +1450,13 @@ const PackWindowCounts = struct {
     perception: u32 = 0,
     memory: u32 = 0,
     affect: u32 = 0,
+    perception_only: u32 = 0,
+    memory_only: u32 = 0,
 };
 
 const PackWindowCountSlot = PaddedSlot(PackWindowCounts);
 
-const CountField = enum { moves, perception, memory, affect };
+const CountField = enum { moves, perception, memory, affect, perception_only, memory_only };
 
 fn countField(counts: PackWindowCounts, field: CountField) usize {
     return switch (field) {
@@ -1461,6 +1464,8 @@ fn countField(counts: PackWindowCounts, field: CountField) usize {
         .perception => counts.perception,
         .memory => counts.memory,
         .affect => counts.affect,
+        .perception_only => counts.perception_only,
+        .memory_only => counts.memory_only,
     };
 }
 
@@ -1474,6 +1479,36 @@ fn compactCounted(list: *IndexList, slots: []const PackWindowCountSlot, items_pe
         dst += count;
     }
     list.items.len = dst;
+}
+
+// Each range's one-component run is `range_start + paired`, length `only`. Those runs
+// are copied out, the paired front is compacted, and the runs are appended.
+fn compactPairedPrefix(
+    list: *IndexList,
+    slots: []const PackWindowCountSlot,
+    items_per_range: usize,
+    paired_field: CountField,
+    only_field: CountField,
+    holes: *IndexList,
+) void {
+    var only_total: usize = 0;
+    for (slots) |*slot| only_total += countField(slot.value, only_field);
+    std.debug.assert(holes.capacity >= only_total);
+    holes.items.len = only_total;
+    var hole_dst: usize = 0;
+    for (slots, 0..) |*slot, range_index| {
+        const paired = countField(slot.value, paired_field);
+        const only = countField(slot.value, only_field);
+        if (only == 0) continue;
+        const src = range_index * items_per_range + paired;
+        @memcpy(holes.items[hole_dst..][0..only], list.items[src..][0..only]);
+        hole_dst += only;
+    }
+    compactCounted(list, slots, items_per_range, paired_field);
+    const paired_total = list.items.len;
+    std.debug.assert(list.capacity >= paired_total + only_total);
+    list.items.len = paired_total + only_total;
+    if (only_total != 0) @memcpy(list.items[paired_total..][0..only_total], holes.items[0..only_total]);
 }
 
 const ThinkPackSide = struct {
@@ -1776,12 +1811,18 @@ fn thinkPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.end <= job.move_dest.len and range.end <= job.move_source.len);
     std.debug.assert(range.end <= job.perception.len and range.end <= job.memory.len and range.end <= job.affect.len);
     job.agents.writeOrderImage(range.start, range.end, job.perm);
-    const rows = job.agents.sliceConst();
+    const image = job.agents.orderImageComponentRows();
+    const perception_row = image.perception_row;
+    const memory_row = image.memory_row;
+    const affect_row = image.affect_row;
+    std.debug.assert(range.end <= perception_row.len and range.end <= memory_row.len and range.end <= affect_row.len);
     const base = range.start;
     var moves: u32 = 0;
-    var perception: u32 = 0;
-    var memory: u32 = 0;
+    var paired: u32 = 0;
+    var perception_only: u32 = 0;
+    var memory_only: u32 = 0;
     var affect: u32 = 0;
+    // The write slot is the running count.
     for (range.start..range.end) |k| {
         const at: u32 = @intCast(k);
         const source = job.perm[k];
@@ -1790,29 +1831,56 @@ fn thinkPackJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             job.move_source[base + moves] = source;
             moves += 1;
             if (source < job.prefix) job.stamp[source] = job.stamp_id;
-            job.perm[k] = at;
         }
-        const perception_row = rows.perception_row[source];
-        if (perception_row != no_component_row) {
-            job.perception[base + perception] = perception_row;
-            perception += 1;
+        const perception = perception_row[k];
+        const memory = memory_row[k];
+        const affect_id = affect_row[k];
+        const has_perception = perception != no_component_row;
+        const has_memory = memory != no_component_row;
+        if (has_perception and has_memory) {
+            paired += 1;
+        } else if (has_perception) {
+            perception_only += 1;
+        } else if (has_memory) {
+            memory_only += 1;
         }
-        const memory_row = rows.memory_row[source];
-        if (memory_row != no_component_row) {
-            job.memory[base + memory] = memory_row;
-            memory += 1;
-        }
-        const affect_row = rows.affect_row[source];
-        if (affect_row != no_component_row) {
-            job.affect[base + affect] = affect_row;
+        if (affect_id != no_component_row) {
+            job.affect[base + affect] = affect_id;
             affect += 1;
         }
     }
+    // Paired rows, then this range's one-component rows. Both runs are cognition order.
+    const span: u32 = @intCast(range.end - range.start);
+    std.debug.assert(paired + perception_only <= span);
+    std.debug.assert(paired + memory_only <= span);
+    var paired_at: u32 = 0;
+    var perception_only_at: u32 = 0;
+    var memory_only_at: u32 = 0;
+    for (range.start..range.end) |k| {
+        const perception = perception_row[k];
+        const memory = memory_row[k];
+        const has_perception = perception != no_component_row;
+        const has_memory = memory != no_component_row;
+        if (has_perception and has_memory) {
+            job.perception[base + paired_at] = perception;
+            job.memory[base + paired_at] = memory;
+            paired_at += 1;
+        } else if (has_perception) {
+            job.perception[base + paired + perception_only_at] = perception;
+            perception_only_at += 1;
+        } else if (has_memory) {
+            job.memory[base + paired + memory_only_at] = memory;
+            memory_only_at += 1;
+        }
+        job.perm[k] = @intCast(k);
+    }
     job.counts[range.index].value = .{
         .moves = moves,
-        .perception = perception,
-        .memory = memory,
+        .perception = paired,
+        .memory = paired,
         .affect = affect,
+        .perception_only = perception_only,
+        .memory_only = memory_only,
     };
 }
 
@@ -3817,6 +3885,48 @@ test "optional pack reties listed rows that sit past the prefix" {
     }
     try sys.packThinkSpan(&data, &threads, .{});
     try expectPerceptionRowsTied(&data);
+}
+
+test "packed think span keeps paired indices ahead of a one-component row from an earlier range" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const span: usize = think_column_alignment + 1;
+    for (0..span) |index| {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{});
+        if (index == 0 or index == span - 1) {
+            try data.setAiPerception(entity, .{});
+            try data.setAiMemory(entity, .{});
+        } else if (index == 1) {
+            try data.setAiMemory(entity, .{});
+        }
+    }
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    try sys.ai_cognition_indices.ensureTotalCapacity(allocator, span);
+    sys.ai_cognition_indices.items.len = span;
+    for (sys.ai_cognition_indices.items, 0..) |*row, k| row.* = @intCast(k);
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 1 });
+    defer threads.deinit();
+    try sys.packThinkSpan(&data, &threads, .{
+        .items_per_range = think_column_alignment,
+        .max_worker_threads = 1,
+        .adaptive = false,
+    });
+    try std.testing.expectEqual(@as(usize, 65), sys.ai_cognition_indices.items.len);
+    for (sys.ai_cognition_indices.items, 0..) |index, k| try std.testing.expectEqual(@as(u32, @intCast(k)), index);
+    const agents = data.aiAgentSliceConst();
+    try std.testing.expectEqual(@as(u32, 0), agents.perception_row[0]);
+    try std.testing.expectEqual(@as(u32, 0), agents.memory_row[0]);
+    try std.testing.expectEqual(no_component_row, agents.perception_row[1]);
+    try std.testing.expectEqual(@as(u32, 2), agents.memory_row[1]);
+    for (agents.perception_row[2..think_column_alignment], agents.memory_row[2..think_column_alignment]) |perception, memory| {
+        try std.testing.expectEqual(no_component_row, perception);
+        try std.testing.expectEqual(no_component_row, memory);
+    }
+    try std.testing.expectEqual(@as(u32, 1), agents.perception_row[think_column_alignment]);
+    try std.testing.expectEqual(@as(u32, 1), agents.memory_row[think_column_alignment]);
 }
 
 test "threaded think order matches serial" {

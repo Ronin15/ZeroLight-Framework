@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather. Open: memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility. Open: the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -89,17 +89,19 @@ in its owning slice.
       § Writes, capacity, and determinism,
       `.grok/rules/memory-performance.md` § Data-oriented design,
       § SIMD and core math). Derived, no bench.
-- [ ] AI memory's visibility pass reads perception in row order. Failure:
-      `refreshVisibleTargets` (`systems/ai_memory.zig:664`) walks members
-      in ascending memory row and reads `target_visible`, `nearest_threat`,
-      and `last_seen_*` at each member's perception row, which ascends only
-      while the perception and memory stores share a row order
-      (`.grok/rules/memory-performance.md` § Data-oriented design). Failure
-      scenario (derived): swap-remove churn on either store makes every
-      member's perception reads scattered, every step. Pass: the stores share
-      the H5 order, so the pass reads both as forward streams; an
-      `ai-memory` variant with a shuffled perception store is within spread
-      of the co-ordered one.
+- [x] AI memory's visibility pass reads perception in row order.
+      `thinkPackJob` (`simulation_scope.zig:1854`) writes paired perception
+      and memory rows, then that range's one-component rows.
+      `compactPairedPrefix` (`:1486`), from `installThinkSpan` (`:721`),
+      puts the paired run at `0 .. paired - 1` in both stores.
+      `refreshVisibleTargets` (`ai_memory.zig:654`) streams both at that
+      index (`i`, or `rows[k]`). `translateJob` (`:422`) asserts the
+      indices match. The ring scan stays scalar. A gapped set uses the
+      memory row for both
+      (`.grok/rules/memory-performance.md` § Data-oriented design,
+      § SIMD and core math). Measured on the tuned case and
+      `serial-direct` of `ai-memory`, `ai-memory-shuffled`,
+      `ai-memory-perception-shuffled`, and `ai-memory-sparse`.
 - [x] `DataSystem` and its non-AI stores against the cost model and the
       rules: row layout and growth seams, the structural applier's per-commit
       cost, handle and generation churn, and per-step walks a store forces on

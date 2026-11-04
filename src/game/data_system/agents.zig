@@ -327,6 +327,20 @@ pub const AiAgentStore = struct {
         types.copyPermutedColumns(AiAgentRow, &self.order_image, &self.rows, start, end, perm, types.u32Index);
     }
 
+    /// Sliced once. The pack reads these columns at `k`, not through `perm`.
+    pub fn orderImageComponentRows(self: *const AiAgentStore) struct {
+        perception_row: []const u32,
+        memory_row: []const u32,
+        affect_row: []const u32,
+    } {
+        const image = self.order_image.slice();
+        return .{
+            .perception_row = image.items(.perception_row),
+            .memory_row = image.items(.memory_row),
+            .affect_row = image.items(.affect_row),
+        };
+    }
+
     /// Each span is a dest range into `order_image`. Columns are sliced once for all of them.
     pub fn writeOrderSpans(self: *AiAgentStore, spans: []const [2]usize, sources: anytype, comptime sourceAt: fn (@TypeOf(sources), usize) usize) void {
         types.copyPermutedSpans(AiAgentRow, &self.order_image, &self.rows, spans, sources, sourceAt);
