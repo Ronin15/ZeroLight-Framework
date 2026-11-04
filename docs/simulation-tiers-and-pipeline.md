@@ -74,15 +74,13 @@ a threaded pass under its own tuner, which may keep it inline below its gate:
 3. `spatial_index_build`: the shared **spatial index** of the halo at the
    previous step's positions and levels (carried); bucket, sort, and link run
    on workers (`docs/architecture.md`).
-4. `ai_cognition_order`: the **think set**, the indexed rows on this step's
-   stagger phase plus `always_active` (every row with no cognition region), in
-   the index's cell-major order, compacted on workers over cell-major
-   positions. Rows sharing a cell are adjacent in every later think-set stage;
-   results never depend on that order.
-   A row's stagger phase is set at movement-body append
-   (`dense_index % cognition_stagger_n`); `setSimulationMetadata` keeps it,
-   and takes the level from the `world_level` row, unless the write names
-   them (`simulation_scope.zig` `EntitySimulationMetadata`).
+4. `ai_cognition_order`: the **think set**. `mergeThinkSet` merges the
+   always-active in-halo run with this step's phase run, or with every phase
+   run when there is no cognition region. One live run is copied. Two or more
+   compare cell prefixes and stay scalar. `packThinkSpan` follows that merge.
+   Rows that share a cell stay adjacent. The phase a row thinks on, and the
+   packed prefix, are in
+   [architecture.md](architecture.md) § Tiers and scope.
 5. `perception_update` (`PerceptionSystem`): think-set observers against the
    index (range, FOV, line of sight), writing sensed state to `PerceptionStore`;
    the gather and the compute run on workers. Carries positions and levels.
@@ -91,13 +89,18 @@ a threaded pass under its own tuner, which may keep it inline below its gate:
    order. Workers translate think rows to memory and perception rows; main
    marks each member in a hierarchical row bitmap; workers order the members
    over the touched row words; workers decay; main refreshes from this step's
-   perception events; workers track still-visible targets, reading each row's
-   carried perception row. A row demoted out of the halo is not gathered, so
-   its memory freezes and resumes cleanly on resync.
+   perception events; workers track still-visible targets. The visibility
+   pass streams the shared think prefix (perception and memory at the same
+   index) when the member rows are that prefix; a gapped set uses the memory
+   row for both. The ring scan stays scalar. A row demoted out of the halo is
+   not gathered, so its memory freezes and resumes cleanly on resync.
 7. `affect_update` (`AffectSystem`): appraises this step's perception and
    memory state (each optional per row) and the agent's `ai_behavior` (carried)
-   into four drives decayed toward per-entity baselines. Its gather runs on
-   main ([Slice 88](roadmap/slices/slice-88.md)); the compute runs on workers.
+   into four drives decayed toward per-entity baselines. The gather is a
+   windowed worker job (`gatherAffectJob`): each range writes its own window,
+   `kept` is a running skip so the job stays scalar, and `compactRowWindows` merges in
+   range order. The serial path is that job inline. The compute runs on
+   workers.
 8. `ai_decide` (`AiSystem`): gather, separation and cohere, and intent emission,
    each on workers. Carries positions, levels, and interest markers.
 9. `path_goal_resolve` → `steering_update` → `pathfinding_update` →
@@ -134,7 +137,10 @@ Late-stage pose order (after movement integrate):
 1. `collision_scope_gather` → `collision_detect` → `collision_respond`
 2. `bounds_and_tile_gate` (world bounds clamp + solid-tile gate)
 3. `plane_traversal` (ramp follow / one-level fall): `PlaneEntrySystem` gathers
-   and classifies the step's NPC cell entries on workers into windows reserved at
+   movement rows and the mirrored collision-bounds columns on workers (the
+   center is the collision box; the player is a separate entry on that same
+   center, and is not an entry without a body or bounds;
+   [architecture.md](architecture.md) § Controllers) into windows reserved at
    init and at the population seam (a shortfall grows on main before dispatch,
    counted in `plane_entry_windows_grown`); the reserve decides every traversal in
    commit order, O(1) per entry, and reserves the carves' write scratch (a carve
@@ -417,14 +423,28 @@ Commit behavior:
 - After publication the state calls `SimulationPipeline.syncPopulationCapacity`
   (main thread, outside `stage_order`). It is an O(1) compare of committed row
   counts against tracked logical capacities, and on growth a geometric
-  (`rows + rows/2 + 16`, hot-store aligned) re-reserve of every
-  population-sized pipeline capacity, frame stream, the event bound, and the
-  pathfinding elastic pools. It is the only population growth point. Each frame
-  stream reserves the range count its writers can produce at the tracked
-  population: `navigation_intents` the `ai_decide` ranges, `intents` and
-  `path_requests` steering's avoidance ranges (`steeringStreamRangeCount`), and
+  (`rows + rows/2 + 16`, hot-store aligned) re-reserve of each capacity that
+  grew. It is the only population growth point. `movement_body_capacity`
+  tracks `PopulationRowCounts.population` (the max of bodies, steering, AI,
+  and bounds), or the configured floor when that is higher. It sizes the
+  scope movement lists, collision, plane-entry windows,
+  structural commands, and the contact streams. It does not size the neighbor
+  index or the per-AI scratch. `navigation_intent_capacity` starts at the
+  committed AI rows and grows from those rows. It sizes `navigation_intents`,
+  the neighbor index, the AI, perception, and affect scratch, and the
+  AI-memory think side. `memory_scratch_capacity` starts at the memory rows
+  and grows from those rows. It sizes the AI-memory memory side.
+  `steering_stream_capacity` sizes `intents` and `path_requests`.
+  `pack_scratch_capacity` follows the max of AI, perception, memory, and
+  affect rows. Event shares and the pathfinding elastic pools grow on their
+  own counts. Each frame
+  stream reserves the range count its writers can produce at its tracked
+  capacity: `navigation_intents` the `ai_decide` ranges at
+  `navigation_intent_capacity`, `intents` and
+  `path_requests` steering's avoidance ranges (`steeringStreamRangeCount`) at
+  `steering_stream_capacity`, and
   `structural_commands` the tier-policy ranges, one destructible range, and one
-  per `structural_headroom` event. The
+  per `structural_headroom` event, at the body cap. The
   contact-dependent capacities (`frame.contacts`, `frame.collision_triggers`, the
   collision-response intents, band order, trigger pairs, observer contacts, and
   gather-range staging) are reserved in

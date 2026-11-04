@@ -158,7 +158,7 @@ Designs start here, then read the live structure below (rules:
   `has_ai_agent`) that only `DataSystem` writes at the commit seam; a player
   without bounds is neither clamped nor gated.
 - `src/game/systems/plane_entry.zig` owns `PlaneEntrySystem`, plane traversal's
-  threaded per-agent cell-entry gather and classification.
+  threaded movement-row cell-entry gather. The center is the collision box.
 - `src/game/systems/static_colliders.zig` owns `StaticColliderSystem`, the shared
   static-collider rows nav, steering, and collision read through `ColliderView`.
 - `src/game/systems/chunk_list_map.zig` holds `ChunkDirectory` (per-level chunk
@@ -817,9 +817,8 @@ A store appends one row at a time through a private `ensureCapacityForOne`
 (reserve one, then `appendAssumeCapacity`), never reserving `n` and then
 `append`. A store whose ranges thread or run SIMD reserves
 `data_system.hotStoreCapacity(n)` (`n` rounded up to
-`movement_range_alignment_items`); `systems/affect.zig`, `particle.zig`,
-`collision.zig`, `perception.zig`, `ai_memory.zig`, and
-`collision_response.zig` hold file-local copies for their scratch rows. A hot
+`movement_range_alignment_items`). Scratch rows call that helper; there is
+no second alignment copy. A hot
 gather loop captures `var row_slice = rows.slice()` once and appends with
 `addOneAssumeCapacity`, then `row_slice.len = rows.len` and
 `row_slice.set(rows.len - 1, row)`, so the slice stays valid without
@@ -898,7 +897,7 @@ The current gameplay fixed-step pipeline is:
    one player footstep when velocity is non-trivial — all before
    `perception_update` reads `frame.stimuli` → `scope_advance_and_ai_gather` →
    `spatial_index_build` (shared `SpatialIndexSystem`) →
-   `ai_cognition_order` (the think set in the index's cell-major order) →
+   `ai_cognition_order` (the think set; [Tiers and scope](#tiers-and-scope)) →
    `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
    `ai_decide` → `path_goal_resolve` (the step's goal table) →
@@ -916,7 +915,8 @@ The current gameplay fixed-step pipeline is:
    static nav marks, commit deferred structural commands to `DataSystem` under the
    budgeted all-or-fail commit, capture the step's static changes into the
    collider's dirty list, run `SimulationPipeline.syncPopulationCapacity` (the
-   population growth seam), sync the static colliders (recording their nav marks;
+   population growth seam; its capacities are not one body cap,
+   [Structural Commands](simulation-tiers-and-pipeline.md#structural-commands)), sync the static colliders (recording their nav marks;
    it runs even when the growth seam failed), then the post-commit nav reaction
    `reactToPostCommitNavEvents` (only after a successful growth seam and collider
    sync, else every mark stays for the next step). Steering has no post-commit
@@ -954,12 +954,31 @@ and colliding) and short-circuit to full-active in O(1) via incremental
 observers, memory, affect, AI decide) gates on tier + camera halo + a per-entity
 stagger cadence, while the shared spatial index (and so every neighbor query's
 candidates) is built from the unstaggered cognition halo so off-phase agents
-remain visible; the think set is the indexed rows on this step's phase
-(`ai_cognition_order`); steering inherits think-set scope transitively through the navigation-intent
+remain visible. Steering inherits think-set scope transitively through the navigation-intent
 stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
 ranges. Scope bounds active work per step; benches at large counts show how
 each stage scales (`.grok/rules/tests-benchmarks.md`).
+
+`ai_cognition_order` is `mergeThinkSet`, then `packThinkSpan`. The merge is
+the always-active in-halo run, then this step's stagger-phase run, or every
+phase run when there is no cognition region. One live run is copied
+(`copyThinkRun`) and does not load a cell prefix. Two or more compare cell
+prefixes (`thinkCellPrefix`) and stay scalar: the next head depends on the
+last compare. A bodiless row is not emitted. `packThinkSpan` rewrites that
+list to `0 .. think_len`. Paired perception and memory rows land at
+`0 .. paired - 1` in both stores; a one-component row follows that prefix
+on its own column. Rows that share a cell stay adjacent, so a cell's
+neighbor queries share one block. Movement, collision, the faction store,
+world level, and drawable runs stay in their own order.
+
+A movement append stores `dense_index % cognition_stagger_n` and leaves the
+phase unsettled. `commitStagger` then overwrites an unsettled AI row: the
+first AI arrival in a `(level, cell)` takes that level's origin, and each
+later arrival takes that cell's next residue. `setSimulationMetadata` keeps
+the stored phase unless the write names one; a named phase settles the row
+and does not take a residue. The level comes from the `world_level` row
+when the entity has one.
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope (today every
@@ -1016,9 +1035,15 @@ processors with typed `DataSystem` views (`.grok/rules/simulation.md`).
 Landed pipeline-owned domain controllers (beside processors):
 
 - `DigController` — dig intents → world-tile edits + stimuli/events, and plane
-  traversal: `PlaneEntrySystem` gathers, on workers, each AI agent that entered a
-  new cell where it could change plane (a ramp-link cell, or a hole with a level
-  below) or lacks `world_level`, and classifies that cell there (`PlaneTarget`:
+  traversal: `PlaneEntrySystem` walks movement rows and the mirrored
+  collision-bounds columns on workers. A row with an AI agent, bounds, and a
+  tier that allows movement, other than the player, is tested in one masked
+  kernel (`laneCellEntries`), tail included. The center is
+  `(position + offset) + size * 0.5`. The player is not in that gather:
+  `playerCellEntry` uses the same center from `collisionBoundsConst`, and a
+  player without a body or without bounds is not an entry. A gathered cell
+  is classified where plane traversal could act (a ramp-link cell, or a hole
+  with a level below) or the agent lacks `world_level` (`PlaneTarget`:
   the action, target level, landing floor layer, whether a carve is needed;
   through the one `planeTarget` the player's own path also uses). The reserve
   then decides every traversal in commit order in O(1) per entry through
@@ -1222,13 +1247,9 @@ query that step reads it (`.grok/rules/simulation.md`).
   § Cost model) while each still tests its own position, radius, budget, and FOV.
   AI keeps one block per query kind per range, perception one per range, and
   steering one per avoidance range; AI and perception each count their fills.
-- **Think set.** `ai_cognition_order` (`SimulationScopeSystem.compactCognition`)
-  keeps the indexed rows whose `cognition_phase` is this step's (or
-  `always_active`; every row with no cognition region), in cell-major order: records in key order, each by (local_y, local_x, faction, slot).
-  `CellMajorSpan` walks any window of cell-major positions, so ranges split a
-  dense chunk like any other. Rows sharing a cell sit together in every think-set
-  stage, which is what lets blocks reuse; every result is the same for any think
-  order.
+- **Cell windows.** `cellMajorSpan` walks any window of the key order, so a
+  range splits a dense chunk like any other. The think set is not these
+  records ([Tiers and scope](#tiers-and-scope)).
 - **Workers.** The build runs three stages, each under a tuner the index owns:
   `index_bucket` over population slots (resolve each body once, pack its key in
   lanes, place it in one of 64 key bands chosen from a fixed 256-slot sample),

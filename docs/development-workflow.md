@@ -587,11 +587,12 @@ Group index (files under `src/benchmarks/`):
   `steering-static-change`, `steering-static-dense`.
 - `spatial_index.zig`: `spatial_index`, `-shape`, `-query`; the shared neighbor
   index.
-- `scope.zig`: `scope-cognition`; the think set.
-- `ai.zig`: `ai`, `ai-cell-ordered`. `ai_memory.zig`: `ai-memory`, `-shuffled`,
-  `-sparse`. `affect.zig`: `ai-affect`, `ai-affect-shuffled`.
+- `scope.zig`: `scope-cognition` (`spread`, `dense_chunk`, `interleaved_runs`);
+  the think set.
+- `ai.zig`: `ai`. `ai_memory.zig`: `ai-memory`, `-shuffled`,
+  `-perception-shuffled`, `-sparse`. `affect.zig`: `ai-affect`, `ai-affect-shuffled`.
   `perception.zig`: `perception`, `-los-dense`, `-scattered-dense-index`,
-  `-cell-ordered`, `perception-crowd`.
+  `perception-crowd`.
 - `production_step.zig`: `production-step`, the production fixed step.
   `world_create.zig`: `world-create`. `world_gate.zig`: `world-gate`.
 - `render_prep.zig`: `render-prep`. `render_game_prep.zig`: `render-game-prep`,

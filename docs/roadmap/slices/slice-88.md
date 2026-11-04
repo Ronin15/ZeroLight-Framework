@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches. Open: the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches. Docs landed. Acceptance is open. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -367,7 +367,7 @@ in its owning slice.
       (`systems/ai_memory.zig:359`)
       (`.grok/rules/engine-design.md` § Cost model,
       `.grok/rules/tests-benchmarks.md` § Benchmarks).
-- [ ] Docs: `docs/architecture.md` (DataSystem, pipeline);
+- [x] Docs: `docs/architecture.md` (DataSystem, pipeline);
       `docs/simulation-tiers-and-pipeline.md`.
 
 ### Acceptance checks
