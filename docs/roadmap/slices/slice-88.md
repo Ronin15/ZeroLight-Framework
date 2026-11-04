@@ -372,8 +372,9 @@ in its owning slice.
 
 ### Acceptance checks
 
-- [ ] Every finding is fixed or is an item with its `file:line` and failure
-      scenario in its owning slice.
+- [x] Every finding is fixed or is an item with its `file:line` and failure
+      scenario in its owning slice. The checklist items are checked. Review
+      findings were folded into their landings.
 - [ ] `production-step` main share and step time no worse than at
       `5d5a089` on any config; touched groups within run-to-run spread
       (tuned-versus-control measured after slice 89's tuner change, which gets
@@ -387,5 +388,9 @@ in its owning slice.
       tuner removal. The three `stacked`
       configs have no base at `5d5a089`. The default-warmup grid is
       `benchmark_outputs/ab-20261103-072301`; its tuned rows were the same
-      `settled=no`.
+      `settled=no`. Rerun (Debug, `x86_64_v2`, code at `e761374`,
+      `benchmark_outputs/ab-20261104-145146`, `--warmup 484`, 30 iterations,
+      tuned case, `--fresh`): all 15 configs again printed `settled=no`.
+      The printed step times and main shares are not a judgment. The three
+      `stacked` configs still have no base.
 - [x] `zig build verify` passes. Debug, 2125 tests. `gpu-smoke` was not run.
