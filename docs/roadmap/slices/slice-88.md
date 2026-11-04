@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout. Open: plane entry, the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry. Open: the affect gather, memory visibility, the neighbor index and per-AI scratch, the AI-memory scratch reserve, the benches, and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -65,17 +65,18 @@ in its owning slice.
       § SIMD and core math). `ai-cell-ordered` and
       `perception-cell-ordered` are gone. `ai-memory-shuffled` and
       `ai-affect-shuffled` stay.
-- [ ] Plane entry gathers by movement row from the bounds columns. Failure:
-      `gatherRange` (`plane_entry.zig:329`) resolves `movementVisualDenseIndices`
-      per lane for every AI row (two slot resolves per row, a lookup into other
-      stores), and the body extent comes from `PrimitiveVisual.size`
-      (`plane_entry.zig:192-193`, `:356-357`), though bounds are never inferred
-      from visuals (`.grok/rules/simulation.md` § Controllers and
-      processors). Pass: a dense movement-row walk reading the mirrored
-      collision-bounds columns the world gate already uses, one masked kernel,
-      no per-row slot resolve; plane entries commit in movement-row order
-      (deterministic for any worker count, owner-accepted order change);
-      serial == threaded; the `plane-traversal` benches within spread.
+- [x] Plane entry gathers by movement row from the bounds columns.
+      `gatherRange` (`plane_entry.zig:339`) walks movement rows and the
+      mirrored collision-bounds columns in one masked kernel
+      (`laneCellEntries`, `:295`), tail included. `playerCellEntry`
+      (`dig_controller.zig:654`) reads `collisionBoundsConst` (`:661`);
+      the center is `(position + offset) + size * 0.5` (`:662`), and a
+      player without a body or without bounds is not an entry. Commit
+      stays movement-row order, the player first among moves
+      (`.grok/rules/memory-performance.md` § Data-oriented design,
+      § SIMD and core math, `.grok/rules/simulation.md` § Controllers
+      and processors, `.grok/rules/threading.md` § What runs where).
+      Derived, no bench.
 - [ ] Affect's gather leaves main. Failure: `gatherScopedIndices`
       (`systems/affect.zig:229-285`) walks the think set on the main thread,
       resolving the affect, perception, and memory rows per entity and

@@ -650,6 +650,7 @@ fn publishAppliedEdit(frame: *SimulationFrame, applied: AppliedEdit) void {
     frame.events.finishWrite();
 }
 
+// The center is the collision box. A player without bounds is not an entry.
 fn playerCellEntry(
     dig: *const DigController,
     world: *const WorldSystem,
@@ -657,9 +658,9 @@ fn playerCellEntry(
     player: Player,
 ) ?PlaneCellEntry {
     const body = data.movementBodyConst(player.entity) orelse return null;
-    const visual = data.primitiveVisualConst(player.entity) orelse return null;
-    const center_x = body.position.x + visual.size.x * 0.5;
-    const center_y = body.position.y + visual.size.y * 0.5;
+    const bounds = data.collisionBoundsConst(player.entity) orelse return null;
+    const center_x = (body.position.x + bounds.offset.x) + bounds.size.x * 0.5;
+    const center_y = (body.position.y + bounds.offset.y) + bounds.size.y * 0.5;
     const target = world.cellContaining(center_x, center_y) orelse return null;
     const cell = CellCoord{ .x = target.x, .y = target.y };
     if (dig.player_last_cell) |last| {
@@ -967,7 +968,7 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
 
     var dig = try testDigController(&tw.meta);
     defer dig.deinit();
-    // The player's entry and the two NPC entries.
+    // Two NPC falls. The player has no bounds and adds no entry.
     try dig.reservePlaneScratch(std.testing.allocator, 3);
     try warmLandingTerrain(&tw.world, dig.tunnel_tile, 1, .{ 4, 3 });
 
@@ -1623,6 +1624,7 @@ test "player_last_cell advances only after successful or intentional no-op trave
     var dig = try testDigController(&tw.meta);
     defer dig.deinit();
     try dig.reservePlaneScratch(std.testing.allocator, 4);
+    try tw.data.setCollisionBounds(tw.player.entity, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
 
     // Hole under the player so the first cell entry falls and carves.
     const floor0 = tw.world.denseFloorLayerForLevel(0).?;
@@ -1641,6 +1643,64 @@ test "player_last_cell advances only after successful or intentional no-op trave
     try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
     try std.testing.expectEqual(@as(usize, 1), frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(CellCoord{ .x = 3, .y = 3 }, dig.player_last_cell.?);
+}
+
+test "player_last_cell follows the collision-bounds center and ignores the visual size" {
+    var tw: TestWorld = undefined;
+    try tw.init(.right, 0);
+    defer tw.deinit();
+    var dig = try testDigController(&tw.meta);
+    defer dig.deinit();
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+
+    // No collision bounds. Visual 32×32 at (96, 96); hole at (3, 3).
+    const visual = tw.data.primitiveVisualConst(tw.player.entity).?;
+    try std.testing.expectEqual(@as(f32, 32), visual.size.x);
+    try std.testing.expectEqual(@as(f32, 32), visual.size.y);
+    const floor0 = tw.world.denseFloorLayerForLevel(0).?;
+    _ = try tw.world.clearDenseTile(floor0, 3, 3);
+    dig.player_last_cell = .{ .x = 0, .y = 0 };
+    const floor1 = tw.world.denseFloorLayerForLevel(1).?;
+    const untouched = tw.world.denseTile(floor1, 3, 3);
+
+    var frame = try testPlaneFrame();
+    defer frame.deinit();
+    try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
+    try std.testing.expectEqual(@as(u16, 0), tw.player.current_level);
+    try std.testing.expectEqual(@as(?u16, 0), tw.data.worldLevelConst(tw.player.entity));
+    try std.testing.expectEqual(CellCoord{ .x = 0, .y = 0 }, dig.player_last_cell.?);
+    try std.testing.expectEqual(untouched, tw.world.denseTile(floor1, 3, 3));
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.world_tile_changed);
+
+    // Bounds center (141, 97) is cell (4, 3). Visual center (116, 112) is cell (3, 3). Hole only at (4, 3).
+    var boxed: TestWorld = undefined;
+    try boxed.init(.right, 0);
+    defer boxed.deinit();
+    var boxed_dig = try testDigController(&boxed.meta);
+    defer boxed_dig.deinit();
+    try boxed_dig.reservePlaneScratch(std.testing.allocator, 4);
+    const boxed_visual = boxed.data.primitiveVisualConst(boxed.player.entity).?;
+    try std.testing.expectEqual(@as(f32, 32), boxed_visual.size.x);
+    try std.testing.expectEqual(@as(f32, 32), boxed_visual.size.y);
+    const boxed_body = boxed.data.movementBodyPtr(boxed.player.entity).?;
+    boxed_body.position_x.* = 100;
+    boxed_body.position_y.* = 96;
+    try boxed.data.setCollisionBounds(boxed.player.entity, .{ .offset = .{ .x = 40, .y = 0 }, .size = .{ .x = 2, .y = 2 } });
+    const boxed_floor0 = boxed.world.denseFloorLayerForLevel(0).?;
+    _ = try boxed.world.clearDenseTile(boxed_floor0, 4, 3);
+    boxed_dig.player_last_cell = .{ .x = 0, .y = 0 };
+    const boxed_floor1 = boxed.world.denseFloorLayerForLevel(1).?;
+    const visual_landing = boxed.world.denseTile(boxed_floor1, 3, 3);
+
+    var boxed_frame = try testPlaneFrame();
+    defer boxed_frame.deinit();
+    try testPlaneTraversalStage(&boxed_dig, &boxed.world, &boxed.data, &boxed.player, &boxed_frame);
+    try std.testing.expectEqual(@as(u16, 1), boxed.player.current_level);
+    try std.testing.expectEqual(@as(?u16, 1), boxed.data.worldLevelConst(boxed.player.entity));
+    try std.testing.expectEqual(CellCoord{ .x = 4, .y = 3 }, boxed_dig.player_last_cell.?);
+    try std.testing.expectEqual(boxed_dig.tunnel_tile, boxed.world.denseTile(boxed_floor1, 4, 3));
+    try std.testing.expectEqual(visual_landing, boxed.world.denseTile(boxed_floor1, 3, 3));
+    try std.testing.expectEqual(@as(usize, 1), boxed_frame.events.stats.world_tile_changed);
 }
 
 test "player_last_cell stays put when the player's traversal fails or has no body, and the retry falls" {
@@ -1676,6 +1736,7 @@ test "player_last_cell stays put when the player's traversal fails or has no bod
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    try fresh_data.setCollisionBounds(fresh, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
     fresh_data.movementBodyPtr(fresh).?.position_x.* = 96;
     fresh_data.movementBodyPtr(fresh).?.position_y.* = 96;
     var fresh_player = tw.player;
@@ -1742,6 +1803,7 @@ test "player spawn pre-attaches world_level so the first fall allocates nothing 
 
     const floor0 = tw.world.denseFloorLayerForLevel(0).?;
     _ = try tw.world.clearDenseTile(floor0, 3, 3);
+    try tw.data.setCollisionBounds(tw.player.entity, .{ .offset = .{}, .size = .{ .x = 32, .y = 32 } });
 
     // The fall only updates the existing world_level row and scope metadata.
     var frame = try testPlaneFrame();
