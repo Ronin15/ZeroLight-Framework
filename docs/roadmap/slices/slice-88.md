@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture. Open: the benches and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches. Open: the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -343,8 +343,15 @@ in its owning slice.
 - [x] One `hotStoreCapacity` (code audit L8). Landed in `fce97cd`: one helper
       (`data_system/types.zig:28`); no private `alignForwardAnyAlign` copy
       remains in the systems.
-- [ ] Benches at the worst-case shape each finding's bound names, with the
+- [x] Benches at the worst-case shape each finding's bound names, with the
       shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
+      `scope-cognition` `interleaved_runs` `2001024` / `2004096` / `2010000`
+      (`thread-adaptive-tuned-range`): both runs non-empty, the other phases
+      empty, a phase-0 row before the last always-active row, and
+      nondecreasing cell prefixes. `spread` `10000` and `dense_chunk`
+      `1004096` assert `thinking + stagger_skips == indexed` and thinking <
+      indexed. Every other finding stays the measured or derived sentence
+      already on its item.
 - [x] AI memory's scratch reserve covers the population it is reserved for.
       The production seam shortfall is closed: a memory count reserved at the
       seam does not call `growPastReserve` (`systems/ai_memory.zig:353`,

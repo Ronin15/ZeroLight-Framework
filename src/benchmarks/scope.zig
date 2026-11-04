@@ -2,17 +2,20 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `scope-cognition`: the think set alone (`mergeThinkSet`) over a halo index built once
-//!   untimed: `spread` over N entities on 16 x-chunks whose levels (`index % 5`) give a
-//!   mixed-tier population (cognition, locomotion, kinematic, dormant), `dense_chunk` with
-//!   every agent in one chunk (one index record). The timed pass is the inline merge,
-//!   linear in thinking rows, not in indexed rows; dense and spread are the two shapes;
-//!   there is no cognition tuner and no worker dispatch. `indexed == agents` and one record
-//!   stay for `dense_chunk`. On `spread`, untimed after the measured passes, the collision
-//!   bounds and AI halo gathers, the tier policy, and the chunk derive at the case's
-//!   controls dispatch. Item code `layout * 10^6 + agents` (layout 0 `spread`, 1
-//!   `dense_chunk`). Prints `indexed=` (H) and `thinking=`; `--details` adds `main=` with
-//!   `main_per_item=` (per thinking row).
+//! `scope-cognition`: the think set alone (`mergeThinkSet`) over a halo index built once,
+//!   untimed. `spread` and `dense_chunk` are one live run, the copy, linear in thinking
+//!   rows and not in indexed rows; the assert is `thinking + stagger_skips == indexed`
+//!   and thinking < indexed. `interleaved_runs` is two live runs, alternating cells in
+//!   one chunk, linear in thinking rows (thinking equals agents); the assert is both runs
+//!   non-empty, the other phases empty, a phase-0 row before the last always-active row,
+//!   and nondecreasing cell prefixes. The merge stays inline. No cognition tuner and no
+//!   worker dispatch. `spread` places N entities on 16 x-chunks whose levels (`index % 5`)
+//!   mix the four tiers. `dense_chunk` keeps `indexed == agents` and one index record.
+//!   On `spread`, untimed after the measured passes, the collision bounds and AI halo
+//!   gathers, the tier policy, and the chunk derive at the case's controls dispatch.
+//!   Item code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`,
+//!   2 `interleaved_runs`). Prints `indexed=` (H) and `thinking=`; `--details` adds
+//!   `main=` with `main_per_item=` (per thinking row).
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -30,6 +33,7 @@ const ActiveRegion = @import("../game/simulation_scope.zig").ActiveRegion;
 const tierForChunkDistance = @import("../game/simulation_scope.zig").tierForChunkDistance;
 const cognition_halo_chunks = @import("../game/simulation_scope.zig").cognition_halo_chunks;
 const cognition_stagger_n = @import("../game/simulation_scope.zig").cognition_stagger_n;
+const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_phase;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -71,18 +75,20 @@ pub const cognition_group = suite.BenchmarkGroup{
     .write_workload = writeCognitionWorkload,
 };
 
-// `spread` banded over the x-chunks; `dense_chunk` puts every agent in chunk (0, 0).
-const CognitionLayout = enum(u8) { spread, dense_chunk };
+// `spread` banded over the x-chunks; `dense_chunk` puts every agent in chunk (0, 0);
+// `interleaved_runs` alternates always-active and phase 0 across that chunk's cells.
+const CognitionLayout = enum(u8) { spread, dense_chunk, interleaved_runs };
 const CognitionCode = suite.ItemCode(struct { layout: CognitionLayout, agents: u32 }, &.{6});
 
-// Each layout at the event-scale sizes.
+// Each layout at the event-scale sizes. The first two blocks stay layout 0 and 1.
 const cognition_item_counts = cognitionCodes(&suite.event_scale_counts);
 
-fn cognitionCodes(comptime counts: []const usize) [2 * counts.len]usize {
-    var codes: [2 * counts.len]usize = undefined;
+fn cognitionCodes(comptime counts: []const usize) [3 * counts.len]usize {
+    var codes: [3 * counts.len]usize = undefined;
     for (counts, 0..) |count, index| {
         codes[index] = CognitionCode.of(.{ .layout = .spread, .agents = count });
         codes[counts.len + index] = CognitionCode.of(.{ .layout = .dense_chunk, .agents = count });
+        codes[2 * counts.len + index] = CognitionCode.of(.{ .layout = .interleaved_runs, .agents = count });
     }
     return codes;
 }
@@ -142,6 +148,35 @@ fn createDenseChunkFixture(allocator: std.mem.Allocator, count: usize) !DataSyst
     return data;
 }
 
+// `count` cognition-tier bodies in chunk (0, 0). Cell is `index % 64` on the 8×8 grid,
+// cell size 32, position inside that cell. Even cells are always-active; odd cells are phase 0.
+fn createInterleavedRunsFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const cells_per_edge: usize = chunk_size_tiles;
+    const cells = cells_per_edge * cells_per_edge;
+    for (0..count) |index| {
+        const entity = try data.createEntity();
+        const cell = index % cells;
+        const local_x: f32 = @floatFromInt(cell % cells_per_edge);
+        const local_y: f32 = @floatFromInt(cell / cells_per_edge);
+        const position = math.Vec2{
+            .x = local_x * tile_size + 8.0,
+            .y = local_y * tile_size + 8.0,
+        };
+        const always_active = cell % 2 == 0;
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSimulationMetadata(entity, .{
+            .tier = .cognition,
+            .chunk = .{ .x = 0, .y = 0 },
+            .stagger_phase = if (always_active) keep_stagger_phase else 0,
+            .always_active = always_active,
+        });
+    }
+    return data;
+}
+
 fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
@@ -149,6 +184,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var data = switch (fields.layout) {
         .spread => try createSpreadFixture(allocator, fields.agents),
         .dense_chunk => try createDenseChunkFixture(allocator, fields.agents),
+        .interleaved_runs => try createInterleavedRunsFixture(allocator, fields.agents),
     };
     defer data.deinit();
     var scope = SimulationScopeSystem.init(allocator);
@@ -203,6 +239,8 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         think_rows = cognition.len;
     }
 
+    std.debug.assert(first_think != null);
+    checkMergeShape(fields.layout, fields.agents, indexed, think_rows, &scope, &data, first_think.?, grid.cell_size, grid.cells_x, grid.cells_y, per_chunk, geometry.chunks_x);
     if (fields.layout == .spread) try checkScopeStagesDispatched(allocator, &scope, &data, thread_ptr, case);
     var stats = accumulator.finish();
     // Not a dispatch: leave the workers cell empty.
@@ -236,6 +274,72 @@ fn checkScopeStagesDispatched(allocator: std.mem.Allocator, scope: *SimulationSc
 
 fn runCognitionOnce(scope: *SimulationScopeSystem, data: *const DataSystem) []const u32 {
     return scope.mergeThinkSet(data, 0, true);
+}
+
+fn checkMergeShape(
+    layout: CognitionLayout,
+    agents: u32,
+    indexed: usize,
+    thinking: usize,
+    scope: *const SimulationScopeSystem,
+    data: *const DataSystem,
+    result: []const u32,
+    cell_size: f32,
+    cells_x: u32,
+    cells_y: u32,
+    cells_per_chunk: u32,
+    chunks_x: u32,
+) void {
+    switch (layout) {
+        .spread, .dense_chunk => {
+            const skips = scope.perf.stagger_skips;
+            std.debug.assert(skips != 0);
+            std.debug.assert(thinking > 0);
+            std.debug.assert(thinking + skips == indexed);
+            std.debug.assert(thinking < indexed);
+        },
+        .interleaved_runs => {
+            std.debug.assert(scope.aa_halo_end > scope.aa_begin);
+            std.debug.assert(scope.phase_halo_end[0] > scope.phase_begin[0]);
+            std.debug.assert(scope.phase_halo_end[1] == scope.phase_begin[1]);
+            std.debug.assert(scope.phase_halo_end[2] == scope.phase_begin[2]);
+            std.debug.assert(scope.phase_halo_end[3] == scope.phase_begin[3]);
+            std.debug.assert(scope.perf.stagger_skips == 0);
+            std.debug.assert(thinking == agents and thinking == indexed);
+            std.debug.assert(result.len == thinking);
+            const agents_slice = data.aiAgentSliceConst();
+            const previous_x = agents_slice.previous_x;
+            const previous_y = agents_slice.previous_y;
+            const always_active = agents_slice.always_active;
+            const phase = agents_slice.stagger_phase;
+            var saw_phase0 = false;
+            var phase0_before_last_aa = false;
+            var previous_cell: u32 = 0;
+            var have_cell = false;
+            for (result) |row| {
+                const index: usize = row;
+                std.debug.assert(index < always_active.len);
+                if (!always_active[index] and phase[index] == 0) saw_phase0 = true;
+                if (always_active[index] and saw_phase0) phase0_before_last_aa = true;
+                const cell = cellPrefix(previous_x[index], previous_y[index], cell_size, cells_x, cells_y, cells_per_chunk, chunks_x);
+                if (have_cell) std.debug.assert(cell >= previous_cell);
+                previous_cell = cell;
+                have_cell = true;
+            }
+            std.debug.assert(have_cell and phase0_before_last_aa);
+        },
+    }
+}
+
+// Chunk then local cell, from the position the fixture stored on the row.
+fn cellPrefix(x: f32, y: f32, cell_size: f32, cells_x: u32, cells_y: u32, cells_per_chunk: u32, chunks_x: u32) u32 {
+    const cx = math.worldPosToCell(x, cell_size, cells_x);
+    const cy = math.worldPosToCell(y, cell_size, cells_y);
+    const per = if (cells_per_chunk == 0) 1 else cells_per_chunk;
+    const across = if (chunks_x == 0) 1 else chunks_x;
+    const chunk_x = cx / per;
+    const chunk_y = cy / per;
+    return ((chunk_y * across + chunk_x) * per + cy % per) * per + cx % per;
 }
 
 // `candidate_pairs` holds the indexed rows and `output_count` the rows that think; `main` is
