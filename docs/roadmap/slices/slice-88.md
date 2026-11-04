@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch. Open: the AI-memory bench fixture, the benches, and the docs. Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture. Open: the benches and the docs. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -345,15 +345,21 @@ in its owning slice.
       remains in the systems.
 - [ ] Benches at the worst-case shape each finding's bound names, with the
       shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
-- [ ] AI memory's scratch reserve covers the population it is reserved for.
+- [x] AI memory's scratch reserve covers the population it is reserved for.
       The production seam shortfall is closed: a memory count reserved at the
       seam does not call `growPastReserve` (`systems/ai_memory.zig:353`,
-      called at `:218`). Still open is the bench fixture.
-      `src/benchmarks/ai_memory.zig` `runCaseImpl` (`:175`) never calls
-      `AiMemorySystem.reserve`: it inits the system (`:182`) and its first
-      step (`runOnce`, `:290`) still hits `growPastReserve`. Pass: that
-      fixture reserves its population; the warning stays the once-per-system
-      growth signal.
+      called at `:218`). `runCaseImpl` (`src/benchmarks/ai_memory.zig:175`)
+      reserves the two live counts once, after `AiMemorySystem.init`
+      (`:182`) and before the first `runOnce` (`:294`, from `:195` and
+      `:208`): the think-set length, or the agent length (`:185`), and the
+      memory-row length (`:186`, `reserve` at `:187`). Sparse passes 256
+      and `item_count`. After warmup and the timed steps,
+      `reserved_think_rows` and `reserved_memory_rows` are at least those
+      counts and `scratch_growth_logged` is false (`:224-226`). The
+      warning stays the once-per-system growth signal
+      (`systems/ai_memory.zig:359`)
+      (`.grok/rules/engine-design.md` § Cost model,
+      `.grok/rules/tests-benchmarks.md` § Benchmarks).
 - [ ] Docs: `docs/architecture.md` (DataSystem, pipeline);
       `docs/simulation-tiers-and-pipeline.md`.
 

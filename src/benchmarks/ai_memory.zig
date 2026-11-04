@@ -181,6 +181,10 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (run.restore_perception_prefix) try restorePerceptionPrefix(allocator, io, &fixture, item_count);
     var system = AiMemorySystem.init(allocator);
     defer system.deinit();
+    // The population `step` passes, before the first step, so scratch does not grow.
+    const think_count = if (think_set) |rows| rows.len else fixture.data.aiAgentSliceConst().entities.len;
+    const memory_count = fixture.data.aiMemorySliceConst().entities.len;
+    try system.reserve(think_count, memory_count);
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
@@ -212,12 +216,14 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
-    const think_count = if (think_set) |rows| rows.len else item_count;
     std.debug.assert(system.memory_dense_indices.items.len == think_count);
     std.debug.assert(last_stats.perf.gather_batch.item_count == think_count);
     std.debug.assert(last_stats.perf.batch.item_count == think_count);
     std.debug.assert(last_stats.perf.visible_batch.item_count == think_count);
     std.debug.assert(last_stats.perf.order_batch.item_count == run.touched_words);
+    std.debug.assert(system.reserved_think_rows >= think_count);
+    std.debug.assert(system.reserved_memory_rows >= memory_count);
+    std.debug.assert(!system.scratch_growth_logged);
     stats.candidate_pairs = system.memory_dense_indices.items.len;
     stats.output_count = fixture.frame.events.stats.entity_perceived;
     stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
