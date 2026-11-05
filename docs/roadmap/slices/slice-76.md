@@ -1,6 +1,6 @@
 ## Slice 76: Cave-Ins
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 64G](slice-64g.md) · Before: [Slice 77](slice-77.md) · Track: [Gameplay direction](../tracks/gameplay-direction.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](../archive/slice-88.md) (structural-share deferral), [Slice 64G](slice-64g.md) · Before: [Slice 77](slice-77.md) · Track: [Gameplay direction](../tracks/gameplay-direction.md)
 
 **Status: not started.** Owner direction 2026-10-09: cave-ins and
 explosions ([Slice 77](slice-77.md)) belong to the destructible controller.
@@ -76,7 +76,7 @@ render pick it up the same step as any other terrain change.
       (`terrain_edit_write`) in the runtime perf log at its call site.
 - [ ] Entities caught in a collapse are handled (the rule decides how).
 - [ ] Collapse entity commands past the structural share defer through
-      [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
+      [Slice 88](../archive/slice-88.md)'s deferral (docs audit M7); test: an over-share
       collapse defers its entity commands and the step succeeds
       (`.grok/rules/budgets-capacities.md`).
 - [ ] Tests: serial equals threaded; OOM leaves terrain intact and the

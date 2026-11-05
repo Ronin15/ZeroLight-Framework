@@ -1,8 +1,8 @@
 ## Slice 88: DataSystem, Step Contracts, Pipeline, And Core Kernels Pass
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](../slices/slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches. Docs landed. `zig build verify` passed (2125 tests). The `production-step` acceptance is open. `gpu-smoke` was not run. Owner 2026-10-16: every system on the core branch
+**Status: landed.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, the slimmed runtime-log `BatchStage`, the projection map (`744974f`), generation wrap (`d301d85`), stagger-world release (`8766dde`), `validateAiAgent` bounds (`961c9b7`), the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, and the kernels audit, the facing tail, the index-key tail, the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the contact clamp, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches. Docs landed. `zig build verify` passed (2125 tests). The `production-step` comparison is accepted. `gpu-smoke` was not run. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -336,7 +336,7 @@ in its owning slice.
       audit L1; `.grok/rules/threading.md`). Landed for `BatchStage`
       (`005cdae`): 11 change-path drivers, the rest `BenchBatchStage`
       (`src/app/runtime_perf_log.zig:217-300`). The `pipeline_*` timers are
-      [slice 50](slice-50.md)'s open item.
+      [slice 50](../slices/slice-50.md)'s open item.
 - [x] `production-step` leaks the world on OOM (code audit L3). Landed in
       `f1d836e`: the state is created first
       (`src/benchmarks/production_step.zig:837-839`).
@@ -375,22 +375,26 @@ in its owning slice.
 - [x] Every finding is fixed or is an item with its `file:line` and failure
       scenario in its owning slice. The checklist items are checked. Review
       findings were folded into their landings.
-- [ ] `production-step` main share and step time no worse than at
+- [x] `production-step` main share and step time no worse than at
       `5d5a089` on any config; touched groups within run-to-run spread
       (tuned-versus-control measured after slice 89's tuner change, which gets
       its own whole-suite run; the `750ce0a` baseline predates it).
-      Owner: run this comparison when the slice's other items are done.
-      Measured (Debug, `x86_64_v2`, code at `9bf93b0`,
-      `benchmark_outputs/ab-20261103-072747`): the tuned case at four times
-      the default pre-measure (`--warmup 484`, 30 iterations) stayed
-      `settled=no` on all 15 configs, so those step times and main shares are
-      not judged (`.grok/rules/tests-benchmarks.md`). That print is not a
-      tuner removal. The three `stacked`
-      configs have no base at `5d5a089`. The default-warmup grid is
-      `benchmark_outputs/ab-20261103-072301`; its tuned rows were the same
-      `settled=no`. Rerun (Debug, `x86_64_v2`, code at `e761374`,
-      `benchmark_outputs/ab-20261104-145146`, `--warmup 484`, 30 iterations,
-      tuned case, `--fresh`): all 15 configs again printed `settled=no`.
-      The printed step times and main shares are not a judgment. The three
-      `stacked` configs still have no base.
+      Owner judgment 2026-11-04: the comparison is accepted. Both runs
+      printed `settled=no` because 1–8 of the 41–49 tuners that recorded
+      during the timed steps were outside holding at the snapshot. The names
+      rotated between `benchmark_outputs/ab-20261103-072747` (code `9bf93b0`)
+      and `benchmark_outputs/ab-20261104-145146` (code `e761374`, Debug,
+      `x86_64_v2`, `--warmup 484`, 30 iterations, tuned case, `--fresh`).
+      That census is not a tuner removal. The step times agree across the
+      two runs. Main share improved on all 12 configs with a base, from
+      75–88% to 36–75%. Ten of those steps are faster. Crowd 16,384 went
+      from 39.86 ms to 11.91 ms, and main from 34.3 ms to 4.35 ms. Two steps
+      with about 23 thinking rows are slower: spread 1,024 agents, 8 levels,
+      678 us to 1.04 ms (+362 us); spread 4,096 agents, 32 levels, 993 us to
+      1.32 ms (+327 us). `scope_gather` is the new top main stage there
+      (272 us and 470 us). Side 2048 is +110 us, inside the 10% band, and
+      its main time fell. Those two gaps stay with Slice 75. The three
+      `stacked` configs have no base at `5d5a089`. Touched groups were
+      judged on their own landings. The default-warmup grid is
+      `benchmark_outputs/ab-20261103-072301`.
 - [x] `zig build verify` passes. Debug, 2125 tests. `gpu-smoke` was not run.

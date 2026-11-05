@@ -209,10 +209,9 @@ the [archive](framework-implementation-slices-archive.md).
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
 | [**87**](roadmap/slices/slice-87.md) | Programming landed | Render Collect By Visible Chunks — Vulkan `gpu-smoke` passed; other machines are not a gate |
-| [**88**](roadmap/slices/slice-88.md) | In progress | Storage items, the commit-share deferral, the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, the kernels audit, the facing tail, the index-key tail, and the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches landed; docs landed; `zig build verify` passed; `production-step` acceptance open |
 | [**89**](roadmap/slices/slice-89.md) | Programming landed; four items recorded | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); four items stay recorded |
 
-**Recently settled (archive only):** 85, 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 88, 85, 86, 90, 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
 **Benches:** `.grok/rules/tests-benchmarks.md`. `production-step` (extended by Slice 52C with CPU render prep, a state digest,
 and a NaN count) tracks the full fixed step's scaling shape across commits; 66E
@@ -289,7 +288,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    store order) →
    [87](roadmap/slices/slice-87.md) programming landed (collect, backend, and
    subsystem; Vulkan `gpu-smoke` passed, other machines are not a gate), then
-   [88](roadmap/slices/slice-88.md) docs landed; `zig build verify` passed; `production-step` acceptance open →
+   [88](roadmap/archive/slice-88.md) landed (the `production-step` comparison is accepted) →
    inert rows (75's movement, tiers, and collision) → [75](roadmap/slices/slice-75.md)'s tier mechanics. The render
    backend pass has landed; it does not wait on the inert-row items. 89 was added by the owner
    2026-10-23 and ordered first 2026-10-24. Items the 64G combined
@@ -460,7 +459,7 @@ order.
 8. **85** Steering On The Shared Neighbor Index — landed (archived), after 84 and 86.
 8a. **35's `world_gate` items** — closed on `core_systems2` (the rest of 35 is line 22).
 9. **87** Render Collect By Visible Chunks — programming landed (core-systems branch). Vulkan `gpu-smoke` passed; other machines are not a gate.
-9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — storage items, the commit-share deferral, the step-contract audit, the intent and path-request reserves, the pipeline audit, the think-row retie, the subset-store reserves, the kernels audit, the facing tail, the index-key tail, and the sprite sin/cos lanes, the run-bounds scan, the saturating ceil, the frame-log gate, the stagger spread, and the hot-pass layout, and plane entry, and the affect gather, and memory visibility, and the neighbor index and per-AI scratch, and the AI-memory bench fixture, and the scope-cognition benches landed; docs landed; `zig build verify` passed; `production-step` acceptance open (after 87).
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — landed (archived). The `production-step` comparison is accepted (after 87).
 9b. **Inert rows** (75's movement, tier-scan, and collision items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14). Collision's share moved from 86.
 9c. **87's render backend pass** — landed with the slice checklist. It does not wait on 9b.
 10. **76** Cave-Ins — after 64G, 88.

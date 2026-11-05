@@ -1,6 +1,6 @@
 ## Slice 57: Items, Inventory, And Equipment
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 56](slice-56.md), [Slice 49](slice-49.md), [Slice 59](slice-59.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](../archive/slice-88.md) (structural-share deferral), [Slice 56](slice-56.md), [Slice 49](slice-49.md), [Slice 59](slice-59.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started.** Needs 56 (health, combat stats, kill events), 49
 (seed domains), and 59 (sky exposure for outdoor decay). The player UI is
@@ -90,7 +90,7 @@ it is deterministic and allocation-free after reserve.
 - [ ] Equipment modifiers in action selection and combat.
 - [ ] Events, stats, structural share, and audio for pickups.
 - [ ] Pickup and transfer commands past the structural share defer through
-      [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
+      [Slice 88](../archive/slice-88.md)'s deferral (docs audit M7); test: an over-share
       pickup burst defers and the step succeeds
       (`.grok/rules/budgets-capacities.md`).
 - [ ] `use_item` player action.

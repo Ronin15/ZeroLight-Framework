@@ -1,6 +1,6 @@
 ## Slice 75: Far Simulation
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
 **Status: not started.** Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity

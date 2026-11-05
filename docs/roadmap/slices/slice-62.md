@@ -1,6 +1,6 @@
 ## Slice 62: NPC Population, Spawning, And Spawn Tables
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 49](slice-49.md), [Slice 57](slice-57.md), [Slice 58](slice-58.md), [Slice 59](slice-59.md), [Slice 63](slice-63.md), [Slice 64G](slice-64g.md), [Slice 75](slice-75.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](../archive/slice-88.md) (structural-share deferral), [Slice 49](slice-49.md), [Slice 57](slice-57.md), [Slice 58](slice-58.md), [Slice 59](slice-59.md), [Slice 63](slice-63.md), [Slice 64G](slice-64g.md), [Slice 75](slice-75.md) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started.** Needs 49 (seed domain, `sim_view`), 58 (spec and
 per-chunk biome), 59 (day phase), 63 (merchant profiles and ledgers), 57
@@ -101,7 +101,7 @@ only committed state and the fixed-step sim view.
 - [ ] Population capacity terms flow through the commit-seam sync; structural
       share for spawn and recycle bursts.
 - [ ] Spawn and recycle commands past the structural share defer through
-      [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
+      [Slice 88](../archive/slice-88.md)'s deferral (docs audit M7); test: an over-share
       spawn burst defers and the step succeeds
       (`.grok/rules/budgets-capacities.md`).
 - [ ] (added by Slice 67) Strings as `StringId`s if this lands after 67E.

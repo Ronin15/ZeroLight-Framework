@@ -46,7 +46,7 @@ fixture and grouped by chunk only if they cost there.
   § Benchmarks).
 - Already routed (not repeated here): slice 35's row-order item moved here
   (the world-gate item below), slice 50's other open tuner items ([50](slice-50.md)),
-  slice 88's plane-entry gather item ([88](slice-88.md)). Merged here (owner
+  slice 88's plane-entry gather item ([88](../archive/slice-88.md)). Merged here (owner
   2026-10-24): slice 35's tuned-versus-fixed item, and slice 50's first-shape,
   movement, and cold-seed items.
 - Measured (`world-gate` uniform, 65,536 rows, ReleaseFast
