@@ -29,7 +29,7 @@ fn preamble() {
     s += "Return at most 5 findings. Each claim is one sentence a skeptic can check against a file. ";
     s += "evidence must be a repo-relative path plus the symbol, constant, stage, or heading you read, and what it says. ";
     s += "dimension is exactly one of: performance, expandability, direction. ";
-    s += "performance means hot path, allocation, fixed budgets, threading, SIMD, or frame cost. ";
+    s += "performance means hot path, allocation, admission and seam-derived budgets, threading, SIMD, or frame cost. ";
     s += "expandability means adding a system, component, feeling, event, controller, or world mutation without a rewrite. ";
     s += "direction means the open roadmap versus the contracts already in the code. ";
     s += "direction field is exactly one of: advancing, risk, gap. ";
@@ -37,8 +37,8 @@ fn preamble() {
     s += "risk means continuing the current plan makes the engine slower or harder to extend. ";
     s += "gap means a needed capability or proof is missing. ";
     s += "severity is exactly one of: high, medium, low. ";
-    s += "Use high only when a next slice would be blocked, would break a fixed budget, or would force a rewrite. ";
-    s += "Work budgets in this repo must stay fixed constants. A budget that scales with world, map, cell, or portal size is a defect. ";
+    s += "Use high only when a next slice would be blocked, would scale work or memory with world or map extent, would grow capacity outside the population seam, or would force a rewrite. ";
+    s += "Budgets have three buckets: fixed admission (path solves, action intents, stimuli, dig/nav_reaction), seam-derived capacity (perception/affect shares and row-tied reserves grown only in syncPopulationCapacity), and hard format/presentation caps. Scaling with world, map, cell, or portal extent is a defect; growing capacity outside the population seam is a defect. ";
     s += "Hot paths must stay allocation-free after init, reserve, and warmup, proven by tests rather than comments. ";
     s += "summary is 2 to 4 sentences about this area only. ";
     s += "If two files disagree, cite both. Prefer fewer, sharper findings over a survey. ";
@@ -177,7 +177,7 @@ let roadmap_prompt = preamble();
 roadmap_prompt += "Your area is the live roadmap. Read docs/framework-implementation-slices.md (the index), docs/roadmap/scaling-gaps.md, and docs/roadmap/tracks/*.md. ";
 roadmap_prompt += "Cover Ground Rules, Open Frontier Slice Index, Next Priority Tracks, Scaling Gaps And Hardening Frontier, Long-Term Gameplay Direction, Suggested Order, and the Architecture notes of the open slice files under docs/roadmap/slices/ (one file per slice; sample the ones the index prioritizes). ";
 roadmap_prompt += "Use the archive only to confirm what Recently settled claims, not to re-audit old slices. ";
-roadmap_prompt += "Judge whether the next work grows simulation beside the existing loop while keeping fixed budgets, ownership boundaries, and measurement-gated perf work. ";
+roadmap_prompt += "Judge whether the next work grows simulation beside the existing loop while keeping the three budget buckets, ownership boundaries, and measurement-gated perf work. ";
 roadmap_prompt += "Call out any open slice that would widen a hot path, add a world-scaled budget, or bypass DataSystem, SimulationPipeline, or SimulationFrame.";
 doc_prompts.push(roadmap_prompt);
 
@@ -241,7 +241,7 @@ let world_prompt = preamble();
 world_prompt += "Your area is the dynamic world and navigation. Grep before reading whole files. ";
 world_prompt += "Cover src/game/world/system.zig, src/game/world/interest.zig, src/game/systems/spatial_index.zig, src/game/systems/pathfinding.zig, and src/game/systems/pathfinding/system.zig, nav_graph.zig, and solve.zig. ";
 world_prompt += "Grep for independent of, regardless of world size, budget, chunk, invalidat, and interest. ";
-world_prompt += "Judge whether digging, nav updates, and spatial queries stay on fixed budgets as the world changes, and whether a new world mutation has a post-commit path.";
+world_prompt += "Judge whether digging, nav updates, and spatial queries cost what changed (never world extent), keep admission budgets fixed, grow capacity only at the population seam, and whether a new world mutation has a post-commit path.";
 code_prompts.push(world_prompt);
 
 let controller_prompt = preamble();
@@ -427,7 +427,7 @@ report_prompt += "Use only status confirmed as fact. State status refuted as a c
 report_prompt += "Mention status unverified or not_checked only as limits on the evidence, never as facts that move the score. ";
 report_prompt += "You may open a file only to resolve a direct conflict between two confirmed findings. Do not start a new investigation. ";
 report_prompt += "readiness is an integer from 1 to 10 for performant expandable forward motion. ";
-report_prompt += "Score 8 to 10 when confirmed evidence shows new work extends the same contracts, hot paths stay on fixed budgets, and a new system has a clear slot. ";
+report_prompt += "Score 8 to 10 when confirmed evidence shows new work extends the same contracts, hot paths keep the three budget buckets, and a new system has a clear slot. ";
 report_prompt += "Score 5 to 7 when the direction is sound but a confirmed contract is tightening or a frontier slice would force a rewrite or a world-scaled budget. ";
 report_prompt += "Score 1 to 4 when confirmed evidence shows the roadmap and the code diverging, or performance and expandability in conflict with no mitigation. ";
 report_prompt += "If confirmed evidence is thin, stay at or below 6 and say so. ";
@@ -436,7 +436,7 @@ report_prompt += "report_markdown uses these headings, in order: Executive summa
 report_prompt += "Under Critical gaps and risks, group confirmed risks and gaps by high, medium, and low. ";
 report_prompt += "Under Scalability, cover entity scale, system interaction, threading, and world dynamism, and only where confirmed. ";
 report_prompt += "Under Expandability, cover adding a system, a component, a feeling, a world mutation, and persistence. ";
-report_prompt += "Recommended next steps are ordered by impact and must keep work budgets as fixed constants. ";
+report_prompt += "Recommended next steps are ordered by impact and must keep the three budget buckets (fixed admission, seam-derived capacity, hard caps). ";
 report_prompt += "Risk register is the top 5 confirmed risks with a mitigation each. Cite the confirmed file evidence. Do not invent paths or symbols.\n\n";
 report_prompt += "<summaries-json>\n";
 report_prompt += json_encode(summaries);

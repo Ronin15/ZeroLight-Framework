@@ -46,7 +46,8 @@ pub const SimulationEventStage = enum {
 /// Producers that append to `frame.events` within one fixed step: stages during
 /// `update`, the structural commit (`.structural_commit`), and the post-commit nav
 /// reaction (`.nav_reaction`). The switch in `maxEventsPerStep` is exhaustive, so a
-/// new producer does not compile until it has a fixed budget.
+/// new producer does not compile until it has a declared arm (fixed admission or
+/// seam-derived from `EventBudgetInputs`).
 pub const EventProducerId = enum {
     dig_world_edit,
     perception_update,

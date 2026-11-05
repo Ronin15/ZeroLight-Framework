@@ -75,15 +75,18 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
 - Events are phase outputs, never callbacks, string topics, or pub/sub. A
   consumer that emits more events names the next phase or defers to the next
   step; no recursive redispatch.
-- Every event producer declares its maximum per step, and capacity is reserved
-  before the step. Failing to append a required (correctness) event is a bug;
-  a diagnostic event may drop with a count.
+- Every event producer has a `maxEventsPerStep` arm. Perception and affect
+  step shares are seam-derived (`per_*_max` times tracked rows), grown only in
+  `syncPopulationCapacity`; other arms are fixed admission counts. Capacity is
+  reserved before the step. Failing to append a required (correctness) event is
+  a bug; a diagnostic event may drop with a count.
 - Frame streams live for one step; a stream writer writes exactly the count it
   declared.
-- Structural and event capacity is preflighted before queuing; commits are
-  all-or-fail and publish events only after success. `DataSystem` is the only
-  structural-command applier, and post-commit reactions touch disjoint state
-  in any order.
+- Structural commands that fit the step's `.structural_commit` share commit;
+  an over-share suffix defers to the next step. A shared event-bound miss or
+  `OutOfMemory` commits nothing. Events publish only after a successful prefix
+  commit. `DataSystem` is the only structural-command applier, and post-commit
+  reactions touch disjoint state in any order.
 
 ## Persistent data
 
