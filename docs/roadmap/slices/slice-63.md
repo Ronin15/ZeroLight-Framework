@@ -56,7 +56,7 @@ Goal: bounded, deterministic social state per world.
 - Social deltas net in event order and emit commands in ascending order;
   affect impulses go through 61's substrate under a new producer budget;
   combat reputation reaches feelings through stance → perception.
-- Per-step budgets are fixed counts; new hashed state is classified in
+- Per-step admission budgets are fixed counts; new hashed state is classified in
   Slice 49's lists and saved by Slice 46 (Ground Rules).
 - The trade screen reads sim state read-only and only enqueues intents;
   session validity is checked in the menu's fixed `update`

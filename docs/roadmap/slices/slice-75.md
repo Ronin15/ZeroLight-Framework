@@ -81,7 +81,7 @@ Scope comes from one camera and puts far entities to sleep.
   the halo-only AI gather contradict this and are replaced.
 - Cadences are pure functions of deterministic state (band, entity,
   `StepIndex`), never wall clock, render cadence, or measured cost
-  (`.grok/rules/simulation.md` § Determinism). Per-step work budgets are
+  (`.grok/rules/simulation.md` § Determinism). Per-step admission budgets are
   fixed counts with deterministic deferral
   (`.grok/rules/budgets-capacities.md`).
 - Scope derives from the observer's fixed-step view and defines a lowest

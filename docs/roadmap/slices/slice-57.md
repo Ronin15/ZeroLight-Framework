@@ -51,7 +51,7 @@ it is deterministic and allocation-free after reserve.
 - World items are created by every producer (loot, 57B drops, 58 dig yields,
   68C death drops) through one template helper; no world-item create is ever
   refused for capacity. Only per-step create, pickup, and decay counts are
-  fixed budgets; overflow defers deterministically.
+  fixed admission budgets; overflow defers deterministically.
 - A dormant item costs nothing per step: pickup and decay work follow
   holders and due decays, never the count of items at rest. 57 owns decay
   scheduling: lazy, computed from elapsed steps, keyed by whether the item
