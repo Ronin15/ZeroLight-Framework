@@ -18,6 +18,7 @@ const pathfinding_connectivity = @import("pathfinding/connectivity.zig");
 const pathfinding_negative = @import("pathfinding/negative.zig");
 const pathfinding_requests = @import("pathfinding/requests.zig");
 const pathfinding_routes = @import("pathfinding/routes.zig");
+const far_sim = @import("far_sim.zig");
 const perception = @import("perception.zig");
 const plane_traversal = @import("plane_traversal.zig");
 const production_step = @import("production_step.zig");
@@ -119,6 +120,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     sparse_window.pan_churned_group,
     sparse_window.add_group,
     scope.cognition_group,
+    far_sim.group,
     plane_traversal.group,
     plane_traversal.falls_group,
     plane_traversal.dense_falls_group,

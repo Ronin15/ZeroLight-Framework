@@ -50,12 +50,14 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
 
 ## Scope and tiers
 
-- Simulation fidelity derives only from the fixed-step simulation view, never
-  the render window. Tiers set fidelity, never whether an entity advances
-  (`engine-design.md` § Target scale). Render visibility controls drawing
+- Simulation fidelity derives only from the observer's one fixed-step
+  `sim_view`, never the render window. Bands from that view set think cadence
+  and collision fidelity, never whether an entity advances. A world with no
+  view uses the lowest band, not a full-active fallback. `dormant` is inert
+  rows only; agents are never dormant. Render visibility controls drawing
   only, and a scope pin never bypasses it.
 - A test that must exclude distance effects puts every agent in the nearest
-  band (a full-extent view or always-active rows).
+  band or marks the rows always-active.
 
 ## Determinism
 

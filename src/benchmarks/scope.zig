@@ -2,17 +2,17 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `scope-cognition`: the think set alone (`mergeThinkSet`) over a halo index built once,
-//!   untimed. `spread` and `dense_chunk` are one live run, the copy, linear in thinking
-//!   rows and not in indexed rows; the assert is `thinking + stagger_skips == indexed`
-//!   and thinking < indexed. `interleaved_runs` is two live runs, alternating cells in
-//!   one chunk, linear in thinking rows (thinking equals agents); the assert is both runs
-//!   non-empty, the other phases empty, a phase-0 row before the last always-active row,
+//! `scope-cognition`: the think set alone (`mergeThinkSet`) over the whole AI index,
+//!   built once, untimed. Thinking is the due subset of every indexed agent.
+//!   `spread` and `dense_chunk`: `thinking + skips ==` keyed rows, and thinking < indexed.
+//!   `interleaved_runs` is the always-active group and the phase-0 residue, alternating
+//!   cells in one chunk; thinking equals agents. The assert is both runs non-empty, the
+//!   other cognition residues empty, a phase-0 row before the last always-active row,
 //!   and nondecreasing cell prefixes. The merge stays inline. No cognition tuner and no
 //!   worker dispatch. `spread` places N entities on 16 x-chunks whose levels (`index % 5`)
-//!   mix the four tiers. `dense_chunk` keeps `indexed == agents` and one index record.
-//!   On `spread`, untimed after the measured passes, the collision bounds and AI halo
-//!   gathers, the tier policy, and the chunk derive at the case's controls dispatch.
+//!   mix the bands. `dense_chunk` keeps `indexed == agents` and one index record.
+//!   On `spread`, untimed after the measured passes, the AI gather, the tier policy, and
+//!   the chunk derive at the case's controls dispatch.
 //!   Item code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`,
 //!   2 `interleaved_runs`). Prints `indexed=` (H) and `thinking=`; `--details` adds
 //!   `main=` with `main_per_item=` (per thinking row).
@@ -33,6 +33,12 @@ const ActiveRegion = @import("../game/simulation_scope.zig").ActiveRegion;
 const tierForChunkDistance = @import("../game/simulation_scope.zig").tierForChunkDistance;
 const cognition_halo_chunks = @import("../game/simulation_scope.zig").cognition_halo_chunks;
 const cognition_stagger_n = @import("../game/simulation_scope.zig").cognition_stagger_n;
+const band_residue_n = @import("../game/simulation_scope.zig").band_residue_n;
+const SimulationTier = @import("../game/simulation_scope.zig").SimulationTier;
+
+fn thinkGroupIndex(tier: SimulationTier, residue: u8) usize {
+    return 1 + @as(usize, @intCast(@backingInt(tier))) * @as(usize, band_residue_n) + residue;
+}
 const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_phase;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
@@ -209,7 +215,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         .cells_y = grid.cells_y,
         .cells_per_chunk = per_chunk,
     }, &setup_threads, .{});
-    const halo = (try scope.gatherAiPopulations(&data, cognitionHaloRegion(), &setup_threads, .{})).halo;
+    const halo = (try scope.gatherAiPopulations(&data, cognitionHaloRegion(), &setup_threads, .{})).population;
     _ = try spatial_index.build(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, &setup_threads, .{});
     const view = spatial_index.view();
     const indexed = view.entryCount();
@@ -252,20 +258,17 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     return stats;
 }
 
-// Untimed, after the measured passes: the collision bounds gather, the AI halo gather, the
-// tier policy, and the chunk derive at the case's controls over the spread layout's mixed
-// tiers. Each runs over its rows, and a fixed threaded case dispatches each, one range per
-// aligned range of rows.
+// Untimed, after the measured passes: the AI gather, the tier policy, and the chunk
+// derive at the case's controls over the spread layout's mixed tiers. Each runs over
+// its rows, and a fixed threaded case dispatches each.
 fn checkScopeStagesDispatched(allocator: std.mem.Allocator, scope: *SimulationScopeSystem, data: *DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
     const range = case.stageItemsPerRange(scope_range_alignment_items);
-    const collision = try scope.gatherCollisionBoundsIndices(data, thread_system, scopeConfig(case));
-    if (collision.indices == null) return error.ScopeGatherFixtureAllActive;
     const ai = try scope.gatherAiPopulations(data, cognitionHaloRegion(), thread_system, scopeConfig(case));
     var commands = RangeOutputStream(StructuralCommand).init(allocator);
     defer commands.deinit();
     const tier_policy = try scope.queueTierChanges(data, visibleRegion(), &commands, thread_system, scopeConfig(case));
     const chunk_derive = try scope.deriveChunks(data, thread_system, .{ .tile_size = tile_size, .chunk_size_tiles = chunk_size_tiles, .width = grid_tiles, .height = grid_tiles }, scopeConfig(case));
-    for ([_]BatchStats{ collision.perf.batch, ai.perf.batch, tier_policy, chunk_derive }) |batch| {
+    for ([_]BatchStats{ ai.perf.batch, tier_policy, chunk_derive }) |batch| {
         if (batch.item_count == 0) return error.ScopeStageSkipped;
         try suite.checkStageDispatched(case, thread_system, range, batch);
         try suite.checkFixedRangeCount(case, thread_system, range, batch);
@@ -273,7 +276,7 @@ fn checkScopeStagesDispatched(allocator: std.mem.Allocator, scope: *SimulationSc
 }
 
 fn runCognitionOnce(scope: *SimulationScopeSystem, data: *const DataSystem) []const u32 {
-    return scope.mergeThinkSet(data, 0, true);
+    return scope.mergeThinkSet(data, 0);
 }
 
 fn checkMergeShape(
@@ -299,11 +302,14 @@ fn checkMergeShape(
             std.debug.assert(thinking < indexed);
         },
         .interleaved_runs => {
-            std.debug.assert(scope.aa_halo_end > scope.aa_begin);
-            std.debug.assert(scope.phase_halo_end[0] > scope.phase_begin[0]);
-            std.debug.assert(scope.phase_halo_end[1] == scope.phase_begin[1]);
-            std.debug.assert(scope.phase_halo_end[2] == scope.phase_begin[2]);
-            std.debug.assert(scope.phase_halo_end[3] == scope.phase_begin[3]);
+            std.debug.assert(scope.group_end[0] > 0);
+            const phase0 = thinkGroupIndex(.cognition, 0);
+            std.debug.assert(scope.group_end[phase0] > scope.group_end[phase0 - 1]);
+            var residue: u8 = 1;
+            while (residue < band_residue_n) : (residue += 1) {
+                const group = thinkGroupIndex(.cognition, residue);
+                std.debug.assert(scope.group_end[group] == scope.group_end[group - 1]);
+            }
             std.debug.assert(scope.perf.stagger_skips == 0);
             std.debug.assert(thinking == agents and thinking == indexed);
             std.debug.assert(result.len == thinking);

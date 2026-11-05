@@ -177,7 +177,7 @@ const per_agent_commands = 2 + ring_segments + 2 * drive_count + ai_memory_ring_
 // HUD: two fixed blocks, one label + up to `max_hud_digits` composed digits per
 // line. The tier block is `hud_lines` lines; the global per-behavior tally is
 // `behavior_count` lines. Fixed constants — neither scales with agent count.
-const hud_lines = 5;
+const hud_lines = 6;
 const max_hud_digits = 10;
 const hud_commands = (hud_lines + behavior_count) * (1 + max_hud_digits);
 
@@ -192,7 +192,7 @@ pub const AiDebugOverlay = struct {
     labels_ready: bool = false,
 
     const hud_color = Color{ .r = 1, .g = 0.902, .b = 0.157, .a = 1 };
-    const tier_names = [hud_lines][]const u8{ "total ", "cognition ", "locomotion ", "kinematic ", "dormant " };
+    const tier_names = [hud_lines][]const u8{ "total ", "cognition ", "locomotion ", "kinematic ", "lowest ", "dormant " };
 
     pub fn init() AiDebugOverlay {
         return .{};
@@ -267,6 +267,7 @@ pub const AiDebugOverlay = struct {
             stats.cognition_entities,
             stats.locomotion_entities,
             stats.kinematic_entities,
+            stats.lowest_entities,
             stats.dormant_entities,
         };
         for (self.tier_labels, tier_counts) |label, value| {

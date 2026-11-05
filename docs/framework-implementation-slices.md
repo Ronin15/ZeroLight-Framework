@@ -202,7 +202,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**72**](roadmap/slices/slice-72.md) | In progress | Live Capacity Sizing Pass — F and G re-scoped after 64G |
 | [**73**](roadmap/slices/slice-73.md) | Not started | Data-Driven Cognition — after 49 |
 | [**74**](roadmap/slices/slice-74.md) | Not started | World Instances — after 64G, 49, 50, 75 |
-| [**75**](roadmap/slices/slice-75.md) | In progress | Far Simulation — inert rows landed; tier mechanics open — after 64G, 73 |
+| [**75**](roadmap/slices/slice-75.md) | In progress | Far Simulation — inert rows and tier mechanics landed; far signal, far paths, and docs open — after 64G, 73 |
 | [**76**](roadmap/slices/slice-76.md) | Not started | Cave-Ins — after 64G, 88 |
 | [**77**](roadmap/slices/slice-77.md) | Not started | Explosions — after 64G, 76, 88 |
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |

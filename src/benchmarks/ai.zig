@@ -202,13 +202,14 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     defer scope.deinit();
     try scope.reserveAiRows(item_count);
     const grid = thinkGrid(geometry);
+    try fixtures.markAlwaysActive(&fixture.data);
     try scope.orderThinkPhases(&fixture.data, null, grid, &setup_threads, .{});
-    const halo = (try scope.gatherAiPopulations(&fixture.data, null, &setup_threads, .{})).halo;
+    const halo = (try scope.gatherAiPopulations(&fixture.data, null, &setup_threads, .{})).population;
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
     _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities, .rows = halo }, geometry, &setup_threads, .{});
     const spatial_view = spatial_sys.view();
-    _ = scope.mergeThinkSet(&fixture.data, 0, false);
+    _ = scope.mergeThinkSet(&fixture.data, 0);
     try scope.packThinkSpan(&fixture.data, &setup_threads, .{});
     const think_set = scope.ai_cognition_indices.items;
     std.debug.assert(think_set.len == item_count);

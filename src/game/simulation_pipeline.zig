@@ -124,7 +124,7 @@ const PipelineResource = enum {
     ai_behavior,
     /// `WorldSystem` interest markers. Authored outside the step; `ai_decide` carries them.
     interest_markers,
-    ai_halo_indices,
+    ai_population_indices,
     ai_cognition_indices,
     spatial_index,
     navigation_intents,
@@ -204,19 +204,19 @@ fn stageContract(stage: StageId) StageContract {
         // writes later.
         .scope_advance_and_ai_gather => .{
             .reads = .empty,
-            .writes = resources(&.{.ai_halo_indices}),
+            .writes = resources(&.{.ai_population_indices}),
             .carried = resources(&.{.chunk_columns}),
         },
-        // Indexes the halo at the previous step's positions and levels, which this
+        // Indexes the AI population at the previous step's positions and levels, which this
         // step's movement and plane traversal write later.
         .spatial_index_build => .{
-            .reads = resources(&.{.ai_halo_indices}),
+            .reads = resources(&.{.ai_population_indices}),
             .writes = resources(&.{.spatial_index}),
             .carried = resources(&.{ .movement_positions, .world_level }),
         },
         // The think set in the index's cell-major order, so rows sharing a neighborhood
         // are adjacent in every think-set stage. `orderThinkPhases` publishes the run bounds.
-        .ai_cognition_order => .{ .reads = resources(&.{.ai_halo_indices}), .writes = resources(&.{.ai_cognition_indices}) },
+        .ai_cognition_order => .{ .reads = resources(&.{.ai_population_indices}), .writes = resources(&.{.ai_cognition_indices}) },
         // Queries the spatial index for hostile candidates and writes sensed
         // state for this step's observers (think set); also emits acquisition/loss
         // transition events. Reads world_tiles for line-of-sight /
@@ -503,8 +503,8 @@ pub const SimulationPipelineUpdateContext = struct {
     /// `cognitionRegionForWorldRect`. Never the render visibility window, which
     /// follows the interpolated render camera and so depends on frame pacing.
     /// Required: a missing view would silently disable scope gating and run every
-    /// entity at full cost. A world with no chunks yields no region, which keeps
-    /// the full-active fallback (no halo, no stagger, no tier demotion).
+    /// entity at full cost. A world with no chunks yields no region, which assigns
+    /// the lowest band.
     sim_view: Rect,
 };
 
@@ -601,6 +601,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.scope_kinematic_entities, metric(scope_stats.kinematic_entities));
         perf.recordMetric(.scope_locomotion_entities, metric(scope_stats.locomotion_entities));
         perf.recordMetric(.scope_cognition_entities, metric(scope_stats.cognition_entities));
+        perf.recordMetric(.scope_lowest_entities, metric(scope_stats.lowest_entities));
         perf.recordMetric(.scope_movement_stage_entities, metric(scope_stats.movement_stage_entities));
         perf.recordMetric(.scope_collision_stage_entities, metric(scope_stats.collision_stage_entities));
         perf.recordMetric(.scope_collision_response_stage_entities, metric(scope_stats.collision_response_stage_entities));
@@ -834,12 +835,11 @@ pub const SimulationPipeline = struct {
     /// commit seam (`reserveStaticColliders`, `captureStaticColliderChanges`,
     /// `syncStaticColliders`); nav and steering read them.
     static_colliders: StaticColliderSystem,
-    /// Backbone scope system: recomputes chunks, gathers the unstaggered
-    /// cognition halo and the stagger-filtered think set, and drives auto tier
-    /// wake/sleep.
+    /// Backbone scope system: recomputes chunks, gathers the AI population and the due-group think set, and drives
+    /// auto tier wake/sleep. A null region assigns `lowest`; cadence still applies.
     scope: SimulationScopeSystem,
-    /// Shared per-step neighbor index, built once on workers from the unstaggered
-    /// cognition halo. Perception and AI separation/cohere query it read-only.
+    /// Shared per-step neighbor index, built once on workers from the AI
+    /// population. Perception and AI separation/cohere query it read-only.
     spatial_index: SpatialIndexSystem,
     /// AI perception substrate: queries the shared spatial index for
     /// hostile candidates within vision/FOV/line-of-sight and writes
@@ -1603,7 +1603,7 @@ pub const SimulationPipeline = struct {
         perf: SimulationPipelineStats.Perf = .{},
         cognition_region: ?ActiveRegion = null,
         stagger_step: u8 = 0,
-        ai_halo_indices: []const u32 = &[_]u32{},
+        ai_population_indices: []const u32 = &[_]u32{},
         ai_cognition_indices: []const u32 = &[_]u32{},
         collision_scope_indices: ?[]const u32 = null,
         spatial_index: SpatialIndexStats = .{},
@@ -1666,10 +1666,10 @@ pub const SimulationPipeline = struct {
         }
     };
 
-    /// Runs `stage_order` and returns stage stats. Scope selection uses the
-    /// fixed-step `sim_view` cognition halo (index/candidates) plus stagger (think
-    /// set); chunk
-    /// columns are derived in their own late stage after positions settle.
+    /// Runs `stage_order` and returns stage stats. Scope selection gathers the
+    /// AI population and the due-group think set from the fixed-step `sim_view`.
+    /// A null region assigns `lowest` and cadence still applies. Chunk columns
+    /// are derived in their own late stage after positions settle.
     /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
         const think_grows_before = if (comptime runtime_perf_log.enabled) self.scope.think_scratch_grows else 0;
@@ -1739,11 +1739,11 @@ pub const SimulationPipeline = struct {
         try written;
     }
 
-    /// Advance the stagger clock, derive the cognition halo from the fixed-step
-    /// `sim_view` (never the render window), and gather this step's unstaggered halo
-    /// (spatial index + perception candidates); `ai_cognition_order` selects the think set
-    /// from its index. Chunk columns are derived later in `chunk_derive`. The AI gather
-    /// reads the chunk written last step. Movement/collision gate on tier only, so they
+    /// Advance the stagger clock, derive the fixed-step `sim_view` region (never
+    /// the render window), and gather the AI population. A null region assigns
+    /// `lowest`. `ai_cognition_order` selects the due-group think set; cadence
+    /// still applies. Chunk columns are derived later in `chunk_derive`. The AI gather
+    /// reads the chunk written last step. Movement and collision gate on tier only, so they
     /// keep running off-screen.
     fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
@@ -1761,12 +1761,12 @@ pub const SimulationPipeline = struct {
             .cells_per_chunk = per_chunk,
         }, context.thread_system, .{});
         const gathered = try self.scope.gatherAiPopulations(context.data, step.cognition_region, context.thread_system, .{});
-        step.ai_halo_indices = gathered.halo;
+        step.ai_population_indices = gathered.population;
         if (comptime runtime_perf_log.enabled) step.perf.scope_ai_gather = gathered.perf.batch;
         scope_gather_timer.stop(context.perf, .pipeline_scope_gather);
     }
 
-    /// Shared neighbor index: built once from the unstaggered halo, at the
+    /// Shared neighbor index: built once from every AI row, at the
     /// previous positions perception and AI read, over the world's chunk grid.
     fn stageSpatialIndexBuild(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
@@ -1774,7 +1774,7 @@ pub const SimulationPipeline = struct {
         var spatial_index_timer = StageTimer.start();
         step.spatial_index = try self.spatial_index.build(
             data,
-            .{ .entities = data.aiAgentSliceConst().entities, .rows = step.ai_halo_indices },
+            .{ .entities = data.aiAgentSliceConst().entities, .rows = step.ai_population_indices },
             IndexGeometry.ofWorld(context.world),
             context.thread_system,
             .{},
@@ -1782,12 +1782,11 @@ pub const SimulationPipeline = struct {
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
     }
 
-    /// The think set: the halo rows on this step's stagger phase (every row with no
-    /// cognition region), in the index's cell-major order, packed to a prefix.
+    /// The think set: due bands by cadence, in cell order, packed to a prefix.
     fn stageAiCognitionOrder(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const cognition_order_timer = BenchStageTimer.start(context.perf);
-        step.ai_cognition_indices = self.scope.mergeThinkSet(context.data, step.stagger_step, step.cognition_region != null);
+        step.ai_cognition_indices = self.scope.mergeThinkSet(context.data, self.scope.currentStep());
         try self.scope.packThinkSpan(context.data, context.thread_system, .{});
         cognition_order_timer.stop(context.perf, .pipeline_cognition_order);
     }
@@ -1942,14 +1941,13 @@ pub const SimulationPipeline = struct {
         movement_timer.stop(context.perf, .pipeline_movement);
     }
 
-    /// Collision gates on tier only (no chunk filter): off-screen entities keep
-    /// colliding. Null indices mean full-active.
+    /// Collision reads the colliding prefix. Null means the prefix is the whole
+    /// dynamic list. Does not dispatch.
     fn stageCollisionScopeGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const collision_scope_timer = BenchStageTimer.start(context.perf);
         const gathered = try self.scope.gatherCollisionBoundsIndices(context.data, context.thread_system, .{});
         step.collision_scope_indices = gathered.indices;
-        if (comptime runtime_perf_log.enabled) step.perf.scope_collision_gather = gathered.perf.batch;
         collision_scope_timer.stop(context.perf, .pipeline_collision_scope);
     }
 
@@ -2031,8 +2029,8 @@ pub const SimulationPipeline = struct {
         action_react_timer.stop(context.perf, .pipeline_action_react);
     }
 
-    /// Assign cognition/locomotion/kinematic/dormant by cube distance from the
-    /// fixed-step sim-view region. Commands are deferred. The anchor level is the
+    /// Assign bands by cube distance from the fixed-step sim-view region.
+    /// A null region assigns `lowest`. Commands are deferred. The anchor level is the
     /// player's, so off-level entities demote. Queues nothing when no tier changed.
     fn stageTierPolicy(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
@@ -2440,9 +2438,8 @@ test "pipeline resamples AI wander direction across fixed steps" {
     });
     defer pipeline.deinit();
 
-    // The world has no chunks, so the full-world `sim_view` yields no cognition
-    // region and the AI gather falls back to full-active with no stagger gating —
-    // the wanderer runs every step.
+    // No chunks, so the `sim_view` yields no region. A null region assigns
+    // `lowest` once tier commands commit. Cadence still applies.
     frame.beginStep();
     _ = try pipeline.update(.{
         .data = &data,
@@ -3094,7 +3091,7 @@ const scope_render_test_steps = 4;
 const ScopeRenderTraceStep = struct {
     cognition_region: ?ActiveRegion,
     ai_entity_count: usize,
-    halo_entity_count: usize,
+    population_entity_count: usize,
     tier_commands: [scope_render_test_agent_count + 1]?StructuralCommand,
 };
 
@@ -3192,7 +3189,7 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
         out.* = .{
             .cognition_region = stats.scope.active_region,
             .ai_entity_count = pipeline.ai.rows.len,
-            .halo_entity_count = pipeline.scope.ai_halo_indices.items.len,
+            .population_entity_count = pipeline.scope.ai_population_indices.items.len,
             .tier_commands = @splat(null),
         };
         const commands = frame.structural_commands.mergedItems();
@@ -3218,7 +3215,7 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     for (trace.steps) |step| {
         try std.testing.expectEqual(@as(?ActiveRegion, expected_cognition), step.cognition_region);
         // Stagger gating: some halo agent is off this step's phase and does not think.
-        try std.testing.expect(step.ai_entity_count < step.halo_entity_count);
+        try std.testing.expect(step.ai_entity_count < step.population_entity_count);
         const promote = (step.tier_commands[0] orelse return error.TestExpectedTierCommand).set_simulation_tier;
         try std.testing.expectEqual(agents[2], promote.entity);
         try std.testing.expectEqual(SimulationTier.cognition, promote.tier);
@@ -3441,8 +3438,9 @@ const TestAllocatorCounters = struct {
 };
 
 /// Test-only `sim_view` covering the whole world extent: every chunk of the
-/// player's level is in view, so nothing on that level leaves the cognition halo
-/// or demotes. A chunkless world yields no region (the full-active fallback).
+/// player's level is in view, so an on-level row stays in the near band. A
+/// chunkless world yields no region, which assigns `lowest`, and cadence still
+/// applies.
 fn fullWorldSimView(world: *const WorldSystem) Rect {
     return .{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() };
 }
@@ -3886,8 +3884,9 @@ const ApplyIntentsScenarioResult = struct {
 };
 
 /// `apply_intents_agent_count` wandering agents, each with a movement body, an AI agent,
-/// and a steering agent, so steering emits one movement intent each step. A chunkless
-/// world keeps every agent thinking every step. `max_worker_threads > 0` pins a
+/// and a steering agent, so steering emits one movement intent each step. Every
+/// movement row is marked always-active, so the think set is the whole population.
+/// `max_worker_threads > 0` pins a
 /// 2-worker, 16-item partition (2 apply ranges). A warm step, then a step with every
 /// allocator failing; returns that step's velocities.
 fn runApplyIntentsScenario(max_worker_threads: usize) !ApplyIntentsScenarioResult {
@@ -3906,6 +3905,7 @@ fn runApplyIntentsScenario(max_worker_threads: usize) !ApplyIntentsScenarioResul
         try data.setAiAgent(agent, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 0 });
         try data.setSteeringAgent(agent, growthSteeringTemplate(.{ 0, 0 }).create_entity.steering_agent.?);
     }
+    try markAllAlwaysActive(&data);
 
     var world = WorldSystem{
         .allocator = std.testing.allocator,
@@ -4706,16 +4706,14 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     defer data.deinit();
     var player = try Player.spawn(&data);
 
-    // Cognition-tier observer (default tier): included in the halo and think
-    // lists, so it becomes both an AI gather row and a perception gather row.
+    // Default tier is cognition. Both AI rows are in the population list.
     const observer = try data.createEntity();
     try data.setMovementBody(observer, .{ .position = .{ .x = 50, .y = 50 }, .previous_position = .{ .x = 50, .y = 50 }, .velocity = .{}, .speed = 20 });
     try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setAiPerception(observer, .{ .vision_range = 100 });
 
-    // Locomotion-tier: `gatherAiPopulations` excludes it (tier.allowsCognition()
-    // is false), so it must never enter perception's gather either — proves
-    // perception shares AI's exact scoped population rather than its own.
+    // Locomotion still allows cognition, so this row stays in the population list.
+    // Perception and AI read the due-group think set, not that list.
     const out_of_scope = try data.createEntity();
     try data.setMovementBody(out_of_scope, .{ .position = .{ .x = 60, .y = 60 }, .previous_position = .{ .x = 60, .y = 60 }, .velocity = .{}, .speed = 20 });
     try data.setAiAgent(out_of_scope, .{ .active_behavior = .wander, .gain_pursue = 0 });
@@ -4758,13 +4756,12 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
         .sim_view = fullWorldSimView(&world),
     });
 
-    // Scoping: perception's gather ran only over the cognition-tier ai agent,
-    // matching AI's own scoped population (both read the same think list)
-    // even though two entities in `DataSystem` carry `AiPerception`. With a
-    // struct-literal world (`cognition_region == null`) halo == think.
-    try std.testing.expectEqual(@as(usize, 1), pipeline.ai.rows.len);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.perception.rows.len);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.spatial_index.view().entryCount());
+    // The index is every AI row. Perception and AI read the due-group think set.
+    // A null region assigns `lowest`; cadence still applies.
+    const think_len = pipeline.scope.ai_cognition_indices.items.len;
+    try std.testing.expectEqual(think_len, pipeline.ai.rows.len);
+    try std.testing.expectEqual(think_len, pipeline.perception.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.spatial_index.view().entryCount());
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.entity_perceived);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.entity_lost);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
@@ -7520,7 +7517,7 @@ test "population sync does not grow scope AI lists, steering scratch, or the goa
     const pack_holes = pipeline.scope.pack_holes.capacity;
     const pack_stamp = pipeline.scope.pack_stamp.capacity;
     const move_dest = pipeline.scope.move_dest.capacity;
-    const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+    const ai_halo = pipeline.scope.ai_population_indices.capacity;
     const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
     const runtime_rows = pipeline.steering.runtime_rows.capacity;
     const intent_rows = pipeline.steering.intent_rows.capacity;
@@ -7550,7 +7547,7 @@ test "population sync does not grow scope AI lists, steering scratch, or the goa
     try std.testing.expectEqual(pack_holes, pipeline.scope.pack_holes.capacity);
     try std.testing.expectEqual(pack_stamp, pipeline.scope.pack_stamp.capacity);
     try std.testing.expectEqual(move_dest, pipeline.scope.move_dest.capacity);
-    try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+    try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
     try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
     try std.testing.expectEqual(runtime_rows, pipeline.steering.runtime_rows.capacity);
     try std.testing.expectEqual(intent_rows, pipeline.steering.intent_rows.capacity);
@@ -7700,7 +7697,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         }
         try std.testing.expectEqual(@as(usize, 203), data.populationRowCounts().population());
         const think_keys = pipeline.scope.think_keys.capacity;
-        const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+        const ai_halo = pipeline.scope.ai_population_indices.capacity;
         const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
         const pack_stamp = pipeline.scope.pack_stamp.capacity;
         const sync = try pipeline.syncPopulationCapacity(&frame, &data);
@@ -7716,7 +7713,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(@as(usize, 2), pipeline.steering.agents_reserved);
         try std.testing.expectEqual(@as(usize, 2), pipeline.steering.intents_reserved);
         try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
-        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
         try std.testing.expect(pipeline.scope.collision_indices.capacity >= 320);
         try std.testing.expectEqual(@as(usize, 320), pipeline.plane_entry.reserved_items);
@@ -7730,7 +7727,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(pack_scratch_synced, pipeline.pack_scratch_capacity);
         try std.testing.expectEqual(ai_rows_synced, pipeline.scope.ai_rows_reserved);
         try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
-        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
     }
 
@@ -7768,7 +7765,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         }
         try std.testing.expectEqual(@as(usize, 3), data.populationRowCounts().population());
         const think_keys = pipeline.scope.think_keys.capacity;
-        const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+        const ai_halo = pipeline.scope.ai_population_indices.capacity;
         const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
         const pack_stamp = pipeline.scope.pack_stamp.capacity;
         const collision_indices = pipeline.scope.collision_indices.capacity;
@@ -7798,7 +7795,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(@as(usize, 0), pipeline.affect_max_events_per_step);
         try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
         try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
-        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
         try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
         try std.testing.expectEqual(@as(usize, 320), pipeline.scope.pack_rows_reserved);
@@ -7814,7 +7811,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(pack_scratch_synced, pipeline.pack_scratch_capacity);
         try std.testing.expectEqual(ai_rows_synced, pipeline.scope.ai_rows_reserved);
         try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
-        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
     }
 
@@ -7851,7 +7848,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
             try data.setAiAffect(entity, .{});
         }
         const think_keys = pipeline.scope.think_keys.capacity;
-        const ai_halo = pipeline.scope.ai_halo_indices.capacity;
+        const ai_halo = pipeline.scope.ai_population_indices.capacity;
         const ai_cognition = pipeline.scope.ai_cognition_indices.capacity;
         const pack_stamp = pipeline.scope.pack_stamp.capacity;
         const sync = try pipeline.syncPopulationCapacity(&frame, &data);
@@ -7863,7 +7860,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(@as(usize, 2), pipeline.pathfinding.goals.limit);
         try std.testing.expectEqual(@as(usize, 2), pipeline.scope.ai_rows_reserved);
         try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
-        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
         try std.testing.expectEqual(@as(usize, 320), pipeline.pack_scratch_capacity);
         try std.testing.expectEqual(@as(usize, 320), pipeline.scope.pack_rows_reserved);
@@ -7879,7 +7876,7 @@ test "population sync reserves pack scratch from perception, memory, or affect w
         try std.testing.expectEqual(pack_scratch_synced, pipeline.pack_scratch_capacity);
         try std.testing.expectEqual(ai_rows_synced, pipeline.scope.ai_rows_reserved);
         try std.testing.expectEqual(think_keys, pipeline.scope.think_keys.capacity);
-        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_halo_indices.capacity);
+        try std.testing.expectEqual(ai_halo, pipeline.scope.ai_population_indices.capacity);
         try std.testing.expectEqual(ai_cognition, pipeline.scope.ai_cognition_indices.capacity);
     }
 }
@@ -9329,7 +9326,7 @@ test "the think-set stage reads the halo and writes the think set every cognitio
     const order = stageContract(.ai_cognition_order);
     try std.testing.expect(!order.reads.contains(.spatial_index));
     try std.testing.expect(!order.writes.contains(.spatial_index));
-    try std.testing.expect(order.reads.contains(.ai_halo_indices));
+    try std.testing.expect(order.reads.contains(.ai_population_indices));
     try std.testing.expect(order.writes.contains(.ai_cognition_indices));
     try std.testing.expect(!stageContract(.scope_advance_and_ai_gather).writes.contains(.ai_cognition_indices));
     const order_at = std.mem.indexOfScalar(StageId, &stage_order, .ai_cognition_order).?;
@@ -9351,9 +9348,10 @@ test "the think set reaches AI in the index's cell-major order, not AI index ord
         agent.* = try data.createEntity();
         try data.setMovementBody(agent.*, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 });
         try data.setAiAgent(agent.*, .{ .active_behavior = .wander, .gain_pursue = 0 });
+        try data.setSimulationMetadata(agent.*, .{ .always_active = true });
     }
 
-    // A struct-literal world: no cognition region, so every agent thinks.
+    // always_active so this step's cadence includes every agent.
     var world = WorldSystem{ .allocator = std.testing.allocator, .width = 64, .height = 64, .tile_size = 32, .chunk_size_tiles = 16 };
     defer world.deinit();
     var frame = SimulationFrame.init(std.testing.allocator);

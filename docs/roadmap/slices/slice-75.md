@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows landed: the advancing prefix and the dynamic-collision list exclude rows at rest. Tier mechanics are open. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows and tier mechanics have landed. Still open: 73's think interval, the far-from-observer signal, far path requests, scope-state classification, the scope-file audit, docs, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -116,17 +116,23 @@ Scope comes from one camera and puts far entities to sleep.
 
 ### Checklist
 
-- [ ] Fidelity bands from the observer, including a lowest band for 74; the
+- [x] Fidelity bands from the observer, including a lowest band for 74; the
       § Scope and tiers rule in `.grok/rules/simulation.md` updated in the
-      same change.
-- [ ] Every agent thinks at its band's cadence; no agent is excluded from
-      cognition by distance.
+      same change. Landed: `cognition` / `locomotion` / `kinematic` / `lowest`
+      at 16 / 32 / 48 chunks and beyond, think cadences 4 / 16 / 32 / 64.
+      A null region assigns `lowest`.
+- [x] Every agent thinks at its band's cadence; no agent is excluded from
+      cognition by distance. The think set is the due groups of the whole
+      AI population.
 - [ ] 73's per-agent think interval takes the band as one input (after 73).
-- [ ] The spatial index covers the whole population in every band.
-- [ ] Movement and terrain gating near full rate in every band; collision
-      fidelity per band set by the design pass.
-- [ ] `dormant` reserved for inert rows, which still advance (57 schedules
-      item decay); agents are never dormant.
+- [x] The spatial index covers the whole population in every band.
+- [x] Movement and terrain gating near full rate in every band; collision
+      fidelity per band set by the design pass. Movement stays on `advancing`.
+      Cognition and locomotion collide every step. Kinematic and `lowest`
+      stay past `dynamic_ids[0..colliding)`.
+- [x] `dormant` reserved for inert rows, which still advance (57 schedules
+      item decay); agents are never dormant. Distance does not write
+      `dormant`.
 - [x] Rows at rest cost no per-step movement or tier-scan work
       (`movement.zig:55`, `systems/simulation_scope.zig:576`). Failure scenario: items
       and resource nodes at rest raise every step's cost (measured above).
@@ -168,8 +174,12 @@ Scope comes from one camera and puts far entities to sleep.
 - [ ] Tests: an agent in every band advances (thinks, moves, paths) at its
       cadence; the far signal is deterministic; results are identical across render cadence and worker
       count; serial equals threaded.
-- [ ] Bench `far-sim`: per-step cost at three or more populations and world
-      sizes with most agents far from the observer.
+- [x] Bench `far-sim`: per-step cost at three or more populations and world
+      sizes with most agents far from the observer. Debug, `x86_64_v2`.
+      Think-set sums over 64 steps equal the agent count at 1024, 4096, and
+      10000 (steps 16, 64, and 156–157). Extent items at population 4096
+      keep that 4096 sum and the index count. Collision items stay 1.
+      Several runs printed `settled=no`; the counters are the proof.
 - [ ] Docs: `docs/architecture.md` tier model; `docs/simulation-tiers-and-pipeline.md`
       scope, bands, and cadences.
 

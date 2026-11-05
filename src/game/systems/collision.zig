@@ -40,6 +40,14 @@ const no_component_row = @import("../data_system/types.zig").no_component_row;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
+const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
+
+fn liveTierExcludesCollision(data: *const DataSystem) bool {
+    inline for (std.meta.tags(SimulationTier)) |tier| {
+        if (!tier.allowsCollision() and data.tierCount(tier) != 0) return true;
+    }
+    return false;
+}
 const EntityId = @import("../data_system.zig").EntityId;
 const hot_soa_column_alignment = @import("../data_system.zig").hot_soa_column_alignment;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -1130,7 +1138,7 @@ pub const CollisionSystem = struct {
         const sweep = try self.buildBanded(data, config.scope_dense_indices, config.strips, threads, &stats);
         // The query reads proxies only, so it runs before the narrowphase and the
         // narrowphase writes order keys only when a static or stored pair will be merged.
-        const exclude = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0;
+        const exclude = liveTierExcludesCollision(data);
         const moved = try self.gatherStaticPairs(data, view, threads, exclude, &stats);
         if (moved) return error.StaticMovedOutsideCommit;
         const store = &self.trigger_store;

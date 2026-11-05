@@ -1352,17 +1352,29 @@ fn thinkTestGrid() SimulationScopeSystem.ThinkCellGrid {
     };
 }
 
-// The unstaggered think set: order, halo, index, merge. Inline.
+fn markThinkRowsAlwaysActive(data: *DataSystem) !void {
+    const count = data.ai_agents.len();
+    for (0..count) |row| {
+        const entity = data.aiAgentSliceConst().entities[row];
+        var metadata = data_test_support.simulationMetadata(data, entity) orelse continue;
+        if (metadata.always_active) continue;
+        metadata.always_active = true;
+        try data.setSimulationMetadata(entity, metadata);
+    }
+}
+
+// The full think set: order, population, index, merge. Inline.
 fn thinkSetInline(scope: *SimulationScopeSystem, data: *DataSystem) ![]const u32 {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     try scope.reserveAiRows(data.ai_agents.len());
+    try markThinkRowsAlwaysActive(data);
     try scope.orderThinkPhases(data, null, thinkTestGrid(), &threads, .{});
-    const halo = (try scope.gatherAiPopulations(data, null, &threads, .{})).halo;
+    const halo = (try scope.gatherAiPopulations(data, null, &threads, .{})).population;
     var index = spatial_index.SpatialIndexSystem.init(std.testing.allocator);
     defer index.deinit();
     _ = try buildInline(&index, data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, thinkTestGeometry(), .{});
-    return scope.mergeThinkSet(data, 0, false);
+    return scope.mergeThinkSet(data, 0);
 }
 
 const data_test_support = @import("../data_system/test_support.zig");

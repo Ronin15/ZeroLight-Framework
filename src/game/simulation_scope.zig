@@ -3,7 +3,8 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! State-owned simulation tier and active-scope contracts.
-//! Tier/chunk scoping drives cognition-stage gating by camera halo, stagger cadence, and tier commands.
+//! Bands from the observer's fixed-step view set think cadence and collision fidelity.
+//! `dormant` is inert rows only; agents are never assigned it.
 
 const std = @import("std");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
@@ -19,18 +20,16 @@ comptime {
     std.debug.assert(cognition_stagger_n <= keep_stagger_phase);
 }
 
-/// Simulation LOD bands as chunk distance from the camera-visible border. An
-/// entity's tier is the band its chunk falls into: within cognition_halo it
-/// thinks; out to locomotion_halo it moves+collides; out to kinematic_halo it
-/// moves only; beyond that it is dormant (fully asleep). The bands must be
-/// monotonically increasing.
+/// Simulation LOD bands as chunk distance from the observer's fixed-step view.
+/// An entity's tier is the band its chunk falls into. The bands must be
+/// monotonically increasing. Past the kinematic halo the band is `lowest`.
 ///
 /// Sized in chunks (1 chunk = chunk_size_tiles × tile_size px; e.g. 8×32 = 256 px).
 /// These are radii BEYOND the visible region, so cognition must clear a full screen
 /// of margin or entities pop-think as they scroll in: a 4K width (3840 px) is ~15
 /// chunks, so cognition ≥ 16 keeps a screen-wide thinking halo. Defaults give
 /// roughly one screen of cognition margin, then a screen each of locomotion and
-/// kinematic before dormant. Tune to your world/camera scale and perf budget.
+/// kinematic before the lowest band. Tune to your world/camera scale and perf budget.
 pub const cognition_halo_chunks: u16 = 16;
 pub const locomotion_halo_chunks: u16 = 32;
 pub const kinematic_halo_chunks: u16 = 48;
@@ -39,7 +38,7 @@ pub const kinematic_halo_chunks: u16 = 48;
 /// (chunk_x, chunk_y, level); applied via `lodDistance`. At the default 16
 /// (= cognition_halo_chunks) one level off the camera lands on the cognition edge,
 /// so an on-screen entity one level away still thinks; two levels off (32) drops to
-/// locomotion, three (48) to kinematic, four+ to dormant. Lower it to keep more
+/// locomotion, three (48) to kinematic, four+ to the lowest band. Lower it to keep more
 /// depth layers in cognition (a px depth ÷ px-per-chunk in spirit, like the halos
 /// above). Tunable to the world's level spacing and per-level perf budget.
 pub const level_distance_chunks: u16 = 16;
@@ -49,41 +48,76 @@ comptime {
     std.debug.assert(locomotion_halo_chunks <= kinematic_halo_chunks);
 }
 
-/// Persistent capability tier for an entity.
-pub const SimulationTier = enum(u2) {
+/// Residue modulus. Every think cadence divides it.
+pub const band_residue_n: u8 = 64;
+pub const locomotion_think_cadence: u8 = 16;
+pub const kinematic_think_cadence: u8 = 32;
+pub const lowest_think_cadence: u8 = 64;
+
+/// Persistent capability tier for an entity. `lowest` is the far band.
+/// `dormant` is inert rows only.
+pub const SimulationTier = enum(u3) {
     dormant,
     kinematic,
     locomotion,
     cognition,
+    lowest = 4,
 
     pub fn allowsMovement(self: SimulationTier) bool {
-        return switch (self) {
-            .dormant => false,
-            .kinematic, .locomotion, .cognition => true,
-        };
+        return self != .dormant;
     }
 
     pub fn allowsCollision(self: SimulationTier) bool {
         return switch (self) {
-            .dormant, .kinematic => false,
             .locomotion, .cognition => true,
+            .dormant, .kinematic, .lowest => false,
         };
     }
 
     pub fn allowsCognition(self: SimulationTier) bool {
-        return self == .cognition;
+        return self != .dormant;
     }
 };
 
-/// Maps a chunk's distance from the visible region to its LOD tier. This is the
-/// simulation-LOD ladder the halo policy applies every step: near entities think,
-/// far entities sleep. `distance` is the chebyshev chunk distance (0 inside the
-/// visible region); see `ActiveRegion.chunkDistance`.
+/// Steps between thinks for `tier`. `dormant` does not think.
+pub fn thinkCadence(tier: SimulationTier) u8 {
+    return switch (tier) {
+        .cognition => cognition_stagger_n,
+        .locomotion => locomotion_think_cadence,
+        .kinematic => kinematic_think_cadence,
+        .lowest => lowest_think_cadence,
+        .dormant => 0,
+    };
+}
+
+/// `always_active` thinks every step. Otherwise `step % cadence == phase % cadence`.
+pub fn thinksThisStep(tier: SimulationTier, always_active: bool, phase: u8, step: u32) bool {
+    if (always_active) return true;
+    const cadence: u32 = thinkCadence(tier);
+    if (cadence == 0) return false;
+    return step % cadence == @as(u32, phase) % cadence;
+}
+
+/// One always-active group, then each tier's residues.
+pub const think_group_count: usize = 1 + std.meta.tags(SimulationTier).len * @as(usize, band_residue_n);
+
+comptime {
+    std.debug.assert(band_residue_n <= keep_stagger_phase);
+    std.debug.assert(band_residue_n % cognition_stagger_n == 0);
+    std.debug.assert(band_residue_n % locomotion_think_cadence == 0);
+    std.debug.assert(band_residue_n % kinematic_think_cadence == 0);
+    std.debug.assert(band_residue_n % lowest_think_cadence == 0);
+    std.debug.assert(think_group_count == 321);
+}
+
+/// Maps a chunk's distance from the visible region to its LOD band.
+/// `distance` is the chebyshev chunk distance (0 inside the region). Past the
+/// kinematic halo the band is `lowest`.
 pub fn tierForChunkDistance(distance: i32) SimulationTier {
     if (distance <= cognition_halo_chunks) return .cognition;
     if (distance <= locomotion_halo_chunks) return .locomotion;
     if (distance <= kinematic_halo_chunks) return .kinematic;
-    return .dormant;
+    return .lowest;
 }
 
 pub const ChunkCoord = struct {
@@ -149,8 +183,7 @@ pub const EntitySimulationMetadata = struct {
     /// one (a supplied level must match), else keeps the row's level at `null` (the default)
     /// and writes any other value; a read returns the row's level.
     level: ?u16 = null,
-    /// Which step within the stagger cycle this entity runs cognition, below
-    /// `cognition_stagger_n`. The first AI arrival in a `(level, cell)` takes that
+    /// Residue within `band_residue_n`. The first AI arrival in a `(level, cell)` takes that
     /// level's next origin and later arrivals take the cell's next residue. The append
     /// stripe `dense_index % cognition_stagger_n` is only the unsettled placeholder.
     /// `keep_stagger_phase` and `setSimulationTier` keep the stored phase; `removeAt`
@@ -164,7 +197,7 @@ pub const EntitySimulationMetadata = struct {
     always_active: bool = false,
 
     pub fn validate(self: EntitySimulationMetadata) error{InvalidStaggerPhase}!void {
-        if (self.stagger_phase != keep_stagger_phase and self.stagger_phase >= cognition_stagger_n) return error.InvalidStaggerPhase;
+        if (self.stagger_phase != keep_stagger_phase and self.stagger_phase >= band_residue_n) return error.InvalidStaggerPhase;
     }
 };
 
@@ -176,6 +209,7 @@ pub const SimulationScopeStats = struct {
     kinematic_entities: usize = 0,
     locomotion_entities: usize = 0,
     cognition_entities: usize = 0,
+    lowest_entities: usize = 0,
     movement_stage_entities: usize = 0,
     collision_stage_entities: usize = 0,
     collision_response_stage_entities: usize = 0,
@@ -183,18 +217,17 @@ pub const SimulationScopeStats = struct {
     steering_stage_entities: usize = 0,
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`. `stagger_skips` is the sum of the other
-    /// in-halo phase run lengths this step (a bodiless row counts), not the indexed halo.
-    /// `chunk_filtered_entities` is cognition entities excluded because their chunk is
-    /// outside the halo.
+    /// Kept only with `runtime_perf_log.enabled`. `stagger_skips` is the not-due
+    /// run length this step (a bodiless row counts). `chunk_filtered_entities`
+    /// stays 0: the index is the whole AI population.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         stagger_skips: usize = 0,
         chunk_filtered_entities: usize = 0,
     } else struct {};
 };
 
-/// Transient fixed-step scope. active_region is the cognition halo (camera visible
-/// chunks expanded by cognition_halo_chunks); null means no visibility data yet.
+/// Transient fixed-step scope. `active_region` is the fixed-step view's chunk
+/// region. Null assigns `lowest`; cadence still applies.
 pub const SimulationScope = struct {
     active_region: ?ActiveRegion = null,
     stats: SimulationScopeStats = .{},
@@ -202,11 +235,21 @@ pub const SimulationScope = struct {
 
 test "simulation tier capabilities are monotonic" {
     try std.testing.expect(!SimulationTier.dormant.allowsMovement());
+    try std.testing.expect(!SimulationTier.dormant.allowsCollision());
+    try std.testing.expect(!SimulationTier.dormant.allowsCognition());
     try std.testing.expect(SimulationTier.kinematic.allowsMovement());
     try std.testing.expect(!SimulationTier.kinematic.allowsCollision());
+    try std.testing.expect(SimulationTier.kinematic.allowsCognition());
     try std.testing.expect(SimulationTier.locomotion.allowsCollision());
-    try std.testing.expect(!SimulationTier.locomotion.allowsCognition());
+    try std.testing.expect(SimulationTier.locomotion.allowsCognition());
     try std.testing.expect(SimulationTier.cognition.allowsCognition());
+    try std.testing.expect(SimulationTier.lowest.allowsMovement());
+    try std.testing.expect(!SimulationTier.lowest.allowsCollision());
+    try std.testing.expect(SimulationTier.lowest.allowsCognition());
+    try std.testing.expect(thinksThisStep(.cognition, false, 4, 0));
+    try std.testing.expect(!thinksThisStep(.locomotion, false, 4, 5));
+    try std.testing.expect(thinksThisStep(.lowest, true, 3, 1));
+    try std.testing.expect(!thinksThisStep(.dormant, false, 0, 0));
 }
 
 test "active region validates and contains half-open chunks" {
@@ -257,8 +300,8 @@ test "tierForChunkDistance walks the LOD ladder by band" {
     try std.testing.expectEqual(SimulationTier.locomotion, tierForChunkDistance(locomotion_halo_chunks));
     try std.testing.expectEqual(SimulationTier.kinematic, tierForChunkDistance(locomotion_halo_chunks + 1));
     try std.testing.expectEqual(SimulationTier.kinematic, tierForChunkDistance(kinematic_halo_chunks));
-    try std.testing.expectEqual(SimulationTier.dormant, tierForChunkDistance(kinematic_halo_chunks + 1));
-    try std.testing.expectEqual(SimulationTier.dormant, tierForChunkDistance(1000));
+    try std.testing.expectEqual(SimulationTier.lowest, tierForChunkDistance(kinematic_halo_chunks + 1));
+    try std.testing.expectEqual(SimulationTier.lowest, tierForChunkDistance(1000));
 }
 
 test "stagger phase rotates across all entities over cognition_stagger_n steps" {

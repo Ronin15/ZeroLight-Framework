@@ -24,6 +24,7 @@ const no_component_row = types.no_component_row;
 const EntitySimulationMetadata = @import("../simulation_scope.zig").EntitySimulationMetadata;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
+const band_residue_n = @import("../simulation_scope.zig").band_residue_n;
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 
@@ -538,7 +539,7 @@ pub const MovementBodyStore = struct {
         assume_capacity: bool,
     ) !u8 {
         if (arrivals.getPtr(key)) |count| {
-            const phase: u8 = @intCast(count.next % cognition_stagger_n);
+            const phase: u8 = @intCast(count.next % band_residue_n);
             count.next += 1;
             count.live += 1;
             return phase;
@@ -551,7 +552,7 @@ pub const MovementBodyStore = struct {
         std.debug.assert(!cell_gop.found_existing);
         cell_gop.value_ptr.* = .{ .next = origin + 1, .live = 1 };
         level_gop.value_ptr.* = origin + 1;
-        return @intCast(origin % cognition_stagger_n);
+        return @intCast(origin % band_residue_n);
     }
 
     pub fn setTier(self: *MovementBodyStore, index: usize, tier: SimulationTier) void {

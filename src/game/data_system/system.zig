@@ -100,6 +100,7 @@ const NullStructuralChangeSink = structural.NullStructuralChangeSink;
 const NullStructuralCommitPreparer = structural.NullStructuralCommitPreparer;
 const EntitySimulationMetadata = @import("../simulation_scope.zig").EntitySimulationMetadata;
 const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
+const band_residue_n = @import("../simulation_scope.zig").band_residue_n;
 const keep_stagger_phase = @import("../simulation_scope.zig").keep_stagger_phase;
 const SimulationScopeStats = @import("../simulation_scope.zig").SimulationScopeStats;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
@@ -113,7 +114,7 @@ pub const DataSystem = struct {
     // Live entity count per simulation tier, maintained incrementally on
     // create/destroy/metadata-change so the per-fixed-step scope stats are O(1)
     // instead of scanning every slot. Indexed by @backingInt(SimulationTier).
-    tier_counts: [4]usize = .{ 0, 0, 0, 0 },
+    tier_counts: [std.meta.tags(SimulationTier).len]usize = @splat(0),
     /// Stamp of movement-row collision allowance. Zero is a packed epoch, not an
     /// unpacked marker. It moves when a tier crosses `allowsCollision`, and when a
     /// movement row is removed, because `swapRemove` can retarget that index.
@@ -285,7 +286,7 @@ pub const DataSystem = struct {
     /// when it has one, and a supplied level must match it; without one, a `null` level
     /// keeps the row's.
     /// Requires a movement body; returns error.InvalidEntity otherwise, and
-    /// error.InvalidStaggerPhase for any other phase not below `cognition_stagger_n`.
+    /// error.InvalidStaggerPhase for any other phase not below `band_residue_n`.
     pub fn setSimulationMetadata(self: *DataSystem, id: EntityId, metadata: EntitySimulationMetadata) !void {
         try metadata.validate();
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
@@ -294,7 +295,7 @@ pub const DataSystem = struct {
         var resolved = metadata;
         const names_phase = resolved.stagger_phase != keep_stagger_phase;
         if (!names_phase) resolved.stagger_phase = stored.stagger_phase;
-        std.debug.assert(resolved.stagger_phase < cognition_stagger_n);
+        std.debug.assert(resolved.stagger_phase < band_residue_n);
         if (slot.world_level_index) |world_level_index| {
             const world_level = self.world_levels.get(@intCast(world_level_index));
             if (metadata.level) |level| std.debug.assert(level == world_level);
@@ -415,8 +416,7 @@ pub const DataSystem = struct {
         self.mirrorLinkedScope(row);
     }
 
-    // Dormant and kinematic are the tiers that do not allow collision. Locomotion
-    // and cognition cross neither each other nor this stamp. The entity is recorded
+    // A tier that crosses `allowsCollision` stamps the epoch. The entity is recorded
     // before the bump; a failed append leaves the epoch and the tier alone.
     fn noteCollisionAllow(self: *DataSystem, id: EntityId, old_tier: SimulationTier, new_tier: SimulationTier) error{OutOfMemory}!void {
         if (old_tier.allowsCollision() == new_tier.allowsCollision()) return;
@@ -456,14 +456,17 @@ pub const DataSystem = struct {
     /// the scoped gather filters. `total_entities` is the count of entities carrying a
     /// simulation tier (i.e. those with a movement body), not the full live-entity set.
     pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
+        var total_entities: usize = 0;
+        for (self.tier_counts) |count| total_entities += count;
         return .{
-            .total_entities = self.tier_counts[0] + self.tier_counts[1] + self.tier_counts[2] + self.tier_counts[3],
+            .total_entities = total_entities,
             .dormant_entities = self.tier_counts[@backingInt(SimulationTier.dormant)],
             .kinematic_entities = self.tier_counts[@backingInt(SimulationTier.kinematic)],
             .locomotion_entities = self.tier_counts[@backingInt(SimulationTier.locomotion)],
             .cognition_entities = self.tier_counts[@backingInt(SimulationTier.cognition)],
+            .lowest_entities = self.tier_counts[@backingInt(SimulationTier.lowest)],
             .movement_stage_entities = self.movement_bodies.advancing,
-            .collision_stage_entities = self.collision_bounds.dynamic_ids.items.len,
+            .collision_stage_entities = self.collision_bounds.colliding,
             .collision_response_stage_entities = self.collision_responses.len(),
             .ai_stage_entities = self.ai_agents.len(),
             .steering_stage_entities = self.steering_agents.len(),
@@ -548,7 +551,7 @@ pub const DataSystem = struct {
 
         self.first_free_slot = null;
         self.free_slot_count = self.slots.items.len;
-        self.tier_counts = .{ 0, 0, 0, 0 };
+        self.tier_counts = @splat(0);
         for (self.slots.items, 0..) |*slot, index| {
             slot.generation = retiredSlotGeneration(slot.generation);
             slot.alive = false;
@@ -1645,8 +1648,8 @@ fn destructibleDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
 
 /// Per-tier counts from an O(rows) scan of the dense scope tier column: the parity
 /// baseline for the incrementally maintained `DataSystem.tier_counts`.
-fn scanLiveTierCounts(data: *const DataSystem) [4]usize {
-    var counts = [4]usize{ 0, 0, 0, 0 };
+fn scanLiveTierCounts(data: *const DataSystem) [std.meta.tags(SimulationTier).len]usize {
+    var counts: [std.meta.tags(SimulationTier).len]usize = @splat(0);
     for (data.movement_bodies.scopeSliceConst().tier) |tier| {
         counts[@backingInt(tier)] += 1;
     }
@@ -2030,8 +2033,10 @@ test "a simulation metadata write keeps the row's stagger phase and level unless
     try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
     try std.testing.expectEqual(@as(?u16, 2), data_test_support.simulationMetadata(&data, entity).?.level);
 
-    try std.testing.expectError(error.InvalidStaggerPhase, data.setSimulationMetadata(entity, .{ .stagger_phase = cognition_stagger_n }));
-    try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
+    try data.setSimulationMetadata(entity, .{ .stagger_phase = band_residue_n - 1 });
+    try std.testing.expectEqual(@as(u8, band_residue_n - 1), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
+    try std.testing.expectError(error.InvalidStaggerPhase, data.setSimulationMetadata(entity, .{ .stagger_phase = band_residue_n }));
+    try std.testing.expectEqual(@as(u8, band_residue_n - 1), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
 }
 
 fn createStaggerBody(data: *DataSystem, x: f32, y: f32, level: u16, ai: bool) !EntityId {
@@ -2121,7 +2126,7 @@ test "stagger phases in one cell stay spread when the spawn period shares a fact
     for (0..2 * cognition_stagger_n) |i| {
         const x = @as(f32, @floatFromInt(i)) * 32;
         const entity = try createStaggerBody(&singles, x, 0, 0, true);
-        try std.testing.expectEqual(@as(u8, @intCast(i % cognition_stagger_n)), data_test_support.simulationMetadata(&singles, entity).?.stagger_phase);
+        try std.testing.expectEqual(@as(u8, @intCast(i % band_residue_n)), data_test_support.simulationMetadata(&singles, entity).?.stagger_phase);
     }
 }
 
@@ -4100,10 +4105,11 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.kinematic)], stats.kinematic_entities);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.locomotion)], stats.locomotion_entities);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.cognition)], stats.cognition_entities);
+    try std.testing.expectEqual(scan[@backingInt(SimulationTier.lowest)], stats.lowest_entities);
     try std.testing.expectEqual(@as(usize, 3), stats.total_entities);
 
     data.clearRetainingCapacity();
-    try std.testing.expectEqual([4]usize{ 0, 0, 0, 0 }, data.tier_counts);
+    try std.testing.expectEqual(@as([std.meta.tags(SimulationTier).len]usize, @splat(0)), data.tier_counts);
     try std.testing.expectEqual(@as(usize, 0), data.simulationScopeStatsFullActive().total_entities);
 }
 

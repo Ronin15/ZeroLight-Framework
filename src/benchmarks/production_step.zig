@@ -23,7 +23,7 @@
 //! wall time minus the off-main time of the logged and bench-only batches that ran on
 //! workers (an upper bound: batches neither carries count as main), and `untimed` is the wall
 //! time no top-level stage timer holds, the log's and the sink's bench-only timers both.
-//! `tiers=` splits the rows by scope tier (cognition/locomotion/kinematic/dormant),
+//! `tiers=` splits the rows by scope tier (cognition/locomotion/kinematic/dormant/lowest),
 //! `thinking=` counts the rows the AI stage ran, `separation_per_thinking=` the AI separation
 //! candidate checks and neighbor samples per thinking row, and `top_main=` names the three
 //! top-level stages with the most main time. `--details` adds each top-level stage's
@@ -38,8 +38,8 @@
 //! of `cognition_stagger_n` (0 stays 0) and warmup does not. `thinking_step=` is that
 //! window's per-step AI-row min-max, and `ai_step=` / `steering_step=` the per-step
 //! `pipeline_ai` / `pipeline_steering` wall min-max. On item `1024008001024` the stagger
-//! balance pass is that minimum not 0 and a non-zero mean of the other in-halo phase
-//! run lengths (`stagger_skips`). Adding those lengths to the AI rows is not the indexed halo.
+//! balance pass is that minimum not 0 and a non-zero `stagger_skips`. `stagger_skips` is
+//! the not-due run length.
 //!
 //! Every case runs the same pre-measure steps (the warmup plus the adaptive settle limit), so
 //! the serial and tuned cases measure the same simulated state. The tuned case then reports
@@ -51,11 +51,12 @@
 //! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
 //! side and in level count at a fixed population, every row advances at its tier and the cost
 //! per advancing row stays flat; flat in inert rows; `stacked` separation checks and samples
-//! per thinking row flat in levels, since a query reads only its own level. On
+//! per thinking row flat in levels, since a query reads only its own level. On `spread`
+//! the five tier counts sum to `rows`. On
 //! `1024008001024` (spread, 1,024 agents, the base side and level count) `thinking_step`'s
-//! minimum is not 0 and the mean `stagger_skips` is not 0. Those skips are the other
-//! in-halo phase run lengths, so adding them to the AI rows is not the indexed halo
-//! while a bodiless row can sit in an in-halo run. Asserts check
+//! minimum stays non-zero and the mean `stagger_skips` is not 0. `stagger_skips` is the
+//! not-due run length. Movement items stay on the advancing count and index items stay
+//! on the AI count. Asserts check
 //! the committed population and that every step finishes; on `stacked`, separation checks
 //! per thinking row within `check_bound=`, the most rows of one level any query's scan box
 //! holds at the measured steps' index input (the pre-measure snapshot, each row widened by
@@ -260,6 +261,7 @@ const census_metrics = [_]Metric{
     .scope_locomotion_entities,
     .scope_kinematic_entities,
     .scope_dormant_entities,
+    .scope_lowest_entities,
     .scope_ai_stage_entities,
     .scope_stagger_skips,
     .ai_entities,
@@ -565,13 +567,8 @@ const CellSpanRecord = struct {
     }
 };
 
-// The `stacked` pass shape per config: separation checks per thinking row within the most
-// rows of one level any query's scan box holds, and that bound below the query's check
-// budget, so a query that also reads other levels fails it.
-// Spread at 1,024 agents on the base world (`1024008001024`): thinking stays off zero and
-// off the whole cognition halo. Other items are not this shape (`stacked` thinks every row).
-// Pass: some row thinks, and another in-halo phase run has length. `stagger_skips` is
-// those run lengths, a bodiless row included, so it is not added back into an indexed halo.
+// Spread at 1,024 agents on the base world (`1024008001024`): thinking stays off zero
+// and `stagger_skips` (the not-due run length) is not 0.
 fn checkStaggerBalance(item_count: usize, summary: *const suite.ProductionStepSummary) !void {
     if (item_count != stagger_balance_item or summary.measured_steps == 0) return;
     const other_phase_runs = summary.metrics.get(.scope_stagger_skips);
@@ -581,6 +578,29 @@ fn checkStaggerBalance(item_count: usize, summary: *const suite.ProductionStepSu
     return error.StaggerThinkingIsTheHalo;
 }
 
+// On `spread`, the five tier counts sum to the movement rows.
+fn checkSpreadTierSum(fields: StepFields, summary: *const suite.ProductionStepSummary) !void {
+    if (fields.shape != .spread or summary.measured_steps == 0) return;
+    const tiers = summary.metrics.get(.scope_cognition_entities) +
+        summary.metrics.get(.scope_locomotion_entities) +
+        summary.metrics.get(.scope_kinematic_entities) +
+        summary.metrics.get(.scope_dormant_entities) +
+        summary.metrics.get(.scope_lowest_entities);
+    if (tiers == @as(u64, summary.population)) return;
+    std.debug.print("production-step: tiers {}/{}/{}/{}/{} rows {}\n", .{
+        summary.metrics.get(.scope_cognition_entities),
+        summary.metrics.get(.scope_locomotion_entities),
+        summary.metrics.get(.scope_kinematic_entities),
+        summary.metrics.get(.scope_dormant_entities),
+        summary.metrics.get(.scope_lowest_entities),
+        summary.population,
+    });
+    return error.TierSumMissesRows;
+}
+
+// The `stacked` pass shape per config: separation checks per thinking row within the most
+// rows of one level any query's scan box holds, and that bound below the query's check
+// budget, so a query that also reads other levels fails it.
 fn checkStackedSeparation(allocator: std.mem.Allocator, summary: *suite.ProductionStepSummary, fields: StepFields, record: *const CellSpanRecord) !void {
     const scan_radius: u32 = @intCast(math.ceilToI32(separation_radius / record.cell_size));
     const bound = try record.oneLevelBoxBound(allocator, fields.levels, scan_radius);
@@ -749,6 +769,7 @@ const Census = struct {
             summary.bench_batch_recorded_steps.set(stage, self.bench_batch_recorded_steps.get(stage));
         }
         for (std.meta.tags(Metric)) |metric| summary.metrics.set(metric, @intCast(self.metrics.get(metric) / steps));
+        self.partitionTierMeans(&summary);
         summary.thinking_min = self.thinking_min;
         summary.thinking_max = self.thinking_max;
         summary.ai_wall_min_ns = self.ai_wall_min_ns;
@@ -756,6 +777,44 @@ const Census = struct {
         summary.steering_wall_min_ns = self.steering_wall_min_ns;
         summary.steering_wall_max_ns = self.steering_wall_max_ns;
         return summary;
+    }
+
+    // The five tier means partition `rows` when every measured step's tiers do.
+    fn partitionTierMeans(self: *const Census, summary: *suite.ProductionStepSummary) void {
+        if (self.steps == 0) return;
+        const steps: u128 = self.steps;
+        const tier_metrics = [_]Metric{
+            .scope_cognition_entities,
+            .scope_locomotion_entities,
+            .scope_kinematic_entities,
+            .scope_dormant_entities,
+            .scope_lowest_entities,
+        };
+        var total: u128 = 0;
+        for (tier_metrics) |metric| total += self.metrics.get(metric);
+        const rows: u128 = summary.population;
+        if (total != rows * steps) return;
+        var floors: [tier_metrics.len]u64 = undefined;
+        var remainders: [tier_metrics.len]u128 = undefined;
+        var sum: u64 = 0;
+        for (tier_metrics, 0..) |metric, index| {
+            const value = self.metrics.get(metric);
+            floors[index] = @intCast(value / steps);
+            remainders[index] = value % steps;
+            sum += floors[index];
+        }
+        var leftover: u64 = @intCast(rows - @as(u128, sum));
+        while (leftover > 0) {
+            var best: usize = 0;
+            for (remainders[1..], 1..) |remainder, index| {
+                if (remainder > remainders[best]) best = index;
+            }
+            if (remainders[best] == 0) return;
+            floors[best] += 1;
+            remainders[best] = 0;
+            leftover -= 1;
+        }
+        for (tier_metrics, floors) |metric, value| summary.metrics.set(metric, value);
     }
 
     // Every batch that ran, under its top-level stage: calls per measured step, items per
@@ -980,6 +1039,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
     }
     try checkStaggerBalance(item_count, &stats.production_step.?);
+    try checkSpreadTierSum(fields, &stats.production_step.?);
     if (case.adaptive) stats.tuner_settle = settle.measured();
     if (threads.workerThreadCount() > 0) try checkPinnedDispatch(&step, &stats.details);
     return stats;
@@ -1081,11 +1141,12 @@ fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.
     const summary = &summary_value;
     try suite.writeShare(writer, "main", summary.main_ns, stats.mean_ns);
     try suite.writeShare(writer, "untimed", summary.untimed_ns, stats.mean_ns);
-    try writer.print(" tiers={}/{}/{}/{} thinking={}", .{
+    try writer.print(" tiers={}/{}/{}/{}/{} thinking={}", .{
         summary.metrics.get(.scope_cognition_entities),
         summary.metrics.get(.scope_locomotion_entities),
         summary.metrics.get(.scope_kinematic_entities),
         summary.metrics.get(.scope_dormant_entities),
+        summary.metrics.get(.scope_lowest_entities),
         summary.metrics.get(.scope_ai_stage_entities),
     });
     try writer.print(" thinking_step={}-{} ai_step={f}-{f} steering_step={f}-{f}", .{

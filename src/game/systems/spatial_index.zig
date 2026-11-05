@@ -47,7 +47,7 @@ const Faction = @import("../data_system.zig").Faction;
 const FactionSet = @import("../faction.zig").FactionSet;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const WorldSystem = @import("../world/system.zig").WorldSystem;
-const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
+const band_residue_n = @import("../simulation_scope.zig").band_residue_n;
 const keep_stagger_phase = @import("../simulation_scope.zig").keep_stagger_phase;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
@@ -243,7 +243,7 @@ pub const SpatialIndexView = struct {
     /// The population row each entry was indexed from.
     population_row: []const u32,
     /// Each entry's body's cognition phase at the build: `every_cognition_phase` for an
-    /// `always_active` body, else its stagger phase, below `cognition_stagger_n`.
+    /// `always_active` body, else its stagger phase, below `band_residue_n`.
     cognition_phase: []const u8,
     // Each populated cell's first entry in key order, then the entry count: cell c's entries
     // are `[cells[c], cells[c + 1])`.
@@ -405,16 +405,16 @@ const FactionBits = @FieldType(FactionSet, "bits");
 pub const every_cognition_phase: u8 = std.math.maxInt(u8);
 
 // A body's cognition phase as the index stores it. A stored stagger phase is below
-// `cognition_stagger_n` (`setSimulationMetadata` validates every write).
+// `band_residue_n` (`setSimulationMetadata` validates every write).
 fn cognitionPhase(always_active: bool, stagger_phase: u8) u8 {
     if (always_active) return every_cognition_phase;
-    std.debug.assert(stagger_phase < cognition_stagger_n);
+    std.debug.assert(stagger_phase < band_residue_n);
     return stagger_phase;
 }
 
 comptime {
     // No stagger phase reads as `every_cognition_phase`.
-    std.debug.assert(cognition_stagger_n < every_cognition_phase);
+    std.debug.assert(band_residue_n < every_cognition_phase);
 }
 
 // Local rows 0 to 63: the domain `cellMajorSpan`'s row search bisects.

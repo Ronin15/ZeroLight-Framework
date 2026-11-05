@@ -136,6 +136,7 @@ pub const Metric = enum {
     scope_kinematic_entities,
     scope_locomotion_entities,
     scope_cognition_entities,
+    scope_lowest_entities,
     scope_movement_stage_entities,
     scope_collision_stage_entities,
     scope_collision_response_stage_entities,
@@ -765,7 +766,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.info(
-            "perf {d:.1}s scope total={} dormant={} kinematic={} locomotion={} cognition={} stage movement={} collision={} response={} ai={} steering={} stagger_skips={} chunk_filtered={}",
+            "perf {d:.1}s scope total={} dormant={} kinematic={} locomotion={} cognition={} lowest={} stage movement={} collision={} response={} ai={} steering={} stagger_skips={} chunk_filtered={}",
             .{
                 elapsed_s,
                 self.metricValue(.scope_total_entities),
@@ -773,6 +774,7 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.scope_kinematic_entities),
                 self.metricValue(.scope_locomotion_entities),
                 self.metricValue(.scope_cognition_entities),
+                self.metricValue(.scope_lowest_entities),
                 self.metricValue(.scope_movement_stage_entities),
                 self.metricValue(.scope_collision_stage_entities),
                 self.metricValue(.scope_collision_response_stage_entities),

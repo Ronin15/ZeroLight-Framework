@@ -51,6 +51,7 @@ const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const CommitSeamResult = @import("../game/simulation_pipeline.zig").CommitSeamResult;
 const suite = @import("suite.zig");
+const data_test_support = @import("../game/data_system/test_support.zig");
 
 /// The case's thread system, or null for the serial case.
 pub fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
@@ -80,6 +81,18 @@ pub fn addBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, mobility
     try data.setCollisionBounds(entity, .{ .size = size });
     try data.setCollisionResponse(entity, .{ .mobility = mobility });
     return entity;
+}
+
+/// Marks every AI row `always_active` so the think set is the whole population.
+pub fn markAlwaysActive(data: *DataSystem) !void {
+    const count = data.ai_agents.len();
+    for (0..count) |row| {
+        const entity = data.aiAgentSliceConst().entities[row];
+        var metadata = data_test_support.simulationMetadata(data, entity) orelse continue;
+        if (metadata.always_active) continue;
+        metadata.always_active = true;
+        try data.setSimulationMetadata(entity, metadata);
+    }
 }
 
 /// A bench's production commit seam: a `SimulationPipeline` over a bench's data with nav over

@@ -323,12 +323,13 @@ fn prepareThinkSet(allocator: std.mem.Allocator, data: *DataSystem, world: *cons
     errdefer scope.deinit();
     try scope.reserveAiRows(data.ai_agents.len());
     const geometry = IndexGeometry.ofWorld(world);
+    try fixtures.markAlwaysActive(data);
     try scope.orderThinkPhases(data, null, thinkGrid(geometry), threads, .{});
-    const halo = (try scope.gatherAiPopulations(data, null, threads, .{})).halo;
+    const halo = (try scope.gatherAiPopulations(data, null, threads, .{})).population;
     var index = SpatialIndexSystem.init(allocator);
     errdefer index.deinit();
     _ = try index.build(data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, geometry, threads, .{});
-    _ = scope.mergeThinkSet(data, 0, false);
+    _ = scope.mergeThinkSet(data, 0);
     try scope.packThinkSpan(data, threads, .{});
     const think_set = scope.ai_cognition_indices.items;
     for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
