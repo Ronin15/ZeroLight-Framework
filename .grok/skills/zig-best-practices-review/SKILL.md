@@ -30,7 +30,7 @@ Hunt for the misses below. Cite the loaded rule. Do not quote it.
 - MultiArrayList: `items(.field)` inside loops vs cached `slice()`; wrong append patterns
 - SIMD/math not through `src/core/simd.zig` / `math.zig`
 - Swallowed errors; missing `errdefer` on partial init
-- Work budgets scaled to world/map size instead of fixed constants
+- Work or memory scaled to world/map extent, or capacity grown outside the population seam
 - Naming/stdlib currency beyond current idiom-lint
 - Threaded-write partitioning: reserve-before-dispatch, disjoint ranges
 
@@ -56,7 +56,7 @@ Keep only CONFIRMED/PLAUSIBLE with `is_real`.
 
 One synthesis agent over confirmed findings. **Do not duplicate** existing
 `tools/lint_idioms.py` rules or guidance already in `.grok/agents/zig-*.md`
-(allocator proofs, ReleaseFast UB, MultiArrayList, fixed budgets, SIMD-through-core,
+(allocator proofs, ReleaseFast UB, MultiArrayList, three budget buckets, SIMD-through-core,
 threaded writes, no test-only production APIs).
 
 Output:

@@ -913,7 +913,7 @@ The current gameplay fixed-step pipeline is:
 5. Update the state-owned follow camera and visible world chunks.
 6. The structural-commit seam, in order: reserve the static-collider rows and
    static nav marks, commit deferred structural commands to `DataSystem` under the
-   budgeted all-or-fail commit, capture the step's static changes into the
+   budgeted structural commit (prefix within share; over-share defers), capture the step's static changes into the
    collider's dirty list, run `SimulationPipeline.syncPopulationCapacity` (the
    population growth seam; its capacities are not one body cap,
    [Structural Commands](simulation-tiers-and-pipeline.md#structural-commands)), sync the static colliders (recording their nav marks;
@@ -1291,10 +1291,10 @@ only. Dense per-step results (visibility,
 last-seen position, nearest threat, heard stimulus) write to `PerceptionStore`
 hot columns; only acquisition/loss transitions emit low-volume
 `entity_perceived`/`entity_lost` domain events, capped per step by
-`SimulationPipelineConfig.perception_max_events_per_step` (caller-sized
-against the pipeline's real per-step event capacity, not a floating library
-default) with drops surfaced through event stats rather than an unhandled
-capacity error.
+the pipeline's seam-derived perception share
+(`perception_events_per_observer_max` times tracked `AiPerception` rows, grown
+only in `syncPopulationCapacity`) with drops surfaced through event stats
+rather than an unhandled capacity error.
 
 ### AI
 

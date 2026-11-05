@@ -280,13 +280,13 @@ the count it declared.
   deferred `StructuralCommand`s (`destroy_entity` / `set_destructible`) plus a
   scalar `destructible_destroyed` domain event (entity still alive at emit;
   commit still emits `entity_destroyed` for nav local re-mask). Ignores
-  `.use`/`.signal`. Structural + event capacity is preflighted before queuing
-  (dig pattern). `tier_policy` may append more `structural_commands` afterward
+  `.use`/`.signal`. Structural commands that exceed the step's structural event share
+  defer their suffix (dig pattern still preflights before side effects). `tier_policy` may append more `structural_commands` afterward
   via `RangeOutputStream` multi-producer append — action_react does not own the
   stream exclusively. Action intents are **carried** into `action_react`:
   wall-clock appends happen in `main_thread_inputs` via `captureActionIntent`
-  before `update`, and no stage writes the stream. Capacity is the fixed
-  constant `action_intent_live_capacity` in `simulation.zig` (64), not
+  before `update`, and no stage writes the stream. Capacity is the fixed admission
+  budget `action_intent_live_capacity` in `simulation.zig` (64), not
   map-scaled. Callers warm with
   `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
   (one range slot per sequential append, same shape as stimuli). Optional
@@ -315,8 +315,8 @@ the count it declared.
   are live-only. Live writes go through `SensoryBus.emit`. Required fails;
   optional increments the drop counter and returns false. `writeLiveStimulus`
   is the unchecked frame append under that cap. Sticky and deferred overflow
-  is a counted drop, not a bigger buffer. Capacities are fixed constants
-  (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
+  is a counted drop, not a bigger buffer. Capacities are fixed admission
+  budgets (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
   `stimulus_deferred_capacity`, `stimulus_max_impacts_per_step` in
   `simulation.zig`). Callers warm `stimuli` to `stimulus_live_capacity` during
   state init (demo/pipeline), not scene-scale-derived counts.
@@ -406,10 +406,11 @@ Structural mutation is deferred. Worker ranges and hot processors write
 gameplay state commits them through `SimulationFrame.applyStructuralCommands`
 or `applyStructuralCommandsBudgeted`, which takes a `StructuralCommitBudget`
 (usually `SimulationPipeline.structuralCommitBudget(extra_required_events)`). The
-budgeted commit is all-or-fail: its preflight rejects, before any mutation, a
-commit whose events exceed its own `.structural_commit` share or that, together
-with the `extra_required_events` reserved for after it (the post-commit nav
-reaction), would not fit the shared event bound.
+budgeted commit takes the longest prefix of deferred then fresh commands whose
+structural events fit `.structural_event_share`; the over-share suffix defers to
+the next step. A shared event-bound miss (including `extra_required_events` for
+the post-commit nav reaction) or `OutOfMemory` commits nothing and retains
+nothing.
 
 Commit behavior:
 

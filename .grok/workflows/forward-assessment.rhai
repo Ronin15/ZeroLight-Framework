@@ -189,7 +189,7 @@ doc_prompts.push(arch_prompt);
 
 let standards_prompt = preamble();
 standards_prompt += "Your area is state, input, and engineering constraints. Read .grok/rules/zig-style.md, .grok/rules/memory-performance.md, .grok/rules/tests-benchmarks.md, docs/state-stack-and-input.md, and the ReleaseFast, test, and benchmark parts of docs/development-workflow.md. ";
-standards_prompt += "Judge whether those rules keep new slices allocation-free, deterministically budgeted, and expandable through the state stack without test-only production API surface.";
+standards_prompt += "Judge whether those rules keep new slices allocation-free, on the three budget buckets, and expandable through the state stack without test-only production API surface.";
 doc_prompts.push(standards_prompt);
 
 let render_prompt = preamble();
