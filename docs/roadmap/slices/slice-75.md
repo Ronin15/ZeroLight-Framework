@@ -127,18 +127,27 @@ Scope comes from one camera and puts far entities to sleep.
       fidelity per band set by the design pass.
 - [ ] `dormant` reserved for inert rows, which still advance (57 schedules
       item decay); agents are never dormant.
-- [ ] Rows at rest cost no per-step movement or tier-scan work
+- [x] Rows at rest cost no per-step movement or tier-scan work
       (`movement.zig:55`, `systems/simulation_scope.zig:576`). Failure scenario: items
       and resource nodes at rest raise every step's cost (measured above).
       Pass: `production-step` flat in inert rows. Collision's share is
       the item below; render collect's is [87](slice-87.md).
-- [ ] Collision's share of rows at rest (moved from 86). Failure: an inert
+      Landed: an at-rest row is the suffix past `advancing`. Movement, tier
+      policy, chunk derive, the world gate, and plane entry dispatch that
+      prefix. Measured (Debug, `x86_64_v2`, tuned, `settled=no`, so the step
+      times are not the verdict): inert 0, 1, and 4 at spread P 4,096 keep
+      movement, tier policy, chunk derive, world gate, and plane entry at
+      4097 `items/call` while rows go 4101, 8197, 20485.
+      `scope_movement_stage_entities=4097`.
+- [x] Collision's share of rows at rest (moved from 86). Failure: an inert
       row in a collision tier is gathered, sorted, and swept every step.
       Measured (`production-step` tuned, Debug, `5d5a089`, spread P 4,096):
       0, 1, 4 inert rows per agent give collision main 0.63 / 1.37 / 3.76 ms
       and collision bodies 1,541 / 3,077 / 7,685. Pass: `production-step`
       collision cost flat in inert rows. It runs in the inert-row step after
-      slice 88.
+      slice 88. Landed: an at-rest bounds row leaves `dynamic_ids`. On the
+      same three items, collision fill stays at 1537 `items/call`. The tuned
+      cases printed `settled=no`, so collision main is not the verdict.
 - [ ] Bench-only (`--details`) timers for the untimed stages, so the
       `production-step` census attributes the 2–20% `untimed` share before
       this slice's policy change (`.grok/rules/threading.md`). Landed

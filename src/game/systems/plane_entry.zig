@@ -173,7 +173,7 @@ pub const PlaneEntrySystem = struct {
         self.entries.clearRetainingCapacity();
         const movement = data.movementBodySliceConst();
         const scope = data.scopeColumnsSliceConst();
-        const item_count = movement.entities.len;
+        const item_count = movement.advancing;
         if (item_count == 0) return self.entries.items;
         if (item_count > self.reserved_items) try self.growWindows(item_count);
         std.debug.assert(self.entries.capacity >= item_count);
@@ -816,14 +816,14 @@ test "plane entry gather reads the collision-bounds center and emits in movement
     defer system.deinit();
     const entries = try system.gather(data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), null);
     try std.testing.expectEqual(@as(usize, 2), entries.len);
-    try std.testing.expect(entries[0].entity.eql(bounds));
-    try std.testing.expectEqual(PlaneAction.fall, entries[0].target.action);
-    try std.testing.expectEqual(CellCoord{ .x = 4, .y = 0 }, entries[0].cell);
-    try std.testing.expect(!entries[0].needs_world_level);
-    try std.testing.expect(entries[1].entity.eql(offset));
-    try std.testing.expectEqual(PlaneAction.attach, entries[1].target.action);
-    try std.testing.expectEqual(CellCoord{ .x = 2, .y = 0 }, entries[1].cell);
-    try std.testing.expect(entries[1].needs_world_level);
+    try std.testing.expect(entries[0].entity.eql(offset));
+    try std.testing.expectEqual(PlaneAction.attach, entries[0].target.action);
+    try std.testing.expectEqual(CellCoord{ .x = 2, .y = 0 }, entries[0].cell);
+    try std.testing.expect(entries[0].needs_world_level);
+    try std.testing.expect(entries[1].entity.eql(bounds));
+    try std.testing.expectEqual(PlaneAction.fall, entries[1].target.action);
+    try std.testing.expectEqual(CellCoord{ .x = 4, .y = 0 }, entries[1].cell);
+    try std.testing.expect(!entries[1].needs_world_level);
     try std.testing.expect(!entries[0].entity.eql(visual_only));
     try std.testing.expect(!entries[1].entity.eql(visual_only));
 }

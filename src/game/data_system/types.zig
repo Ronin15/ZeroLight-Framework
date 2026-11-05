@@ -299,6 +299,8 @@ pub const MovementBodySlice = struct {
     has_ai_agent: []const bool,
     /// Mirror of `world_level` presence, written only at the commit seam; read-only here.
     has_world_level: []const bool,
+    /// Rows `[0, advancing)` are this step's movement items. The suffix is at rest.
+    advancing: usize,
 };
 
 pub const ConstMovementBodySlice = struct {
@@ -324,6 +326,8 @@ pub const ConstMovementBodySlice = struct {
     has_ai_agent: []const bool,
     /// Mirror of `world_level` presence, written only at the commit seam; read-only here.
     has_world_level: []const bool,
+    /// Rows `[0, advancing)` are this step's movement items. The suffix is at rest.
+    advancing: usize,
 };
 
 /// Dense simulation-scope columns in lockstep with the movement store rows
@@ -343,6 +347,8 @@ pub const ScopeColumnsSlice = struct {
     level: []const u16,
     stagger_phase: []const u8,
     always_active: []const bool,
+    /// Rows `[0, advancing)` are this step's movement items. The suffix is at rest.
+    advancing: usize,
 };
 
 pub const ConstScopeColumnsSlice = struct {
@@ -353,6 +359,8 @@ pub const ConstScopeColumnsSlice = struct {
     level: []const u16,
     stagger_phase: []const u8,
     always_active: []const bool,
+    /// Rows `[0, advancing)` are this step's movement items. The suffix is at rest.
+    advancing: usize,
 };
 
 pub const FacingData = struct {

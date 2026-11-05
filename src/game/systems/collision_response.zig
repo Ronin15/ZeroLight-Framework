@@ -424,7 +424,7 @@ pub const CollisionResponseSystem = struct {
         const selection = gather_stage.select(contact_count, collision_response_range_alignment_items);
         setSlotCount(GatherRow, &self.gather_rows, selection.range_count);
         const inline_apply = selection.worker_threads == 0;
-        const blocks = blockCount(input.movement_entities.len);
+        const blocks = blockCount(input.advancing);
         if (!inline_apply and blocks != 0) {
             try self.ensureDirectTables(threads.thread_system.participantSlotCount(), blocks);
         }
@@ -530,6 +530,7 @@ pub const CollisionResponseSystem = struct {
                 .contacts = contacts,
                 .observer = observer,
                 .movement_entities = movement.entities,
+                .advancing = movement.advancing,
                 .intents = IntentColumns.of(self.intent_rows.slice()),
                 .triggers = self.trigger_staging.items,
                 .observers = self.observer_staging.items,
@@ -666,6 +667,7 @@ const GatherInput = struct {
     contacts: []const CollisionContact,
     observer: EntityId,
     movement_entities: []const EntityId,
+    advancing: usize,
     intents: IntentColumns,
     triggers: []CollisionTriggerEvent,
     observers: []u32,

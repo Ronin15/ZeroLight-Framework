@@ -81,7 +81,7 @@ pub const WorldGateSystem = struct {
             .excluded_row = player_row orelse no_row,
             .range_count = 0,
         };
-        const row_count = job.input.position_x.len;
+        const row_count = job.input.advancing;
         if (row_count > 0) {
             const gate = Dispatch.init(thread_system, &self.tuner, .{
                 .items_per_range = config.items_per_range,
@@ -168,6 +168,7 @@ const GateInput = struct {
     has_ai_agent: []const bool,
     tier: []const SimulationTier,
     level: []const u16,
+    advancing: usize,
 
     fn of(world: *const WorldSystem, data: *DataSystem, bounds_width: f32, bounds_height: f32) GateInput {
         const movement = data.movementBodySlice();
@@ -190,6 +191,7 @@ const GateInput = struct {
             .has_ai_agent = movement.has_ai_agent,
             .tier = scope.tier,
             .level = scope.level,
+            .advancing = movement.advancing,
         };
     }
 

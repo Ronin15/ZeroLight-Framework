@@ -27,6 +27,7 @@ const EntityId = @import("data_system.zig").EntityId;
 const Faction = @import("data_system.zig").Faction;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
+const StructuralChange = @import("data_system.zig").StructuralChange;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SteeringAgent = @import("data_system.zig").SteeringAgent;
 const ai_archetypes = @import("ai_archetypes.zig");
@@ -890,7 +891,17 @@ fn placeDemoInterestMarkers(world: *WorldSystem) !void {
 
 fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, index: usize) !EntityId {
     const entity = if (spec.use_template) blk: {
-        _ = try data.applyStructuralCommands(&[_]StructuralCommand{.{
+        const Created = struct {
+            entity: EntityId = EntityId.invalid,
+            pub fn record(self: *@This(), change: StructuralChange) void {
+                switch (change) {
+                    .entity_created => |entity| self.entity = entity,
+                    else => {},
+                }
+            }
+        };
+        var created: Created = .{};
+        _ = try data.applyStructuralCommandsWithChangeSink(&[_]StructuralCommand{.{
             .create_entity = .{
                 .movement_body = .{
                     .position = spec.position,
@@ -919,9 +930,8 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
                 .steering_agent = demoSteeringAgent(spec.size),
                 .faction = spec.faction,
             },
-        }});
-        const post = data.movementBodySliceConst();
-        break :blk post.entities[post.entities.len - 1];
+        }}, &created);
+        break :blk created.entity;
     } else blk: {
         const e = try data.createEntity();
         errdefer data.destroyCreatedEntity(e);
@@ -2189,9 +2199,9 @@ test "demo structural static obstacle change emits one navigation invalidation e
 
 // Commits one step whose nav reaction runs out of memory: more recorded tile marks than
 // the nav batch storage holds, applied under a failing nav allocator. The same commit
-// destroys a bystander body, swap-removing the steering agent into the bystander's movement
-// row, and places the static box: beside the agent with `move_static`, else where it is
-// parked. Returns the agent's lateral steering component on the next step.
+// destroys a bystander body. The bystander is at rest, so the removal swaps the tail,
+// not the prefix agent. It places the static box beside the agent with `move_static`,
+// else where it is parked. Returns the agent's lateral steering component on the next step.
 fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
@@ -2239,8 +2249,7 @@ fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
     nav.allocator = nav_allocator;
     nav.graph.allocator = graph_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
-    // The agent's movement row moved.
-    try std.testing.expect(demo.data.movementBodyDenseIndex(scene.agent).? != agent_row);
+    try std.testing.expectEqual(agent_row, demo.data.movementBodyDenseIndex(scene.agent).?);
 
     const lateral = try lateralSteeringOnce(&demo.pipeline, frame, &demo.data, scene.agent, scene.goal);
     try expectSteeringSeesOwnPosition(&demo.pipeline, &demo.data, scene.agent);

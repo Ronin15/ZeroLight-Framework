@@ -99,6 +99,13 @@ const MovementBodyRow = struct {
 };
 
 const no_drawable: u32 = std.math.maxInt(u32);
+const no_pending: u32 = std.math.maxInt(u32);
+
+/// The row `removeAt` moved into the hole, and a second row whose index changed.
+pub const MovementRowRemoval = struct {
+    at_index: ?EntityId = null,
+    also: ?struct { entity: EntityId, index: usize } = null,
+};
 
 const DrawableRow = struct {
     entity: EntityId,
@@ -206,6 +213,12 @@ fn drawableKey(level: u16, chunk_x: i32, chunk_y: i32) u128 {
 
 pub const MovementBodyStore = struct {
     rows: std.MultiArrayList(MovementBodyRow) = .{},
+    /// Rows `[0, advancing)` advance this step. The suffix is at rest.
+    advancing: usize = 0,
+    /// At-rest rows whose chunk is not settled, in push order.
+    pending_chunk_rows: std.ArrayList(u32) = .empty,
+    /// Parallel to `rows`. Slot in `pending_chunk_rows`, or `no_pending`.
+    pending_slots: std.ArrayList(u32) = .empty,
     // One run per occupied (level, chunk) of drawable rows. Map values are indices into `runs`.
     runs: std.ArrayList(DrawableRun) = .empty,
     free_runs: std.ArrayList(u32) = .empty,
@@ -256,8 +269,58 @@ pub const MovementBodyStore = struct {
             .bounds_row = no_component_row,
         });
         self.arrival_holds.appendAssumeCapacity(.{});
+        self.pending_slots.appendAssumeCapacity(no_pending);
         std.debug.assert(self.arrival_holds.items.len == self.rows.len);
+        std.debug.assert(self.pending_slots.items.len == self.rows.len);
+        self.pushPendingRow(@intCast(index));
         return index;
+    }
+
+    pub fn entityAt(self: *const MovementBodyStore, index: usize) EntityId {
+        return self.rows.slice().items(.entity)[index];
+    }
+
+    /// Exchanges every column, the arrival hold, and the pending slot of `a` and `b`.
+    pub fn exchangeRows(self: *MovementBodyStore, a: usize, b: usize) void {
+        if (a == b) return;
+        self.rows.swap(a, b);
+        const hold_a = self.arrival_holds.items[a];
+        const hold_b = self.arrival_holds.items[b];
+        self.arrival_holds.items[a] = hold_b;
+        self.arrival_holds.items[b] = hold_a;
+        if (hold_a.held) self.holderRows(hold_a.world).items[@intCast(hold_a.holder_slot)] = @intCast(b);
+        if (hold_b.held) self.holderRows(hold_b.world).items[@intCast(hold_b.holder_slot)] = @intCast(a);
+        const slot_a = self.pending_slots.items[a];
+        const slot_b = self.pending_slots.items[b];
+        self.pending_slots.items[a] = slot_b;
+        self.pending_slots.items[b] = slot_a;
+        if (slot_a != no_pending) self.pending_chunk_rows.items[slot_a] = @intCast(b);
+        if (slot_b != no_pending) self.pending_chunk_rows.items[slot_b] = @intCast(a);
+    }
+
+    /// One pending index for an at-rest row. A row already pending is left as it is.
+    pub fn pushPendingRow(self: *MovementBodyStore, index: usize) void {
+        if (self.pending_slots.items[index] != no_pending) return;
+        std.debug.assert(self.pending_chunk_rows.capacity > self.pending_chunk_rows.items.len);
+        const slot: u32 = @intCast(self.pending_chunk_rows.items.len);
+        self.pending_chunk_rows.appendAssumeCapacity(@intCast(index));
+        self.pending_slots.items[index] = slot;
+    }
+
+    /// Drops `index` from the pending list. A settled row is left as it is.
+    pub fn clearPendingRow(self: *MovementBodyStore, index: usize) void {
+        const slot = self.pending_slots.items[index];
+        if (slot == no_pending) return;
+        const last_pending = self.pending_chunk_rows.items.len - 1;
+        const moved = self.pending_chunk_rows.items[last_pending];
+        _ = self.pending_chunk_rows.swapRemove(slot);
+        self.pending_slots.items[index] = no_pending;
+        if (slot != last_pending) self.pending_slots.items[moved] = slot;
+    }
+
+    pub fn clearPending(self: *MovementBodyStore) void {
+        for (self.pending_chunk_rows.items) |row| self.pending_slots.items[row] = no_pending;
+        self.pending_chunk_rows.clearRetainingCapacity();
     }
 
     pub fn set(self: *MovementBodyStore, index: usize, body: MovementBody) void {
@@ -507,23 +570,37 @@ pub const MovementBodyStore = struct {
         s.items(.velocity_y)[index] = 0;
     }
 
-    pub fn removeAt(self: *MovementBodyStore, index: usize) ?EntityId {
+    pub fn removeAt(self: *MovementBodyStore, index: usize) MovementRowRemoval {
         std.debug.assert(self.arrival_holds.items.len == self.rows.len);
-        const hold = self.arrival_holds.items[index];
-        if (hold.held) self.dropArrivalHold(hold);
-        _ = self.arrival_holds.swapRemove(index);
-        const s = self.rows.slice();
+        std.debug.assert(self.pending_slots.items.len == self.rows.len);
+        var hole = index;
+        var result: MovementRowRemoval = .{};
+        if (index < self.advancing) {
+            const boundary = self.advancing - 1;
+            if (index != boundary) {
+                result.at_index = self.entityAt(boundary);
+                self.exchangeRows(index, boundary);
+            }
+            self.advancing -= 1;
+            hole = self.advancing;
+        }
         const last = self.rows.len - 1;
-        const moved_entity = if (index != last) s.items(.entity)[last] else null;
-        self.rows.swapRemove(index);
-        if (index != last) {
-            const moved = self.arrival_holds.items[index];
-            if (moved.held) {
-                // `holder_slot` indexes the moved row's world list; `index` is below the `u32` cap.
-                self.holderRows(moved.world).items[@intCast(moved.holder_slot)] = @intCast(index);
+        if (hole != last) {
+            const tail = self.entityAt(last);
+            self.exchangeRows(hole, last);
+            if (result.at_index == null) {
+                result.at_index = tail;
+            } else {
+                result.also = .{ .entity = tail, .index = hole };
             }
         }
-        return moved_entity;
+        const hold = self.arrival_holds.items[last];
+        if (hold.held) self.dropArrivalHold(hold);
+        self.clearPendingRow(last);
+        _ = self.arrival_holds.pop();
+        _ = self.pending_slots.pop();
+        self.rows.swapRemove(last);
+        return result;
     }
 
     pub fn slice(self: *MovementBodyStore) MovementBodySlice {
@@ -546,6 +623,7 @@ pub const MovementBodyStore = struct {
             .has_collision_bounds = s.items(.has_collision_bounds),
             .has_ai_agent = s.items(.has_ai_agent),
             .has_world_level = s.items(.has_world_level),
+            .advancing = self.advancing,
         };
     }
 
@@ -569,6 +647,7 @@ pub const MovementBodyStore = struct {
             .has_collision_bounds = s.items(.has_collision_bounds),
             .has_ai_agent = s.items(.has_ai_agent),
             .has_world_level = s.items(.has_world_level),
+            .advancing = self.advancing,
         };
     }
 
@@ -582,6 +661,7 @@ pub const MovementBodyStore = struct {
             .level = s.items(.level),
             .stagger_phase = s.items(.stagger_phase),
             .always_active = s.items(.always_active),
+            .advancing = self.advancing,
         };
     }
 
@@ -595,11 +675,15 @@ pub const MovementBodyStore = struct {
             .level = s.items(.level),
             .stagger_phase = s.items(.stagger_phase),
             .always_active = s.items(.always_active),
+            .advancing = self.advancing,
         };
     }
 
     pub fn clearRetainingCapacity(self: *MovementBodyStore) void {
         self.rows.clearRetainingCapacity();
+        self.advancing = 0;
+        self.pending_chunk_rows.clearRetainingCapacity();
+        self.pending_slots.clearRetainingCapacity();
         self.arrival_holds.clearRetainingCapacity();
         self.arrivals.clearRetainingCapacity();
         self.level_origins.clearRetainingCapacity();
@@ -630,6 +714,8 @@ pub const MovementBodyStore = struct {
         self.free_runs.deinit(allocator);
         self.run_of.deinit(allocator);
         self.arrival_holds.deinit(allocator);
+        self.pending_chunk_rows.deinit(allocator);
+        self.pending_slots.deinit(allocator);
         var worlds = self.other_worlds.iterator();
         while (worlds.next()) |entry| {
             entry.value_ptr.arrivals.deinit(allocator);
@@ -1205,6 +1291,8 @@ pub const MovementBodyStore = struct {
         const slots = hotStoreCapacity(capacity);
         try self.rows.ensureTotalCapacity(allocator, slots);
         try self.arrival_holds.ensureTotalCapacity(allocator, slots);
+        try self.pending_chunk_rows.ensureTotalCapacity(allocator, slots);
+        try self.pending_slots.ensureTotalCapacity(allocator, slots);
     }
 
     fn staggerWorldMaps(self: *MovementBodyStore, world_id: u32) ?struct {
@@ -1319,6 +1407,8 @@ test "MovementBodyStore append is allocation-free after ensureCapacity reserves"
         _ = try store.append(failing_alloc, entity, .{});
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), store.advancing);
+    try std.testing.expectEqual(@as(usize, reserved), store.pending_chunk_rows.items.len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 

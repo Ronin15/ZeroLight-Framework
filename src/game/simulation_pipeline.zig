@@ -1932,8 +1932,7 @@ pub const SimulationPipeline = struct {
         apply_intents_timer.stop(step.context.perf, .pipeline_apply_intents);
     }
 
-    /// Movement integrates the full contiguous range. Non-moving rows carry zero
-    /// velocity, so they integrate as no-ops. Chunk maintenance is `chunk_derive`,
+    /// Movement integrates the advancing prefix. Chunk maintenance is `chunk_derive`,
     /// after collision, the tile gate, and plane traversal have settled positions.
     fn stageMovementIntegrate(self: *SimulationPipeline, step: *StepState) void {
         const context = step.context;
@@ -2003,9 +2002,9 @@ pub const SimulationPipeline = struct {
         plane_traversal_timer.stop(context.perf, .pipeline_plane_traversal);
     }
 
-    /// Recompute each body's chunk from its settled position. Consumers are tier
-    /// policy and render prep. `action_react` may sit between this and tier policy;
-    /// neither rewrites chunk columns.
+    /// Recompute the advancing prefix's chunks from settled positions. Settled
+    /// at-rest rows are not rewritten. Consumers are tier policy and render prep.
+    /// `action_react` may sit between this and tier policy; neither rewrites chunk columns.
     fn stageChunkDerive(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var chunk_derive_timer = StageTimer.start();
@@ -2056,9 +2055,7 @@ pub const SimulationPipeline = struct {
         // Steering is transitively scoped via AI's intents; its real participation
         // is the count of movement intents it actually emitted this step.
         stats.steering_stage_entities = steering_stats.movement_intent_count;
-        // Movement integrates the full contiguous range every step (non-moving rows
-        // are zero-velocity no-ops), so its stage entity count is the full-active
-        // default set above — there is no movement scope filter to narrow it.
+        // The movement stage count is the advancing prefix set above.
         if (collision_scope_indices) |idx| stats.collision_stage_entities = idx.len;
         if (comptime runtime_perf_log.enabled) stats.perf = .{
             .stagger_skips = self.scope.perf.stagger_skips,
@@ -7163,6 +7160,7 @@ test "after population growth the seam's stream range counts are the binding res
     try addSealedGoalBoxes(&data);
     const crate = try data.createEntity();
     try data.setMovementBody(crate, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setCollisionResponse(crate, .{});
     try data.setDestructible(crate, .{ .hit_points = 1 });
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -8371,10 +8369,9 @@ test "a population growth seam that runs out of memory still runs the steering r
     try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
     try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
 
-    // The commit moves the box beside the agent and destroys the bystander, swap-removing
-    // the agent into the bystander's row; two creates then push the population past the
-    // reserve, the first refilling the agent's old row. The growth seam's first reserve
-    // fails.
+    // The commit moves the box beside the agent and destroys the bystander. The bystander
+    // is at rest, so the removal swaps the tail, not the prefix agent. Two creates then
+    // push the population past the reserve. The growth seam's first reserve fails.
     const far = math.Vec2{ .x = 640, .y = 640 };
     const create: StructuralCommand = .{ .create_entity = .{
         .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
@@ -8389,10 +8386,10 @@ test "a population growth seam that runs out of memory still runs the steering r
     fixture.pipeline.scope.allocator = scope_allocator;
     try std.testing.expectError(error.OutOfMemory, result);
     try std.testing.expectEqual(@as(usize, 5), fixture.data.movementBodySliceConst().entities.len);
-    try std.testing.expect(fixture.data.movementBodyDenseIndex(scene.agent).? != agent_row);
+    try std.testing.expectEqual(agent_row, fixture.data.movementBodyDenseIndex(scene.agent).?);
 
-    // The synced collider rows push the agent away from the moved box (+y), and the
-    // selected start reads the agent's own renumbered row, not the create now in its old one.
+    // The synced collider rows push the agent away from the moved box (+y). The
+    // agent row stayed put, so the selected start reads that row.
     try std.testing.expect(try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
     try expectSteeringSeesOwnPosition(&fixture.pipeline, &fixture.data, scene.agent);
 }

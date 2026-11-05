@@ -206,6 +206,9 @@ pub const StructuralPrefix = struct {
     deferred_applied: usize = 0,
     fresh_applied: usize = 0,
     stagger_arrivals: usize = 0,
+    /// Slots this commit may append: 3 per destroy and per tier command, 5 per
+    /// movement create, 2 per other command.
+    allow_records: usize = 0,
 };
 
 const ProjectedEntityState = struct {
@@ -716,6 +719,7 @@ pub fn projectStructuralPrefix(
     var stagger_arrivals: usize = 0;
     var deferred_applied: usize = 0;
     var fresh_applied: usize = 0;
+    var allow_records: usize = 0;
     var free_cursor: ?u32 = self.first_free_slot;
     var free_previous: ?u32 = null;
 
@@ -729,6 +733,7 @@ pub fn projectStructuralPrefix(
             structural_event_count = summed;
             _ = try validateStructuralCommands(&.{command});
             try projectAcceptedCommand(self, scratch, &projection, &free_cursor, &free_previous, &stagger_arrivals, command);
+            allow_records = try addCapacity(allow_records, collisionAllowRecords(command));
             if (slice_index == 0) {
                 deferred_applied = index + 1;
             } else {
@@ -746,6 +751,16 @@ pub fn projectStructuralPrefix(
         .deferred_applied = deferred_applied,
         .fresh_applied = fresh_applied,
         .stagger_arrivals = stagger_arrivals,
+        .allow_records = allow_records,
+    };
+}
+
+fn collisionAllowRecords(command: StructuralCommand) usize {
+    return switch (command) {
+        .destroy_entity => 3,
+        .set_simulation_tier => 3,
+        .create_entity => |template| if (template.movement_body != null) 5 else 2,
+        else => 2,
     };
 }
 
@@ -838,9 +853,8 @@ pub fn preflightStructuralCommands(
 fn finishStructuralPrefix(self: *DataSystem, scratch: *StructuralPlanScratch, prefix: StructuralPrefix) !void {
     if (prefix.plan.command_count == 0) return;
     try prefix.plan.capacity_needs.validateLimits();
-    // Each applied command records at most two allow ids (a removal and its landed
-    // tail, or a create's errdefer removal). Tier changes record one. The tail does not.
-    try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + prefix.plan.command_count * 2);
+    // 3 per destroy and per tier command, 5 per movement create, 2 per other command.
+    try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + prefix.allow_records);
     try reserveStructuralPlanCapacity(self, prefix.plan);
     // Upper bound: one new arrival key and one level origin per AI arrival this commit
     // settles. The commit puts into that capacity. Without a grid the commit does not insert.
@@ -1324,7 +1338,7 @@ test "structural command preflight projection does not walk retained capacity" {
     }
     try data.collision_allow_records.ensureTotalCapacity(
         std.testing.allocator,
-        data.collision_allow_records.items.len + tier_commands.items.len * 2,
+        data.collision_allow_records.items.len + tier_commands.items.len * 3,
     );
 
     scratch.projected_entities.available = 0;

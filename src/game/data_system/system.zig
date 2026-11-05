@@ -218,9 +218,9 @@ pub const DataSystem = struct {
         if (slot.primitive_visual_index) |dense_index| self.removePrimitiveVisualAt(@intCast(dense_index));
         if (slot.asset_ref_index) |dense_index| self.removeAssetReferenceAt(@intCast(dense_index));
         if (slot.collision_bounds_index) |dense_index| self.removeCollisionBoundsAt(@intCast(dense_index));
-        if (slot.collision_response_index) |dense_index| self.removeCollisionResponseAt(@intCast(dense_index));
-        if (slot.ai_agent_index) |dense_index| self.removeAiAgentAt(@intCast(dense_index));
-        if (slot.steering_agent_index) |dense_index| self.removeSteeringAgentAt(@intCast(dense_index));
+        if (slot.collision_response_index) |dense_index| try self.removeCollisionResponseAt(@intCast(dense_index));
+        if (slot.ai_agent_index) |dense_index| try self.removeAiAgentAt(@intCast(dense_index));
+        if (slot.steering_agent_index) |dense_index| try self.removeSteeringAgentAt(@intCast(dense_index));
         if (slot.world_level_index) |dense_index| self.removeWorldLevelAt(@intCast(dense_index));
         if (slot.faction_index) |dense_index| self.removeFactionAt(@intCast(dense_index));
         if (slot.ai_perception_index) |dense_index| self.removeAiPerceptionAt(@intCast(dense_index));
@@ -321,7 +321,10 @@ pub const DataSystem = struct {
         if (names_phase) self.movement_bodies.markStaggerSettled(di);
         try self.movement_bodies.reserveDrawableNeighborLevels(self.allocator, di);
         self.snapInterpolationIfStill(di, metadata.tier);
-        self.mirrorLinkedScope(di);
+        try self.noteMovementParticipation(id);
+        const row = self.movementBodyDenseIndex(id) orelse return error.InvalidEntity;
+        self.mirrorLinkedScope(row);
+        self.movement_bodies.clearPendingRow(row);
     }
 
     /// Installs the spatial index's cell grid. The same scalars are a no-op.
@@ -342,14 +345,14 @@ pub const DataSystem = struct {
     pub fn releaseStaggerWorld(self: *DataSystem, world_id: u32) error{OutOfMemory}!void {
         const holders = self.movement_bodies.staggerHolderCount(world_id);
         if (holders != 0) {
-            const need = self.collision_allow_records.items.len + holders * 2;
+            const need = self.collision_allow_records.items.len + holders * 3;
             try self.collision_allow_records.ensureTotalCapacity(self.allocator, need);
             const entities = self.movement_bodies.sliceConst().entities;
             while (self.movement_bodies.lastStaggerHolder(world_id)) |row| {
                 const before = self.movement_bodies.staggerHolderCount(world_id);
                 // `row` is a live movement index below the sliced length.
                 const entity = entities[@intCast(row)];
-                // Two allow records per holder were reserved above, so the removal cannot allocate.
+                // Three allow records per holder were reserved above, so the removal cannot allocate.
                 const removed = self.destroyEntity(entity) catch unreachable; // lint:allow catch-unreachable: collision-allow records were reserved for every holder
                 std.debug.assert(removed);
                 std.debug.assert(self.movement_bodies.staggerHolderCount(world_id) == before - 1);
@@ -407,7 +410,9 @@ pub const DataSystem = struct {
         self.movement_bodies.setTier(di, tier);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
-        self.mirrorLinkedScope(di);
+        try self.noteMovementParticipation(id);
+        const row = self.movementBodyDenseIndex(id) orelse return error.InvalidEntity;
+        self.mirrorLinkedScope(row);
     }
 
     // Dormant and kinematic are the tiers that do not allow collision. Locomotion
@@ -419,12 +424,8 @@ pub const DataSystem = struct {
         self.collision_allow_epoch +%= 1;
     }
 
-    /// When an entity enters a non-moving tier, snap previous=position so render
-    /// interpolation (lerp previous→position) does not oscillate, and zero its
-    /// velocity. Zeroing is what lets the movement processor integrate the full
-    /// contiguous SoA range every step: a non-moving row integrates as a no-op
-    /// instead of drifting on a stale velocity, so movement needs no scattered
-    /// skip-path. Velocity is re-established by AI intents when the row reactivates.
+    /// When an entity enters a non-moving tier, snap previous to position so render
+    /// interpolation does not oscillate, and zero its velocity.
     fn snapInterpolationIfStill(self: *DataSystem, di: usize, tier: SimulationTier) void {
         if (tier.allowsMovement()) return;
         self.movement_bodies.snapPreviousToPosition(di);
@@ -461,7 +462,7 @@ pub const DataSystem = struct {
             .kinematic_entities = self.tier_counts[@backingInt(SimulationTier.kinematic)],
             .locomotion_entities = self.tier_counts[@backingInt(SimulationTier.locomotion)],
             .cognition_entities = self.tier_counts[@backingInt(SimulationTier.cognition)],
-            .movement_stage_entities = self.movement_bodies.len(),
+            .movement_stage_entities = self.movement_bodies.advancing,
             .collision_stage_entities = self.collision_bounds.dynamic_ids.items.len,
             .collision_response_stage_entities = self.collision_responses.len(),
             .ai_stage_entities = self.ai_agents.len(),
@@ -598,6 +599,8 @@ pub const DataSystem = struct {
                 try self.syncScopeLevelFromWorldLevel(id, level, reserved);
                 self.movement_bodies.setHasWorldLevel(index, true);
             }
+            try self.noteMovementParticipation(id);
+            self.noteRestingPosition(id);
             return;
         }
 
@@ -639,8 +642,8 @@ pub const DataSystem = struct {
             try self.syncScopeLevelFromWorldLevel(id, level, reserved);
             self.movement_bodies.setHasWorldLevel(dense_index, true);
         }
-        // An existing body write does not change static membership. A new body can.
-        self.syncDynamicBounds(id);
+        try self.noteMovementParticipation(id);
+        self.noteRestingPosition(id);
     }
 
     fn linkMovementVisual(self: *DataSystem, movement_index: u32, reserved: bool) !void {
@@ -848,14 +851,14 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.collision_response_index) |index| {
             self.collision_responses.set(@intCast(index), response);
-            self.syncDynamicBounds(id);
+            try self.noteMovementParticipation(id);
             return;
         }
 
         const dense_index = try self.collision_responses.append(self.allocator, id, response);
         slot.collision_response_index = dense_index;
         slot.addComponent(.collision_response);
-        self.syncDynamicBounds(id);
+        try self.noteMovementParticipation(id);
     }
 
     pub fn collisionResponseConst(self: *const DataSystem, id: EntityId) ?CollisionResponse {
@@ -891,6 +894,7 @@ pub const DataSystem = struct {
         if (slot.ai_perception_index) |perception_index| self.ai_agents.setPerceptionRow(dense_index, perception_index);
         if (slot.ai_memory_index) |memory_index| self.ai_agents.setMemoryRow(dense_index, memory_index);
         if (slot.ai_affect_index) |affect_index| self.ai_agents.setAffectRow(dense_index, affect_index);
+        try self.noteMovementParticipation(id);
     }
 
     pub fn aiAgentSliceConst(self: *const DataSystem) ConstAiAgentSlice {
@@ -914,6 +918,7 @@ pub const DataSystem = struct {
         const dense_index = try self.steering_agents.append(self.allocator, id, agent);
         slot.steering_agent_index = dense_index;
         slot.addComponent(.steering_agent);
+        try self.noteMovementParticipation(id);
     }
 
     pub fn steeringAgentDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
@@ -1159,36 +1164,103 @@ pub const DataSystem = struct {
         // The scope tier row leaves with the movement body, so drop its tier count
         // before the swap overwrites it. The moved tail row keeps its own tier.
         // A later row may land on this index; stored trigger pairs re-read it.
-        // Both ids are recorded before the bump and the removal; a failed reserve
-        // leaves the epoch, the list, and the row.
-        const entities = self.movement_bodies.sliceConst().entities;
+        // Every id whose row index changes is recorded before the bump and the
+        // removal; a failed reserve leaves the epoch, the list, and the row.
+        const bodies = &self.movement_bodies;
+        const entities = bodies.sliceConst().entities;
         const removed = entities[index];
         const last = entities.len - 1;
-        const tail: ?EntityId = if (index == last) null else entities[last];
-        try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + if (tail != null) @as(usize, 2) else 1);
+        const in_prefix = index < bodies.advancing;
+        const boundary: usize = if (in_prefix) bodies.advancing - 1 else index;
+        const partner_moves = in_prefix and index != boundary;
+        const suffix_at: usize = if (in_prefix) boundary else index;
+        const tail_moves = suffix_at != last;
+        const record_count: usize = 1 + @as(usize, @intFromBool(partner_moves)) + @as(usize, @intFromBool(tail_moves));
+        try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + record_count);
         self.collision_allow_records.appendAssumeCapacity(removed);
-        if (tail) |tail_id| self.collision_allow_records.appendAssumeCapacity(tail_id);
+        if (partner_moves) self.collision_allow_records.appendAssumeCapacity(entities[boundary]);
+        if (tail_moves) self.collision_allow_records.appendAssumeCapacity(entities[last]);
         self.collision_allow_epoch +%= 1;
-        self.tier_counts[@backingInt(self.movement_bodies.tierAt(index))] -= 1;
+        self.tier_counts[@backingInt(bodies.tierAt(index))] -= 1;
         const bounds_index = self.slots.items[@intCast(removed.index)].collision_bounds_index;
-        self.movement_bodies.unlinkDrawable(index);
-        // Store removals swap the tail row into the removed row. If a row moved,
-        // the moved entity's slot must be patched immediately.
-        const removed_ai = self.movement_bodies.aiRowAt(index);
-        const removed_bounds = self.movement_bodies.boundsRowAt(index);
-        const moved = self.movement_bodies.removeAt(index);
+        bodies.unlinkDrawable(index);
+        const removed_ai = bodies.aiRowAt(index);
+        const removed_bounds = bodies.boundsRowAt(index);
+        const removal = bodies.removeAt(index);
         if (removed_ai != no_component_row) self.ai_agents.setMovementRow(removed_ai, no_component_row);
         if (removed_bounds != no_component_row) self.collision_bounds.setMovementRow(removed_bounds, no_component_row);
-        if (moved) |entity| {
-            self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
-            self.movement_bodies.retieDrawableMovementIndex(index);
-            const tail_ai = self.movement_bodies.aiRowAt(index);
-            if (tail_ai != no_component_row) self.ai_agents.setMovementRow(tail_ai, @intCast(index));
-            const tail_bounds = self.movement_bodies.boundsRowAt(index);
-            if (tail_bounds != no_component_row) self.collision_bounds.setMovementRow(tail_bounds, @intCast(index));
-        }
+        if (removal.at_index) |entity| self.retieMovementRow(entity, index);
+        if (removal.also) |also| self.retieMovementRow(also.entity, also.index);
         // Losing the movement body ends a static obstacle. The bounds row stays.
         if (bounds_index) |dense| self.collision_bounds.addDynamic(dense);
+    }
+
+    fn retieMovementRow(self: *DataSystem, entity: EntityId, index: usize) void {
+        self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
+        self.movement_bodies.retieDrawableMovementIndex(index);
+        const ai = self.movement_bodies.aiRowAt(index);
+        if (ai != no_component_row) self.ai_agents.setMovementRow(ai, @intCast(index));
+        const bounds = self.movement_bodies.boundsRowAt(index);
+        if (bounds != no_component_row) self.collision_bounds.setMovementRow(bounds, @intCast(index));
+    }
+
+    /// `id`'s movement row while that row still stores `id`.
+    fn movementRowForEntity(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const index: usize = slot.movement_body_index orelse return null;
+        if (index >= self.movement_bodies.len()) return null;
+        if (!self.movement_bodies.entityAt(index).eql(id)) return null;
+        return index;
+    }
+
+    fn movementRowAdvances(self: *const DataSystem, id: EntityId, row: usize) bool {
+        const movement = self.movement_bodies.sliceConst();
+        if (movement.velocity_x[row] != 0 or movement.velocity_y[row] != 0) return true;
+        if (self.movement_bodies.aiRowAt(row) != no_component_row) return true;
+        const slot = self.resolveSlotConst(id).?;
+        if (slot.steering_agent_index != null) return true;
+        if (slot.collision_response_index) |response| {
+            if (self.collision_responses.get(@intCast(response)).mobility == .dynamic) return true;
+        }
+        return false;
+    }
+
+    /// Swaps `id` across `advancing` when its side is wrong, then refreshes dynamic bounds.
+    /// The allow-record ensure runs before the swap. A failure leaves the rows where they were.
+    fn noteMovementParticipation(self: *DataSystem, id: EntityId) error{OutOfMemory}!void {
+        const row = self.movementRowForEntity(id) orelse return;
+        const advances = self.movementRowAdvances(id, row);
+        const in_prefix = row < self.movement_bodies.advancing;
+        if (advances != in_prefix) {
+            const partner: usize = if (advances) self.movement_bodies.advancing else self.movement_bodies.advancing - 1;
+            if (partner != row) {
+                const entities = self.movement_bodies.sliceConst().entities;
+                const other = entities[partner];
+                try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + 2);
+                self.collision_allow_records.appendAssumeCapacity(id);
+                self.collision_allow_records.appendAssumeCapacity(other);
+                self.collision_allow_epoch +%= 1;
+                self.movement_bodies.exchangeRows(row, partner);
+                if (advances) self.movement_bodies.advancing += 1 else self.movement_bodies.advancing -= 1;
+                if (advances) self.movement_bodies.clearPendingRow(partner);
+                self.retieMovementRow(id, partner);
+                self.retieMovementRow(other, row);
+            } else {
+                if (advances) {
+                    self.movement_bodies.advancing += 1;
+                    self.movement_bodies.clearPendingRow(row);
+                } else {
+                    self.movement_bodies.advancing -= 1;
+                }
+            }
+        }
+        self.syncDynamicBounds(id);
+    }
+
+    /// A position write that leaves the row at rest marks its chunk pending.
+    fn noteRestingPosition(self: *DataSystem, id: EntityId) void {
+        const row = self.movementRowForEntity(id) orelse return;
+        if (row >= self.movement_bodies.advancing) self.movement_bodies.pushPendingRow(row);
     }
 
     fn removeFacingAt(self: *DataSystem, index: usize) void {
@@ -1217,31 +1289,44 @@ pub const DataSystem = struct {
         }
     }
 
-    fn removeCollisionResponseAt(self: *DataSystem, index: usize) void {
+    fn removeCollisionResponseAt(self: *DataSystem, index: usize) error{OutOfMemory}!void {
         const removed = self.collision_responses.sliceConst().entities[index];
         const moved = self.collision_responses.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].collision_response_index = @intCast(index);
         // Bounds may already have been swap-removed (destroy drops bounds first). Only a row
-        // that still belongs to this entity becomes dynamic.
+        // that still belongs to this entity is refreshed.
         const slot = &self.slots.items[@intCast(removed.index)];
         const bounds_index = slot.collision_bounds_index orelse return;
         if (@as(usize, bounds_index) >= self.collision_bounds.len()) return;
         const bounds_entity = self.collision_bounds.sliceConst().entities[bounds_index];
         if (!bounds_entity.eql(removed)) return;
-        self.collision_bounds.addDynamic(bounds_index);
-    }
-
-    fn syncDynamicBounds(self: *DataSystem, id: EntityId) void {
-        const slot = self.resolveSlot(id) orelse return;
-        const bounds_index = slot.collision_bounds_index orelse return;
-        if (self.isStaticNavigationObstacle(id)) {
-            self.collision_bounds.removeDynamic(bounds_index);
+        if (self.movementRowForEntity(removed)) |_| {
+            try self.noteMovementParticipation(removed);
         } else {
             self.collision_bounds.addDynamic(bounds_index);
         }
     }
 
-    fn removeAiAgentAt(self: *DataSystem, index: usize) void {
+    fn syncDynamicBounds(self: *DataSystem, id: EntityId) void {
+        const slot = self.resolveSlot(id) orelse return;
+        const bounds_index = slot.collision_bounds_index orelse return;
+        if (self.boundsRowIsDynamic(id)) {
+            self.collision_bounds.addDynamic(bounds_index);
+        } else {
+            self.collision_bounds.removeDynamic(bounds_index);
+        }
+    }
+
+    /// A static obstacle or a row at rest is not dynamic. A bounds row with no movement
+    /// row stays dynamic. Any other bounds row is dynamic.
+    fn boundsRowIsDynamic(self: *const DataSystem, id: EntityId) bool {
+        if (self.isStaticNavigationObstacle(id)) return false;
+        const row = self.movementRowForEntity(id) orelse return true;
+        return row < self.movement_bodies.advancing;
+    }
+
+    fn removeAiAgentAt(self: *DataSystem, index: usize) error{OutOfMemory}!void {
+        const removed = self.ai_agents.sliceConst().entities[index];
         const removed_movement = self.ai_agents.movementRowAt(index);
         if (removed_movement != no_component_row) self.movement_bodies.setAiRow(removed_movement, no_component_row);
         const moved = self.ai_agents.removeAt(index);
@@ -1250,11 +1335,14 @@ pub const DataSystem = struct {
             const tail_movement = self.ai_agents.movementRowAt(index);
             if (tail_movement != no_component_row) self.movement_bodies.setAiRow(tail_movement, @intCast(index));
         }
+        if (self.movementRowForEntity(removed)) |_| try self.noteMovementParticipation(removed);
     }
 
-    fn removeSteeringAgentAt(self: *DataSystem, index: usize) void {
+    fn removeSteeringAgentAt(self: *DataSystem, index: usize) error{OutOfMemory}!void {
+        const removed = self.steering_agents.sliceConst().entities[index];
         const moved = self.steering_agents.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].steering_agent_index = @intCast(index);
+        if (self.movementRowForEntity(removed)) |_| try self.noteMovementParticipation(removed);
     }
 
     fn removeWorldLevelAt(self: *DataSystem, index: usize) void {
@@ -1957,9 +2045,18 @@ fn createStaggerBody(data: *DataSystem, x: f32, y: f32, level: u16, ai: bool) !E
             .ai_agent = if (ai) @as(?AiAgent, .{}) else null,
         } },
     };
-    _ = try data.applyStructuralCommands(&commands);
-    const entities = data.movementBodySliceConst().entities;
-    return entities[entities.len - 1];
+    const Created = struct {
+        entity: EntityId = EntityId.invalid,
+        pub fn record(self: *@This(), change: types.StructuralChange) void {
+            switch (change) {
+                .entity_created => |entity| self.entity = entity,
+                else => {},
+            }
+        }
+    };
+    var created: Created = .{};
+    _ = try data.applyStructuralCommandsWithChangeSink(&commands, &created);
+    return created.entity;
 }
 
 test "stagger phases in one cell stay spread when the spawn period shares a factor with cognition_stagger_n" {
@@ -2064,7 +2161,7 @@ test "a stagger batch of two new cells leaves no entity or map entry when the se
     try std.testing.expect(try data.destroyEntity(first));
     try std.testing.expect(try data.destroyEntity(second));
     data.collision_allow_records.clearRetainingCapacity();
-    const allow_need = batch.len * 2;
+    const allow_need = batch.len * 5;
     if (data.collision_allow_records.capacity < allow_need) {
         try data.collision_allow_records.ensureTotalCapacity(failing.allocator(), allow_need);
     }
@@ -2202,7 +2299,8 @@ test "releasing one stagger world destroys only that world's holders" {
     try std.testing.expectEqual(@as(u32, 2), world1.level_origins.get(0).?);
     try std.testing.expectEqual(@as(usize, 2), world1.arrival_holder_rows.items.len);
 
-    const allow_need = data.collision_allow_records.items.len + 2 * 3;
+    // Two world-1 holders, then world 0's holder. Each destroy reserves three allow ids.
+    const allow_need = data.collision_allow_records.items.len + 3 * 3;
     if (data.collision_allow_records.capacity < allow_need) {
         try data.collision_allow_records.ensureTotalCapacity(failing.allocator(), allow_need);
     }
@@ -2379,7 +2477,7 @@ test "a reserved stagger batch of two new cells puts both phases without allocat
     try std.testing.expect(try data.destroyEntity(first));
     try std.testing.expect(try data.destroyEntity(second));
     data.collision_allow_records.clearRetainingCapacity();
-    const allow_need = batch.len * 2;
+    const allow_need = batch.len * 5;
     if (data.collision_allow_records.capacity < allow_need) {
         try data.collision_allow_records.ensureTotalCapacity(failing.allocator(), allow_need);
     }
@@ -2747,7 +2845,7 @@ test "full active scope stats count tiers and current stage slices" {
     try std.testing.expectEqual(@as(usize, 2), stats.dormant_entities);
     try std.testing.expectEqual(@as(usize, 1), stats.locomotion_entities);
     try std.testing.expectEqual(@as(usize, 1), stats.cognition_entities);
-    try std.testing.expectEqual(data.movementBodySliceConst().entities.len, stats.movement_stage_entities);
+    try std.testing.expectEqual(@as(usize, 2), stats.movement_stage_entities);
     try std.testing.expectEqual(@as(usize, 2), data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 1), stats.collision_stage_entities);
     try std.testing.expectEqual(data.collisionResponseSliceConst().entities.len, stats.collision_response_stage_entities);
@@ -2772,6 +2870,31 @@ test "entity free slot count tracks destroy reuse and reset" {
 
     data.clearRetainingCapacity();
     try std.testing.expectEqual(data.slots.items.len, data.free_slot_count);
+}
+
+test "prefix removal leaves suffix rows in the suffix" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const walker = try data.createEntity();
+    try data.setMovementBody(walker, .{ .velocity = .{ .x = 1, .y = 0 } });
+    try data.setCollisionResponse(walker, .{ .mobility = .dynamic });
+    const left = try data.createEntity();
+    try data.setMovementBody(left, .{});
+    try data.setCollisionResponse(left, .{ .mobility = .static });
+    const right = try data.createEntity();
+    try data.setMovementBody(right, .{});
+    try data.setCollisionResponse(right, .{ .mobility = .static });
+    try data.setSimulationTier(left, .locomotion);
+    try data.setSimulationTier(right, .locomotion);
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.advancing);
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(walker).?);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodyDenseIndex(left).?);
+    try std.testing.expectEqual(@as(usize, 2), data.movementBodyDenseIndex(right).?);
+    try std.testing.expect(try data.destroyEntity(walker));
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.advancing);
+    try std.testing.expectEqual(@as(usize, 2), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(right).?);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodyDenseIndex(left).?);
 }
 
 test "movement body store is row aligned and compact after removal" {
@@ -4069,6 +4192,87 @@ test "a movement body append then a failed set leaves the entity not alive" {
     try std.testing.expect(!data.isAlive(entity));
     try std.testing.expectEqual(@as(?usize, null), data.movementBodyDenseIndex(entity));
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "setSimulationMetadata to dormant parks a prefix row" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 12, .y = 34 },
+        .velocity = .{ .x = 5, .y = -3 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.advancing);
+    try std.testing.expect(data.aiAgentSliceConst().entities.len == 0);
+    try std.testing.expect(data.steeringAgentSliceConst().entities.len == 0);
+    try std.testing.expect(data.collisionResponseSliceConst().entities.len == 0);
+
+    try data.setSimulationMetadata(entity, .{ .tier = .dormant });
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.advancing);
+    const body = data.movementBodyConst(entity).?;
+    try std.testing.expectEqual(@as(f32, 12), body.position.x);
+    try std.testing.expectEqual(@as(f32, 34), body.position.y);
+}
+
+test "removing a non-boundary prefix row with three allow slots allocates nothing" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const prefix = try data.createEntity();
+    const boundary = try data.createEntity();
+    const suffix = try data.createEntity();
+    try data.setMovementBody(prefix, .{ .position = .{ .x = 1, .y = 0 }, .velocity = .{ .x = 1, .y = 0 } });
+    try data.setMovementBody(boundary, .{ .position = .{ .x = 2, .y = 0 }, .velocity = .{ .x = 1, .y = 0 } });
+    try data.setMovementBody(suffix, .{ .position = .{ .x = 3, .y = 0 } });
+    try std.testing.expectEqual(@as(usize, 2), data.movement_bodies.advancing);
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(prefix).?);
+    try std.testing.expect(data.movementBodyDenseIndex(suffix).? >= data.movement_bodies.advancing);
+
+    data.collision_allow_records.clearAndFree(std.testing.allocator);
+    try data.collision_allow_records.ensureTotalCapacityPrecise(std.testing.allocator, 3);
+    try std.testing.expectEqual(@as(usize, 3), data.collision_allow_records.capacity - data.collision_allow_records.items.len);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    data.allocator = failing.allocator();
+    try std.testing.expect(try data.destroyEntity(prefix));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(!data.isAlive(prefix));
+    try std.testing.expect(data.isAlive(boundary));
+    try std.testing.expect(data.isAlive(suffix));
+    try std.testing.expectEqual(@as(usize, 3), data.collision_allow_records.items.len);
+}
+
+test "a failed create with five allow slots leaves no live entity" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const prefix = try data.createEntity();
+    const boundary = try data.createEntity();
+    const suffix = try data.createEntity();
+    try data.setMovementBody(prefix, .{ .velocity = .{ .x = 1, .y = 0 } });
+    try data.setMovementBody(boundary, .{ .velocity = .{ .x = 1, .y = 0 } });
+    try data.setMovementBody(suffix, .{});
+    try std.testing.expectEqual(@as(usize, 2), data.movement_bodies.advancing);
+
+    data.collision_allow_records.clearAndFree(std.testing.allocator);
+    try data.collision_allow_records.ensureTotalCapacityPrecise(std.testing.allocator, 5);
+    try std.testing.expectEqual(@as(usize, 5), data.collision_allow_records.capacity - data.collision_allow_records.items.len);
+    try data.slots.ensureTotalCapacity(std.testing.allocator, data.slots.items.len + 1);
+    try data.movement_bodies.ensureCapacity(std.testing.allocator, data.movement_bodies.len() + 1);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    data.allocator = failing.allocator();
+    const created = try data.createEntity();
+    try data.setMovementBody(created, .{ .velocity = .{ .x = 4, .y = 0 } });
+    try std.testing.expect(data.movementBodyDenseIndex(created).? < data.movement_bodies.advancing);
+    try std.testing.expectError(error.OutOfMemory, data.setWorldLevel(created, 1));
+    data.destroyCreatedEntity(created);
+    try std.testing.expect(!data.isAlive(created));
+    try std.testing.expectEqual(@as(?usize, null), data.movementBodyDenseIndex(created));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(data.isAlive(prefix));
+    try std.testing.expect(data.isAlive(boundary));
+    try std.testing.expect(data.isAlive(suffix));
 }
 
 test "destroying a non-tail movement row allocates nothing once two allow records are reserved" {

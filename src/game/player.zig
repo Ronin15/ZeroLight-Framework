@@ -37,6 +37,7 @@ pub const Player = struct {
             .velocity = .{},
             .speed = speed,
         });
+        try data.setCollisionResponse(entity, .{});
         try data.setFacing(entity, .{ .direction = .down });
         try data.setPrimitiveVisual(entity, playerVisual());
         try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });

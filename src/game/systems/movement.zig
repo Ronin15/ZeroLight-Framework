@@ -201,12 +201,10 @@ fn applyIntentRangeScalar(bodies: *data.DataSystem, frame: *const SimulationFram
     }
 }
 
-/// Integrates every movement body over one contiguous SIMD range. Non-moving
-/// (dormant/kinematic) rows carry zero velocity — DataSystem zeros it on entry to a
-/// non-moving tier — so they integrate as no-ops; movement needs no scattered
-/// skip-path and the warm contiguous SIMD load stays intact. Chunk maintenance is a
-/// separate pass (SimulationScopeSystem.deriveChunks); movement only integrates
-/// position, so its benchmark exercises exactly this production path.
+/// Integrates the advancing prefix over one contiguous SIMD range. Rows at rest
+/// are the suffix and are not items. Chunk maintenance is a separate pass
+/// (SimulationScopeSystem.deriveChunks); movement only integrates position, so
+/// its benchmark exercises exactly this production path.
 ///
 /// Only x/y are snapshotted for render interpolation: z is a discrete plane index
 /// the renderer orders by directly (never interpolated), so movement never reads or
@@ -216,19 +214,20 @@ fn updateMovementBodies(
     integrate: Dispatch,
     delta_seconds: f32,
 ) MovementStats {
-    if (slice.entities.len == 0) return .{};
+    const n = slice.advancing;
+    if (n == 0) return .{};
 
     // Pre-select so the job context can dual-assert range.index against the
     // dispatched range count.
-    const selection = integrate.select(slice.entities.len, data.movement_range_alignment_items);
+    const selection = integrate.select(n, data.movement_range_alignment_items);
     var context = MovementJobContext{
         .slice = slice.*,
         .delta_seconds = delta_seconds,
         .range_count = selection.range_count,
     };
-    const batch = integrate.run(selection, slice.entities.len, data.movement_range_alignment_items, &context, movementJob);
+    const batch = integrate.run(selection, n, data.movement_range_alignment_items, &context, movementJob);
     return .{
-        .body_count = slice.entities.len,
+        .body_count = n,
         .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{},
     };
 }
@@ -582,9 +581,7 @@ test "threaded multi-worker movement update has no steady-state allocation after
 }
 
 test "dormant rows carry zero velocity and stay frozen across a full-range integrate" {
-    // Movement integrates the full contiguous SoA range (no scattered skip-path).
-    // Correctness for non-moving rows relies on DataSystem zeroing their velocity on
-    // entry to a non-moving tier, so integrating them here is a no-op.
+    // The dormant body has no AI and no response, so tier entry parks it.
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
 
@@ -609,6 +606,45 @@ test "dormant rows carry zero velocity and stay frozen across a full-range integ
     const after_moving = game_data.movementBodyConst(moving).?;
     try std.testing.expectEqual(@as(f32, 100 + 40 * 0.5), after_moving.position.x);
     try std.testing.expectEqual(@as(f32, 200 - 20 * 0.5), after_moving.position.y);
+}
+
+test "integrate skips an at-rest row" {
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+
+    const moving = try game_data.createEntity();
+    try game_data.setMovementBody(moving, .{
+        .position = .{ .x = 10, .y = 20 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{ .x = 4, .y = -2 },
+    });
+    const resting = try game_data.createEntity();
+    try game_data.setMovementBody(resting, .{
+        .position = .{ .x = 30, .y = 40 },
+        .previous_position = .{ .x = 30, .y = 40 },
+    });
+    try game_data.setCollisionBounds(resting, .{ .size = .{ .x = 8, .y = 8 } });
+
+    var slice = game_data.movementBodySlice();
+    const resting_row = game_data.movementBodyDenseIndex(resting).?;
+    slice.previous_x[resting_row] = -1;
+    slice.previous_y[resting_row] = -1;
+    try std.testing.expectEqual(@as(usize, 1), slice.advancing);
+    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
+    try updateInline(&slice, 0.5);
+
+    const after_moving = game_data.movementBodyConst(moving).?;
+    try std.testing.expectEqual(@as(f32, 12), after_moving.position.x);
+    try std.testing.expectEqual(@as(f32, 19), after_moving.position.y);
+    try std.testing.expectEqual(@as(f32, 10), after_moving.previous_position.x);
+    try std.testing.expectEqual(@as(f32, 20), after_moving.previous_position.y);
+    const after_resting = game_data.movementBodyConst(resting).?;
+    try std.testing.expectEqual(@as(f32, 30), after_resting.position.x);
+    try std.testing.expectEqual(@as(f32, 40), after_resting.position.y);
+    try std.testing.expectEqual(@as(f32, -1), after_resting.previous_position.x);
+    try std.testing.expectEqual(@as(f32, -1), after_resting.previous_position.y);
+    try std.testing.expectEqual(@as(usize, 1), game_data.movementBodySliceConst().advancing);
+    try std.testing.expectEqual(@as(usize, 2), game_data.movementBodySliceConst().entities.len);
 }
 
 // Velocity of a row no intent writes.

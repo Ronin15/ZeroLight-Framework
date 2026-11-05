@@ -48,6 +48,9 @@ const EntityId = @import("../data_system.zig").EntityId;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
+const ScopeColumnsSlice = @import("../data_system.zig").ScopeColumnsSlice;
+const MovementBodySlice = @import("../data_system.zig").MovementBodySlice;
+const MovementBodyStore = @import("../data_system/movement.zig").MovementBodyStore;
 const HotI32Slice = @import("../data_system.zig").HotI32Slice;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
@@ -319,13 +322,11 @@ pub const SimulationScopeSystem = struct {
         height: u16,
     };
 
-    /// Recompute each movement body's chunk coordinate from its settled position,
-    /// once per step, over the full contiguous SoA range. This is the separate pass
-    /// that replaces movement's former in-pass chunk write: movement is now a pure
-    /// position integrator. Non-moving rows recompute the same chunk from their
-    /// frozen position (harmless). Worker ranges own disjoint chunk writes.
-    /// `chunk_changes` is reserved before the batch; the main thread retargets
-    /// drawable runs from it after the join.
+    /// Recomputes chunk coordinates for the advancing prefix. At-rest rows whose
+    /// chunk is pending are written on this thread first, one row at a time.
+    /// Worker ranges own disjoint chunk writes of the prefix. `chunk_changes` is
+    /// reserved before the batch; the main thread retargets drawable runs from it
+    /// after the join.
     pub fn deriveChunks(
         self: *SimulationScopeSystem,
         data: *DataSystem,
@@ -333,8 +334,9 @@ pub const SimulationScopeSystem = struct {
         grid: ChunkGrid,
         config: ScopeConfig,
     ) !BatchStats {
+        try drainPendingChunks(self, data, grid);
         const move = data.movementBodySliceConst();
-        const n = move.entities.len;
+        const n = move.advancing;
         if (n == 0) return .{};
         const scope = data.scopeColumnsSlice();
         const derive = Dispatch.init(thread_system, &self.chunk_derive_tuner, .{
@@ -1133,7 +1135,7 @@ pub const SimulationScopeSystem = struct {
     ) !BatchStats {
         const region = visible_region orelse return .{};
         const scope = data.scopeColumnsSliceConst();
-        const n = scope.entities.len;
+        const n = scope.advancing;
         if (n == 0) return .{};
 
         const selection = thread_system.selectBatchProfile(&self.tier_policy_tuner, .{
@@ -1307,11 +1309,74 @@ fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         }
     }
     while (i < range.end) : (i += 1) {
-        const tx = math.worldPosToCell(job.position_x[i], grid.tile_size, grid.width);
-        const ty = math.worldPosToCell(job.position_y[i], grid.tile_size, grid.height);
-        const cx: i32 = @intCast(tx / @as(u32, @intCast(chunk_size)));
-        const cy: i32 = @intCast(ty / @as(u32, @intCast(chunk_size)));
-        recordChunkChange(job, range, i, cx, cy);
+        const chunk = chunkCoordFor(grid, job.position_x[i], job.position_y[i]);
+        recordChunkChange(job, range, i, chunk.x, chunk.y);
+    }
+}
+
+fn chunkCoordFor(grid: SimulationScopeSystem.ChunkGrid, x: f32, y: f32) struct { x: i32, y: i32 } {
+    const chunk_size: u32 = @max(grid.chunk_size_tiles, 1);
+    const tx = math.worldPosToCell(x, grid.tile_size, grid.width);
+    const ty = math.worldPosToCell(y, grid.tile_size, grid.height);
+    return .{
+        .x = @intCast(tx / chunk_size),
+        .y = @intCast(ty / chunk_size),
+    };
+}
+
+fn drainPendingChunks(self: *SimulationScopeSystem, data: *DataSystem, grid: SimulationScopeSystem.ChunkGrid) !void {
+    const pending = data.movement_bodies.pending_chunk_rows.items;
+    if (pending.len == 0) return;
+    try self.chunk_changes.ensureTotalCapacity(self.allocator, pending.len);
+    self.chunk_changes.items.len = pending.len;
+    const move = data.movementBodySlice();
+    const scope = data.scopeColumnsSlice();
+    const bodies = &data.movement_bodies;
+    var written: usize = 0;
+    for (pending) |row_u| {
+        const row: usize = row_u;
+        const chunk = chunkCoordFor(grid, move.position_x[row], move.position_y[row]);
+        const old_x = scope.chunk_x[row];
+        const old_y = scope.chunk_y[row];
+        if (move.has_primitive_visual[row] and (old_x != chunk.x or old_y != chunk.y)) {
+            bodies.reserveDrawableDestination(data.allocator, scope.level[row], chunk.x, chunk.y) catch |err| {
+                rollbackPendingDrain(bodies, move, scope, self.chunk_changes.items[0..written]);
+                return err;
+            };
+        }
+        self.chunk_changes.items[written] = .{
+            .movement_index = row_u,
+            .old_chunk_x = old_x,
+            .old_chunk_y = old_y,
+        };
+        written += 1;
+        scope.chunk_x[row] = chunk.x;
+        scope.chunk_y[row] = chunk.y;
+    }
+    for (self.chunk_changes.items[0..written]) |change| {
+        const row: usize = change.movement_index;
+        if (!move.has_primitive_visual[row]) continue;
+        if (change.old_chunk_x == scope.chunk_x[row] and change.old_chunk_y == scope.chunk_y[row]) continue;
+        bodies.relinkReservedDrawable(row, scope.level[row], scope.chunk_x[row], scope.chunk_y[row]);
+    }
+    bodies.clearPending();
+}
+
+fn rollbackPendingDrain(
+    bodies: *MovementBodyStore,
+    move: MovementBodySlice,
+    scope: ScopeColumnsSlice,
+    written: []const ChunkChange,
+) void {
+    for (written) |change| {
+        const row: usize = change.movement_index;
+        const new_x = scope.chunk_x[row];
+        const new_y = scope.chunk_y[row];
+        if (move.has_primitive_visual[row] and (new_x != change.old_chunk_x or new_y != change.old_chunk_y)) {
+            bodies.unreserveDrawableDestination(scope.level[row], new_x, new_y);
+        }
+        scope.chunk_x[row] = change.old_chunk_x;
+        scope.chunk_y[row] = change.old_chunk_y;
     }
 }
 
@@ -2374,8 +2439,14 @@ test "tier policy assigns all four LOD tiers by distance band" {
     const to_loco = try makeScoped(&data, .cognition, .{ .x = loco_x, .y = 0 }, false);
     const to_kine = try makeScoped(&data, .cognition, .{ .x = kine_x, .y = 0 }, false);
     const to_dorm = try makeScoped(&data, .cognition, .{ .x = dorm_x, .y = 0 }, false);
-    _ = try makeScoped(&data, .cognition, .{ .x = 2, .y = 2 }, false); // dist 0, already cognition → no change
-    _ = try makeScoped(&data, .cognition, .{ .x = dorm_x, .y = 0 }, true); // always_active far → pinned, skipped
+    const unchanged = try makeScoped(&data, .cognition, .{ .x = 2, .y = 2 }, false); // dist 0, already cognition → no change
+    const pinned = try makeScoped(&data, .cognition, .{ .x = dorm_x, .y = 0 }, true); // always_active far → pinned, skipped
+    try keepTierPolicyRow(&data, to_cog);
+    try keepTierPolicyRow(&data, to_loco);
+    try keepTierPolicyRow(&data, to_kine);
+    try keepTierPolicyRow(&data, to_dorm);
+    try keepTierPolicyRow(&data, unchanged);
+    try keepTierPolicyRow(&data, pinned);
 
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
@@ -2410,9 +2481,11 @@ test "tier policy demotes off-level entities by the cube distance" {
     const on_level = try data.createEntity();
     try data.setMovementBody(on_level, .{});
     try data.setSimulationMetadata(on_level, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .level = 0 });
+    try keepTierPolicyRow(&data, on_level);
     const off_level = try data.createEntity();
     try data.setMovementBody(off_level, .{});
     try data.setSimulationMetadata(off_level, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .level = 2 });
+    try keepTierPolicyRow(&data, off_level);
 
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
@@ -2457,16 +2530,16 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
 
     var data = DataSystem.init(allocator);
     defer data.deinit();
-    const a = try data.createEntity();
-    try data.setMovementBody(a, .{ .position = .{ .x = 300, .y = 100 } });
-    try data.setPrimitiveVisual(a, testDrawableVisual());
-    const dormant = try data.createEntity();
-    try data.setMovementBody(dormant, .{ .position = .{ .x = 500, .y = 200 } });
-    try data.setPrimitiveVisual(dormant, testDrawableVisual());
-    try data.setSimulationTier(dormant, .dormant);
-    const b = try data.createEntity();
-    try data.setMovementBody(b, .{ .position = .{ .x = 700, .y = 260 } });
-    try data.setPrimitiveVisual(b, testDrawableVisual());
+    const advancing = try data.createEntity();
+    try data.setMovementBody(advancing, .{ .position = .{ .x = 300, .y = 100 }, .velocity = .{ .x = 1, .y = 0 } });
+    try data.setPrimitiveVisual(advancing, testDrawableVisual());
+    const settled = try data.createEntity();
+    try data.setMovementBody(settled, .{ .position = .{ .x = 500, .y = 200 }, .previous_position = .{ .x = 500, .y = 200 } });
+    try data.setPrimitiveVisual(settled, testDrawableVisual());
+    try data.setSimulationMetadata(settled, .{ .tier = .cognition, .chunk = .{ .x = 9, .y = 4 } });
+    const pending = try data.createEntity();
+    try data.setMovementBody(pending, .{ .position = .{ .x = 700, .y = 260 }, .previous_position = .{ .x = 700, .y = 260 } });
+    try data.setPrimitiveVisual(pending, testDrawableVisual());
 
     const tile_size: f32 = 32;
     const chunk_size: u16 = 8;
@@ -2481,17 +2554,25 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
         .height = dims,
     }, .{});
 
-    // Every row's chunk (dormant included) matches the canonical world formula.
     var world = WorldSystem{ .allocator = allocator, .width = dims, .height = dims, .tile_size = tile_size, .chunk_size_tiles = chunk_size };
     defer world.deinit();
-    inline for (.{ a, dormant, b }) |ent| {
-        const body = data.movementBodyConst(ent).?;
-        const meta = data_test_support.simulationMetadata(&data, ent).?;
-        const expect = world.chunkCoordForWorldPos(body.position.x, body.position.y);
-        try std.testing.expectEqual(expect.x, meta.chunk.x);
-        try std.testing.expectEqual(expect.y, meta.chunk.y);
-    }
+    const advancing_body = data.movementBodyConst(advancing).?;
+    const advancing_chunk = world.chunkCoordForWorldPos(advancing_body.position.x, advancing_body.position.y);
+    const advancing_meta = data_test_support.simulationMetadata(&data, advancing).?;
+    try std.testing.expectEqual(advancing_chunk.x, advancing_meta.chunk.x);
+    try std.testing.expectEqual(advancing_chunk.y, advancing_meta.chunk.y);
+    const settled_meta = data_test_support.simulationMetadata(&data, settled).?;
+    try std.testing.expectEqual(@as(i32, 9), settled_meta.chunk.x);
+    try std.testing.expectEqual(@as(i32, 4), settled_meta.chunk.y);
+    const pending_body = data.movementBodyConst(pending).?;
+    const pending_chunk = world.chunkCoordForWorldPos(pending_body.position.x, pending_body.position.y);
+    const pending_meta = data_test_support.simulationMetadata(&data, pending).?;
+    try std.testing.expectEqual(pending_chunk.x, pending_meta.chunk.x);
+    try std.testing.expectEqual(pending_chunk.y, pending_meta.chunk.y);
+    try std.testing.expectEqual(@as(usize, 0), data.movement_bodies.pending_chunk_rows.items.len);
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.advancing);
     const movement = data.movementBodySliceConst();
+    try std.testing.expectEqual(@as(usize, 3), movement.entities.len);
     for (0..movement.entities.len) |index| try expectDrawableAtSettledChunk(&data, index);
 }
 
@@ -2511,10 +2592,10 @@ test "threaded deriveChunks matches serial across the range block and tail" {
     for (0..count) |i| {
         const fi: f32 = @floatFromInt(i);
         const te = try threaded_data.createEntity();
-        try threaded_data.setMovementBody(te, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+        try threaded_data.setMovementBody(te, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 }, .velocity = .{ .x = 1, .y = 0 } });
         try threaded_data.setPrimitiveVisual(te, testDrawableVisual());
         const se = try serial_data.createEntity();
-        try serial_data.setMovementBody(se, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+        try serial_data.setMovementBody(se, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 }, .velocity = .{ .x = 1, .y = 0 } });
         try serial_data.setPrimitiveVisual(se, testDrawableVisual());
     }
 
@@ -2654,7 +2735,7 @@ test "threaded deriveChunks records one sample into its own tuner" {
     for (0..count) |i| {
         const fi: f32 = @floatFromInt(i);
         const entity = try data.createEntity();
-        try data.setMovementBody(entity, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+        try data.setMovementBody(entity, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 }, .velocity = .{ .x = 1, .y = 0 } });
     }
 
     var sys = SimulationScopeSystem.init(allocator);
@@ -2745,8 +2826,108 @@ test "collision gather skips a locomotion static and keeps a locomotion dynamic"
         try plain.setMovementBody(body, .{});
         try plain.setCollisionBounds(body, .{ .size = .{ .x = 8, .y = 8 } });
     }
-    try std.testing.expect(try gatherCollisionInline(&sys, &plain) == null);
-    try std.testing.expectEqual(plain.collision_bounds.len(), plain.collision_bounds.dynamic_ids.items.len);
+    const plain_gather = try gatherCollisionInline(&sys, &plain);
+    try std.testing.expect(plain_gather != null);
+    try std.testing.expectEqual(@as(usize, 0), plain_gather.?.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.collision_bounds.dynamic_ids.items.len);
+}
+
+test "collision gather skips an at-rest row" {
+    const allocator = std.testing.allocator;
+    const collision = @import("collision.zig");
+    const CollisionContact = @import("../simulation.zig").CollisionContact;
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const a = try data.createEntity();
+    const b = try data.createEntity();
+    const resting = try data.createEntity();
+    for ([_]EntityId{ a, b, resting }) |entity| {
+        try data.setMovementBody(entity, .{ .position = .{ .x = 100, .y = 100 }, .previous_position = .{ .x = 100, .y = 100 } });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    }
+    try data.setCollisionResponse(a, .{});
+    try data.setCollisionResponse(b, .{});
+
+    try std.testing.expectEqual(@as(usize, 2), data.collision_bounds.dynamic_ids.items.len);
+    const resting_bounds = data.resolveSlotConst(resting).?.collision_bounds_index.?;
+    for (data.collision_bounds.dynamic_ids.items) |bounds_index| {
+        try std.testing.expect(bounds_index != resting_bounds);
+    }
+
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(allocator);
+    defer contacts.deinit();
+    var cs = collision.CollisionSystem.init(allocator);
+    defer cs.deinit();
+    _ = try cs.update(&data, &contacts, &threads, .{});
+    var named_both = false;
+    for (contacts.mergedItems()) |contact| {
+        try std.testing.expect(contact.a.index != resting.index);
+        try std.testing.expect(contact.b.index != resting.index);
+        const names_a = contact.a.index == a.index or contact.b.index == a.index;
+        const names_b = contact.a.index == b.index or contact.b.index == b.index;
+        if (names_a and names_b) named_both = true;
+    }
+    try std.testing.expect(named_both);
+
+    try data.setSimulationTier(a, .kinematic);
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    const indices = try gatherCollisionInline(&sys, &data);
+    try std.testing.expect(indices != null);
+    try std.testing.expectEqual(@as(usize, 1), indices.?.len);
+    try std.testing.expect(indices.?[0] != resting_bounds);
+}
+
+test "tier policy skips an at-rest row" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    const far: i32 = 4 + kinematic_halo_chunks;
+    const advancing = try data.createEntity();
+    try data.setMovementBody(advancing, .{ .position = .{ .x = 10, .y = 20 }, .previous_position = .{ .x = 10, .y = 20 } });
+    try data.setCollisionResponse(advancing, .{});
+    try data.setSimulationMetadata(advancing, .{ .tier = .cognition, .chunk = .{ .x = far, .y = 0 }, .always_active = false });
+    const resting = try data.createEntity();
+    try data.setMovementBody(resting, .{ .position = .{ .x = 30, .y = 40 }, .previous_position = .{ .x = 30, .y = 40 } });
+    try data.setCollisionBounds(resting, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setSimulationMetadata(resting, .{ .tier = .cognition, .chunk = .{ .x = far + 8, .y = 0 }, .always_active = false });
+    try std.testing.expectEqual(@as(usize, 1), data.movement_bodies.advancing);
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    var stream = RangeOutputStream(StructuralCommand).init(allocator);
+    defer stream.deinit();
+    const visible = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 });
+    try queueTierChangesInline(&sys, &data, visible, &stream);
+    const inline_out = stream.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), inline_out.len);
+    try std.testing.expectEqual(advancing, inline_out[0].set_simulation_tier.entity);
+    const inline_tier = inline_out[0].set_simulation_tier.tier;
+
+    stream.clearRetainingCapacity();
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    _ = try sys.queueTierChanges(&data, visible, &stream, &threads, .{
+        .items_per_range = scope_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    const threaded_out = stream.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), threaded_out.len);
+    try std.testing.expectEqual(advancing, threaded_out[0].set_simulation_tier.entity);
+    try std.testing.expectEqual(inline_tier, threaded_out[0].set_simulation_tier.tier);
+    try std.testing.expectEqual(SimulationTier.cognition, data_test_support.simulationMetadata(&data, resting).?.tier);
+    const body = data.movementBodyConst(resting).?;
+    try std.testing.expectEqual(@as(f32, 30), body.position.x);
+    try std.testing.expectEqual(@as(f32, 40), body.position.y);
+}
+
+fn keepTierPolicyRow(data: *DataSystem, id: EntityId) !void {
+    try data.setCollisionResponse(id, .{});
 }
 
 /// Test helper: a live entity with a movement body and the given scope metadata.
@@ -2832,8 +3013,10 @@ test "queueTierChanges appends its range alongside another structural producer" 
     // Placed past the kinematic halo (band-relative) so it lands in the dormant band.
     const far: i32 = 5 + @as(i32, kinematic_halo_chunks);
     const demoted = try makeScoped(&data, .cognition, .{ .x = far, .y = far }, false);
+    try keepTierPolicyRow(&data, demoted);
     // One always_active entity used only as a marker for a prior producer's range.
     const marker = try makeScoped(&data, .cognition, .{ .x = 1, .y = 1 }, true);
+    try keepTierPolicyRow(&data, marker);
 
     var stream = RangeOutputStream(StructuralCommand).init(allocator);
     defer stream.deinit();
@@ -2869,7 +3052,8 @@ test "queueTierChanges writes its range as the sole producer on a fresh stream" 
     // Far cognition entity sleeps to dormant; near one stays cognition (no command).
     const far: i32 = 4 + @as(i32, kinematic_halo_chunks);
     const sleeper = try makeScoped(&data, .cognition, .{ .x = far, .y = far }, false);
-    _ = try makeScoped(&data, .cognition, .{ .x = 1, .y = 1 }, false);
+    try keepTierPolicyRow(&data, sleeper);
+    try keepTierPolicyRow(&data, try makeScoped(&data, .cognition, .{ .x = 1, .y = 1 }, false));
 
     // Fresh stream, no prior producer — exercises the prefix_ready=false fallback
     // path that the live pipeline actually hits (queueTierChanges runs first).
@@ -2955,6 +3139,7 @@ test "threaded tier policy matches serial" {
     for (0..scope_range_alignment_items * 6) |index| {
         const e = try data.createEntity();
         try data.setMovementBody(e, .{});
+        try data.setCollisionResponse(e, .{});
         const level: u16 = if (index % 6 == 0) 2 else 0;
         try data.setSimulationMetadata(e, .{ .tier = .cognition, .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = level });
     }
@@ -4031,14 +4216,17 @@ test "collision gather filters on the bounds tier column" {
     const first = try data.createEntity();
     try data.setMovementBody(first, .{ .position = .{ .x = 1, .y = 1 } });
     try data.setCollisionBounds(first, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setCollisionResponse(first, .{});
     try data.setSimulationTier(first, .locomotion);
     const dropped = try data.createEntity();
     try data.setMovementBody(dropped, .{ .position = .{ .x = 8, .y = 8 } });
     try data.setCollisionBounds(dropped, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setCollisionResponse(dropped, .{});
     try data.setSimulationTier(dropped, .kinematic);
     const second = try data.createEntity();
     try data.setMovementBody(second, .{ .position = .{ .x = 16, .y = 16 } });
     try data.setCollisionBounds(second, .{ .size = .{ .x = 4, .y = 4 } });
+    try data.setCollisionResponse(second, .{});
     try data.setSimulationTier(second, .locomotion);
     const dropped_movement = data.movementBodyDenseIndex(dropped).?;
     var dropped_bounds: usize = 0;

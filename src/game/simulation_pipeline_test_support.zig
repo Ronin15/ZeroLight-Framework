@@ -126,8 +126,7 @@ pub const SteeringBox = struct {
 };
 
 /// A steering agent heading +x and a static box parked far from it, on `level`. The agent
-/// is created last, so it is the last movement row: destroying any earlier movement body
-/// swap-removes the agent into that body's row.
+/// is in the advancing prefix. The static box is at rest.
 pub fn addSteeringAgentAndParkedBox(data: *DataSystem, level: u16) !SteeringBox {
     const parked = math.Vec2{ .x = 96, .y = 960 };
     const box = try data.createEntity();

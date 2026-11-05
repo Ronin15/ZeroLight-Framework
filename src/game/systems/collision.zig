@@ -1125,11 +1125,6 @@ pub const CollisionSystem = struct {
         std.debug.assert(std.math.frexp(config.strips.height).significand == 0.5);
         self.strips = config.strips;
         const view = config.static_colliders;
-        if (comptime builtin.mode == .debug) {
-            if (view.geometry == null) {
-                std.debug.assert(data.collision_bounds.dynamic_ids.items.len == data.collision_bounds.len());
-            }
-        }
         const threads: Threads = .{ .thread_system = thread_system, .config = config };
         var stats = CollisionStats{};
         const sweep = try self.buildBanded(data, config.scope_dense_indices, config.strips, threads, &stats);
@@ -3320,7 +3315,7 @@ const TestBox = struct {
     offset_y: f32 = 0,
 };
 
-fn addBox(data: *DataSystem, box: TestBox) !EntityId {
+fn addBoundsBody(data: *DataSystem, box: TestBox) !EntityId {
     const entity = try data.createEntity();
     try data.setMovementBody(entity, .{
         .position = .{ .x = box.x, .y = box.y },
@@ -3329,6 +3324,12 @@ fn addBox(data: *DataSystem, box: TestBox) !EntityId {
     });
     try data.setCollisionBounds(entity, .{ .offset = .{ .x = box.offset_x, .y = box.offset_y }, .size = .{ .x = box.w, .y = box.h } });
     if (box.level) |level| try data.setWorldLevel(entity, level);
+    return entity;
+}
+
+fn addBox(data: *DataSystem, box: TestBox) !EntityId {
+    const entity = try addBoundsBody(data, box);
+    try data.setCollisionResponse(entity, .{});
     return entity;
 }
 
@@ -5154,7 +5155,7 @@ fn testGeometry() ColliderGeometry {
 }
 
 fn addObstacle(data: *DataSystem, box: TestBox, mobility: @import("../data_system.zig").CollisionResponseMobility, mode: @import("../data_system.zig").CollisionResponseMode) !EntityId {
-    const entity = try addBox(data, box);
+    const entity = try addBoundsBody(data, box);
     try data.setCollisionResponse(entity, .{ .mobility = mobility, .mode = mode, .restitution = 0 });
     return entity;
 }
@@ -5486,7 +5487,8 @@ fn expectStoredTriggerAllowFollowsMovedRow(workers: usize) !void {
     // holds right's row 2 until the removal's allow epoch refreshes it. A kinematic body
     // then takes row 2 and turns exclusion on.
     try std.testing.expect(try data.destroyEntity(walker));
-    const parked = try addObstacle(&data, .{ .x = 2000, .y = 2000, .w = 8, .h = 8 }, .dynamic, .solid);
+    // At rest, so it appends at the stale row instead of swapping into the prefix.
+    const parked = try addBoundsBody(&data, .{ .x = 2000, .y = 2000, .w = 8, .h = 8 });
     try data.setSimulationTier(parked, .kinematic);
     try std.testing.expectEqual(@as(usize, 0), data.movementBodyDenseIndex(right).?);
     try std.testing.expectEqual(@as(usize, 2), data.movementBodyDenseIndex(parked).?);
