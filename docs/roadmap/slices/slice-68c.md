@@ -54,7 +54,7 @@ its first weapon); player death drops (the player is downed, Slice 56).
   and a consume queued before apply never fails at apply.
 - The AI emitter picks ranged or fallback reach from ammo presence, read
   only; combat resolve rechecks against this step's queued transfers.
-- Work is bounded per step by fixed counts and runs serial only where the
+- Work is bounded per step by fixed admission counts and runs serial only where the
   cost model allows (`.grok/rules/threading.md`).
 - VoidLight reference: port required-ammo matching (first compatible stack,
   one per shot) and the AI ranged gate; change the out-of-ammo path from
