@@ -47,7 +47,7 @@ content across world sizes.
   (53B, 60); spatial-index coverage of the whole population (75);
   `behavior_count` (73);
   `cognition_stagger_n` and LOD bands (75).
-- Kept, justified at each site: work budgets (audio commands per step, SFX
+- Kept, justified at each site: fixed admission budgets (audio commands per step, SFX
   voices, `TimeLoop.max_updates_per_frame`, full SDL event drain); format
   widths (`TileId` u16, component `enum(u5)`, entity u32, GPU u32 guards,
   AI memory ring, probe tables at 2×); seam growth already proven
@@ -114,7 +114,7 @@ content across world sizes.
 - [ ] E6 · Initial elastic capacity from the loaded population.
 - [ ] E7 · Solve result slots isolated per worker (65A's helper).
 - [ ] E8 · Worker path and stitched pool stripes start on a line.
-- [ ] E9 · Per-step solve and fallback budgets are fixed counts, not clamped
+- [ ] E9 · Per-step solve and fallback budgets are fixed admission counts, not clamped
       to population.
 - [x] F1 · Exact reserves for exact-size nav arrays. Superseded: nav has no
       level-sized arrays; per-chunk pools grow counted at their seam (`5db9025`,

@@ -12,7 +12,7 @@ per intent). Damage and crit rolls are deterministic functions of the
 session seed's combat domain, stable entity IDs, and the step. Deaths commit
 as deferred destroys. Damage feeds affect through a real appraisal signal,
 and scalar domain events drive audio and particles. Serial == threaded,
-allocation-free after reserve, every per-step budget a fixed count.
+allocation-free after reserve, every per-step admission budget a fixed count.
 
 In scope: melee (explicit-target AI attacks and the player's faced-arc
 swing), simultaneous same-step resolution, death, the affect signal, events
@@ -80,9 +80,9 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
 - Damage reaches affect once per hit through a watermark on the victim
   (`.grok/rules/simulation.md` § AI and affect); rows without health
   contribute zero.
-- Kills preflight events and structural commands; commits are all-or-fail
-  (`.grok/rules/simulation.md` § Events and streams).
-- Per-step hit and kill caps are fixed counts; excess hits defer
+- Kills preflight events and structural commands; an over-share structural
+  suffix defers (`.grok/rules/simulation.md` § Events and streams).
+- Per-step hit and kill caps are fixed admission counts; excess hits defer
   deterministically to later steps, never dropped or refused; a kill
   resolves when its hit applies (`.grok/rules/budgets-capacities.md`).
 - Player: `Action.attack` is a gameplay action under modal routing

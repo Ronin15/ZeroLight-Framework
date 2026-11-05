@@ -28,9 +28,10 @@ only committed state and the fixed-step sim view.
   (`src/game/simulation_scope.zig`); Slice 75 removes dormancy for agents.
 - `tier_policy` reads Slice 49's `simViewRegion`; `visibleChunkRegion()` is
   render-only after 49.
-- Deferred structure: `StructuralCommand.create_entity` / `destroy_entity`
-  with all-or-fail preflight; destroy-then-create slot reuse is
-  allocation-free after preflight (`data_system/system.zig` test).
+- Deferred structure: `StructuralCommand.create_entity` / `destroy_entity`;
+  over-share suffixes defer, shared-bound or OOM commits nothing;
+  destroy-then-create slot reuse is allocation-free after the commit
+  prefix is known (`data_system/system.zig` test).
 - Archetype bundles (`AiArchetypeCatalog.bundleForId`, `ai_archetypes.zig`);
   the archetype JSON has no body or visual block; demo spawn builds
   templates by hand and sizes from `battle_scale_demo_mover_count`.
@@ -63,7 +64,7 @@ only committed state and the fixed-step sim view.
   table's class.
 - No global or per-world population cap: totals follow anchor content
   (`max_alive` per anchor). Per-step spawn, recycle, and evaluation counts are
-  fixed budgets with deterministic deferral; a group that does not fit this
+  fixed admission budgets with deterministic deferral; a group that does not fit this
   step waits, never starves.
 - Placement is integer-only and seeded on `seed.derive(.population)` by
   anchor and member, never entity or worker order; candidates on blocking
