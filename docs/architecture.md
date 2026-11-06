@@ -136,23 +136,24 @@ Designs start here, then read the live structure below (rules:
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
-  orchestration, reusable gameplay systems, and full-active scope stats;
+  orchestration, reusable gameplay systems, and scope stats;
   its test-only scenario fixtures are private in that file.
 - `src/game/simulation_scope.zig` defines simulation tiers, active-region
-  scaffolding, per-entity scope metadata types, stagger/halo constants, and scope
+  scaffolding, per-entity scope metadata types, band and residue constants, and scope
   counters.
 - `src/game/systems/simulation_scope.zig` owns `SimulationScopeSystem`, the
-  backbone scope processor: tier/halo/stagger gathers and the auto tier wake/sleep
-  policy (entity chunk columns are derived by the dedicated late `chunk_derive`
-  stage after positions settle, not in the scope pass).
+  backbone scope processor: band gathers and the tier policy (entity chunk
+  columns are derived by the dedicated late `chunk_derive` stage after
+  positions settle, not in the scope pass).
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
-- `src/game/systems/movement.zig` integrates movement-body SoA columns through
-  serial or threaded SIMD-aware ranges (world x/y only; discrete vertical plane
-  is `position_z` / `world_level`, not continuous z motion) and applies the
-  step's AI movement intents as a threaded stage.
+- `src/game/systems/movement.zig` integrates the advancing prefix of the
+  movement-body columns through serial or threaded SIMD-aware ranges (world
+  x/y only; discrete vertical plane is `position_z` / `world_level`, not
+  continuous z motion) and applies the step's AI movement intents as a
+  threaded stage. Rows at rest are the suffix and are not items of that pass.
 - `src/game/systems/world_gate.zig` clamps settled bodies to world bounds and
-  gates them off solid tiles as threaded lane batches over the movement rows,
+  gates them off solid tiles as threaded lane batches over the advancing prefix,
   then the player row on the main thread. The body box is the collision bounds,
   mirrored into movement-row columns (offset, size, `has_collision_bounds`,
   `has_ai_agent`) that only `DataSystem` writes at the commit seam; a player
@@ -939,33 +940,34 @@ composer and each controller and system owns its own internals
 Simulation tiers and active scope belong in the same pipeline boundary. Tier and
 chunk metadata are dense SoA columns on the movement-body store
 (`tier`, `chunk_x/y`, `stagger_phase`, `always_active`), in lockstep with the
-movement rows so they exist exactly for simulated entities and the O(N) scope
-passes read/write dense columns rather than scattered slots. The pipeline-owned
+movement rows so they exist exactly for simulated entities and the scope
+passes read and write dense columns rather than scattered slots. The pipeline-owned
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
-that derives the camera cognition halo from `WorldSystem` and selects which entities
+that derives the bands from the fixed-step view and selects which entities
 enter each stage; entity chunk columns are derived by the dedicated late `chunk_derive`
 stage, ordered after every `movement_positions` writer so tier policy and render prep
 read chunks matching each body's final settled position.
-Processors keep their hot loops and receive a `scope_dense_indices` option
-(null = full-active) instead of learning world/chunk policy. Movement and
-collision gate on tier only (no chunk filter, so off-screen entities keep moving
-and colliding) and short-circuit to full-active in O(1) via incremental
-`tier_counts` when nothing is dormant/kinematic; **cognition thinking** (perception
-observers, memory, affect, AI decide) gates on tier + camera halo + a per-entity
-stagger cadence, while the shared spatial index (and so every neighbor query's
-candidates) is built from the unstaggered cognition halo so off-phase agents
-remain visible. Steering inherits think-set scope transitively through the navigation-intent
-stream. Tier wake/sleep changes flow through deferred
-`set_simulation_tier` structural commands at the commit seam, never inside worker
-ranges. Scope bounds active work per step; benches at large counts show how
-each stage scales (`.grok/rules/tests-benchmarks.md`).
+Processors keep their hot loops and receive the row list for that pass
+instead of learning world or chunk policy. Movement integrates the advancing
+prefix, so a row at rest is not an item and distance does not stop a moving
+row (`.grok/rules/simulation.md` § Scope and tiers,
+`.grok/rules/engine-design.md` § Cost model). Collision sweeps
+`dynamic_ids[0..colliding)`: cognition and locomotion are in that prefix,
+and kinematic and `lowest` are not. **Cognition thinking** (perception,
+memory, affect, AI decide) runs the due groups of every band. The shared
+spatial index is every AI row, so a neighbor query still sees an agent that
+is not due this step. Steering inherits the think set through the
+navigation-intent stream. Tier changes flow through deferred
+`set_simulation_tier` structural commands at the commit seam, never inside
+worker ranges. Benches at large counts show how each stage scales
+(`.grok/rules/tests-benchmarks.md`).
 
-`ai_cognition_order` is `mergeThinkSet`, then `packThinkSpan`. The merge is
-the always-active in-halo run, then this step's stagger-phase run, or every
-phase run when there is no cognition region. One live run is copied
-(`copyThinkRun`) and does not load a cell prefix. Two or more compare cell
-prefixes (`thinkCellPrefix`) and stay scalar: the next head depends on the
-last compare. A bodiless row is not emitted. `packThinkSpan` rewrites that
+`ai_cognition_order` is `mergeThinkSet`, then `packThinkSpan`. The merge
+emits the due groups only: the always-active group, plus each band's
+residues that are due this step. One live run is copied (`copyThinkRun`)
+and does not load a cell prefix. Two or more compare cell prefixes
+(`thinkCellPrefix`) and stay scalar: the next head depends on the last
+compare. A bodiless row is not emitted. `packThinkSpan` rewrites that
 list to `0 .. think_len`. Paired perception and memory rows land at
 `0 .. paired - 1` in both stores; a one-component row follows that prefix
 on its own column. Rows that share a cell stay adjacent, so a cell's
@@ -980,15 +982,14 @@ the stored phase unless the write names one; a named phase settles the row
 and does not take a residue. The level comes from the `world_level` row
 when the entity has one.
 
-The durable tier model is capability-based, not visibility-based:
-`dormant` entities exist but do not enter normal active scope (today every
-row not `always_active` past `kinematic_halo_chunks` of the sim-view region;
-the Target Model keeps `dormant` for inert things), `kinematic`
-entities run movement integration, `locomotion` entities add collision
-detection/response, and `cognition` entities add AI, steering, and path
-requests. Scope then decides which worlds, chunks, chunk halos, or
-staggered/reduced-cadence groups enter those tiered stages for the current
-fixed step.
+The durable tier model is capability-based, not visibility-based
+(`.grok/rules/simulation.md` § Scope and tiers). Distance from the one
+fixed-step `sim_view` assigns `cognition`, `locomotion`, `kinematic`, or
+`lowest`. It does not assign `dormant`. `dormant` is the at-rest suffix.
+Agents are not put there. A world with no view uses `lowest`, not a
+full-active fallback. Every band moves. Cognition and locomotion also
+collide. Each band thinks on its own cadence, and `always_active` thinks
+every step.
 
 ### Affect
 
@@ -1002,9 +1003,9 @@ or transient range streams; only notable transitions become low-volume domain
 events (`entity_perceived` / `entity_lost`, `affect_threshold_crossed`, and
 similar). Cross-entity classification (faction/stance), a deterministic
 per-entity RNG facility in `src/core`, and a shared per-frame spatial index are
-shared substrate these stages consume. Because they *think* only for in-halo, on-phase cognition entities, their
-think cost scales with the stagger-filtered set (~N/4), not total entity
-count; the shared index scales with the unstaggered halo.
+shared substrate these stages consume. Think work follows the due rows.
+The index follows the AI population. Neither grows with world extent
+(`.grok/rules/engine-design.md` § Cost model).
 
 **Emotion model (Slice 31 substrate):** `AiAffect` stores independent scalar
 drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
@@ -1210,9 +1211,9 @@ impacts and collision audio, replacing two scans of every contact.
 ### Spatial index
 
 `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) is the pipeline's one
-neighbor index. `spatial_index_build` builds it each step from the unstaggered
-cognition halo at the previous step's positions and levels, and every neighbor
-query that step reads it (`.grok/rules/simulation.md`).
+neighbor index. `spatial_index_build` builds it each step from every AI row
+at the previous step's positions and levels, and every neighbor query that
+step reads it (`.grok/rules/simulation.md` § Scope and tiers).
 
 - **Key and records.** Each entry sorts by one 128-bit key: level | chunk_y |
   chunk_x | faction | local_y | local_x | slot. Cells tile the world's chunk grid

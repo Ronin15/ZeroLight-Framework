@@ -69,18 +69,17 @@ a threaded pass under its own tuner, which may keep it inline below its gate:
 1. `dig_world_edit`: the dig's world edit and the step's stimuli (deferred
    impacts promoted, the dig, at most one player footstep).
 2. `scope_advance_and_ai_gather`: the **scope pass** advances the stagger clock
-   and gathers the unstaggered cognition halo on workers. Chunk columns come
+   and gathers every AI row on workers. Chunk columns come
    later, from `chunk_derive`.
-3. `spatial_index_build`: the shared **spatial index** of the halo at the
+3. `spatial_index_build`: the shared **spatial index** of every AI row at the
    previous step's positions and levels (carried); bucket, sort, and link run
    on workers (`docs/architecture.md`).
-4. `ai_cognition_order`: the **think set**. `mergeThinkSet` merges the
-   always-active in-halo run with this step's phase run, or with every phase
-   run when there is no cognition region. One live run is copied. Two or more
-   compare cell prefixes and stay scalar. `packThinkSpan` follows that merge.
-   Rows that share a cell stay adjacent. The phase a row thinks on, and the
-   packed prefix, are in
-   [architecture.md](architecture.md) § Tiers and scope.
+4. `ai_cognition_order`: the **think set**. `mergeThinkSet` emits the due
+   groups only: the always-active group, plus each band's residues that are
+   due this step. One live run is copied. Two or more compare cell prefixes
+   and stay scalar. `packThinkSpan` follows that merge. Rows that share a
+   cell stay adjacent. The phase a row thinks on, and the packed prefix, are
+   in [architecture.md](architecture.md) § Tiers and scope.
 5. `perception_update` (`PerceptionSystem`): think-set observers against the
    index (range, FOV, line of sight), writing sensed state to `PerceptionStore`;
    the gather and the compute run on workers. Carries positions and levels.
@@ -92,8 +91,9 @@ a threaded pass under its own tuner, which may keep it inline below its gate:
    perception events; workers track still-visible targets. The visibility
    pass streams the shared think prefix (perception and memory at the same
    index) when the member rows are that prefix; a gapped set uses the memory
-   row for both. The ring scan stays scalar. A row demoted out of the halo is
-   not gathered, so its memory freezes and resumes cleanly on resync.
+   row for both. The ring scan stays scalar. A row that is not due this step
+   is gathered again on its cadence. Leaving the near bands does not freeze it
+   (`.grok/rules/engine-design.md` § Cost model).
 7. `affect_update` (`AffectSystem`): appraises this step's perception and
    memory state (each optional per row) and the agent's `ai_behavior` (carried)
    into four drives decayed toward per-entity baselines. The gather is a
@@ -109,28 +109,25 @@ a threaded pass under its own tuner, which may keep it inline below its gate:
    frame-delayed pathfinding, movement intents in movement-row order, and
    movement.
 10. The late-stage pose order below, then `chunk_derive` → `action_react` →
-    `tier_policy`. The **simulation-LOD tier policy** assigns each entity a
-    cognition/locomotion/kinematic/dormant tier by cube distance and emits
-    deferred `set_simulation_tier` commands at the commit seam (the Target
-    Model keeps `dormant` for inert things only).
+    `tier_policy`. The **simulation-LOD tier policy** assigns
+    `cognition`, `locomotion`, `kinematic`, or `lowest` from the fixed-step
+    view and emits deferred `set_simulation_tier` commands at the commit seam.
+    Distance does not write `dormant` (`.grok/rules/simulation.md` § Scope and tiers).
 
 Collision broadphase keeps its own sweep-and-prune structure rather than
 consuming the spatial index (see `docs/architecture.md`).
 
-**Sim-view rule (Slice 49).** Every scope band (cognition halo, tier policy,
-and later coast/spawn bands) derives from the fixed-step
-`SimulationPipelineUpdateContext.sim_view` rect: the scope pass uses
-`WorldSystem.cognitionRegionForWorldRect(sim_view, sim_view_overscan_chunks,
-cognition_halo_chunks)` and the tier policy (and any later scope-band reader)
-uses the pipeline's `simViewRegion(context)`. `GameDemoState.simViewRect()` is
-the only sim-view source (`camera_current`, the camera computed at the end of
-the previous step). No simulation path reads `WorldSystem.visibleChunkRegion()`
-— that window is set by `render` from the interpolated camera for draw culling
-only. `sim_view` is required (a non-optional `Rect`), so no caller can silently
-skip scope gating. Only a world with no chunks yields no region, which keeps the
-full-active fallback (no halo, no stagger filter, no tier changes); pipeline tests
-pass a full-world-extent rect, and a test whose subject is the whole population
-thinking in one step on a chunked world marks it `always_active`.
+**Sim view.** Bands derive from the fixed-step
+`SimulationPipelineUpdateContext.sim_view` rect
+(`.grok/rules/simulation.md` § Scope and tiers). The tier policy uses
+`simViewRegion(context)`. `GameDemoState.simViewRect()` is the only sim-view
+source (`camera_current`, the camera computed at the end of the previous
+step). No simulation path reads `WorldSystem.visibleChunkRegion()` — that
+window is set by `render` from the interpolated camera for draw culling
+only. `sim_view` is required (a non-optional `Rect`). A world with no chunks
+has no region and assigns `lowest`; cadence still applies. A test whose
+subject is the whole population thinking in one step marks the rows
+always-active, or puts every agent in the nearest band.
 
 Late-stage pose order (after movement integrate):
 

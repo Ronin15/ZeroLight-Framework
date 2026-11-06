@@ -588,7 +588,8 @@ Group index (files under `src/benchmarks/`):
 - `spatial_index.zig`: `spatial_index`, `-shape`, `-query`; the shared neighbor
   index.
 - `scope.zig`: `scope-cognition` (`spread`, `dense_chunk`, `interleaved_runs`);
-  the think set.
+  the think set. `far_sim.zig`: `far-sim`; think rows against population and
+  world extent, with the index and movement counts beside them.
 - `ai.zig`: `ai`. `ai_memory.zig`: `ai-memory`, `-shuffled`,
   `-perception-shuffled`, `-sparse`. `affect.zig`: `ai-affect`, `ai-affect-shuffled`.
   `perception.zig`: `perception`, `-los-dense`, `-scattered-dense-index`,

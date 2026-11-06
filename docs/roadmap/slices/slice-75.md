@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows and tier mechanics have landed. Still open: 73's think interval, the far-from-observer signal, far path requests, scope-state classification, the scope-file audit, docs, and acceptance. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows, tier mechanics, and the tier docs have landed. Still open: 73's think interval, the far-from-observer signal, far path requests, scope-state classification, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -77,8 +77,7 @@ Scope comes from one camera and puts far entities to sleep.
   observer; worlds the observer is not in still step; nothing is evicted from
   the simulation (`.grok/rules/engine-design.md` § Target scale).
 - Tiers set fidelity, never whether an entity advances
-  (`.grok/rules/simulation.md` § Scope and tiers); the live tier policy and
-  the halo-only AI gather contradict this and are replaced.
+  (`.grok/rules/simulation.md` § Scope and tiers).
 - Cadences are pure functions of deterministic state (band, entity,
   `StepIndex`), never wall clock, render cadence, or measured cost
   (`.grok/rules/simulation.md` § Determinism). Per-step work budgets are
@@ -95,17 +94,13 @@ Scope comes from one camera and puts far entities to sleep.
 - 75 owns spatial-index coverage of the whole population: every agent thinks,
   so every agent is indexed for perception and steering queries, in every
   band.
-- Per-step cost follows population divided by each band's cadence, never
-  world extent × world count; serial and threaded paths with parity
-  (`.grok/rules/threading.md`).
-- The think set's membership is one phase test over the indexed rows
-  (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`), and band
-  cadence replaces that test. With the whole population indexed, that pass
-  costs one compare per indexed row every step on workers, so to meet the
-  cost line above it walks only rows that can think this step, or an
-  O(think rows) producer in the same cell-major order replaces it. The think
-  set reads each entry's `population_row` as its AI row; a population 75
-  hands the index keeps that mapping.
+- Think work follows population divided by each band's cadence. The index
+  and movement follow the agents, every step. None of that grows with world
+  extent (`.grok/rules/engine-design.md` § Cost model). Serial and threaded
+  paths have parity (`.grok/rules/threading.md`).
+- Think-set membership is the rows that can think this step. It does not
+  scan the indexed population to drop the ones that are not due. The index
+  still covers every AI row (`.grok/rules/engine-design.md` § Cost model).
 - Needs from 64G: whole-world chunked nav. From 73: the per-agent think
   interval, which 75's distance bands feed as one input (55's idle coasting
   is another).
@@ -180,16 +175,18 @@ Scope comes from one camera and puts far entities to sleep.
       10000 (steps 16, 64, and 156–157). Extent items at population 4096
       keep that 4096 sum and the index count. Collision items stay 1.
       Several runs printed `settled=no`; the counters are the proof.
-- [ ] Docs: `docs/architecture.md` tier model; `docs/simulation-tiers-and-pipeline.md`
-      scope, bands, and cadences.
+- [x] Docs: `docs/architecture.md` tier model; `docs/simulation-tiers-and-pipeline.md`
+      scope, bands, and cadences. The tier sections cite the scope rule.
+      Think work follows the due rows. The index and movement follow the agents.
 
 ### Acceptance checks
 
 - [ ] No entity stops advancing because of distance from the observer
       (tests over every band).
-- [ ] `far-sim` matches the cost model (linear in population ÷ cadence);
-      `production-step`, `ai`, and `steering` show no near-observer regression beyond
-      run-to-run spread.
+- [ ] `far-sim` matches the cost model: think rows follow population divided
+      by cadence, the index and movement follow the agent count, and neither
+      grows with world extent. `production-step`, `ai`, and `steering` show
+      no near-observer regression beyond run-to-run spread.
 - [ ] `production-step` meets its pass shape on the level-count and
       level-side axes with every row advancing at its tier.
 - [ ] Manual (display, Debug): NPCs revisited after travelling far away have
