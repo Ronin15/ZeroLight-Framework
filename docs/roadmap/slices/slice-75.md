@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, and far path requests have landed. Still open: 73's think interval, scope-state classification, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, far path requests, and the scope-state classification have landed. Still open: 73's think interval, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -106,8 +106,10 @@ Scope comes from one camera and puts far entities to sleep.
   is another).
 - Provides: the far-from-observer signal 62's ambient recycling uses; the
   lowest band 74 applies to worlds the observer is not in.
-- New persistent scope state is classified for 49/64B and included in 46's
-  v1.
+- Persistent scope state is the hashed movement-row fields and the
+  stagger-arrival history in the checklist. This item adds no column, no
+  hasher, and no tag. 49 writes the lists, 64B walks the hashed fields, and
+  46's v1 saves them. `was_far` stays with 62.
 
 ### Checklist
 
@@ -165,8 +167,24 @@ Scope comes from one camera and puts far entities to sleep.
       budget. Every band, including `lowest`, already emits one request.
       A zero admission budget leaves them `.pending`. The solve ceiling
       stays `default_max_solves_per_frame` (512).
-- [ ] New persistent scope state classified for 49/64B; included in 46's
-      v1.
+- [x] New persistent scope state classified for 49/64B; included in 46's
+      v1. No column, hasher, or tag added. 49 writes the lists, 64B walks
+      the hashed fields, and 46's v1 saves them. Those slices are not done
+      here. There is no live checksum tag to bump.
+      Hashed, on the movement row: `tier`, `level`, `stagger_phase`,
+      `stagger_settled`, `always_active`. Hashed with them: the
+      stagger-arrival history (`arrivals.next`, `level_origins`,
+      `arrivals.live`, `arrival_holds`, `arrival_holder_rows`). World 0
+      uses the store fields; any other id uses the same fields on
+      `other_worlds`. Map entries are hashed and saved in ascending key
+      order. `arrival_holder_rows` stays list order.
+      `arrival_holds.holder_slot` stays the index into that list.
+      Excluded, rebuilt: `chunk_x` and `chunk_y`; `cell_size`, `cells_x`,
+      and `cells_y` (and the same three on `OtherStaggerWorld`); the
+      `AiAgentRow` copies of `level`, `chunk_x`, `chunk_y`, `tier`,
+      `stagger_phase`, and `always_active`; `CollisionBoundsRow.tier`;
+      `DataSystem.tier_counts`. `was_far` is not a column. 62's caller
+      keeps that bit.
 - [ ] The whole of `systems/simulation_scope.zig` and `simulation_scope.zig`
       checked against the cost model and the rules (owner 2026-10-16), not only
       the items above. Each finding becomes an item here.
