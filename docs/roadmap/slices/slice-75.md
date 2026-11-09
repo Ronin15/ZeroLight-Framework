@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows, tier mechanics, and the tier docs have landed. Still open: 73's think interval, the far-from-observer signal, far path requests, scope-state classification, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, and the far-from-observer signal have landed. Still open: 73's think interval, far path requests, scope-state classification, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -158,8 +158,9 @@ Scope comes from one camera and puts far entities to sleep.
       `benchmarks/production_step.zig:668-689`). Landed:
       `pipeline_dig_world_edit` on `stageDigWorldEdit`, census via the
       `BenchTiming` tags, not in `Timing`.
-- [ ] A deterministic far-from-observer signal for 62's ambient
-      recycling.
+- [x] A deterministic far-from-observer signal for 62's ambient
+      recycling. `farFromObserver(tier, was_far)` follows the stored tier;
+      `kinematic` holds the caller's bit; nothing is stored.
 - [ ] Far path requests over the whole-world nav within the fixed request
       budget.
 - [ ] New persistent scope state classified for 49/64B; included in 46's

@@ -46,6 +46,7 @@ pub const level_distance_chunks: u16 = 16;
 comptime {
     std.debug.assert(cognition_halo_chunks <= locomotion_halo_chunks);
     std.debug.assert(locomotion_halo_chunks <= kinematic_halo_chunks);
+    std.debug.assert(locomotion_halo_chunks < kinematic_halo_chunks);
 }
 
 /// Residue modulus. Every think cadence divides it.
@@ -118,6 +119,16 @@ pub fn tierForChunkDistance(distance: i32) SimulationTier {
     if (distance <= locomotion_halo_chunks) return .locomotion;
     if (distance <= kinematic_halo_chunks) return .kinematic;
     return .lowest;
+}
+
+/// The caller keeps `was_far`. `lowest` is past `kinematic_halo_chunks`.
+/// `kinematic` holds that bit. This writes nothing.
+fn farFromObserver(tier: SimulationTier, was_far: bool) bool {
+    return switch (tier) {
+        .lowest => true,
+        .kinematic => was_far,
+        .cognition, .locomotion, .dormant => false,
+    };
 }
 
 pub const ChunkCoord = struct {
@@ -302,6 +313,46 @@ test "tierForChunkDistance walks the LOD ladder by band" {
     try std.testing.expectEqual(SimulationTier.kinematic, tierForChunkDistance(kinematic_halo_chunks));
     try std.testing.expectEqual(SimulationTier.lowest, tierForChunkDistance(kinematic_halo_chunks + 1));
     try std.testing.expectEqual(SimulationTier.lowest, tierForChunkDistance(1000));
+}
+
+test "farFromObserver follows tierForChunkDistance and holds the kinematic band" {
+    for (0..2) |_| {
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(0), false));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(0), true));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(cognition_halo_chunks), false));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(cognition_halo_chunks), true));
+
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(cognition_halo_chunks + 1), false));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(cognition_halo_chunks + 1), true));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(locomotion_halo_chunks), false));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(locomotion_halo_chunks), true));
+
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(locomotion_halo_chunks + 1), false));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(locomotion_halo_chunks + 1), true));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(kinematic_halo_chunks), false));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(kinematic_halo_chunks), true));
+
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(kinematic_halo_chunks + 1), false));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(kinematic_halo_chunks + 1), true));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(1000), false));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(1000), true));
+
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(kinematic_halo_chunks), false));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(kinematic_halo_chunks + 1), false));
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(kinematic_halo_chunks), true));
+
+        try std.testing.expectEqual(true, farFromObserver(tierForChunkDistance(locomotion_halo_chunks + 1), true));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(locomotion_halo_chunks), true));
+        try std.testing.expectEqual(false, farFromObserver(tierForChunkDistance(locomotion_halo_chunks + 1), false));
+
+        try std.testing.expectEqual(
+            true,
+            farFromObserver(tierForChunkDistance(kinematic_halo_chunks + 1 - level_distance_chunks), true),
+        );
+
+        try std.testing.expectEqual(false, farFromObserver(.dormant, false));
+        try std.testing.expectEqual(false, farFromObserver(.dormant, true));
+    }
 }
 
 test "stagger phase rotates across all entities over cognition_stagger_n steps" {
