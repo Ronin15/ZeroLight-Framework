@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, far path requests, and the scope-state classification have landed. Still open: 73's think interval, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, far path requests, the scope-state classification, and the scope-file audit have landed. Still open: 73's think interval, the seven audit findings below, the tests item, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -185,9 +185,67 @@ Scope comes from one camera and puts far entities to sleep.
       `stagger_phase`, and `always_active`; `CollisionBoundsRow.tier`;
       `DataSystem.tier_counts`. `was_far` is not a column. 62's caller
       keeps that bit.
-- [ ] The whole of `systems/simulation_scope.zig` and `simulation_scope.zig`
+- [x] The whole of `systems/simulation_scope.zig` and `simulation_scope.zig`
       checked against the cost model and the rules (owner 2026-10-16), not only
-      the items above. Each finding becomes an item here.
+      the items above. Each finding is an item below. `simulation_scope.zig`
+      had none.
+- [ ] Think order permutes every AI row every step (`systems/simulation_scope.zig:1795`,
+      `thinkSortJob` from `orderThinkPhases`). Failure: a standing far population
+      whose think keys did not change still pays a full sort and a 28-column
+      permute. Cost-model miss (`engine-design.md` § Cost model). Pass: column
+      writes follow rows whose think key changed. A row whose key did not
+      change is not column-permuted. The due-group merge stays. Each think-order
+      tuner still records one sample per step at the count that step runs.
+      The whole-population index stays.
+- [ ] `deriveChunkJob` finishes the cell math with a scalar tail
+      (`systems/simulation_scope.zig:1216`). Failure: full lanes run
+      `worldPosToCell4`, then `chunkCoordFor` repeats that math one row at a
+      time (`memory-performance.md` § SIMD and core math). Pass: one lane
+      kernel, last batch masked, stores `chunk_x` and `chunk_y` from lanes.
+      The visual change list stays a scalar compact. Serial and threaded
+      chunk columns still match, including a short tail.
+- [ ] `scanTierDistance` drains lanes into scalar tier branches and repeats
+      the compares in a scalar tail (`systems/simulation_scope.zig:1407`).
+      Failure: the chebyshev and the band compares run in lanes, then each
+      lane branches, and the remainder calls `lodDistance` /
+      `tierForChunkDistance` (`memory-performance.md` § SIMD and core math).
+      Pass: distance and tier class stay in lanes through one masked tail of
+      that same kernel. The command compact stays scalar. Serial and threaded
+      tier commands still match, including a short tail.
+- [ ] Chunk derive grows a destination run inside the change loop
+      (`systems/simulation_scope.zig:367`). Failure: `reserveDrawableDestination`
+      calls `ensureTotalCapacity` once per visual chunk change, and
+      `drainPendingChunks` does the same per pending row
+      (`memory-performance.md` § Hot paths). Pass: one geometric reserve per
+      destination run on the main thread before any per-row link. After that
+      reserve, a `FailingAllocator` proves the link allocates nothing. OOM
+      still rolls the new reserves and the chunk columns back. Growth is
+      counted. Drawable runs stay off workers.
+- [ ] Think-pack tuners record the cognition span for work that is not that
+      span (`systems/simulation_scope.zig:560`). Failure: `think_pack_tuner`
+      samples include optional-column rounds, and the hole and retie tuners
+      are begun and finished at the span while they walk a shorter list or
+      another store (`threading.md` § Building a stage). Pass:
+      `think_pack_tuner` records one sample whose rounds are only that span's
+      AI image, scatter, and apply. Perception, memory, and affect each use
+      their own tuner at `listed`. Hole classify and optional retie begin,
+      run, and finish at the index count that round walks.
+- [ ] Think pack writes `pack_stamp` outside the range window
+      (`systems/simulation_scope.zig:1857`). Failure: `thinkPackJob` and
+      `optionalPackJob` store a moved source's stamp in a scattered `u32`
+      column, so neighboring ranges share cache lines
+      (`threading.md` § Writes, capacity, and determinism). Pass: each
+      range's stamp stores land in a contiguous window that range owns,
+      bucketed by destination in range order before the write. The threaded
+      pack parity test stays clean under ThreadSanitizer at its small fixture.
+- [ ] `thinkPlaceJob` re-slices columns inside the batch loop and drains cell
+      division per lane (`systems/simulation_scope.zig:1749`). Failure:
+      `writable.items(.faction)` and `writable.items(.entity)` run per batch,
+      and `cell_x` / `cell_y` leave lanes for scalar `div` / `mod`
+      (`memory-performance.md` § Dense SoA storage, § SIMD and core math).
+      Pass: `faction` and `entity` are sliced once per range. Cell division
+      stays in lanes. A scalar `packThinkKey` states at the loop why the
+      u128 mix cannot stay in lanes, if it cannot.
 - [ ] Tests: an agent in every band advances (thinks, moves, paths) at its
       cadence; the far signal is deterministic; results are identical across render cadence and worker
       count; serial equals threaded.
