@@ -1707,6 +1707,7 @@ pub const SimulationPipeline = struct {
 
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const dig_world_edit_timer = BenchStageTimer.start(context.perf);
         // The dig is planned and its world growth (tile storage, a ramp's exit
         // clear and link) reserved once, before the promote, so an OOM fails the
         // stage with the deferred impacts still queued; the promote writes no world
@@ -1716,6 +1717,7 @@ pub const SimulationPipeline = struct {
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         if (dig_edit) |edit| try self.commitDigWorldEdit(context.world, edit, context.frame);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
+        dig_world_edit_timer.stop(context.perf, .pipeline_dig_world_edit);
     }
 
     /// Plans `intent`'s dig and reserves its world growth and its nav record, so an OOM

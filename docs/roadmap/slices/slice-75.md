@@ -149,14 +149,15 @@ Scope comes from one camera and puts far entities to sleep.
       slice 88. Landed: an at-rest bounds row leaves `dynamic_ids`. On the
       same three items, collision fill stays at 1537 `items/call`. The tuned
       cases printed `settled=no`, so collision main is not the verdict.
-- [ ] Bench-only (`--details`) timers for the untimed stages, so the
+- [x] Bench-only (`--details`) timers for the untimed stages, so the
       `production-step` census attributes the 2–20% `untimed` share before
       this slice's policy change (`.grok/rules/threading.md`). Landed
       (`f59cf3b`) for scope gather, cognition order, collision scope, plane
       traversal, tier policy, and action react (`BenchTiming`,
       `src/app/runtime_perf_log.zig:331-338`; census
-      `benchmarks/production_step.zig:668-689`). Open: `dig_world_edit` has no
-      timer in `Timing` or `BenchTiming`.
+      `benchmarks/production_step.zig:668-689`). Landed:
+      `pipeline_dig_world_edit` on `stageDigWorldEdit`, census via the
+      `BenchTiming` tags, not in `Timing`.
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request

@@ -217,6 +217,7 @@ fn benchStageBatches(stage: BenchTiming) StageBatches {
         .pipeline_plane_traversal => .{ .bench = &.{.plane_entry} },
         .pipeline_tier_policy => .{ .bench = &.{.scope_tier_policy} },
         .pipeline_action_react => .{},
+        .pipeline_dig_world_edit => .{},
     };
 }
 

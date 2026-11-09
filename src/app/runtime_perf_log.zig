@@ -332,8 +332,9 @@ pub const BenchBatchStage = enum {
 };
 
 /// Top-level stage timers that are bench output only: the scope gathers, the think-set
-/// order, plane traversal, tier policy, and the action-intent consumer. A bench that sets a
-/// `StepBatches` sink on its `Context` receives them; the log never records them.
+/// order, plane traversal, tier policy, the action-intent consumer, and the dig world edit.
+/// A bench that sets a `StepBatches` sink on its `Context` receives them; the log never
+/// records them.
 pub const BenchTiming = enum {
     pipeline_scope_gather,
     pipeline_cognition_order,
@@ -341,6 +342,7 @@ pub const BenchTiming = enum {
     pipeline_plane_traversal,
     pipeline_tier_policy,
     pipeline_action_react,
+    pipeline_dig_world_edit,
 };
 
 pub const FrameSample = struct {
