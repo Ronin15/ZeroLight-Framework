@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, and the far-from-observer signal have landed. Still open: 73's think interval, far path requests, scope-state classification, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, and far path requests have landed. Still open: 73's think interval, scope-state classification, the scope-file audit, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -161,8 +161,10 @@ Scope comes from one camera and puts far entities to sleep.
 - [x] A deterministic far-from-observer signal for 62's ambient
       recycling. `farFromObserver(tier, was_far)` follows the stored tier;
       `kinematic` holds the caller's bit; nothing is stored.
-- [ ] Far path requests over the whole-world nav within the fixed request
-      budget.
+- [x] Far path requests over the whole-world nav within the fixed request
+      budget. Every band, including `lowest`, already emits one request.
+      A zero admission budget leaves them `.pending`. The solve ceiling
+      stays `default_max_solves_per_frame` (512).
 - [ ] New persistent scope state classified for 49/64B; included in 46's
       v1.
 - [ ] The whole of `systems/simulation_scope.zig` and `simulation_scope.zig`

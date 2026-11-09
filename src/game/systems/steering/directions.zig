@@ -527,8 +527,16 @@ fn distance(a: math.Vec2, b: math.Vec2) f32 {
 }
 
 const PathRequest = @import("../../simulation.zig").PathRequest;
+const PathRequestKind = @import("../../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
+const SimulationTier = @import("../../simulation_scope.zig").SimulationTier;
+const cognition_halo_chunks = @import("../../simulation_scope.zig").cognition_halo_chunks;
+const kinematic_halo_chunks = @import("../../simulation_scope.zig").kinematic_halo_chunks;
+const locomotion_halo_chunks = @import("../../simulation_scope.zig").locomotion_halo_chunks;
+const tierForChunkDistance = @import("../../simulation_scope.zig").tierForChunkDistance;
+const default_max_solves_per_frame = @import("../pathfinding/types.zig").default_max_solves_per_frame;
+const min_capacity_floor = @import("../pathfinding/types.zig").min_capacity_floor;
 
 // Test-only fixtures for multi-level start_level regression (not production API).
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
@@ -614,6 +622,100 @@ test "steering requests missing paths then follows available path results" {
     const movement = frame.intents.mergedItems()[0].movement;
     try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(movement.direction_x)));
     try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(movement.direction_y)));
+}
+
+test "steering requests a path from every band including lowest and a zero admission budget leaves the rest pending" {
+    // One cell per nav chunk, so chunk distance is the cell x. Cells x = 0..49, y = 0..1, open.
+    const cell_size: f32 = 32;
+    const bounds_width: f32 = 50 * cell_size;
+    const bounds_height: f32 = 2 * cell_size;
+    const bands = [_]struct { distance: i32, tier: SimulationTier }{
+        .{ .distance = 0, .tier = .cognition },
+        .{ .distance = @as(i32, @intCast(cognition_halo_chunks)) + 1, .tier = .locomotion },
+        .{ .distance = @as(i32, @intCast(locomotion_halo_chunks)) + 1, .tier = .kinematic },
+        .{ .distance = @as(i32, @intCast(kinematic_halo_chunks)) + 1, .tier = .lowest },
+    };
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var agents: [bands.len]EntityId = undefined;
+    var starts: [bands.len]math.Vec2 = undefined;
+    var goals: [bands.len]math.Vec2 = undefined;
+    for (bands, 0..) |band, index| {
+        try std.testing.expectEqual(band.tier, tierForChunkDistance(band.distance));
+        const x = @as(f32, @floatFromInt(band.distance)) * cell_size + cell_size / 2;
+        const start = math.Vec2{ .x = x, .y = cell_size / 2 };
+        const goal = math.Vec2{ .x = x, .y = cell_size + cell_size / 2 };
+        const entity = try addSteeredEntity(&data, start);
+        try data.setSteeringAgent(entity, .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 0,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        });
+        try data.setSimulationTier(entity, tierForChunkDistance(band.distance));
+        const row = data.movementBodyDenseIndex(entity) orelse return error.TestExpectedMovement;
+        try std.testing.expectEqual(band.tier, data.scopeColumnsSliceConst().tier[row]);
+        agents[index] = entity;
+        starts[index] = start;
+        goals[index] = goal;
+    }
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .nav_chunk_tiles = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, bounds_width, bounds_height, cell_size);
+    var colliders = try testColliders(&pathfinding, &data, bounds_width, bounds_height, cell_size);
+    defer colliders.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(bands.len, 0, bands.len, 0, 0, 0);
+    try frame.reservePathRequests(bands.len, bands.len);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(bands.len);
+
+    var intents: [bands.len]NavigationIntent = undefined;
+    for (agents, goals, 0..) |entity, goal, index| {
+        intents[index] = .{ .entity = entity, .kind = .individual, .goal = goal };
+    }
+    frame.beginStep();
+    try appendNavigationIntents(&frame, &intents);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    try std.testing.expectEqual(bands.len, stats.path_request_count);
+    const requests = frame.path_requests.mergedItems();
+    try std.testing.expectEqual(bands.len, requests.len);
+    var seen: [bands.len]bool = @splat(false);
+    for (requests) |request| {
+        var matched = false;
+        for (agents, starts, goals, 0..) |entity, start, goal, index| {
+            if (!request.entity.eql(entity)) continue;
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+            matched = true;
+            try std.testing.expectEqual(start, request.start);
+            try std.testing.expectEqual(goal, request.goal);
+            try std.testing.expectEqual(@as(u16, 0), request.start_level);
+            try std.testing.expectEqual(@as(u16, 0), request.goal_level);
+            try std.testing.expectEqual(PathRequestKind.individual, request.kind);
+        }
+        try std.testing.expect(matched);
+    }
+    for (seen) |flag| try std.testing.expect(flag);
+
+    _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, bands.len, .{ .max_solve_admissions_per_step = 0 });
+    try std.testing.expectEqual(bands.len, pathfinding.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), pathfinding.completed.count());
+    try std.testing.expectEqual(@as(usize, 0), pathfinding.solve_results.items.len);
+    for (starts, goals) |start, goal| try expectPathStatus(&pathfinding, start, goal, .pending);
+    try std.testing.expectEqual(min_capacity_floor, pathfinding.limits.solves_per_step);
+    try std.testing.expectEqual(@min(default_max_solves_per_frame, min_capacity_floor), pathfinding.limits.solves_per_step);
+    try std.testing.expectEqual(@as(usize, 512), default_max_solves_per_frame);
 }
 
 test "steering follows a partial path, requests the next hop inside its end window, and holds at its end without a stuck replan" {
