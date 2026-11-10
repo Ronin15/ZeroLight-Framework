@@ -1088,6 +1088,49 @@ fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) 
     try self.ai_memories.ensureCapacity(self.allocator, plan.capacity_needs.ai_memories);
     try self.ai_affects.ensureCapacity(self.allocator, plan.capacity_needs.ai_affects);
     try self.destructibles.ensureCapacity(self.allocator, plan.capacity_needs.destructibles);
+    try self.reserveThinkKeySlots(plan.capacity_needs.slots);
+    try self.think_key_dirty.ensureTotalCapacity(self.allocator, plan.capacity_needs.slots);
+}
+
+test "think key dirty note allocates nothing after the structural reserve" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const id = try data.createEntity();
+    try data.setMovementBody(id, .{});
+    try data.setAiAgent(id, .{});
+    const slots = data.slots.items.len;
+    try reserveStructuralPlanCapacity(&data, .{
+        .command_count = 0,
+        .structural_event_count = 0,
+        .capacity_needs = .{
+            .slots = slots,
+            .movement_bodies = data.movement_bodies.len(),
+            .facings = 0,
+            .primitive_visuals = 0,
+            .asset_refs = 0,
+            .collision_bounds = 0,
+            .collision_responses = 0,
+            .ai_agents = data.ai_agents.len(),
+            .steering_agents = 0,
+            .world_levels = 0,
+            .factions = 0,
+            .ai_perceptions = 0,
+            .ai_memories = 0,
+            .ai_affects = 0,
+            .destructibles = 0,
+        },
+    });
+    data.think_key_dirty.clearRetainingCapacity();
+    data.bumpThinkKeyEpoch();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const saved = data.allocator;
+    data.allocator = failing.allocator();
+    defer data.allocator = saved;
+    try data.setSimulationTier(id, .locomotion);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), data.think_key_dirty.items.len);
+    try std.testing.expect(data.think_key_dirty.items[0].eql(id));
 }
 
 pub fn validateStructuralCommands(commands: []const StructuralCommand) !usize {

@@ -69,7 +69,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(suite.tunerSettled(&system.adaptive_tuner))) {
-        _ = runOnce(&system, &data, &threads, case);
+        _ = try runOnce(&system, &data, &threads, case);
     }
     const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, case);
 
@@ -77,7 +77,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&system, &data, &threads, case);
+        const batch = try runOnce(&system, &data, &threads, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         std.debug.assert(batch.item_count == item_count);
         try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(movement_range_alignment_items), batch);
@@ -99,10 +99,8 @@ fn runOnce(
     data: *DataSystem,
     thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
-) BatchStats {
-    var slice = data.movementBodySlice();
-
-    const stats = system.update(&slice, thread_system, delta_seconds, .{
+) !BatchStats {
+    const stats = try system.update(data, thread_system, delta_seconds, .{
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](../archive/slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, far path requests, the scope-state classification, and the scope-file audit have landed. Still open: 73's think interval, the seven audit findings below, the tests item, and acceptance. Its core-branch items (owner 2026-10-16; index,
+**Status: in progress.** Inert rows, tier mechanics, the tier docs, the dig-stage bench timer, the far-from-observer signal, far path requests, the scope-state classification, and the scope-file audit have landed. Still open: 73's think interval, five audit findings below, the tests item, and acceptance. Its core-branch items (owner 2026-10-16; index,
 merged order 9b) are the inert-rows item and the tier mechanics: fidelity
 bands, every agent thinking at its band's cadence, whole-population index
 coverage, movement near full rate, and `dormant` for inert rows only. They
@@ -189,14 +189,9 @@ Scope comes from one camera and puts far entities to sleep.
       checked against the cost model and the rules (owner 2026-10-16), not only
       the items above. Each finding is an item below. `simulation_scope.zig`
       had none.
-- [ ] Think order permutes every AI row every step (`systems/simulation_scope.zig:1795`,
-      `thinkSortJob` from `orderThinkPhases`). Failure: a standing far population
-      whose think keys did not change still pays a full sort and a 28-column
-      permute. Cost-model miss (`engine-design.md` § Cost model). Pass: column
-      writes follow rows whose think key changed. A row whose key did not
-      change is not column-permuted. The due-group merge stays. Each think-order
-      tuner still records one sample per step at the count that step runs.
-      The whole-population index stays.
+- [x] Think order is a B+ tree per think group. `orderThinkPhases` does not
+      column-write a key that did not change. The due-span pack stays the
+      think-work copy. The motion record is an `EntityId` resolved at the next order.
 - [ ] `deriveChunkJob` finishes the cell math with a scalar tail
       (`systems/simulation_scope.zig:1216`). Failure: full lanes run
       `worldPosToCell4`, then `chunkCoordFor` repeats that math one row at a
@@ -238,14 +233,8 @@ Scope comes from one camera and puts far entities to sleep.
       range's stamp stores land in a contiguous window that range owns,
       bucketed by destination in range order before the write. The threaded
       pack parity test stays clean under ThreadSanitizer at its small fixture.
-- [ ] `thinkPlaceJob` re-slices columns inside the batch loop and drains cell
-      division per lane (`systems/simulation_scope.zig:1749`). Failure:
-      `writable.items(.faction)` and `writable.items(.entity)` run per batch,
-      and `cell_x` / `cell_y` leave lanes for scalar `div` / `mod`
-      (`memory-performance.md` § Dense SoA storage, § SIMD and core math).
-      Pass: `faction` and `entity` are sliced once per range. Cell division
-      stays in lanes. A scalar `packThinkKey` states at the loop why the
-      u128 mix cannot stay in lanes, if it cannot.
+- [x] `thinkPlaceJob`'s per-batch column slice is gone with that loop, and the
+      place job does not call `.items` inside a batch loop.
 - [ ] Tests: an agent in every band advances (thinks, moves, paths) at its
       cadence; the far signal is deterministic; results are identical across render cadence and worker
       count; serial equals threaded.

@@ -304,46 +304,9 @@ pub const AiAgentStore = struct {
         return types.ensureGeometricImage(AiAgentRow, &self.order_image, allocator, count);
     }
 
-    /// Sizes both lists to one capacity that holds `live` rows, so publishing by swap
-    /// does not shrink the store. Returns whether either capacity grew.
-    pub fn prepareOrderImage(self: *AiAgentStore, allocator: std.mem.Allocator, live: usize) !bool {
-        const target = @max(live, @max(self.rows.capacity, self.order_image.capacity));
-        if (self.order_image.len > target) self.order_image.len = target;
-        var grew = false;
-        if (self.order_image.capacity < target) {
-            try self.order_image.setCapacity(allocator, target);
-            grew = true;
-        }
-        if (self.rows.capacity < target) {
-            try self.rows.setCapacity(allocator, target);
-            grew = true;
-        }
-        self.order_image.len = live;
-        return grew;
-    }
-
     /// `[start, end)` of `order_image` from `rows[perm[i]]`, one pass per column.
     pub fn writeOrderImage(self: *AiAgentStore, start: usize, end: usize, perm: []const u32) void {
         types.copyPermutedColumns(AiAgentRow, &self.order_image, &self.rows, start, end, perm, types.u32Index);
-    }
-
-    /// Sliced once. The pack reads these columns at `k`, not through `perm`.
-    pub fn orderImageComponentRows(self: *const AiAgentStore) struct {
-        perception_row: []const u32,
-        memory_row: []const u32,
-        affect_row: []const u32,
-    } {
-        const image = self.order_image.slice();
-        return .{
-            .perception_row = image.items(.perception_row),
-            .memory_row = image.items(.memory_row),
-            .affect_row = image.items(.affect_row),
-        };
-    }
-
-    /// Each span is a dest range into `order_image`. Columns are sliced once for all of them.
-    pub fn writeOrderSpans(self: *AiAgentStore, spans: []const [2]usize, sources: anytype, comptime sourceAt: fn (@TypeOf(sources), usize) usize) void {
-        types.copyPermutedSpans(AiAgentRow, &self.order_image, &self.rows, spans, sources, sourceAt);
     }
 
     /// `[start, end)` of `rows` from the same indices of `order_image`.
@@ -354,12 +317,6 @@ pub const AiAgentStore = struct {
     /// `rows[dest[j]] = rows[src[j]]` for pair index `j` in `[start, end)`.
     pub fn scatterRows(self: *AiAgentStore, start: usize, end: usize, dest: anytype, src: anytype, comptime destAt: fn (@TypeOf(dest), usize) usize, comptime srcAt: fn (@TypeOf(src), usize) usize) void {
         types.scatterColumns(AiAgentRow, &self.rows, start, end, dest, src, destAt, srcAt);
-    }
-
-    pub fn publishOrderImage(self: *AiAgentStore) void {
-        const sorted = self.order_image;
-        self.order_image = self.rows;
-        self.rows = sorted;
     }
 
     fn ensureCapacityForOne(self: *AiAgentStore, allocator: std.mem.Allocator) !void {

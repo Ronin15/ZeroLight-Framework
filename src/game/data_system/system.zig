@@ -106,6 +106,20 @@ const SimulationScopeStats = @import("../simulation_scope.zig").SimulationScopeS
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const simd = @import("../../core/simd.zig");
 
+/// Leaf index and slot of an entity's think key. `leaf == think_key_absent` is not in a tree.
+pub const ThinkKeyPos = struct {
+    leaf: u32 = think_key_absent,
+    slot: u32 = 0,
+};
+
+pub const think_key_absent: u32 = std.math.maxInt(u32);
+
+/// One movement range's displaced-row count, on its own cache line.
+pub const ThinkMotionCount = struct {
+    count: u32 align(64) = 0,
+    _pad: [60]u8 = undefined,
+};
+
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
     slots: std.ArrayList(EntitySlot) = .empty,
@@ -136,6 +150,20 @@ pub const DataSystem = struct {
     ai_memories: AiMemoryStore = .{},
     ai_affects: AiAffectStore = .{},
     destructibles: DestructibleStore = .{},
+    /// Entities whose think key changed since the last order. One append per epoch.
+    think_key_dirty: std.ArrayList(EntityId) = .empty,
+    /// `think_key_epoch` when `think_key_dirty` already holds that entity. Indexed by slot.
+    think_key_stamp: std.ArrayList(u32) = .empty,
+    /// Bumped when the dirty and motion lists are drained, so stamps read empty.
+    think_key_epoch: u32 = 1,
+    /// Inverse index from entity slot to the think-key leaf. Indexed by slot.
+    think_key_pos: std.ArrayList(ThinkKeyPos) = .empty,
+    /// Bumped by `clearRetainingCapacity`. The next order drops its trees.
+    clear_epoch: u32 = 0,
+    /// Displaced entity ids since the last order, in range order.
+    think_motion_rows: std.ArrayList(EntityId) = .empty,
+    /// Per-range displaced counts for the integrate compact. One slot a range.
+    think_motion_counts: std.ArrayList(ThinkMotionCount) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) DataSystem {
         return .{ .allocator = allocator };
@@ -157,8 +185,60 @@ pub const DataSystem = struct {
         self.facings.deinit(self.allocator);
         self.movement_bodies.deinit(self.allocator);
         self.collision_allow_records.deinit(self.allocator);
+        self.think_motion_counts.deinit(self.allocator);
+        self.think_motion_rows.deinit(self.allocator);
+        self.think_key_pos.deinit(self.allocator);
+        self.think_key_stamp.deinit(self.allocator);
+        self.think_key_dirty.deinit(self.allocator);
         self.slots.deinit(self.allocator);
         self.* = init(self.allocator);
+    }
+
+    /// Slot-indexed think-key stamp and inverse index. New slots read as absent. Grow-only.
+    pub fn reserveThinkKeySlots(self: *DataSystem, count: usize) !void {
+        try self.think_key_stamp.ensureTotalCapacity(self.allocator, count);
+        try self.think_key_pos.ensureTotalCapacity(self.allocator, count);
+        if (self.think_key_stamp.items.len < count) {
+            const old = self.think_key_stamp.items.len;
+            self.think_key_stamp.items.len = count;
+            @memset(self.think_key_stamp.items[old..], 0);
+        }
+        if (self.think_key_pos.items.len < count) {
+            const old = self.think_key_pos.items.len;
+            self.think_key_pos.items.len = count;
+            @memset(self.think_key_pos.items[old..], .{});
+        }
+        std.debug.assert(self.think_key_stamp.capacity >= count);
+        std.debug.assert(self.think_key_pos.capacity >= count);
+    }
+
+    /// Displaced-row windows for `bodies` movement rows. Grow-only.
+    pub fn reserveThinkMotion(self: *DataSystem, bodies: usize) !void {
+        try self.think_motion_rows.ensureTotalCapacity(self.allocator, bodies);
+        try self.think_motion_counts.ensureTotalCapacity(self.allocator, bodies);
+        std.debug.assert(self.think_motion_rows.capacity >= bodies);
+        std.debug.assert(self.think_motion_counts.capacity >= bodies);
+    }
+
+    fn ensureThinkKeyNote(self: *DataSystem) !void {
+        try self.reserveThinkKeySlots(self.slots.items.len);
+        try self.think_key_dirty.ensureTotalCapacity(self.allocator, self.think_key_dirty.items.len + 1);
+    }
+
+    fn noteThinkKey(self: *DataSystem, id: EntityId) void {
+        const index: usize = @intCast(id.index);
+        std.debug.assert(index < self.think_key_stamp.items.len);
+        if (self.think_key_stamp.items[index] == self.think_key_epoch) return;
+        self.think_key_stamp.items[index] = self.think_key_epoch;
+        self.think_key_dirty.appendAssumeCapacity(id);
+    }
+
+    pub fn bumpThinkKeyEpoch(self: *DataSystem) void {
+        self.think_key_epoch +%= 1;
+        if (self.think_key_epoch == 0) {
+            @memset(self.think_key_stamp.items, 0);
+            self.think_key_epoch = 1;
+        }
     }
 
     /// O(1): each population-sized store's committed row count.
@@ -308,6 +388,8 @@ pub const DataSystem = struct {
         const old_level = stored.level orelse 0;
         const new_level = resolved.level orelse old_level;
         const key_changed = old_level != new_level or stored.chunk.x != metadata.chunk.x or stored.chunk.y != metadata.chunk.y;
+        const think_changed = slot.ai_agent_index != null and (stored.tier != metadata.tier or stored.stagger_phase != resolved.stagger_phase or stored.always_active != resolved.always_active or old_level != new_level);
+        if (think_changed) try self.ensureThinkKeyNote();
         // Tier lands before the retarget so a retry does not apply it twice. The chunk and level
         // land after the row is linked, so a failed retarget keeps the old key.
         if (key_changed) {
@@ -316,10 +398,12 @@ pub const DataSystem = struct {
             staged.level = stored.level;
             self.movement_bodies.setScopeMetadata(di, staged);
             if (names_phase) self.movement_bodies.markStaggerSettled(di);
+            if (think_changed) self.noteThinkKey(id);
             try self.movement_bodies.retargetDrawable(self.allocator, di, new_level, metadata.chunk.x, metadata.chunk.y);
         }
         self.movement_bodies.setScopeMetadata(di, resolved);
         if (names_phase) self.movement_bodies.markStaggerSettled(di);
+        if (think_changed) self.noteThinkKey(id);
         try self.movement_bodies.reserveDrawableNeighborLevels(self.allocator, di);
         self.snapInterpolationIfStill(di, metadata.tier);
         try self.noteMovementParticipation(id);
@@ -384,7 +468,11 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return;
         const index: usize = slot.movement_body_index orelse return;
         const level = self.worldLevelConst(id) orelse 0;
-        try self.movement_bodies.commitStagger(self.allocator, world_id, index, level, slot.ai_agent_index != null, false);
+        const has_ai = slot.ai_agent_index != null;
+        const before = self.movement_bodies.scopeMetadataAt(index).stagger_phase;
+        if (has_ai and self.movement_bodies.staggerCommitOpen(index)) try self.ensureThinkKeyNote();
+        try self.movement_bodies.commitStagger(self.allocator, world_id, index, level, has_ai, false);
+        if (has_ai and self.movement_bodies.scopeMetadataAt(index).stagger_phase != before) self.noteThinkKey(id);
         self.mirrorLinkedScope(index);
     }
 
@@ -393,7 +481,11 @@ pub const DataSystem = struct {
         const index: usize = slot.movement_body_index orelse return;
         if (!self.movement_bodies.staggerCommitOpen(index)) return;
         const level = self.worldLevelConst(id) orelse 0;
-        try self.movement_bodies.commitStagger(self.allocator, 0, index, level, slot.ai_agent_index != null, assume_capacity);
+        const has_ai = slot.ai_agent_index != null;
+        const before = self.movement_bodies.scopeMetadataAt(index).stagger_phase;
+        if (has_ai) try self.ensureThinkKeyNote();
+        try self.movement_bodies.commitStagger(self.allocator, 0, index, level, has_ai, assume_capacity);
+        if (has_ai and self.movement_bodies.scopeMetadataAt(index).stagger_phase != before) self.noteThinkKey(id);
         self.mirrorLinkedScope(index);
     }
 
@@ -404,11 +496,14 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
         const old_tier = self.movement_bodies.tierAt(di);
+        const think_changed = slot.ai_agent_index != null and old_tier != tier;
+        if (think_changed) try self.ensureThinkKeyNote();
         // The record lands before the tier, so a failed append leaves the row.
         try self.noteCollisionAllow(id, old_tier, tier);
         self.tier_counts[@backingInt(old_tier)] -= 1;
         self.tier_counts[@backingInt(tier)] += 1;
         self.movement_bodies.setTier(di, tier);
+        if (think_changed) self.noteThinkKey(id);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
         try self.noteMovementParticipation(id);
@@ -548,6 +643,10 @@ pub const DataSystem = struct {
         self.facings.clearRetainingCapacity();
         self.movement_bodies.clearRetainingCapacity();
         self.collision_allow_records.clearRetainingCapacity();
+        self.think_key_dirty.clearRetainingCapacity();
+        self.think_motion_rows.clearRetainingCapacity();
+        self.clear_epoch +%= 1;
+        self.bumpThinkKeyEpoch();
 
         self.first_free_slot = null;
         self.free_slot_count = self.slots.items.len;
@@ -594,6 +693,9 @@ pub const DataSystem = struct {
         // while missing rows are appended and registered in the entity slot.
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.movement_body_index) |index| {
+            const stored = self.movement_bodies.get(@intCast(index));
+            const position_changed = slot.ai_agent_index != null and (stored.position.x != body.position.x or stored.position.y != body.position.y or stored.previous_position.x != body.previous_position.x or stored.previous_position.y != body.previous_position.y);
+            if (position_changed) try self.ensureThinkKeyNote();
             self.movement_bodies.set(@intCast(index), body);
             // A failed create leaves the row without its world-level mirror. This upsert is the retry.
             // The flag follows a successful sync, same as the create path.
@@ -602,6 +704,7 @@ pub const DataSystem = struct {
                 try self.syncScopeLevelFromWorldLevel(id, level, reserved);
                 self.movement_bodies.setHasWorldLevel(index, true);
             }
+            if (position_changed) self.noteThinkKey(id);
             try self.noteMovementParticipation(id);
             self.noteRestingPosition(id);
             return;
@@ -609,6 +712,7 @@ pub const DataSystem = struct {
 
         // Removal records this id and, when the row is not the tail, the id swapRemove
         // moves. Reserved before the append so that cleanup cannot allocate.
+        if (slot.ai_agent_index != null) try self.ensureThinkKeyNote();
         try self.collision_allow_records.ensureTotalCapacity(self.allocator, self.collision_allow_records.items.len + 2);
         const dense_index = try self.movement_bodies.append(self.allocator, id, body);
         slot.movement_body_index = dense_index;
@@ -647,6 +751,7 @@ pub const DataSystem = struct {
         }
         try self.noteMovementParticipation(id);
         self.noteRestingPosition(id);
+        if (slot.ai_agent_index != null) self.noteThinkKey(id);
     }
 
     fn linkMovementVisual(self: *DataSystem, movement_index: u32, reserved: bool) !void {
@@ -882,6 +987,7 @@ pub const DataSystem = struct {
             return;
         }
 
+        try self.ensureThinkKeyNote();
         const dense_index = try self.ai_agents.append(self.allocator, id, agent);
         slot.ai_agent_index = dense_index;
         slot.addComponent(.ai_agent);
@@ -897,6 +1003,7 @@ pub const DataSystem = struct {
         if (slot.ai_perception_index) |perception_index| self.ai_agents.setPerceptionRow(dense_index, perception_index);
         if (slot.ai_memory_index) |memory_index| self.ai_agents.setMemoryRow(dense_index, memory_index);
         if (slot.ai_affect_index) |affect_index| self.ai_agents.setAffectRow(dense_index, affect_index);
+        self.noteThinkKey(id);
         try self.noteMovementParticipation(id);
     }
 
@@ -970,6 +1077,9 @@ pub const DataSystem = struct {
 
     pub fn setFaction(self: *DataSystem, id: EntityId, entity_faction: Faction) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        const previous = if (slot.faction_index) |index| self.factions.factionAt(@intCast(index)) else null;
+        const think_changed = slot.ai_agent_index != null and if (previous) |faction| faction != entity_faction else true;
+        if (think_changed) try self.ensureThinkKeyNote();
         if (slot.faction_index) |index| {
             self.factions.setFaction(@intCast(index), entity_faction);
         } else {
@@ -978,6 +1088,7 @@ pub const DataSystem = struct {
             slot.addComponent(.faction);
         }
         if (slot.ai_agent_index) |ai_index| self.ai_agents.setFactionColumn(ai_index, entity_faction);
+        if (think_changed) self.noteThinkKey(id);
     }
 
     pub fn factionConst(self: *const DataSystem, id: EntityId) ?Faction {
@@ -1113,6 +1224,8 @@ pub const DataSystem = struct {
         const di: usize = slot.movement_body_index orelse return;
         var metadata = self.movement_bodies.scopeMetadataAt(di);
         if (metadata.level == level) return;
+        const think_changed = slot.ai_agent_index != null;
+        if (think_changed) try self.ensureThinkKeyNote();
         // Level lands after the row is linked, so a failed retarget keeps the old level and a retry moves it.
         if (reserved) {
             self.movement_bodies.retargetReservedDrawable(di, level, metadata.chunk.x, metadata.chunk.y);
@@ -1121,6 +1234,7 @@ pub const DataSystem = struct {
         }
         metadata.level = level;
         self.movement_bodies.setScopeMetadata(di, metadata);
+        if (think_changed) self.noteThinkKey(id);
         self.snapInterpolationIfStill(di, metadata.tier);
         self.mirrorLinkedScope(di);
     }
@@ -1330,6 +1444,7 @@ pub const DataSystem = struct {
 
     fn removeAiAgentAt(self: *DataSystem, index: usize) error{OutOfMemory}!void {
         const removed = self.ai_agents.sliceConst().entities[index];
+        try self.ensureThinkKeyNote();
         const removed_movement = self.ai_agents.movementRowAt(index);
         if (removed_movement != no_component_row) self.movement_bodies.setAiRow(removed_movement, no_component_row);
         const moved = self.ai_agents.removeAt(index);
@@ -1338,6 +1453,7 @@ pub const DataSystem = struct {
             const tail_movement = self.ai_agents.movementRowAt(index);
             if (tail_movement != no_component_row) self.movement_bodies.setAiRow(tail_movement, @intCast(index));
         }
+        self.noteThinkKey(removed);
         if (self.movementRowForEntity(removed)) |_| try self.noteMovementParticipation(removed);
     }
 
@@ -4752,6 +4868,31 @@ fn testBody(base: f32) MovementBody {
         .velocity = .{ .x = base + 40, .y = base + 50 },
         .speed = base + 60,
     };
+}
+
+test "think order notes the key when a metadata retarget fails" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const id = try data.createEntity();
+    try data.setMovementBody(id, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 } });
+    try data.setAiAgent(id, .{});
+    try data.setPrimitiveVisual(id, testVisual());
+    try data.setSimulationMetadata(id, .{ .tier = .cognition, .chunk = .{ .x = 0, .y = 0 }, .stagger_phase = 0 });
+    data.think_key_dirty.clearRetainingCapacity();
+    data.bumpThinkKeyEpoch();
+    const next = EntitySimulationMetadata{
+        .tier = .locomotion,
+        .chunk = .{ .x = 4, .y = 4 },
+        .stagger_phase = 0,
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const saved = data.allocator;
+    data.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, data.setSimulationMetadata(id, next));
+    data.allocator = saved;
+    try data.setSimulationMetadata(id, next);
+    try std.testing.expectEqual(@as(usize, 1), data.think_key_dirty.items.len);
+    try std.testing.expect(data.think_key_dirty.items[0].eql(id));
 }
 
 fn testVisual() PrimitiveVisual {

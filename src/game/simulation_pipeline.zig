@@ -1224,7 +1224,7 @@ pub const SimulationPipeline = struct {
     pub fn syncPopulationCapacity(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
-        data: *const DataSystem,
+        data: *DataSystem,
     ) !PopulationSyncStats {
         const rows = data.populationRowCounts();
         const population = rows.population();
@@ -1239,12 +1239,13 @@ pub const SimulationPipeline = struct {
         {
             return .{};
         }
-        return self.growPopulationCapacity(frame, rows);
+        return self.growPopulationCapacity(frame, data, rows);
     }
 
     fn growPopulationCapacity(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
+        data: *DataSystem,
         rows: PopulationRowCounts,
     ) !PopulationSyncStats {
         @branchHint(.cold);
@@ -1287,6 +1288,7 @@ pub const SimulationPipeline = struct {
 
         const body_grew = body != old_body;
         if (body_grew) {
+            try data.reserveThinkMotion(body);
             try self.scope.reserve(body);
             try self.plane_entry.reserve(body);
             try self.collision.reserve(body);
@@ -1693,7 +1695,7 @@ pub const SimulationPipeline = struct {
             .steering_update => try self.stageSteeringUpdate(step),
             .pathfinding_update => try self.stagePathfindingUpdate(step),
             .apply_ai_movement_intents => self.stageApplyAiMovementIntents(step),
-            .movement_integrate => self.stageMovementIntegrate(step),
+            .movement_integrate => try self.stageMovementIntegrate(step),
             .collision_scope_gather => try self.stageCollisionScopeGather(step),
             .collision_detect => try self.stageCollisionDetect(step),
             .collision_respond => try self.stageCollisionRespond(step),
@@ -1935,11 +1937,10 @@ pub const SimulationPipeline = struct {
 
     /// Movement integrates the advancing prefix. Chunk maintenance is `chunk_derive`,
     /// after collision, the tile gate, and plane traversal have settled positions.
-    fn stageMovementIntegrate(self: *SimulationPipeline, step: *StepState) void {
+    fn stageMovementIntegrate(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        var movement_slice = context.data.movementBodySlice();
         var movement_timer = StageTimer.start();
-        step.movement = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        step.movement = try self.movement.update(context.data, context.thread_system, context.delta_seconds, .{});
         movement_timer.stop(context.perf, .pipeline_movement);
     }
 

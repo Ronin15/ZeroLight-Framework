@@ -88,26 +88,6 @@ pub fn copyPermutedColumns(
     }
 }
 
-/// One pass per column over each `[span[0], span[1])`, columns sliced once for every span.
-pub fn copyPermutedSpans(
-    comptime Row: type,
-    dest_list: *std.MultiArrayList(Row),
-    src_list: *const std.MultiArrayList(Row),
-    spans: []const [2]usize,
-    sources: anytype,
-    comptime sourceAt: fn (@TypeOf(sources), usize) usize,
-) void {
-    const dest = dest_list.slice();
-    const src = src_list.slice();
-    inline for (@typeInfo(Row).@"struct".field_names) |name| {
-        const d = dest.items(@field(std.MultiArrayList(Row).Field, name));
-        const s = src.items(@field(std.MultiArrayList(Row).Field, name));
-        for (spans) |span| {
-            for (span[0]..span[1]) |i| d[i] = s[sourceAt(sources, i)];
-        }
-    }
-}
-
 /// One pass per column over `[start, end)`: `dest[i] = src[i]`.
 pub fn copyColumnRange(
     comptime Row: type,

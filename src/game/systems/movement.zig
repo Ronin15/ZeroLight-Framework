@@ -55,12 +55,13 @@ pub const MovementSystem = struct {
 
     pub fn update(
         self: *MovementSystem,
-        slice: *data.MovementBodySlice,
+        bodies: *data.DataSystem,
         thread_system: *ThreadSystem,
         delta_seconds: f32,
         config: MovementConfig,
-    ) MovementStats {
-        return updateMovementBodies(slice, (MovementThreads{ .thread_system = thread_system, .config = config }).stage(&self.adaptive_tuner), delta_seconds);
+    ) !MovementStats {
+        var slice = bodies.movementBodySlice();
+        return updateMovementBodies(bodies, &slice, (MovementThreads{ .thread_system = thread_system, .config = config }).stage(&self.adaptive_tuner), delta_seconds);
     }
 
     pub fn syncPreviousPositions(_: *MovementSystem, slice: *data.MovementBodySlice) void {
@@ -210,26 +211,54 @@ fn applyIntentRangeScalar(bodies: *data.DataSystem, frame: *const SimulationFram
 /// the renderer orders by directly (never interpolated), so movement never reads or
 /// writes it — there is no previous-z to maintain, keeping the vectorized loop pure.
 fn updateMovementBodies(
+    bodies: *data.DataSystem,
     slice: *data.MovementBodySlice,
     integrate: Dispatch,
     delta_seconds: f32,
-) MovementStats {
+) !MovementStats {
     const n = slice.advancing;
-    if (n == 0) return .{};
+    if (n == 0) {
+        bodies.think_motion_rows.clearRetainingCapacity();
+        return .{};
+    }
 
     // Pre-select so the job context can dual-assert range.index against the
-    // dispatched range count.
+    // dispatched range count. The motion window is reserved to the prefix before the run.
     const selection = integrate.select(n, data.movement_range_alignment_items);
+    try bodies.reserveThinkMotion(n);
+    try bodies.reserveThinkKeySlots(bodies.slots.items.len);
+    std.debug.assert(bodies.think_motion_rows.capacity >= n);
+    std.debug.assert(bodies.think_motion_counts.capacity >= selection.range_count);
+    bodies.think_motion_rows.items.len = n;
+    bodies.think_motion_counts.items.len = selection.range_count;
+    for (bodies.think_motion_counts.items) |*slot| slot.count = 0;
     var context = MovementJobContext{
         .slice = slice.*,
         .delta_seconds = delta_seconds,
         .range_count = selection.range_count,
+        .motion = bodies.think_motion_rows.items,
+        .motion_counts = bodies.think_motion_counts.items,
     };
     const batch = integrate.run(selection, n, data.movement_range_alignment_items, &context, movementJob);
+    compactMotion(bodies, selection.items_per_range, selection.range_count);
     return .{
         .body_count = n,
         .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{},
     };
+}
+
+// Range windows land in order. The id is the entity at integrate, before the commit seam.
+fn compactMotion(bodies: *data.DataSystem, items_per_range: usize, range_count: usize) void {
+    const rows = bodies.think_motion_rows.items;
+    var dst: usize = 0;
+    for (0..range_count) |range_index| {
+        const count: usize = bodies.think_motion_counts.items[range_index].count;
+        const src = range_index * items_per_range;
+        std.debug.assert(src + count <= rows.len);
+        if (dst != src and count != 0) @memmove(rows[dst..][0..count], rows[src..][0..count]);
+        dst += count;
+    }
+    bodies.think_motion_rows.items.len = dst;
 }
 
 fn syncPreviousPositionsImpl(slice: *data.MovementBodySlice) void {
@@ -244,23 +273,35 @@ fn movementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     // Dual worker asserts (mirror affect.zig / collision.zig). Buffer bounds
     // also live in processRange (shared with the serial path).
     std.debug.assert(range.index < job.range_count);
-    processRange(&job.slice, range, job.delta_seconds);
+    processRange(&job.slice, range, job.delta_seconds, job.motion, &job.motion_counts[range.index].count);
 }
 
 // Integrates `range` in lane batches; its last batch is the same kernel masked to the rows
 // left, so no lane reads or writes past the range.
-fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32) void {
+fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32, motion: []data.EntityId, motion_count: *u32) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= slice.entities.len);
+    std.debug.assert(range.end <= motion.len);
 
     var index = range.start;
+    var listed: u32 = 0;
     const dt = simd.splatFloat4(delta_seconds);
     while (index < range.end) : (index += simd.lane_count) {
         const count = range.end - index;
         const position_x = simd.loadFloat4Lanes(slice.position_x[index..], count);
         const position_y = simd.loadFloat4Lanes(slice.position_y[index..], count);
+        const previous_x = simd.loadFloat4Lanes(slice.previous_x[index..], count);
+        const previous_y = simd.loadFloat4Lanes(slice.previous_y[index..], count);
         const velocity_x = simd.loadFloat4Lanes(slice.velocity_x[index..], count);
         const velocity_y = simd.loadFloat4Lanes(slice.velocity_y[index..], count);
+        const still = stillLanes(velocity_x, velocity_y, position_x, position_y, previous_x, previous_y);
+        var moved = simd.lanesBelow(count) & ~still;
+        while (moved != 0) {
+            const lane: usize = @ctz(moved);
+            moved &= moved - 1;
+            motion[range.start + listed] = slice.entities[index + lane];
+            listed += 1;
+        }
         const next_x = simd.addFloat4(position_x, simd.mulFloat4(velocity_x, dt));
         const next_y = simd.addFloat4(position_y, simd.mulFloat4(velocity_y, dt));
 
@@ -269,21 +310,38 @@ fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seco
         simd.storeFloat4Lanes(slice.position_x[index..], next_x, count);
         simd.storeFloat4Lanes(slice.position_y[index..], next_y, count);
     }
+    motion_count.* = listed;
 }
 
-// Scalar reference for the lane kernel.
-fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32) void {
+fn stillLanes(velocity_x: simd.Float4, velocity_y: simd.Float4, position_x: simd.Float4, position_y: simd.Float4, previous_x: simd.Float4, previous_y: simd.Float4) simd.MaskBits {
+    const zero = simd.splatFloat4(0);
+    const none: simd.Mask4 = @splat(false);
+    const velocity_clear = @select(bool, simd.equalFloat4(velocity_x, zero), simd.equalFloat4(velocity_y, zero), none);
+    const position_clear = @select(bool, simd.equalFloat4(position_x, previous_x), simd.equalFloat4(position_y, previous_y), none);
+    return simd.maskBits(@select(bool, velocity_clear, position_clear, none));
+}
+
+// Scalar reference for the lane kernel. The motion compact is the same row list, not the integrate math.
+fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32, motion: []data.EntityId, motion_count: *u32) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= slice.entities.len);
+    std.debug.assert(range.end <= motion.len);
 
+    var listed: u32 = 0;
     for (range.start..range.end) |index| {
         const position_x = slice.position_x[index];
         const position_y = slice.position_y[index];
+        const moved = slice.velocity_x[index] != 0 or slice.velocity_y[index] != 0 or position_x != slice.previous_x[index] or position_y != slice.previous_y[index];
+        if (moved) {
+            motion[range.start + listed] = slice.entities[index];
+            listed += 1;
+        }
         slice.previous_x[index] = position_x;
         slice.previous_y[index] = position_y;
         slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
         slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
     }
+    motion_count.* = listed;
 }
 
 const MovementJobContext = struct {
@@ -291,6 +349,8 @@ const MovementJobContext = struct {
     /// Dispatched range count; dual-asserted against `range.index` at job entry.
     range_count: usize,
     delta_seconds: f32,
+    motion: []data.EntityId,
+    motion_counts: []@import("../data_system/system.zig").ThinkMotionCount,
 };
 
 fn fillMovementData(data_system: *data.DataSystem, count: usize) !void {
@@ -317,11 +377,11 @@ fn expectMovementDataBitsEqual(actual: *const data.DataSystem, expected: *const 
 }
 
 // `MovementSystem.update` inline as one range: a thread system with no workers.
-fn updateInline(slice: *data.MovementBodySlice, delta_seconds: f32) !void {
+fn updateInline(bodies: *data.DataSystem, delta_seconds: f32) !void {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var system = MovementSystem.init();
-    _ = system.update(slice, &threads, delta_seconds, .{});
+    _ = try system.update(bodies, &threads, delta_seconds, .{});
 }
 
 // `MovementSystem.applyIntents` inline as one range: a thread system with no workers.
@@ -342,10 +402,11 @@ test "inline movement lane batches, the masked tail included, match scalar integ
         try fillMovementData(&simd_data, count);
         try fillMovementData(&scalar_data, count);
 
-        var simd_slice = simd_data.movementBodySlice();
-        try updateInline(&simd_slice, 0.25);
+        try updateInline(&simd_data, 0.25);
         var scalar_slice = scalar_data.movementBodySlice();
-        processRangeScalar(&scalar_slice, .{ .start = 0, .end = scalar_slice.entities.len }, 0.25);
+        var motion: [9]data.EntityId = undefined;
+        var listed: u32 = 0;
+        processRangeScalar(&scalar_slice, .{ .start = 0, .end = scalar_slice.entities.len }, 0.25, &motion, &listed);
 
         try expectMovementDataBitsEqual(&simd_data, &scalar_data);
     }
@@ -366,14 +427,12 @@ test "threaded movement matches serial movement, the last range ending in the ma
     defer threads.deinit();
 
     var system = MovementSystem.init();
-    var threaded_slice = threaded_data.movementBodySlice();
-    const stats = system.update(&threaded_slice, &threads, 0.5, .{
+    const stats = try system.update(&threaded_data, &threads, 0.5, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    var serial_slice = serial_data.movementBodySlice();
-    try updateInline(&serial_slice, 0.5);
+    try updateInline(&serial_data, 0.5);
 
     try std.testing.expectEqual(serial_data.movementBodySliceConst().entities.len, stats.body_count);
     try expectMovementDataBitsEqual(&threaded_data, &serial_data);
@@ -386,8 +445,7 @@ test "threaded movement matches serial across multiple range splits and worker c
     var serial_data = data.DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     try fillMovementData(&serial_data, item_count);
-    var serial_slice = serial_data.movementBodySlice();
-    try updateInline(&serial_slice, 0.5);
+    try updateInline(&serial_data, 0.5);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 4,
@@ -406,13 +464,13 @@ test "threaded movement matches serial across multiple range splits and worker c
         var threaded_data = data.DataSystem.init(std.testing.allocator);
         defer threaded_data.deinit();
         try fillMovementData(&threaded_data, item_count);
-        var threaded_slice = threaded_data.movementBodySlice();
-        _ = system.update(&threaded_slice, &threads, 0.5, .{
+        _ = try system.update(&threaded_data, &threads, 0.5, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
         try expectMovementDataBitsEqual(&threaded_data, &serial_data);
+        try std.testing.expectEqualSlices(data.EntityId, serial_data.think_motion_rows.items, threaded_data.think_motion_rows.items);
     }
 }
 
@@ -428,8 +486,7 @@ test "movement explicit items_per_range bypasses tuner" {
     defer threads.deinit();
 
     var system = MovementSystem.init();
-    var slice = game_data.movementBodySlice();
-    _ = system.update(&slice, &threads, 0.5, .{
+    _ = try system.update(&game_data, &threads, 0.5, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
     });
@@ -450,8 +507,7 @@ test "movement system owns adaptive tuner for default update" {
     defer threads.deinit();
 
     var system = MovementSystem.init();
-    var slice = game_data.movementBodySlice();
-    const stats = system.update(&slice, &threads, 0.5, .{ .max_worker_threads = 2 });
+    const stats = try system.update(&game_data, &threads, 0.5, .{ .max_worker_threads = 2 });
 
     try std.testing.expectEqual(game_data.movementBodySliceConst().entities.len, stats.body_count);
     try std.testing.expectEqual(@as(usize, 1), system.adaptive_tuner.sample_count);
@@ -473,7 +529,9 @@ fn expectMovementRangeWritesOnlyItsRows(range: ParallelRange) !void {
     try fillMovementData(&game_data, 12);
 
     var slice = game_data.movementBodySlice();
-    processRange(&slice, range, 1.0);
+    var motion: [12]data.EntityId = undefined;
+    var listed: u32 = 0;
+    processRange(&slice, range, 1.0, &motion, &listed);
 
     for (0..slice.entities.len) |index| {
         const base: f32 = @floatFromInt(index);
@@ -501,8 +559,7 @@ test "integrate leaves the discrete z plane untouched" {
     try game_data.setMovementBody(entity, .{ .position = .{ .x = 10, .y = 20 }, .velocity = .{ .x = 5, .y = -5 } });
     game_data.movementBodyPtr(entity).?.snapZ(3);
 
-    var slice = game_data.movementBodySlice();
-    try updateInline(&slice, 0.5);
+    try updateInline(&game_data, 0.5);
 
     const body = game_data.movementBodyConst(entity).?;
     try std.testing.expectEqual(@as(i32, 3), body.position_z);
@@ -515,6 +572,8 @@ test "warmed movement update does not allocate" {
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
     try fillMovementData(&game_data, 32);
+    try game_data.reserveThinkMotion(32);
+    try game_data.reserveThinkKeySlots(game_data.slots.items.len);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -533,8 +592,7 @@ test "warmed movement update does not allocate" {
     }
 
     var system = MovementSystem.init();
-    var slice = game_data.movementBodySlice();
-    const stats = system.update(&slice, &threads, 0.016, .{
+    const stats = try system.update(&game_data, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
@@ -552,8 +610,7 @@ test "threaded multi-worker movement update has no steady-state allocation after
     defer threads.deinit();
 
     var system = MovementSystem.init();
-    var slice = game_data.movementBodySlice();
-    _ = system.update(&slice, &threads, 0.016, .{
+    _ = try system.update(&game_data, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -571,8 +628,7 @@ test "threaded multi-worker movement update has no steady-state allocation after
         threads.allocator = original_thread_allocator;
     }
 
-    slice = game_data.movementBodySlice();
-    const stats = system.update(&slice, &threads, 0.016, .{
+    const stats = try system.update(&game_data, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -596,8 +652,7 @@ test "dormant rows carry zero velocity and stay frozen across a full-range integ
     try std.testing.expectEqual(@as(f32, 0), dormant_body.velocity.x);
     try std.testing.expectEqual(@as(f32, 0), dormant_body.velocity.y);
 
-    var slice = game_data.movementBodySlice();
-    try updateInline(&slice, 0.5);
+    try updateInline(&game_data, 0.5);
 
     // Dormant row unmoved; moving row integrated pos + vel*dt exactly.
     const after_dormant = game_data.movementBodyConst(going_dormant).?;
@@ -606,6 +661,27 @@ test "dormant rows carry zero velocity and stay frozen across a full-range integ
     const after_moving = game_data.movementBodyConst(moving).?;
     try std.testing.expectEqual(@as(f32, 100 + 40 * 0.5), after_moving.position.x);
     try std.testing.expectEqual(@as(f32, 200 - 20 * 0.5), after_moving.position.y);
+}
+
+test "movement integrate lists a displaced row and not a standing one" {
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    const moving = try game_data.createEntity();
+    try game_data.setMovementBody(moving, .{
+        .position = .{ .x = 10, .y = 20 },
+        .previous_position = .{ .x = 10, .y = 20 },
+        .velocity = .{ .x = 4, .y = 0 },
+    });
+    const standing = try game_data.createEntity();
+    try game_data.setMovementBody(standing, .{
+        .position = .{ .x = 30, .y = 40 },
+        .previous_position = .{ .x = 30, .y = 40 },
+    });
+    try game_data.setAiAgent(standing, .{});
+    const standing_row = game_data.movementBodyDenseIndex(standing).?;
+    try std.testing.expect(standing_row < game_data.movementBodySliceConst().advancing);
+    try updateInline(&game_data, 0.5);
+    try std.testing.expectEqualSlices(data.EntityId, &.{moving}, game_data.think_motion_rows.items);
 }
 
 test "integrate skips an at-rest row" {
@@ -631,7 +707,7 @@ test "integrate skips an at-rest row" {
     slice.previous_y[resting_row] = -1;
     try std.testing.expectEqual(@as(usize, 1), slice.advancing);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
-    try updateInline(&slice, 0.5);
+    try updateInline(&game_data, 0.5);
 
     const after_moving = game_data.movementBodyConst(moving).?;
     try std.testing.expectEqual(@as(f32, 12), after_moving.position.x);
